@@ -1,0 +1,28 @@
+{
+  "manifest_version": "1.0.0",
+  "integration_id": "synthetic-custom-fork-review",
+  "host": {
+    "project": "New API",
+    "module": "github.com/QuantumNous/new-api",
+    "version": "v1.0.0-rc.20",
+    "commit": "synthetic-commit",
+    "source_digest": "sha256:synthetic",
+    "dirty": false
+  },
+  "form": "custom_fork_integration_kit",
+  "status": "candidate",
+  "hooks": [
+    {"hook_id": "HOOK-AUTH-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-CONTRACT-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-ROUTE-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-COMMIT-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-OUTCOME-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-BILL-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-LOG-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-MEDIA-001", "status": "pending", "evidence": []}
+  ],
+  "tests": [],
+  "known_gaps": ["Host integration has not started."],
+  "full_parity": false
+}
+

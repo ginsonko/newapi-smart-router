@@ -1,0 +1,23 @@
+NewAPI Smart Router Notices
+
+This project contains and is derived from New API source code.
+
+New API
+Copyright (c) QuantumNous and contributors.
+Original project: https://github.com/QuantumNous/new-api
+
+NewAPI Smart Router modifications
+Copyright (c) 2026 NewAPI Smart Router contributors.
+
+The combined and derived work is distributed under the GNU Affero General
+Public License version 3. See LICENSE for the complete terms. Preserve the
+upstream New API NOTICE, author attribution, additional AGPLv3 Section 7 terms,
+and THIRD-PARTY-LICENSES.md when redistributing a Full distribution, Bridge,
+binary, container image, frontend bundle, or other derivative artifact.
+
+This public Alpha package is unsigned and has not completed external-site or
+three-database certification. RELEASE-STATUS.md is part of the release notice.
+
+Alternative commercial terms may be available only for Smart Router material
+whose copyright is owned by the project maintainer. They do not relicense New
+API or third-party components. See COMMERCIAL-LICENSE.md.

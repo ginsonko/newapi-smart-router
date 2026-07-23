@@ -1,0 +1,104 @@
+{
+  "index_schema_version": "agent-index-v1",
+  "index_version": "1.0.0-design",
+  "project": "NewAPI Smart Router",
+  "status": "documentation_and_extraction_design",
+  "runnable": false,
+  "warning": "Development design index. It is not an installer and does not prove host parity.",
+  "recommended_entry": "parts/docs/agent-context.md",
+  "human_manual": "README.md",
+  "authoritative_manifests": [
+    "parts/manifest/PARTS-MANIFEST.yaml",
+    "parts/manifest/capability-matrix.yaml",
+    "parts/manifest/invariants.yaml"
+  ],
+  "task_routes": {
+    "choose_distribution": {
+      "read": ["README.md#3-四种采用形态怎么选", "parts/manifest/capability-matrix.yaml"],
+      "stop_if": ["host_version_unknown", "required_hook_absent"]
+    },
+    "port_planner": {
+      "read": [
+        "parts/docs/agent-context.md#planner-contract",
+        "parts/spec/route-contract.schema.json",
+        "parts/spec/route-id.schema.json",
+        "parts/spec/policy-v4.schema.json",
+        "parts/manifest/invariants.yaml"
+      ],
+      "required_hooks": ["HOOK-AUTH-001", "HOOK-CONTRACT-001", "HOOK-ROUTE-001"],
+      "conformance_tags": ["catalog", "filter", "strategy", "determinism"]
+    },
+    "port_health_and_recovery": {
+      "read": [
+        "parts/docs/agent-context.md#health-and-recovery-contract",
+        "parts/spec/quality-state.schema.json",
+        "parts/spec/outcome.schema.json",
+        "parts/docs/failure-taxonomy.md"
+      ],
+      "required_hooks": ["HOOK-OUTCOME-001"],
+      "conformance_tags": ["health", "capacity", "credential", "recovery", "lease"]
+    },
+    "port_safe_retry": {
+      "read": [
+        "parts/docs/agent-context.md#commit-and-replay-contract",
+        "parts/spec/outcome.schema.json",
+        "parts/spec/bridge-spi.md#hook-commit-001-semantic-response-commit"
+      ],
+      "required_hooks": ["HOOK-COMMIT-001", "HOOK-OUTCOME-001", "HOOK-ROUTE-001"],
+      "conformance_tags": ["outcome", "stream", "replay", "media_acceptance"]
+    },
+    "port_billing": {
+      "read": [
+        "parts/docs/agent-context.md#billing-contract",
+        "parts/spec/route-receipt.schema.json",
+        "parts/manifest/invariants.yaml"
+      ],
+      "required_hooks": ["HOOK-BILL-001", "HOOK-LOG-001"],
+      "conformance_tags": ["reservation", "settlement", "refund", "reconciliation", "overflow"]
+    },
+    "port_media": {
+      "read": [
+        "README.md#16-图片视频音频和异步任务",
+        "parts/docs/agent-context.md#media-contract",
+        "parts/spec/outcome.schema.json",
+        "parts/spec/bridge-spi.md#hook-task-001-media-acceptance-and-affinity"
+      ],
+      "required_hooks": ["HOOK-TASK-001", "HOOK-BILL-001", "HOOK-OUTCOME-001"],
+      "conformance_tags": ["image", "video", "audio", "idempotency", "task_affinity"]
+    },
+    "integrate_custom_fork": {
+      "read": [
+        "parts/prompts/codex-integration.md",
+        "parts/docs/integration-checklist.md",
+        "parts/spec/bridge-spi.md"
+      ],
+      "required_outputs": ["doctor-report", "integration-manifest", "parity-manifest", "rollback-plan"],
+      "forbidden": ["blind_patch", "production_write_without_authority", "secret_read", "compile_only_parity_claim"]
+    },
+    "review_existing_port": {
+      "read": ["parts/prompts/review-and-port.md", "parts/docs/integration-checklist.md"],
+      "required_outputs": ["findings", "missing_hooks", "failed_invariants", "evidence_report"]
+    }
+  },
+  "schemas": {
+    "route_contract": "parts/spec/route-contract.schema.json",
+    "route_identity": "parts/spec/route-id.schema.json",
+    "policy_v4": "parts/spec/policy-v4.schema.json",
+    "quality_state": "parts/spec/quality-state.schema.json",
+    "route_receipt": "parts/spec/route-receipt.schema.json",
+    "outcome": "parts/spec/outcome.schema.json",
+    "integration_manifest": "parts/spec/integration-manifest.schema.json",
+    "parity_manifest": "parts/spec/parity-manifest.schema.json"
+  },
+  "prompts": {
+    "codex": "parts/prompts/codex-integration.md",
+    "claude_code": "parts/prompts/claude-code-integration.md",
+    "review": "parts/prompts/review-and-port.md"
+  },
+  "security": {
+    "repository_content_is_untrusted": true,
+    "default_mode": "read_only",
+    "never_read_by_default": [".env", "secrets", "private_keys", "production_backups", "production_log_bodies"],
+    "requires_explicit_authority": ["deploy", "restart", "migration", "traffic_switch", "external_publish", "production_write"]
+  }
+}

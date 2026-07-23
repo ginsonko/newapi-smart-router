@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:policy-v4:v1",
+  "title": "NewAPI Smart Router per-key policy v4",
+  "description": "Normative design schema aligned with the reference policy contract. Cross-field rules such as balanced weights totaling 100 and fixed-scope completeness must also be enforced by conformance tests.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "enabled",
+    "strategy",
+    "manual_group_order",
+    "max_attempts",
+    "failure_threshold",
+    "max_effective_ratio_ppm",
+    "excluded_groups",
+    "excluded_routes",
+    "contract_overrides",
+    "health_guard",
+    "recovery_profile",
+    "ttft_policy",
+    "queue_policy",
+    "balanced_weights",
+    "affinity_enabled",
+    "affinity_mode",
+    "affinity_max_premium_percent",
+    "affinity_ttl_seconds",
+    "compression_thresholds",
+    "allow_future_groups"
+  ],
+  "properties": {
+    "version": { "const": 4 },
+    "policy_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "enabled": { "type": "boolean" },
+    "strategy": { "enum": ["price", "stability", "latency", "balanced", "manual"] },
+    "pool_policy": { "type": "string" },
+    "order_mode": { "enum": ["auto_price", "manual"] },
+    "manual_group_order": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "max_attempts": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 },
+    "failure_threshold": { "type": "integer", "minimum": 1, "maximum": 100, "default": 3 },
+    "max_effective_ratio_ppm": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero means inherit the site default. It does not mean free and does not disable routing."
+    },
+    "excluded_groups": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "excluded_routes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "contract_overrides": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/contractOverride" }
+    },
+    "health_guard": {
+      "const": true,
+      "description": "Shared health protection is mandatory in v4 reference behavior."
+    },
+    "recovery_profile": { "enum": ["fast", "balanced", "stable"], "default": "balanced" },
+    "ttft_policy": { "$ref": "#/$defs/ttftPolicy" },
+    "queue_policy": { "$ref": "#/$defs/queuePolicy" },
+    "balanced_weights": { "$ref": "#/$defs/balancedWeights" },
+    "affinity_enabled": { "type": "boolean", "default": true },
+    "affinity_mode": { "enum": ["fixed_premium", "economic_break_even"] },
+    "affinity_max_premium_percent": { "type": "integer", "minimum": 0, "maximum": 1000 },
+    "affinity_ttl_seconds": { "type": "integer", "minimum": 0, "maximum": 604800, "default": 1800 },
+    "compression_thresholds": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/compressionThreshold" }
+    },
+    "allow_future_groups": { "type": "boolean", "default": true },
+    "allow_future_certified_routes": {
+      "type": "boolean",
+      "description": "Rolling-upgrade compatibility alias. A v4 writer keeps it synchronized with allow_future_groups."
+    }
+  },
+  "$defs": {
+    "contractOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pool_policy": { "type": "string" },
+        "order_mode": { "enum": ["auto_price", "manual"] },
+        "manual_route_order": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "ttftPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "metric", "target_ms", "hard_max_ms", "min_samples"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "metric": { "const": "p95" },
+        "target_ms": { "type": "integer", "minimum": 0 },
+        "hard_max_ms": { "type": "integer", "minimum": 0 },
+        "min_samples": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "queuePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "max_wait_ms", "min_saving_percent"],
+      "properties": {
+        "mode": { "enum": ["no_queue", "short_wait"] },
+        "max_wait_ms": { "type": "integer", "minimum": 0, "maximum": 60000 },
+        "min_saving_percent": { "type": "integer", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "balancedWeights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stability", "price", "ttft"],
+      "properties": {
+        "stability": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "price": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "ttft": { "type": "integer", "minimum": 0, "maximum": 100 }
+      },
+      "description": "The three values must total 100. Reference default is 45/40/15."
+    },
+    "compressionThreshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "tokens"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "tokens": { "type": "integer", "minimum": 1, "maximum": 100000000 }
+      }
+    }
+  }
+}

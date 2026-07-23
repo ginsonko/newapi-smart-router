@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:route-id:v1",
+  "title": "NewAPI Smart Router canonical route identity input",
+  "description": "Design contract. Serialize canonical_input as compact UTF-8 JSON with properties emitted in the exact order declared below, no insignificant whitespace, JSON string escaping, and base-10 integers. Hash those bytes with SHA-256 and encode lowercase hexadecimal as route_sha256_<64 hex>. Golden vectors are mandatory before Stable release.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "canonicalization_version", "hash_algorithm", "canonical_input", "route_id"],
+  "properties": {
+    "schema_version": { "const": "route-id-v1" },
+    "canonicalization_version": { "const": "ordered-json-v1" },
+    "hash_algorithm": { "const": "sha256-lowerhex" },
+    "canonical_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_id",
+        "channel_id",
+        "channel_generation",
+        "group",
+        "upstream_model",
+        "capabilities",
+        "max_context"
+      ],
+      "properties": {
+        "contract_id": { "type": "string", "minLength": 1 },
+        "channel_id": { "type": "integer", "minimum": 1 },
+        "channel_generation": {
+          "type": "string",
+          "pattern": "^channel_sha256_[0-9a-f]{64}$"
+        },
+        "group": { "type": "string", "minLength": 1 },
+        "upstream_model": { "type": "string", "minLength": 1 },
+        "capabilities": { "type": "integer", "minimum": 0 },
+        "max_context": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "route_id": {
+      "type": "string",
+      "pattern": "^route_sha256_[0-9a-f]{64}$"
+    }
+  }
+}

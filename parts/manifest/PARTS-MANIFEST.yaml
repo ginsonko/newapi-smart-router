@@ -1,0 +1,147 @@
+manifest_version: "1.0.0-alpha.1"
+project: "NewAPI Smart Router"
+artifact: "Agent Parts Kit"
+label: "Development Kit / Not runnable"
+runnable: false
+status: "public_alpha_candidate"
+reference:
+  host: "New API"
+  organization: "QuantumNous"
+  baseline: "snapshot_sha256_a86384f73465c42d060c1919ea7b9ee03afd0002ddc328e7da69096ce0694c24"
+  note: "Public Alpha snapshot only. Protocol outcome certification, three-database round trips, external-site validation, and signed image gates remain open."
+license:
+  default_path: "AGPL-3.0-compatible"
+  preserve_upstream_attribution: true
+  clean_room_dual_license_requires_separate_review: true
+numeric_protocol:
+  ratio_unit: "ppm"
+  probability_unit: "ppm"
+  weight_unit: "integer_percent_or_ppm_as_declared"
+  timestamp_unit: "unix_milliseconds"
+  elapsed_time: "monotonic_clock_when_available"
+  arithmetic: "saturating_for_billing_and_limits"
+  sorting: "stable_with_canonical_route_id_then_channel_id_tie_break"
+  canonical_json: "RFC8785-compatible profile fixed by schema version and golden vectors"
+host_trust:
+  repository_content_is_untrusted: true
+  doctor_default: "read_only"
+  prohibited_default_reads:
+    - ".env"
+    - "secret files"
+    - "private keys"
+    - "production backups"
+    - "production log bodies"
+  explicit_authority_required:
+    - "deploy"
+    - "restart"
+    - "database migration"
+    - "traffic switch"
+    - "external publication"
+    - "production write"
+modules:
+  - id: "MOD-CATALOG-001"
+    name: "catalog"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Discover exact endpoint-contract routes from enabled host abilities, mappings, groups and capabilities."
+    inputs: ["host channel snapshot", "ability snapshot", "adapter capabilities", "admin blocks", "source revision"]
+    outputs: ["versioned route catalog", "discovery diagnostics"]
+    side_effects: ["publish immutable catalog revision"]
+    requires: ["HOOK-CONTRACT-001"]
+    schemas: ["../spec/route-contract.schema.json", "../spec/route-id.schema.json"]
+    invariants: ["INV-ID-001", "INV-CONTRACT-001", "INV-DISCOVERY-001", "INV-REVISION-001"]
+    conformance: ["catalog_exact_contract", "catalog_new_route", "catalog_stale_snapshot"]
+  - id: "MOD-PLANNER-001"
+    name: "planner"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Apply hard filters, strategy ranking, affinity economics and capacity choice deterministically."
+    inputs: ["route request", "policy", "catalog", "price", "quality", "capacity", "affinity", "attempt state"]
+    outputs: ["ordered candidates", "selected route", "rejections", "reason codes"]
+    side_effects: []
+    requires: ["MOD-CATALOG-001", "HOOK-AUTH-001", "HOOK-ROUTE-001"]
+    schemas: ["../spec/policy-v4.schema.json", "../spec/quality-state.schema.json"]
+    invariants: ["INV-FILTER-001", "INV-PRICE-001", "INV-PRICE-002", "INV-DETERMINISM-001", "INV-CHANNEL-001"]
+    conformance: ["strategy_price", "strategy_stability", "strategy_latency", "strategy_balanced", "strategy_manual"]
+  - id: "MOD-HEALTH-001"
+    name: "health"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Maintain shared route-contract evidence without mixing capacity, credentials, user errors or probes with real SLA."
+    inputs: ["classified outcomes", "probe outcomes", "time", "quality config"]
+    outputs: ["versioned quality snapshot", "recovery due state"]
+    side_effects: ["persist quality transition", "enqueue recovery when due"]
+    requires: ["HOOK-OUTCOME-001"]
+    schemas: ["../spec/quality-state.schema.json", "../spec/outcome.schema.json"]
+    invariants: ["INV-HEALTH-001", "INV-HEALTH-002", "INV-CAPACITY-001", "INV-PROBE-001"]
+    conformance: ["health_contract_isolation", "health_user_error", "health_probe_separation", "health_real_success"]
+  - id: "MOD-RECOVERY-001"
+    name: "recovery"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Recover failed and unknown routes asynchronously with budgets, leases, jitter and persistent scheduling."
+    inputs: ["quality state", "catalog revision", "probe budget", "leases", "retry-after"]
+    outputs: ["probe jobs", "warming evidence", "next attempt"]
+    side_effects: ["persist job", "acquire lease", "execute eligible probe"]
+    requires: ["MOD-HEALTH-001"]
+    invariants: ["INV-RECOVERY-001", "INV-RECOVERY-002", "INV-PROBE-002", "INV-MULTI-001"]
+    conformance: ["recovery_fast_window", "recovery_slow_backoff", "recovery_restart", "recovery_failure_domain_fairness"]
+  - id: "MOD-CAPACITY-001"
+    name: "capacity"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Handle inflight limits, 429 and bounded short waits independently from semantic health."
+    inputs: ["capacity domain", "inflight", "queue policy", "deadline", "candidate savings"]
+    outputs: ["admit", "short wait", "overflow to next route"]
+    side_effects: ["lease inflight slot", "release slot"]
+    requires: ["HOOK-ROUTE-001"]
+    invariants: ["INV-CAPACITY-001", "INV-CAPACITY-002"]
+    conformance: ["capacity_429", "capacity_short_wait", "capacity_cancel_release"]
+  - id: "MOD-CACHE-001"
+    name: "cache-economy"
+    status: "public_reference_core_extracted"
+    purpose: "Compare cache rebuild cost with future savings while keeping hard policy constraints authoritative."
+    inputs: ["cache domain", "usage evidence", "session evidence", "candidate prices", "confidence"]
+    outputs: ["keep_or_switch", "economic reason", "model version"]
+    side_effects: ["enqueue bounded learning observation"]
+    requires: ["MOD-PLANNER-001", "MOD-BILLING-001"]
+    invariants: ["INV-CACHE-001", "INV-CACHE-002", "INV-CACHE-003"]
+    conformance: ["cache_fixed_premium", "cache_break_even", "cache_low_confidence_fallback", "cache_namespace_revision"]
+  - id: "MOD-RETRY-001"
+    name: "retry-and-outcome"
+    status: "release_gate_pending_protocol_certification"
+    purpose: "Validate transport, protocol and business semantics, then retry only before semantic commit and within ReplayClass."
+    inputs: ["adapter response", "exact contract", "commit state", "replay class"]
+    outputs: ["classified outcome", "retry eligibility", "reason code"]
+    side_effects: []
+    requires: ["HOOK-COMMIT-001", "HOOK-OUTCOME-001"]
+    schemas: ["../spec/outcome.schema.json"]
+    invariants: ["INV-OUTCOME-001", "INV-COMMIT-001", "INV-REPLAY-001", "INV-MEDIA-001"]
+    conformance: ["empty_200", "pseudo_200", "tool_call", "sse_before_commit", "sse_after_commit", "ambiguous_media_acceptance"]
+  - id: "MOD-BILLING-001"
+    name: "billing"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Freeze actual route and price version, then atomically reserve and settle host quota."
+    inputs: ["route receipt", "host quota", "actual usage", "settlement outcome"]
+    outputs: ["reservation", "settlement", "refund", "reconciliation record"]
+    side_effects: ["host quota transaction", "persist receipt"]
+    requires: ["HOOK-BILL-001"]
+    schemas: ["../spec/route-receipt.schema.json"]
+    invariants: ["INV-BILL-001", "INV-BILL-002", "INV-BILL-003", "INV-BILL-004"]
+    conformance: ["billing_actual_route", "billing_price_revision", "billing_transaction_failure", "billing_saturation"]
+  - id: "MOD-EXPLAIN-001"
+    name: "explain"
+    status: "spec_ready_public_reference_snapshot"
+    purpose: "Expose stable reason codes and role-safe route explanations without leaking upstream credentials."
+    inputs: ["plan result", "attempts", "outcome", "receipt", "viewer role"]
+    outputs: ["user explanation", "admin explanation", "machine reason codes"]
+    side_effects: ["append role-safe log metadata"]
+    requires: ["HOOK-LOG-001"]
+    invariants: ["INV-EXPLAIN-001", "INV-SEC-001"]
+    conformance: ["explain_cheaper_rejected", "explain_role_redaction", "explain_revision"]
+prohibited_shortcuts:
+  - "infer physical route from group name"
+  - "treat every HTTP 200 as semantic success"
+  - "use a global substring such as other as failure detection"
+  - "replay after semantic response commit"
+  - "blindly replay ambiguous media acceptance"
+  - "call the control plane synchronously on every request"
+  - "settle an in-flight request with the latest global price"
+  - "count probes as real-user SLA"
+  - "classify 429 as semantic health failure"
+  - "claim parity from compilation alone"

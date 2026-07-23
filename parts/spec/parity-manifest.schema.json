@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:parity-manifest:v1",
+  "title": "Smart Router release or host parity manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_ms",
+    "artifact",
+    "form",
+    "host_commit",
+    "smart_router_commit",
+    "claim",
+    "capabilities",
+    "critical_invariants",
+    "database_results",
+    "roundtrip_results",
+    "known_gaps",
+    "evidence_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": "parity-manifest-v1" },
+    "generated_at_ms": { "type": "integer", "minimum": 0 },
+    "artifact": { "type": "string", "minLength": 1 },
+    "form": { "enum": ["full", "certified_bridge", "custom_integration", "agent_parts", "sidecar_lite"] },
+    "host_commit": { "type": "string", "minLength": 7 },
+    "smart_router_commit": { "type": "string", "minLength": 7 },
+    "image_digest": { "type": "string" },
+    "claim": { "enum": ["full_parity", "partial_parity", "development_kit", "lite", "not_certified"] },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/result" }
+    },
+    "critical_invariants": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/result" }
+    },
+    "database_results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sqlite", "mysql", "postgresql"],
+      "properties": {
+        "sqlite": { "$ref": "#/$defs/status" },
+        "mysql": { "$ref": "#/$defs/status" },
+        "postgresql": { "$ref": "#/$defs/status" }
+      }
+    },
+    "roundtrip_results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["install", "upgrade", "rollback", "uninstall", "purge"],
+      "properties": {
+        "install": { "$ref": "#/$defs/status" },
+        "upgrade": { "$ref": "#/$defs/status" },
+        "rollback": { "$ref": "#/$defs/status" },
+        "uninstall": { "$ref": "#/$defs/status" },
+        "purge": { "$ref": "#/$defs/status" }
+      }
+    },
+    "known_gaps": { "type": "array", "items": { "type": "string" } },
+    "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "signature": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "claim": { "const": "full_parity" } },
+        "required": ["claim"]
+      },
+      "then": {
+        "properties": {
+          "form": { "enum": ["full", "certified_bridge", "custom_integration"] },
+          "capabilities": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/result" },
+                { "properties": { "status": { "const": "pass" } } }
+              ]
+            }
+          },
+          "critical_invariants": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/result" },
+                { "properties": { "status": { "const": "pass" } } }
+              ]
+            }
+          },
+          "database_results": {
+            "properties": {
+              "sqlite": { "const": "pass" },
+              "mysql": { "const": "pass" },
+              "postgresql": { "const": "pass" }
+            }
+          },
+          "roundtrip_results": {
+            "properties": {
+              "install": { "const": "pass" },
+              "upgrade": { "const": "pass" },
+              "rollback": { "const": "pass" },
+              "uninstall": { "const": "pass" },
+              "purge": { "const": "pass" }
+            }
+          },
+          "known_gaps": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "form": { "const": "agent_parts" } }, "required": ["form"] },
+      "then": { "properties": { "claim": { "const": "development_kit" } } }
+    },
+    {
+      "if": { "properties": { "form": { "const": "sidecar_lite" } }, "required": ["form"] },
+      "then": { "properties": { "claim": { "const": "lite" } } }
+    }
+  ],
+  "$defs": {
+    "status": { "enum": ["pass", "fail", "blocked", "skipped", "unknown", "not_claimed"] },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "evidence"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible Smart Router defect using synthetic data.
+title: "[Bug] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach API keys, production logs, database backups, user data, real upstream URLs, or billing records. Security issues belong in private vulnerability reporting.
+  - type: input
+    id: release
+    attributes:
+      label: Smart Router release and form
+      placeholder: v0.1.0-alpha.1 / Full, Bridge, Integration, or Agent Parts
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: New API host tag and commit
+      placeholder: v1.0.0-rc.20 / commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal synthetic reproduction
+      description: Include contract, strategy, expected result, actual result, and stable reason codes.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: List tests, manifest checks, and synthetic logs without secrets.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private URLs, user data, billing data, and production log bodies.
+          required: true

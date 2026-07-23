@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:integration-manifest:v1",
+  "title": "Smart Router host integration manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_ms",
+    "host",
+    "target_form",
+    "doctor_mode",
+    "hooks",
+    "database_support",
+    "planned_changes",
+    "rollback",
+    "authorization"
+  ],
+  "properties": {
+    "schema_version": { "const": "integration-manifest-v1" },
+    "generated_at_ms": { "type": "integer", "minimum": 0 },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "commit", "dirty", "license", "schema_fingerprint"],
+      "properties": {
+        "project": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "minLength": 7 },
+        "tag": { "type": "string" },
+        "dirty": { "type": "boolean" },
+        "license": { "type": "string", "minLength": 1 },
+        "schema_fingerprint": { "type": "string", "minLength": 1 }
+      }
+    },
+    "target_form": { "enum": ["certified_bridge", "custom_fork_integration", "selected_parts"] },
+    "doctor_mode": { "const": "read_only" },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hook_id", "status", "evidence"],
+        "properties": {
+          "hook_id": { "type": "string", "pattern": "^HOOK-[A-Z]+-[0-9]{3}$" },
+          "status": { "enum": ["pass", "fail", "blocked", "unknown", "not_claimed"] },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "conflicts": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "database_support": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sqlite": { "$ref": "#/$defs/status" },
+        "mysql": { "$ref": "#/$defs/status" },
+        "postgresql": { "$ref": "#/$defs/status" }
+      }
+    },
+    "planned_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "purpose", "hook_ids", "risk"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "purpose": { "type": "string", "minLength": 1 },
+          "hook_ids": { "type": "array", "items": { "type": "string" } },
+          "risk": { "enum": ["low", "medium", "high", "critical"] }
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "data_preservation", "activity_blocks"],
+      "properties": {
+        "strategy": { "type": "string", "minLength": 1 },
+        "data_preservation": { "type": "array", "items": { "type": "string" } },
+        "activity_blocks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read_source", "write_source", "deploy", "production_access", "external_publish"],
+      "properties": {
+        "read_source": { "type": "boolean" },
+        "write_source": { "type": "boolean" },
+        "deploy": { "type": "boolean" },
+        "production_access": { "type": "boolean" },
+        "external_publish": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "status": { "enum": ["pass", "fail", "blocked", "unknown", "not_claimed"] }
+  }
+}

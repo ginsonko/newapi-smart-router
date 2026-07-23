@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:route-contract:v1",
+  "title": "NewAPI Smart Router exact route contract",
+  "description": "Normative design schema for an exact model, endpoint and capability contract. This schema is not release evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "canonical_model",
+    "endpoint",
+    "capability_fingerprint",
+    "capabilities",
+    "replay_class"
+  ],
+  "properties": {
+    "schema_version": { "const": "route-contract-v1" },
+    "contract_id": {
+      "type": "string",
+      "pattern": "^contract(_v[0-9]+)?_sha256_[0-9a-f]{64}$"
+    },
+    "canonical_model": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "endpoint": {
+      "enum": [
+        "openai-chat-completions-v1",
+        "openai-legacy-completions-v1",
+        "openai-responses-v1",
+        "anthropic-messages-v1",
+        "openai-image-generations-v1",
+        "openai-image-edits-v1",
+        "openai-video-generations-v1",
+        "openai-audio-speech-v1",
+        "openai-audio-transcriptions-v1",
+        "openai-audio-translations-v1"
+      ]
+    },
+    "capability_fingerprint": {
+      "type": "string",
+      "pattern": "^cap(_v[0-9]+)?_sha256_[0-9a-f]{64}$"
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "text",
+          "streaming",
+          "tools",
+          "vision",
+          "structured_output",
+          "reasoning",
+          "prompt_cache",
+          "image_generation",
+          "image_edit",
+          "video_generation",
+          "async_task",
+          "reference_image",
+          "reference_video",
+          "reference_audio",
+          "audio_speech",
+          "audio_transcription",
+          "audio_translation"
+        ]
+      }
+    },
+    "max_context_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero means unknown, not unlimited."
+    },
+    "replay_class": {
+      "enum": [
+        "sync_text_safe_before_commit",
+        "stream_safe_before_commit",
+        "media_idempotent",
+        "media_safe_only_if_not_accepted",
+        "media_never_cross_route",
+        "task_query_affinity"
+      ]
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "probe_allowed",
+        "synchronous",
+        "idempotency_supported",
+        "query_affinity_required",
+        "safe_replay_before_acceptance"
+      ],
+      "properties": {
+        "probe_allowed": { "type": "boolean" },
+        "synchronous": { "type": "boolean" },
+        "idempotency_supported": { "type": "boolean" },
+        "query_affinity_required": { "type": "boolean" },
+        "safe_replay_before_acceptance": { "type": "boolean" },
+        "acceptance_evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "endpoint": {
+            "enum": [
+              "openai-image-generations-v1",
+              "openai-image-edits-v1",
+              "openai-video-generations-v1",
+              "openai-audio-speech-v1",
+              "openai-audio-transcriptions-v1",
+              "openai-audio-translations-v1"
+            ]
+          }
+        },
+        "required": ["endpoint"]
+      },
+      "then": { "required": ["media"] }
+    }
+  ]
+}

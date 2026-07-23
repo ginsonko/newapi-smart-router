@@ -1,0 +1,90 @@
+{
+  "version": "planner-v1",
+  "cases": [
+    {
+      "id": "price_prefers_currently_cheap_even_with_lower_history",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "background_recovery": false,
+      "routes": [
+        {"id": "route-cheap", "group": "cheap", "channel_id": 11, "ratio_ppm": 20000, "phase": "healthy", "reliability_ppm": 800000, "samples": 10},
+        {"id": "route-stable", "group": "stable", "channel_id": 12, "ratio_ppm": 100000, "phase": "healthy", "reliability_ppm": 999000, "samples": 100}
+      ],
+      "want_route": "route-cheap"
+    },
+    {
+      "id": "ratio_limit_filters_expensive_route",
+      "strategy": "price",
+      "max_ratio_ppm": 50000,
+      "routes": [
+        {"id": "route-cheap", "group": "cheap", "channel_id": 21, "ratio_ppm": 20000, "phase": "healthy"},
+        {"id": "route-expensive", "group": "expensive", "channel_id": 22, "ratio_ppm": 160000, "phase": "healthy"}
+      ],
+      "want_route": "route-cheap"
+    },
+    {
+      "id": "open_cheap_route_spills_to_next_known_route",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "routes": [
+        {"id": "route-cheap", "group": "cheap", "channel_id": 31, "ratio_ppm": 20000, "phase": "open", "consecutive_hard_failures": 3, "failure_window_until_ms": 200000, "next_probe_at_ms": 200000},
+        {"id": "route-plus", "group": "plus", "channel_id": 32, "ratio_ppm": 80000, "phase": "healthy"}
+      ],
+      "want_route": "route-plus"
+    },
+    {
+      "id": "capacity_is_not_health_failure",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "routes": [
+        {"id": "route-cheap", "group": "cheap", "channel_id": 41, "ratio_ppm": 20000, "phase": "healthy", "capacity_full": true},
+        {"id": "route-plus", "group": "plus", "channel_id": 42, "ratio_ppm": 80000, "phase": "healthy"}
+      ],
+      "want_route": "route-plus"
+    },
+    {
+      "id": "same_channel_is_not_retried_through_alias",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "attempted_channels": [51],
+      "routes": [
+        {"id": "route-alias-a", "group": "cheap", "channel_id": 51, "ratio_ppm": 20000, "phase": "healthy"},
+        {"id": "route-alias-b", "group": "plus", "channel_id": 51, "ratio_ppm": 80000, "phase": "healthy"},
+        {"id": "route-independent", "group": "pro", "channel_id": 52, "ratio_ppm": 120000, "phase": "healthy"}
+      ],
+      "want_route": "route-independent"
+    },
+    {
+      "id": "manual_group_order_wins",
+      "strategy": "manual",
+      "max_ratio_ppm": 1000000,
+      "manual_group_order": ["plus", "cheap"],
+      "routes": [
+        {"id": "route-cheap", "group": "cheap", "channel_id": 61, "ratio_ppm": 20000, "phase": "healthy"},
+        {"id": "route-plus", "group": "plus", "channel_id": 62, "ratio_ppm": 80000, "phase": "healthy"}
+      ],
+      "want_route": "route-plus"
+    },
+    {
+      "id": "committed_request_fails_closed",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "committed": true,
+      "routes": [
+        {"id": "route-only", "group": "cheap", "channel_id": 71, "ratio_ppm": 20000, "phase": "healthy"}
+      ],
+      "want_error": "response is already committed"
+    },
+    {
+      "id": "virgin_unknown_price_bootstrap_is_bounded",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "background_recovery": true,
+      "routes": [
+        {"id": "route-virgin-cheap", "group": "cheap", "channel_id": 81, "ratio_ppm": 20000},
+        {"id": "route-virgin-plus", "group": "plus", "channel_id": 82, "ratio_ppm": 80000}
+      ],
+      "want_route": "route-virgin-cheap"
+    }
+  ]
+}

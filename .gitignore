@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+coverage/
+dist/
+secret-scan.json
+validation-report.json
+doctor-report.json
+integration-manifest.json

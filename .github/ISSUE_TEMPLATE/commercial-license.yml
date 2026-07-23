@@ -1,0 +1,43 @@
+name: Commercial licensing inquiry
+description: Ask about closed-source, proprietary, OEM, or commercial support terms.
+title: "[Commercial licensing] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is only an initial contact. Do not include credentials, private contracts, customer data, pricing secrets, or other confidential information.
+  - type: dropdown
+    id: request_type
+    attributes:
+      label: Request type
+      options:
+        - Closed-source or proprietary integration
+        - OEM or embedded distribution
+        - Commercial support or integration service
+        - Other licensing question
+    validations:
+      required: true
+  - type: input
+    id: organization
+    attributes:
+      label: Organization or project
+      description: A public name or short non-confidential description is sufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Intended use
+      description: Describe the requested rights and deployment form without sharing confidential details.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I understand that New API and third-party components retain their own license terms.
+          required: true
+        - label: I have not included secrets or confidential information in this issue.
+          required: true

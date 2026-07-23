@@ -1,0 +1,42 @@
+{
+  "version": "outcome-v1",
+  "cases": [
+    {
+      "id": "valid_text_success",
+      "contract": "openai-responses-v1",
+      "input": {"http_status": 200, "protocol_valid": true, "semantic_output": "text"},
+      "expected": {"kind": "success", "commit_state": "semantically_validated", "retry_allowed": false, "health_attribution": "route"}
+    },
+    {
+      "id": "empty_success_shape",
+      "contract": "openai-responses-v1",
+      "input": {"http_status": 200, "protocol_valid": true, "semantic_output": "empty"},
+      "expected": {"kind": "retryable_failure", "commit_state": "buffered", "retry_allowed": true, "health_attribution": "route"}
+    },
+    {
+      "id": "valid_tool_call_is_not_empty",
+      "contract": "openai-chat-v1",
+      "input": {"http_status": 200, "protocol_valid": true, "semantic_output": "tool_call"},
+      "expected": {"kind": "success", "commit_state": "semantically_validated", "retry_allowed": false, "health_attribution": "route"}
+    },
+    {
+      "id": "stream_failure_after_commit",
+      "contract": "anthropic-messages-v1",
+      "input": {"http_status": 200, "protocol_valid": false, "semantic_output": "partial_text", "already_committed": true},
+      "expected": {"kind": "terminal_failure", "commit_state": "committed", "retry_allowed": false, "health_attribution": "route"}
+    },
+    {
+      "id": "ambiguous_video_acceptance",
+      "contract": "video-submit-v1",
+      "input": {"http_status": 200, "protocol_valid": false, "acceptance": "unknown"},
+      "expected": {"kind": "ambiguous_acceptance", "commit_state": "buffered", "retry_allowed": false, "health_attribution": "unknown"}
+    },
+    {
+      "id": "capacity_limit_is_not_route_failure",
+      "contract": "openai-responses-v1",
+      "input": {"http_status": 429, "retry_after_ms": 2000},
+      "expected": {"kind": "retryable_failure", "commit_state": "buffered", "retry_allowed": true, "health_attribution": "capacity"}
+    }
+  ]
+}
+

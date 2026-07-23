@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:outcome:v1",
+  "title": "NewAPI Smart Router semantic attempt outcome",
+  "description": "Contract-specific result classification. HTTP status alone cannot produce semantic success.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "route_id",
+    "kind",
+    "attribution",
+    "commit_state",
+    "acceptance_state",
+    "replay_class",
+    "retry_allowed",
+    "reason_code",
+    "observed_at_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": "outcome-v1" },
+    "contract_id": { "type": "string", "minLength": 1 },
+    "route_id": { "type": "string", "pattern": "^route_sha256_[0-9a-f]{64}$" },
+    "kind": { "enum": ["success", "retryable_failure", "terminal_failure", "ambiguous_acceptance"] },
+    "attribution": {
+      "enum": ["route", "credential", "capacity", "user", "content_policy", "client", "host", "unknown"]
+    },
+    "commit_state": { "enum": ["buffered", "semantically_validated", "committed", "terminal"] },
+    "acceptance_state": { "enum": ["not_applicable", "not_accepted", "accepted", "unknown"] },
+    "replay_class": {
+      "enum": ["unsupported", "safe_text", "safe_image", "safe_video", "safe_audio", "state_bound", "side_effecting"]
+    },
+    "retry_allowed": { "type": "boolean" },
+    "reason_code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{2,127}$" },
+    "http_status": { "type": "integer", "minimum": 0, "maximum": 599 },
+    "retry_after_ms": { "type": "integer", "minimum": 0 },
+    "transport_valid": { "type": "boolean" },
+    "protocol_valid": { "type": "boolean" },
+    "semantic_valid": { "type": "boolean" },
+    "probe": { "type": "boolean", "default": false },
+    "synthetic_probe": { "type": "boolean", "default": false },
+    "summary": { "type": "string", "maxLength": 2048 },
+    "observed_at_ms": { "type": "integer", "minimum": 0 },
+    "adapter_evidence": {
+      "type": "object",
+      "description": "Redacted structured evidence only. Credentials, upstream URLs and raw sensitive bodies are forbidden.",
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "commit_state": { "enum": ["committed", "terminal"] } }, "required": ["commit_state"] },
+      "then": { "properties": { "retry_allowed": { "const": false } } }
+    },
+    {
+      "if": { "properties": { "acceptance_state": { "enum": ["accepted", "unknown"] } }, "required": ["acceptance_state"] },
+      "then": {
+        "if": { "properties": { "replay_class": { "enum": ["safe_image", "safe_video", "safe_audio", "state_bound", "side_effecting"] } } },
+        "then": { "properties": { "retry_allowed": { "const": false } } }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "success" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "transport_valid": { "const": true },
+          "protocol_valid": { "const": true },
+          "semantic_valid": { "const": true },
+          "retry_allowed": { "const": false }
+        },
+        "required": ["transport_valid", "protocol_valid", "semantic_valid"]
+      }
+    }
+  ]
+}

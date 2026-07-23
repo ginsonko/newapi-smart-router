@@ -1,0 +1,31 @@
+{
+  "manifest_version": "1.0.0-alpha.1",
+  "form": "certified_bridge_candidate",
+  "host": {
+    "module": "github.com/QuantumNous/new-api",
+    "base_tag": "v1.0.0-rc.20",
+    "base_upstream_commit": "a7f3067bf34a2fa125f843acdfcf45d0b0bfd682",
+    "reference_fork_commit": "6ce7305cd36f16506fb6a2c3c524a5a318539ba7",
+    "latest_upstream_observed": "v1.0.0-rc.21",
+    "exact_commit_required": true
+  },
+  "bridge_protocol": "bridge-spi-v1alpha1",
+  "certification_status": "public_alpha_reference_candidate_not_certified",
+  "full_parity": false,
+  "required_hooks": [
+    "HOOK-AUTH-001",
+    "HOOK-CONTRACT-001",
+    "HOOK-ROUTE-001",
+    "HOOK-COMMIT-001",
+    "HOOK-OUTCOME-001",
+    "HOOK-BILL-001",
+    "HOOK-LOG-001",
+    "HOOK-MEDIA-001"
+  ],
+  "remaining_gates": [
+    "frozen_protocol_outcome_vectors",
+    "bridge_off_differential_suite",
+    "sqlite_mysql_postgresql_roundtrip",
+    "external_non_production_site_roundtrip"
+  ]
+}
