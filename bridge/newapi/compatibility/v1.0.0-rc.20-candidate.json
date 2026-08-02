@@ -1,5 +1,5 @@
 {
-  "manifest_version": "1.0.0-alpha.1",
+  "manifest_version": "2.0.0-alpha.1",
   "form": "certified_bridge_candidate",
   "host": {
     "module": "github.com/QuantumNous/new-api",
@@ -9,13 +9,14 @@
     "latest_upstream_observed": "v1.0.0-rc.21",
     "exact_commit_required": true
   },
-  "bridge_protocol": "bridge-spi-v1alpha1",
+  "bridge_protocol": "bridge-spi-v1alpha2",
   "certification_status": "public_alpha_reference_candidate_not_certified",
   "full_parity": false,
   "required_hooks": [
     "HOOK-AUTH-001",
     "HOOK-CONTRACT-001",
     "HOOK-ROUTE-001",
+    "HOOK-PRICE-001",
     "HOOK-COMMIT-001",
     "HOOK-OUTCOME-001",
     "HOOK-BILL-001",
@@ -26,6 +27,7 @@
     "frozen_protocol_outcome_vectors",
     "bridge_off_differential_suite",
     "sqlite_mysql_postgresql_roundtrip",
-    "external_non_production_site_roundtrip"
+    "external_non_production_site_roundtrip",
+    "web_worker_identical_artifact_receipt"
   ]
 }

@@ -28,6 +28,10 @@
     },
     "commit_state": { "enum": ["buffered", "semantically_validated", "committed", "terminal"] },
     "acceptance_state": { "enum": ["not_applicable", "not_accepted", "accepted", "unknown"] },
+    "dispatch_state": {
+      "enum": ["not_started", "started", "accepted", "unknown", "completed"],
+      "description": "Whether the exact physical upstream dispatch has begun. side_effecting requests may choose one initial route, but cannot move to a second route after this state leaves not_started."
+    },
     "replay_class": {
       "enum": ["unsupported", "safe_text", "safe_image", "safe_video", "safe_audio", "state_bound", "side_effecting"]
     },
@@ -70,6 +74,40 @@
           "retry_allowed": { "const": false }
         },
         "required": ["transport_valid", "protocol_valid", "semantic_valid"]
+      }
+    },
+    {
+      "if": { "required": ["http_status"], "properties": { "http_status": { "const": 200 } } },
+      "then": { "required": ["transport_valid", "protocol_valid", "semantic_valid"] }
+    },
+    {
+      "if": { "required": ["replay_class"], "properties": { "replay_class": { "const": "side_effecting" } } },
+      "then": {
+        "required": ["dispatch_state"],
+        "allOf": [
+          {
+            "if": {
+              "properties": { "dispatch_state": { "enum": ["started", "accepted", "unknown", "completed"] } },
+              "required": ["dispatch_state"]
+            },
+            "then": { "properties": { "retry_allowed": { "const": false } } }
+          }
+        ]
+      }
+    },
+    {
+      "if": { "required": ["replay_class"], "properties": { "replay_class": { "const": "state_bound" } } },
+      "then": { "properties": { "retry_allowed": { "const": false } } }
+    },
+    {
+      "if": { "required": ["reason_code"], "properties": { "reason_code": { "const": "convert_request_failed" } } },
+      "then": {
+        "required": ["dispatch_state"],
+        "properties": {
+          "dispatch_state": { "const": "not_started" },
+          "acceptance_state": { "const": "not_accepted" },
+          "commit_state": { "const": "buffered" }
+        }
       }
     }
   ]

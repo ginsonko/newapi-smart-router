@@ -11,12 +11,14 @@ func completeHost() HostFingerprint {
 		hooks = append(hooks, HookStatus{ID: id, Present: true, Verified: true, Evidence: "fixture"})
 	}
 	return HostFingerprint{
-		Module:       "github.com/QuantumNous/new-api",
-		Version:      "v1.0.0-rc.20",
-		Commit:       "synthetic-commit",
-		SourceDigest: "sha256:synthetic",
-		Protocol:     ProtocolVersion,
-		Hooks:        hooks,
+		Module:               "github.com/QuantumNous/new-api",
+		Version:              "v1.0.0-rc.20",
+		Commit:               "synthetic-commit",
+		SourceDigest:         "sha256:synthetic",
+		Protocol:             ProtocolVersion,
+		Hooks:                hooks,
+		WebArtifactDigest:    "sha256:synthetic-artifact",
+		WorkerArtifactDigest: "sha256:synthetic-artifact",
 	}
 }
 
@@ -51,3 +53,20 @@ func TestValidateDoesNotCertifyDirtyOrUnknownHost(t *testing.T) {
 	}
 }
 
+func TestValidateRequiresIdenticalWebAndWorkerArtifacts(t *testing.T) {
+	host := completeHost()
+	host.WorkerArtifactDigest = "sha256:different-worker"
+	result, err := Validate(host)
+	if !errors.Is(err, ErrIncompatibleHost) || result.FullParity {
+		t.Fatalf("expected runtime mismatch to fail closed, result=%+v err=%v", result, err)
+	}
+	found := false
+	for _, reason := range result.ReasonCodes {
+		if reason == "runtime_artifact_mismatch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected runtime_artifact_mismatch, got %+v", result.ReasonCodes)
+	}
+}

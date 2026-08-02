@@ -102,12 +102,13 @@ func chooseCapacity(candidates []Candidate, snapshot CapacitySnapshot, policy Qu
 }
 
 func shouldPreferQueue(queued, immediate Candidate, minSavingPercent int) bool {
-	if immediate.RatioPPM <= 0 || queued.RatioPPM >= immediate.RatioPPM {
+	queuedPrice, immediatePrice, comparable := comparableCandidatePriceScores(queued, immediate)
+	if !comparable || queuedPrice >= immediatePrice || immediatePrice <= 0 {
 		return false
 	}
-	difference := immediate.RatioPPM - queued.RatioPPM
+	difference := immediatePrice - queuedPrice
 	// ceil(total * percent / 100), split before multiplying to avoid overflow.
 	percent := int64(minSavingPercent)
-	minimumDifference := (immediate.RatioPPM/100)*percent + ((immediate.RatioPPM%100)*percent+99)/100
+	minimumDifference := (immediatePrice/100)*percent + ((immediatePrice%100)*percent+99)/100
 	return difference >= minimumDifference
 }

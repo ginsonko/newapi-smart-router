@@ -1,8 +1,8 @@
 {
   "index_schema_version": "agent-index-v1",
-  "index_version": "1.0.0-design",
+  "index_version": "2.0.0-alpha.1",
   "project": "NewAPI Smart Router",
-  "status": "documentation_and_extraction_design",
+  "status": "public_alpha_v0_2_candidate",
   "runnable": false,
   "warning": "Development design index. It is not an installer and does not prove host parity.",
   "recommended_entry": "parts/docs/agent-context.md",
@@ -23,10 +23,21 @@
         "parts/spec/route-contract.schema.json",
         "parts/spec/route-id.schema.json",
         "parts/spec/policy-v4.schema.json",
+        "parts/spec/route-price.schema.json",
         "parts/manifest/invariants.yaml"
       ],
       "required_hooks": ["HOOK-AUTH-001", "HOOK-CONTRACT-001", "HOOK-ROUTE-001"],
       "conformance_tags": ["catalog", "filter", "strategy", "determinism"]
+    },
+    "port_effective_pricing": {
+      "read": [
+        "parts/spec/route-price.schema.json",
+        "parts/manifest/invariants.yaml",
+        "parts/conformance/golden-vectors/planner-v1.json"
+      ],
+      "required_hooks": ["HOOK-AUTH-001", "HOOK-CONTRACT-001", "HOOK-BILL-001"],
+      "conformance_tags": ["inherited_global_price", "explicit_group_model_price", "comparison_class", "single_group_ratio_application"],
+      "forbidden": ["synthetic_1x_inheritance", "cross_unit_numeric_order", "double_apply_group_model_price"]
     },
     "port_health_and_recovery": {
       "read": [
@@ -83,6 +94,7 @@
   "schemas": {
     "route_contract": "parts/spec/route-contract.schema.json",
     "route_identity": "parts/spec/route-id.schema.json",
+    "route_price": "parts/spec/route-price.schema.json",
     "policy_v4": "parts/spec/policy-v4.schema.json",
     "quality_state": "parts/spec/quality-state.schema.json",
     "route_receipt": "parts/spec/route-receipt.schema.json",

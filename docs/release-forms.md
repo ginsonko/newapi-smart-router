@@ -39,3 +39,12 @@ health, price ordering, and failover, but it cannot guarantee per-Key policy,
 actual-route billing, pre-stream commit safety, media idempotency, or native UI
 parity without the Bridge Hooks.
 
+## v0.2 additions
+
+All four primary forms now carry the R39 contract delta. Full contains the
+reference host implementation; Bridge carries stricter trusted Hook
+requirements; Integration carries the doctor/checklist workflow; Agent Parts
+carries the synchronized core, RoutePrice schema, invariants and vectors.
+Sidecar Lite is unchanged and is not promoted to a fifth full-parity form.
+
+Read [the v0.2 contract delta](v0.2-contract-delta.md) before choosing a form.

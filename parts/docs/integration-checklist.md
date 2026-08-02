@@ -208,3 +208,16 @@
 ## Q. 最终状态
 
 只有所有被声明为 mandatory 的项目为 PASS，且没有 Critical invariant 失败，Full/Certified 才能标 `Full Parity`。`UNKNOWN`、`BLOCKED` 和 `SKIPPED` 不能被文案折算为 PASS。
+
+## R. v0.2 增量门禁
+
+- [ ] inherit 使用真实全局模型价格，不合成 `1x`
+- [ ] 显式分组模型价格替换全局基础价，分组倍率只乘一次
+- [ ] token、按次、按秒、固定时长和表达式按 comparison class 隔离
+- [ ] 默认穷尽仅授予 `safe_text`，每个物理 Channel 一次且串行
+- [ ] `side_effecting` 首次可选路，dispatch 后无第二次派发
+- [ ] `state_bound` 在上游连接前拒绝并优先分类
+- [ ] Adapter endpoint allowlist 只收窄合同
+- [ ] `convert_request_failed` 仅在 dispatch 前可回退
+- [ ] HTTP 200 通过 exact semantic fixtures
+- [ ] Web 与 Smart Router Worker 完整 artifact SHA-256 一致

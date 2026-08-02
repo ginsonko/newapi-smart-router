@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,11 +17,13 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
+import yaml
 
-RELEASE_VERSION = "v0.1.0-alpha.1"
+
+RELEASE_VERSION = "v0.2.0-alpha.1"
 RELEASE_NAME = f"newapi-smart-router-{RELEASE_VERSION}"
 MARKER_NAME = ".smart-router-release-root"
-FIXED_ZIP_TIME = (2026, 7, 23, 0, 0, 0)
+FIXED_ZIP_TIME = (2026, 8, 2, 0, 0, 0)
 ALLOWED_UNTRACKED_ROOTS = {
     "common", "constant", "controller", "docs", "middleware", "model",
     "pkg", "relay", "router", "service", "setting", "types", "web",
@@ -164,7 +167,12 @@ def ensure_safe_generated_root(path: Path, releases_root: Path) -> None:
         marker = path / MARKER_NAME
         if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != RELEASE_NAME:
             raise RuntimeError(f"refusing to replace unmarked output: {path}")
-        shutil.rmtree(path)
+
+        def clear_readonly_and_retry(function, value, _error) -> None:
+            os.chmod(value, stat.S_IWRITE)
+            function(value)
+
+        shutil.rmtree(path, onerror=clear_readonly_and_retry)
 
 
 def copy_tree(source: Path, target: Path, ignore_names: set[str] | None = None) -> None:
@@ -183,17 +191,23 @@ def copy_tree(source: Path, target: Path, ignore_names: set[str] | None = None) 
 
 def update_parts_manifest(path: Path, source_snapshot_id: str) -> None:
     text = path.read_text(encoding="utf-8")
-    text = text.replace('manifest_version: "1.0.0-design"', 'manifest_version: "1.0.0-alpha.1"')
-    text = text.replace('status: "approved_for_documentation_and_extraction_design"', 'status: "public_alpha_candidate"')
-    text = text.replace('baseline: "pending_frozen_reference"', f'baseline: "{source_snapshot_id}"')
-    text = text.replace(
-        'note: "Do not extract public code until the semantic-success repair is frozen and the public repository is rebuilt from clean upstream history."',
-        'note: "Public Alpha snapshot only. Protocol outcome certification, three-database round trips, external-site validation, and signed image gates remain open."',
-    )
-    text = text.replace("spec_ready_reference_extraction_pending", "spec_ready_public_reference_snapshot")
-    text = text.replace("implemented_in_reference_fork_extraction_pending", "public_reference_core_extracted")
-    text = text.replace("release_target_pending_frozen_semantic_baseline", "release_gate_pending_protocol_certification")
-    path.write_text(text, encoding="utf-8", newline="\n")
+    manifest = yaml.safe_load(text)
+    if manifest.get("manifest_version") != "2.0.0-alpha.1":
+        raise RuntimeError("unexpected Agent Parts manifest version")
+    reference = manifest.get("reference")
+    if not isinstance(reference, dict):
+        raise RuntimeError("Agent Parts reference contract is missing")
+    placeholder = "bound_by_v0_2_release_source_receipt"
+    if reference.get("baseline") != placeholder:
+        raise RuntimeError("Agent Parts source baseline placeholder is missing or already bound")
+    needle = f'  baseline: "{placeholder}"'
+    if text.count(needle) != 1:
+        raise RuntimeError("Agent Parts baseline is not represented exactly once")
+    updated = text.replace(needle, f'  baseline: "{source_snapshot_id}"')
+    rebound = yaml.safe_load(updated)
+    if rebound.get("reference", {}).get("baseline") != source_snapshot_id:
+        raise RuntimeError("Agent Parts source baseline binding failed")
+    path.write_text(updated, encoding="utf-8", newline="\n")
 
 
 def update_capability_matrix(path: Path) -> None:
@@ -207,7 +221,7 @@ def update_capability_matrix(path: Path) -> None:
 
 
 def assemble_repository(template: Path, reference: Path, target: Path, source_snapshot_id: str) -> None:
-    copy_tree(template, target, {"__pycache__", ".pytest_cache"})
+    copy_tree(template, target, {".git", "__pycache__", ".pytest_cache"})
     shutil.copy2(reference / "LICENSE", target / "LICENSE")
     shutil.copy2(reference / "NOTICE", target / "UPSTREAM-NOTICE")
     third_party = reference / "THIRD-PARTY-LICENSES.md"
@@ -389,11 +403,11 @@ def make_spdx(full_source: Path, source_snapshot_id: str) -> dict:
         "SPDXID": "SPDXRef-DOCUMENT",
         "name": f"NewAPI-Smart-Router-{RELEASE_VERSION}",
         "documentNamespace": f"https://github.com/ginsonko/newapi-smart-router/releases/tag/{RELEASE_VERSION}#{source_snapshot_id}",
-        "creationInfo": {"created": "2026-07-23T00:00:00Z", "creators": ["Tool: local-build-release-v1"]},
+        "creationInfo": {"created": "2026-08-02T00:00:00Z", "creators": ["Tool: local-build-release-v1"]},
         "packages": packages,
         "relationships": relationships,
         "annotations": [{
-            "annotationDate": "2026-07-23T00:00:00Z",
+            "annotationDate": "2026-08-02T00:00:00Z",
             "annotationType": "OTHER",
             "annotator": "Tool: local-build-release-v1",
             "comment": "Public Alpha source SBOM. Image-layer, signature, and resolved-license certification remain Stable gates.",
@@ -477,8 +491,15 @@ def main() -> int:
             repository, full_source, args.go, args.run_full_tests, args.build_linux, binaries,
         )
         python = sys.executable
-        build_receipts.append(run([python, "-m", "unittest", "discover", "-s", "integration/doctor", "-p", "test_*.py"], repository))
-        build_receipts.append(run([python, "scripts/validate_repository.py", "--root", "."], repository))
+        python_env = os.environ.copy()
+        python_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        build_receipts.append(run(
+            [python, "-m", "unittest", "discover", "-s", "integration/doctor", "-p", "test_*.py"],
+            repository, python_env,
+        ))
+        build_receipts.append(run(
+            [python, "scripts/validate_repository.py", "--root", "."], repository, python_env,
+        ))
         build_receipts = redact_local_paths(build_receipts, [
             (str(staging), "<RELEASE_STAGING>"),
             (str(output), "<RELEASE_ROOT>"),

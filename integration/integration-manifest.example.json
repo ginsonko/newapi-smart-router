@@ -15,6 +15,7 @@
     {"hook_id": "HOOK-AUTH-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-CONTRACT-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-ROUTE-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-PRICE-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-COMMIT-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-OUTCOME-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-BILL-001", "status": "pending", "evidence": []},
@@ -25,4 +26,3 @@
   "known_gaps": ["Host integration has not started."],
   "full_parity": false
 }
-

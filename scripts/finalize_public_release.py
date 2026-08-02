@@ -10,6 +10,9 @@ import re
 from pathlib import Path
 
 
+RELEASE_NAME = "newapi-smart-router-v0.2.0-alpha.1"
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -27,7 +30,7 @@ def main() -> int:
     root = args.release_root.resolve(strict=True)
     marker = root / ".smart-router-release-root"
     commit = args.repository_commit.lower()
-    if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != "newapi-smart-router-v0.1.0-alpha.1":
+    if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != RELEASE_NAME:
         raise RuntimeError("release root marker is missing or unexpected")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("repository commit must be a full 40-character SHA-1")

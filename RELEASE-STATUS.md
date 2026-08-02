@@ -31,3 +31,27 @@ material is described in `COMMERCIAL-LICENSE.md`; upstream rights are excluded.
 
 `Full Parity` is a machine-checked capability claim, not a synonym for
 "compiled successfully". See `parts/spec/parity-manifest.schema.json`.
+
+## v0.2.0-alpha.1 additive status
+
+The v0.2 candidate keeps the same four primary release forms and adds the R39
+Smart Router contract delta:
+
+| Form | v0.2 content | Remaining boundary |
+|---|---|---|
+| Full compatibility distribution | Sanitized R39 host snapshot, frontend, Worker and synchronized core | Exact release gates and target-environment acceptance |
+| Certified Bridge Add-on candidate | Price Hook, dispatch/commit/outcome contract and same-artifact validation | No official upstream commit is certified yet |
+| Custom Fork Integration Kit | Updated doctor workflow, schemas, vectors and checklist | Every trusted host Hook must be implemented and evidenced |
+| Agent Parts Kit | Latest reference core, RoutePrice schema, invariants and fixtures | Development Kit / Not runnable |
+
+Sidecar Lite remains an experimental appendix, not a fifth complete form.
+
+The v0.2 Full reference host contains exact-adapter handling for pseudo-success
+HTTP 200 responses, pre-dispatch conversion fallback, side-effecting
+single-send behavior and safe-text exhaustive fallback. These host results do
+not certify another fork merely because it imports the core.
+
+The release remains a Pre-release. Stable still requires an exact current
+upstream Bridge certification, multi-database and lifecycle round trips,
+external non-production validation, signed artifacts and complete container
+supply-chain evidence.

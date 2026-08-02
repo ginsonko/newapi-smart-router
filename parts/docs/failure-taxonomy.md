@@ -180,3 +180,29 @@
 - 将客户端取消归为上游故障；
 - 将媒体超时一律当作 not accepted；
 - 在 committed 后返回到 planner 选择新路线。
+
+## 13. v0.2 新增判定
+
+### `convert_request_failed`
+
+仅当请求转换在 upstream dispatch 前失败时，才可按 exact contract 选择另一路线。dispatch 已开始时不得借此 reason code 重放。
+
+### `semantic_http_200_invalid`
+
+HTTP 200 的 transport 可正常，但 protocol 或业务语义无有效结果。保持未提交时可按 ReplayClass 处理；已提交、已受理或受理不明时禁止跨路线。
+
+### `state_bound_pre_dispatch_rejected`
+
+请求含 `previous_response_id`、conversation 或上游绑定文件。连接上游前拒绝智能选路，不污染渠道健康。
+
+### `side_effecting_dispatch_fenced`
+
+`store:true`、`background:true` 或托管工具已开始派发。当前失败可以记录和结算/退款，但不能选择第二个渠道。
+
+### `route_price_incomparable`
+
+价格缺失或计费单位/表达式不同，无法可靠静态比较。不得用默认 `1x` 或数值大小猜测更便宜路线。
+
+### `runtime_revision_mismatch`
+
+Web 与 Smart Router Worker 二进制或协议 revision 不同。阻断发布/Worker 接管，避免旧合同写入新版共享状态。
