@@ -15,12 +15,25 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
+RELEASE_VERSION = "v0.2.0-alpha.1"
+FIXED_ZIP_TIME = (2026, 8, 2, 0, 0, 0)
+README_BASELINE_LINES = 2274
+README_BASELINE_SHA256 = "e03f7eef1143b7e0e8d31b36d062562131171a2d01de85b090aa3521196af054"
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def normalized_readme_prefix(path: Path) -> tuple[int, str]:
+    normalized = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    lines = normalized.splitlines(keepends=True)
+    prefix = b"".join(lines[:README_BASELINE_LINES])
+    return len(lines), hashlib.sha256(prefix).hexdigest()
 
 
 class Validator:
@@ -45,6 +58,7 @@ class Validator:
             self.repository / "RELEASE-STATUS.md", self.repository / "core" / "go.mod",
             self.repository / "bridge" / "newapi" / "go.mod", self.repository / "integration" / "doctor" / "doctor.py",
             self.repository / "parts" / "manifest" / "PARTS-MANIFEST.yaml",
+            self.repository / "parts" / "spec" / "route-price.schema.json",
             self.full / "go.mod", self.full / "SMART-ROUTER-RELEASE.md",
             self.full / "web" / "default" / "dist" / "index.html",
             self.artifacts / "RELEASE-MANIFEST.json", self.artifacts / "SPDX-SBOM.json", self.artifacts / "SHA256SUMS",
@@ -56,6 +70,10 @@ class Validator:
             if path.name in {"__pycache__", ".pytest_cache"} or (path.is_file() and path.suffix.lower() == ".pyc")
         ]
         self.check("no_generated_python_caches", not generated_caches, generated_caches[:20])
+        vcs_metadata = [
+            path.relative_to(self.root).as_posix() for path in self.root.rglob(".git")
+        ]
+        self.check("no_vcs_metadata_in_release", not vcs_metadata, vcs_metadata[:20])
         status = (self.repository / "RELEASE-STATUS.md").read_text(encoding="utf-8")
         self.check("four_release_forms_labeled", all(value in status for value in (
             "Full compatibility distribution", "Certified Bridge Add-on", "Custom Fork Integration Kit", "Agent Parts Kit",
@@ -76,18 +94,23 @@ class Validator:
         self.check("public_core_module", core_mod.startswith(f"module {expected_core}\n"), core_mod.splitlines()[0])
         self.check("public_bridge_module", bridge_mod.startswith(f"module {expected_bridge}\n") and expected_core in bridge_mod, bridge_mod.splitlines()[:8])
         local_module_marker = "smart-router" + ".local"
-        local_version_marker = "v0.1.0-alpha.1-" + "local"
+        local_version_marker = RELEASE_VERSION + "-" + "local"
         self.check("no_local_module_placeholder", not any(
             local_module_marker in path.read_text(encoding="utf-8", errors="replace")
             for path in self.repository.rglob("*") if path.is_file() and path.suffix.lower() in {".go", ".mod", ".md"}
         ), "public Go and Markdown files")
         self.check("public_origin_documented", expected_origin in readme and manifest.get("repository", {}).get("url") == expected_origin, manifest.get("repository"))
-        self.check("public_version_documented", "v0.1.0-alpha.1" in readme and local_version_marker not in readme, "README release status")
+        self.check("public_version_documented", RELEASE_VERSION in readme and local_version_marker not in readme, "README release status")
         self.check("upstream_drift_disclosed", "v1.0.0-rc.21" in release_status and "rc.20" in release_status, "release compatibility boundary")
         self.check("agpl_license_preserved", "GNU AFFERO GENERAL PUBLIC LICENSE" in license_text and "Version 3" in license_text, "LICENSE")
         self.check("commercial_boundary_documented", all(value in commercial for value in (
             "AGPL-3.0-only", "does not grant", "QuantumNous New API", "not a license grant",
         )), "COMMERCIAL-LICENSE.md")
+        self.check("release_manifest_version", manifest.get("release") == RELEASE_VERSION, manifest.get("release"))
+        line_count, prefix_digest = normalized_readme_prefix(self.repository / "README.md")
+        self.check("readme_v0_1_prefix_preserved", (
+            line_count > README_BASELINE_LINES and prefix_digest == README_BASELINE_SHA256
+        ), {"lines": line_count, "prefix_sha256": prefix_digest})
 
     def validate_json_yaml_schema(self) -> None:
         json_files = sorted(self.repository.rglob("*.json")) + sorted(self.artifacts.glob("*.json")) + sorted(self.receipts.glob("*.json"))
@@ -107,7 +130,23 @@ class Validator:
         schemas = sorted((self.repository / "parts" / "spec").glob("*.schema.json"))
         for path in schemas:
             jsonschema.Draft202012Validator.check_schema(parsed[path])
-        self.check("json_schema_valid", len(schemas) >= 8, {"schemas": len(schemas)})
+        self.check("json_schema_valid", len(schemas) >= 9, {"schemas": len(schemas)})
+        route_price_schema = parsed[self.repository / "parts" / "spec" / "route-price.schema.json"]
+        route_price_validator = jsonschema.Draft202012Validator(route_price_schema)
+        route_price_validator.validate({
+            "billing_mode": "ratio", "billing_unit": "per_token", "static_comparable": True,
+            "comparison_class": "token:input", "score_ppm": 2500000, "synthetic": False,
+            "scope": "group_model", "revision": "fixture-revision",
+        })
+        rejected = False
+        try:
+            route_price_validator.validate({
+                "billing_mode": "ratio", "billing_unit": "per_token", "static_comparable": True,
+                "score_ppm": 2500000,
+            })
+        except jsonschema.ValidationError:
+            rejected = True
+        self.check("route_price_comparison_class_required", rejected, "comparable prices require an exact class")
         outcome_schema = parsed[self.repository / "parts" / "spec" / "outcome.schema.json"]
         invalid_outcome = {
             "schema_version": "outcome-v1", "contract_id": "fixture", "route_id": "route_sha256_" + "a" * 64,
@@ -121,6 +160,19 @@ class Validator:
         except jsonschema.ValidationError:
             rejected = True
         self.check("committed_retry_negative_vector", rejected, "committed outcome must reject retry_allowed=true")
+        invalid_side_effecting = {
+            "schema_version": "outcome-v1", "contract_id": "fixture",
+            "route_id": "route_sha256_" + "b" * 64, "kind": "retryable_failure",
+            "attribution": "route", "commit_state": "buffered", "acceptance_state": "not_accepted",
+            "dispatch_state": "started", "replay_class": "side_effecting", "retry_allowed": True,
+            "reason_code": "fixture_failure", "observed_at_ms": 1,
+        }
+        rejected = False
+        try:
+            jsonschema.Draft202012Validator(outcome_schema).validate(invalid_side_effecting)
+        except jsonschema.ValidationError:
+            rejected = True
+        self.check("side_effecting_second_dispatch_rejected", rejected, "started dispatch must forbid retry")
         parity_schema = parsed[self.repository / "parts" / "spec" / "parity-manifest.schema.json"]
         invalid_parity = {
             "schema_version": "parity-manifest-v1", "generated_at_ms": 1, "artifact": "fixture",
@@ -164,16 +216,37 @@ class Validator:
             if not path.is_file() or sha256_file(path) != entry["sha256"]:
                 mismatches.append(entry["path"])
         self.check("full_source_snapshot_parity", not mismatches, {"files": len(receipt["files"]), "mismatches": mismatches[:20]})
+        full_root = self.full / "pkg" / "smartrouter"
+        core_root = self.repository / "core" / "smartrouter"
+        parts_root = self.repository / "parts" / "reference" / "go" / "smartrouter"
+        full_files = {path.name: path for path in full_root.glob("*.go")}
+        core_files = {path.name: path for path in core_root.glob("*.go")}
+        parts_files = {path.name: path for path in parts_root.glob("*.go")}
+        self.check("core_extraction_file_set", (
+            len(full_files) == 15 and set(full_files) == set(core_files) == set(parts_files)
+            and "route_price.go" in full_files
+        ), {"full": sorted(full_files), "core": sorted(core_files), "parts": sorted(parts_files)})
         core_mismatches = []
-        for full_path in sorted((self.full / "pkg" / "smartrouter").glob("*.go")):
-            relative = full_path.name
-            for candidate in (
-                self.repository / "core" / "smartrouter" / relative,
-                self.repository / "parts" / "reference" / "go" / "smartrouter" / relative,
-            ):
-                if not candidate.is_file() or sha256_file(candidate) != sha256_file(full_path):
-                    core_mismatches.append(str(candidate.relative_to(self.repository)))
+        for name in sorted(full_files):
+            expected = sha256_file(full_files[name])
+            for label, candidate in (("core", core_files[name]), ("parts", parts_files[name])):
+                if sha256_file(candidate) != expected:
+                    core_mismatches.append(f"{label}/{name}")
         self.check("core_extraction_parity", not core_mismatches, {"mismatches": core_mismatches})
+
+        core_vectors = self.repository / "core" / "testdata" / "planner-v1.json"
+        parts_vectors = self.repository / "parts" / "conformance" / "golden-vectors" / "planner-v1.json"
+        self.check("planner_vector_mirror_digest", (
+            sha256_file(core_vectors) == sha256_file(parts_vectors)
+        ), {"core": sha256_file(core_vectors), "parts": sha256_file(parts_vectors)})
+
+        import yaml
+        parts_manifest = yaml.safe_load((
+            self.repository / "parts" / "manifest" / "PARTS-MANIFEST.yaml"
+        ).read_text(encoding="utf-8"))
+        self.check("parts_manifest_source_snapshot_bound", (
+            parts_manifest.get("reference", {}).get("baseline") == receipt.get("source_snapshot_id")
+        ), parts_manifest.get("reference", {}).get("baseline"))
 
     def validate_archives(self) -> None:
         manifest = json.loads((self.artifacts / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
@@ -192,7 +265,7 @@ class Validator:
                     pure = PurePosixPath(info.filename)
                     if pure.is_absolute() or ".." in pure.parts or re.match(r"^[A-Za-z]:", info.filename):
                         unsafe_paths.append(info.filename)
-                    if info.date_time != (2026, 7, 23, 0, 0, 0):
+                    if info.date_time != FIXED_ZIP_TIME:
                         wrong_times.append({"path": info.filename, "time": info.date_time})
                     mode = (info.external_attr >> 16) & 0xFFFF
                     if stat.S_ISLNK(mode):

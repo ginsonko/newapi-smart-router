@@ -36,7 +36,30 @@
       "contract": "openai-responses-v1",
       "input": {"http_status": 429, "retry_after_ms": 2000},
       "expected": {"kind": "retryable_failure", "commit_state": "buffered", "retry_allowed": true, "health_attribution": "capacity"}
+    },
+    {
+      "id": "pseudo_success_error_body_is_not_semantic_success",
+      "contract": "openai-responses-v1",
+      "input": {"http_status": 200, "protocol_valid": true, "semantic_output": "error_object", "dispatch_state": "completed"},
+      "expected": {"kind": "retryable_failure", "commit_state": "buffered", "retry_allowed": true, "health_attribution": "route"}
+    },
+    {
+      "id": "convert_request_failed_before_dispatch_can_fall_back",
+      "contract": "openai-responses-v1",
+      "input": {"reason_code": "convert_request_failed", "dispatch_state": "not_started", "acceptance": "not_accepted"},
+      "expected": {"kind": "retryable_failure", "commit_state": "buffered", "retry_allowed": true, "health_attribution": "host"}
+    },
+    {
+      "id": "side_effecting_failure_after_dispatch_is_single_send",
+      "contract": "openai-responses-v1",
+      "input": {"http_status": 500, "replay_class": "side_effecting", "dispatch_state": "started", "acceptance": "unknown"},
+      "expected": {"kind": "terminal_failure", "commit_state": "terminal", "retry_allowed": false, "health_attribution": "route"}
+    },
+    {
+      "id": "state_bound_is_rejected_before_upstream_connection",
+      "contract": "openai-responses-v1",
+      "input": {"replay_class": "state_bound", "dispatch_state": "not_started", "reason_code": "state_bound_pre_dispatch_rejected"},
+      "expected": {"kind": "terminal_failure", "commit_state": "terminal", "retry_allowed": false, "health_attribution": "user"}
     }
   ]
 }
-

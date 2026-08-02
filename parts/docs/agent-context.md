@@ -157,6 +157,7 @@ Receipt 冻结：policy hash、catalog/source revision、price version、health 
 HOOK-AUTH-001
 HOOK-CONTRACT-001
 HOOK-ROUTE-001
+HOOK-PRICE-001
 HOOK-COMMIT-001
 HOOK-OUTCOME-001
 HOOK-BILL-001
@@ -189,3 +190,23 @@ HOOK-UI-001 (native UX claim)
 - 测试需要真实密钥或生产数据；
 - 用户要求 Full Parity 但强制 Hook 缺失；
 - 并行任务拥有同一修复，尚未冻结基线。
+
+## 16. v0.2 价格与重放增量
+
+- `RoutePrice.score_ppm = resolved model base * effective group ratio`，只乘一次；
+- 显式分组模型价替换全局基础价，inherit 使用真实全局模型价；
+- 缺少可靠价格时不可比，不合成 `1x`；
+- 只有相同 `comparison_class` 可排序，token/按次/按秒/固定时长/表达式不可混比；
+- 默认顺序穷尽仅适用于 `safe_text`，每个物理 Channel 一次；
+- `side_effecting` 首次可选路，dispatch 后禁止第二次派发；
+- `state_bound` 在上游连接前拒绝，并优先于副作用分类。
+
+## 17. v0.2 宿主必证边界
+
+- Adapter endpoint allow 只能收窄；
+- `convert_request_failed` 只在 dispatch 前可回退；
+- HTTP 200 仍须 exact semantic validation；
+- Web 与 Smart Router Worker 必须同一 artifact hash；
+- Full 参考快照的宿主测试不自动认证其他 fork。
+
+详细版本增量见 [`docs/v0.2-contract-delta.md`](../../docs/v0.2-contract-delta.md)。

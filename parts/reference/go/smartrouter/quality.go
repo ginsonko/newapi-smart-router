@@ -53,7 +53,7 @@ func (class ReplayClass) String() string {
 // media submission; that decision is made after each concrete attempt.
 func IsRoutableReplayClass(class ReplayClass) bool {
 	switch class {
-	case ReplaySafeText, ReplaySafeImage, ReplaySafeVideo, ReplaySafeAudio:
+	case ReplaySafeText, ReplaySafeImage, ReplaySafeVideo, ReplaySafeAudio, ReplaySideEffecting:
 		return true
 	default:
 		return false

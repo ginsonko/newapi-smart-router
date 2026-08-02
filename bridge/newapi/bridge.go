@@ -10,14 +10,15 @@ import (
 	"github.com/ginsonko/newapi-smart-router/core/smartrouter"
 )
 
-const ProtocolVersion = "bridge-spi-v1alpha1"
+const ProtocolVersion = "bridge-spi-v1alpha2"
 
 type HookID string
 
 const (
-	HookPostAuthPolicy   HookID = "HOOK-AUTH-001"
+	HookPostAuthPolicy  HookID = "HOOK-AUTH-001"
 	HookRequestContract HookID = "HOOK-CONTRACT-001"
 	HookExactRoute      HookID = "HOOK-ROUTE-001"
+	HookPriceSnapshot   HookID = "HOOK-PRICE-001"
 	HookCommitBoundary  HookID = "HOOK-COMMIT-001"
 	HookOutcome         HookID = "HOOK-OUTCOME-001"
 	HookBilling         HookID = "HOOK-BILL-001"
@@ -29,6 +30,7 @@ var criticalHooks = []HookID{
 	HookPostAuthPolicy,
 	HookRequestContract,
 	HookExactRoute,
+	HookPriceSnapshot,
 	HookCommitBoundary,
 	HookOutcome,
 	HookBilling,
@@ -44,14 +46,16 @@ type HookStatus struct {
 }
 
 type HostFingerprint struct {
-	Module         string       `json:"module"`
-	Version        string       `json:"version"`
-	Commit         string       `json:"commit"`
-	SourceDigest   string       `json:"source_digest"`
-	Protocol       string       `json:"protocol"`
-	Hooks          []HookStatus `json:"hooks"`
-	DirtyWorktree  bool         `json:"dirty_worktree"`
-	UnknownVersion bool         `json:"unknown_version"`
+	Module               string       `json:"module"`
+	Version              string       `json:"version"`
+	Commit               string       `json:"commit"`
+	SourceDigest         string       `json:"source_digest"`
+	Protocol             string       `json:"protocol"`
+	Hooks                []HookStatus `json:"hooks"`
+	DirtyWorktree        bool         `json:"dirty_worktree"`
+	UnknownVersion       bool         `json:"unknown_version"`
+	WebArtifactDigest    string       `json:"web_artifact_digest"`
+	WorkerArtifactDigest string       `json:"worker_artifact_digest"`
 }
 
 type Validation struct {
@@ -105,6 +109,11 @@ func Validate(host HostFingerprint) (Validation, error) {
 	}
 	if host.Module == "" || host.Commit == "" || host.SourceDigest == "" {
 		result.ReasonCodes = append(result.ReasonCodes, "incomplete_host_fingerprint")
+	}
+	if host.WebArtifactDigest == "" || host.WorkerArtifactDigest == "" {
+		result.ReasonCodes = append(result.ReasonCodes, "incomplete_runtime_artifact_fingerprint")
+	} else if host.WebArtifactDigest != host.WorkerArtifactDigest {
+		result.ReasonCodes = append(result.ReasonCodes, "runtime_artifact_mismatch")
 	}
 	result.Compatible = len(result.Missing) == 0 && len(result.ReasonCodes) == 0
 	result.FullParity = result.Compatible && len(result.Unverified) == 0

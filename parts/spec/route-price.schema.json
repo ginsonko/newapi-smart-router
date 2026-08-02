@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:route-price:v1",
+  "title": "NewAPI Smart Router effective route price",
+  "description": "A versioned static price descriptor used only for routing comparisons. It must be derived from the same resolved model and group pricing contract used by reservation and settlement.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["billing_mode", "billing_unit", "static_comparable"],
+  "properties": {
+    "billing_mode": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Examples include ratio, fixed_price and tiered_expr. Hosts may extend this vocabulary only with matching billing and conformance support."
+    },
+    "billing_unit": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Examples include per_token, per_request, per_second and fixed_duration."
+    },
+    "fixed_duration_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Part of price identity when a fixed-duration contract is used."
+    },
+    "comparison_class": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Only descriptors with the exact same class are ordered by score_ppm. The class must include every cost-shape field that changes comparability."
+    },
+    "score_ppm": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Resolved model base price multiplied by the effective group ratio exactly once, encoded in fixed-point PPM. It is not a user balance mutation."
+    },
+    "static_comparable": { "type": "boolean" },
+    "synthetic": {
+      "type": "boolean",
+      "default": false,
+      "description": "Synthetic evidence may participate only where explicitly supported and must never train cache-economy observations. Inherited NewAPI prices use the real global model price and are not synthetic."
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Origin of the resolved base price, such as global_model, group_model or legacy."
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Immutable pricing-contract revision frozen for the request."
+    },
+    "incomparable_reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable reason code when a reliable static comparison cannot be made."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "static_comparable": { "const": true } },
+        "required": ["static_comparable"]
+      },
+      "then": { "required": ["comparison_class", "score_ppm"] },
+      "else": { "required": ["incomparable_reason"] }
+    }
+  ]
+}

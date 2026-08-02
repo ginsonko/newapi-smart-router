@@ -1,14 +1,15 @@
-manifest_version: "1.0.0-alpha.1"
+manifest_version: "2.0.0-alpha.1"
 project: "NewAPI Smart Router"
 artifact: "Agent Parts Kit"
 label: "Development Kit / Not runnable"
 runnable: false
-status: "public_alpha_candidate"
+status: "public_alpha_v0_2_candidate"
 reference:
   host: "New API"
   organization: "QuantumNous"
-  baseline: "snapshot_sha256_a86384f73465c42d060c1919ea7b9ee03afd0002ddc328e7da69096ce0694c24"
-  note: "Public Alpha snapshot only. Protocol outcome certification, three-database round trips, external-site validation, and signed image gates remain open."
+  baseline: "bound_by_v0_2_release_source_receipt"
+  core_sync: "NewAPI R39 accepted pkg/smartrouter snapshot"
+  note: "Public Alpha v0.2 candidate. The release builder binds the exact Full source snapshot. Generic host protocol certification, three-database round trips, external-site validation, and signed image gates remain open."
 license:
   default_path: "AGPL-3.0-compatible"
   preserve_upstream_attribution: true
@@ -57,10 +58,10 @@ modules:
     inputs: ["route request", "policy", "catalog", "price", "quality", "capacity", "affinity", "attempt state"]
     outputs: ["ordered candidates", "selected route", "rejections", "reason codes"]
     side_effects: []
-    requires: ["MOD-CATALOG-001", "HOOK-AUTH-001", "HOOK-ROUTE-001"]
-    schemas: ["../spec/policy-v4.schema.json", "../spec/quality-state.schema.json"]
-    invariants: ["INV-FILTER-001", "INV-PRICE-001", "INV-PRICE-002", "INV-DETERMINISM-001", "INV-CHANNEL-001"]
-    conformance: ["strategy_price", "strategy_stability", "strategy_latency", "strategy_balanced", "strategy_manual"]
+    requires: ["MOD-CATALOG-001", "HOOK-AUTH-001", "HOOK-ROUTE-001", "HOOK-PRICE-001"]
+    schemas: ["../spec/policy-v4.schema.json", "../spec/quality-state.schema.json", "../spec/route-price.schema.json"]
+    invariants: ["INV-FILTER-001", "INV-PRICE-001", "INV-PRICE-002", "INV-PRICE-003", "INV-DETERMINISM-001", "INV-CHANNEL-001", "INV-REPLAY-002", "INV-DISPATCH-001"]
+    conformance: ["strategy_price", "strategy_stability", "strategy_latency", "strategy_balanced", "strategy_manual", "route_price_comparison_class", "safe_text_exhaustion", "side_effecting_initial_route", "state_bound_rejection"]
   - id: "MOD-HEALTH-001"
     name: "health"
     status: "spec_ready_public_reference_snapshot"
@@ -80,7 +81,7 @@ modules:
     outputs: ["probe jobs", "warming evidence", "next attempt"]
     side_effects: ["persist job", "acquire lease", "execute eligible probe"]
     requires: ["MOD-HEALTH-001"]
-    invariants: ["INV-RECOVERY-001", "INV-RECOVERY-002", "INV-PROBE-002", "INV-MULTI-001"]
+    invariants: ["INV-RECOVERY-001", "INV-RECOVERY-002", "INV-PROBE-002", "INV-MULTI-001", "INV-RUNTIME-001"]
     conformance: ["recovery_fast_window", "recovery_slow_backoff", "recovery_restart", "recovery_failure_domain_fairness"]
   - id: "MOD-CAPACITY-001"
     name: "capacity"
@@ -104,15 +105,15 @@ modules:
     conformance: ["cache_fixed_premium", "cache_break_even", "cache_low_confidence_fallback", "cache_namespace_revision"]
   - id: "MOD-RETRY-001"
     name: "retry-and-outcome"
-    status: "release_gate_pending_protocol_certification"
+    status: "public_reference_host_contract_portable_certification_open"
     purpose: "Validate transport, protocol and business semantics, then retry only before semantic commit and within ReplayClass."
     inputs: ["adapter response", "exact contract", "commit state", "replay class"]
     outputs: ["classified outcome", "retry eligibility", "reason code"]
     side_effects: []
     requires: ["HOOK-COMMIT-001", "HOOK-OUTCOME-001"]
     schemas: ["../spec/outcome.schema.json"]
-    invariants: ["INV-OUTCOME-001", "INV-COMMIT-001", "INV-REPLAY-001", "INV-MEDIA-001"]
-    conformance: ["empty_200", "pseudo_200", "tool_call", "sse_before_commit", "sse_after_commit", "ambiguous_media_acceptance"]
+    invariants: ["INV-OUTCOME-001", "INV-COMMIT-001", "INV-REPLAY-001", "INV-REPLAY-002", "INV-DISPATCH-001", "INV-ADAPTER-001", "INV-MEDIA-001"]
+    conformance: ["empty_200", "pseudo_200", "tool_call", "sse_before_commit", "sse_after_commit", "convert_request_failed_before_dispatch", "side_effecting_after_dispatch", "ambiguous_media_acceptance"]
   - id: "MOD-BILLING-001"
     name: "billing"
     status: "spec_ready_public_reference_snapshot"
@@ -145,3 +146,9 @@ prohibited_shortcuts:
   - "count probes as real-user SLA"
   - "classify 429 as semantic health failure"
   - "claim parity from compilation alone"
+  - "replace an explicit group-model price by multiplying it with the global model base again"
+  - "invent a synthetic 1x inherited price when the real global model price is missing"
+  - "compare token request second duration or expression prices across different comparison classes"
+  - "apply exhaustive fallback to side-effecting state-bound media background hosted-tool or committed requests"
+  - "let an adapter endpoint allowlist broaden the certified route contract"
+  - "run a Smart Router Worker binary that differs from the serving Web binary"

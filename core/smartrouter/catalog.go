@@ -83,8 +83,9 @@ func RouteFailureDomain(route CertifiedRoute) string {
 // PriceSnapshot is produced outside the core from current New API pricing.
 // A missing route price is ineligible rather than being treated as free.
 type PriceSnapshot struct {
-	Version   string           `json:"version"`
-	RatiosPPM map[string]int64 `json:"ratios_ppm"`
+	Version     string                `json:"version"`
+	RatiosPPM   map[string]int64      `json:"ratios_ppm"`
+	RoutePrices map[string]RoutePrice `json:"route_prices,omitempty"`
 }
 
 func (catalog CertifiedRouteCatalog) Validate() error {
@@ -169,6 +170,14 @@ func (snapshot PriceSnapshot) Validate() error {
 	for routeID, ratio := range snapshot.RatiosPPM {
 		if routeID == "" || ratio < 0 {
 			return fmt.Errorf("smartrouter: invalid price for route %q", routeID)
+		}
+	}
+	for routeID, price := range snapshot.RoutePrices {
+		if routeID == "" {
+			return errors.New("smartrouter: route price has an empty route ID")
+		}
+		if err := price.Validate(); err != nil {
+			return fmt.Errorf("smartrouter: invalid route price for %q: %w", routeID, err)
 		}
 	}
 	return nil

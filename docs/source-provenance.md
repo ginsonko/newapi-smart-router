@@ -16,3 +16,12 @@ implicitly certified by the rc.20 Bridge candidate. A changed post-auth,
 relay, billing, media, or UI Hook requires a fresh compatibility review. The
 public repository uses a new sanitized history, retains LICENSE/NOTICE and
 third-party notices, and must pass local plus remote secret scanning.
+
+## v0.2 additive source note
+
+The v0.2 standalone core and Agent Parts reference are mechanically synchronized
+from the accepted NewAPI R39 `pkg/smartrouter` snapshot. The release builder
+creates a path, size and SHA-256 receipt for the sanitized Full source and binds
+that receipt to the public candidate commit. Production hostnames, credentials,
+logs, databases, media, deployment receipts and local planning files are not
+part of the public source.

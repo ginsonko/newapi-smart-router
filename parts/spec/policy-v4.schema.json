@@ -2,7 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:newapi-smart-router:schema:policy-v4:v1",
   "title": "NewAPI Smart Router per-key policy v4",
-  "description": "Normative design schema aligned with the reference policy contract. Cross-field rules such as balanced weights totaling 100 and fixed-scope completeness must also be enforced by conformance tests.",
+  "description": "Normative design schema aligned with the reference policy contract. Cross-field rules such as balanced weights totaling 100 and fixed-scope completeness must also be enforced by conformance tests. The host-level attempt_limit_enabled option is deliberately outside this per-Key document.",
+  "$comment": "When the site attempt limit is disabled, the host maps only replay-safe text to AttemptState.exhaust_eligible_channels=true. max_attempts remains serialized for rollback compatibility but is dormant. Every other replay class remains bounded by its dispatch and replay contract.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -40,7 +41,13 @@
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
     },
-    "max_attempts": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 },
+    "max_attempts": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8,
+      "default": 3,
+      "description": "Per-Key numeric ceiling used only when the host site attempt-limit switch is enabled. It never authorizes replay by itself."
+    },
     "failure_threshold": { "type": "integer", "minimum": 1, "maximum": 100, "default": 3 },
     "max_effective_ratio_ppm": {
       "type": "integer",

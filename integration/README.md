@@ -23,3 +23,20 @@ python integration/doctor/doctor.py --source C:\path\to\new-api --json report.js
 The command does not read `.env`, credentials, database files, backups, VCS
 objects, logs, or `node_modules`, and it does not modify the checkout.
 
+## v0.2 integration evidence
+
+An R39-equivalent integration additionally proves:
+
+- the price snapshot uses the same resolved global/group-model contract as
+  reservation and settlement, with the effective group ratio applied once;
+- routes with different price comparison classes are never numerically ordered;
+- the disabled attempt-limit mode is mapped only to sequential `safe_text`
+  exhaustion and every physical channel is attempted at most once;
+- `side_effecting` receives one initial route but no second dispatch, while
+  `state_bound` is rejected before upstream connection;
+- adapter endpoint declarations narrow rather than broaden the catalog;
+- HTTP 200 passes exact semantic validation before commit;
+- the serving Web and recovery Worker artifact hashes are identical.
+
+See [the v0.2 contract delta](../docs/v0.2-contract-delta.md) before filling a
+host integration or parity manifest.

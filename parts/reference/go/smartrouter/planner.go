@@ -46,12 +46,13 @@ type RouteRequest struct {
 }
 
 type AttemptState struct {
-	MaxAttempts       int      `json:"max_attempts"`
-	StartedAttempts   int      `json:"started_attempts"`
-	AttemptedRoutes   []string `json:"attempted_routes"`
-	AttemptedChannels []int    `json:"attempted_channels"`
-	Committed         bool     `json:"committed"`
-	RecoveryProbeUsed bool     `json:"recovery_probe_used"`
+	MaxAttempts             int      `json:"max_attempts"`
+	StartedAttempts         int      `json:"started_attempts"`
+	AttemptedRoutes         []string `json:"attempted_routes"`
+	AttemptedChannels       []int    `json:"attempted_channels"`
+	Committed               bool     `json:"committed"`
+	RecoveryProbeUsed       bool     `json:"recovery_probe_used"`
+	ExhaustEligibleChannels bool     `json:"exhaust_eligible_channels"`
 	// VirginMediaRetryAuthorized is a one-shot controller grant. It is set only
 	// after an image/video attempt is known not to have reached submission, and
 	// consumed when the next concrete attempt starts. It must never be inferred
@@ -137,6 +138,7 @@ const (
 type Candidate struct {
 	Route            CertifiedRoute
 	RatioPPM         int64
+	Price            RoutePrice
 	PoolIndex        int
 	ManualIndex      int
 	Quality          QualityState
@@ -150,6 +152,7 @@ type Candidate struct {
 	TTFTP95MS        int64
 	TTFTSlow         bool
 	TTFTAboveTarget  bool
+	priceClassRank   int
 }
 
 type RejectReason string
@@ -232,6 +235,7 @@ type PlanResult struct {
 	Group               string
 	UpstreamModel       string
 	RatioPPM            int64
+	Price               RoutePrice
 	CacheDomain         string
 	CapacityDomain      string
 	Admission           AdmissionKind
@@ -259,7 +263,9 @@ func Filter(input FilterInput) (FilterResult, error) {
 	if input.Attempt.Committed {
 		return FilterResult{}, ErrAlreadyCommitted
 	}
-	if input.Attempt.MaxAttempts <= 0 || input.Attempt.StartedAttempts < 0 || input.Attempt.StartedAttempts >= input.Attempt.MaxAttempts {
+	if input.Attempt.MaxAttempts <= 0 || input.Attempt.StartedAttempts < 0 ||
+		(input.Attempt.StartedAttempts >= input.Attempt.MaxAttempts &&
+			!(input.Attempt.ExhaustEligibleChannels && input.Request.ReplayClass == ReplaySafeText)) {
 		return FilterResult{}, ErrAttemptBudget
 	}
 	if input.Prices.Version == "" || input.Prices.RatiosPPM == nil {
@@ -299,6 +305,7 @@ func Filter(input FilterInput) (FilterResult, error) {
 	attemptedChannels := intSet(input.Attempt.AttemptedChannels)
 	manualRanks := routeRanks(manualOrder)
 	manualGroupRanks := routeRanks(input.Policy.ManualGroupOrder)
+	priceClassRanks := make(map[string]int)
 	result := FilterResult{
 		ContractID: input.Request.ContractID,
 		PoolID:     poolID,
@@ -381,9 +388,20 @@ func Filter(input FilterInput) (FilterResult, error) {
 			continue
 		}
 		manualIndex := manualCandidateIndex(route, index, len(pool.Candidates), manualRanks, manualGroupRanks)
+		routePrice := routePriceForCandidate(input.Prices, route.RouteID, ratio)
+		priceClass := routePrice.ComparisonClass
+		if !routePrice.StaticComparable {
+			priceClass = "incomparable:" + route.RouteID
+		}
+		priceClassRank, exists := priceClassRanks[priceClass]
+		if !exists {
+			priceClassRank = len(priceClassRanks)
+			priceClassRanks[priceClass] = priceClassRank
+		}
 		candidate := Candidate{
 			Route:            route,
 			RatioPPM:         ratio,
+			Price:            routePrice,
 			PoolIndex:        index,
 			ManualIndex:      manualIndex,
 			Quality:          quality,
@@ -392,6 +410,7 @@ func Filter(input FilterInput) (FilterResult, error) {
 			Admission:        admission,
 			KeySuppressed:    suppressed,
 			StabilityPPM:     qualityStabilityPPM(quality),
+			priceClassRank:   priceClassRank,
 		}
 		applyTTFTKnowledge(&candidate, input.TTFT.Routes[route.RouteID], metricPolicy, input.NowMS)
 		if bootstrapUnknown {
@@ -579,6 +598,7 @@ func Plan(input PlanInput) (PlanResult, error) {
 		Group:               choice.Candidate.Route.Group,
 		UpstreamModel:       choice.Candidate.Route.UpstreamModel,
 		RatioPPM:            choice.Candidate.RatioPPM,
+		Price:               choice.Candidate.Price,
 		CacheDomain:         choice.Candidate.Route.CacheDomain,
 		CapacityDomain:      choice.Candidate.Route.CapacityDomain,
 		Admission:           choice.Candidate.Admission,
@@ -664,8 +684,7 @@ func qualityAdmission(route CertifiedRoute, quality QualityState, input FilterIn
 			}
 			return AdmissionDegraded, false, ""
 		case QualityWarming:
-			if strategyDirectlyAdmitsFreshRecovery(input.Policy.EffectiveStrategy()) &&
-				hasFreshSuccessfulEvidence(quality, input.NowMS, input.RecoveryEvidenceTTLMS) {
+			if hasFreshSuccessfulEvidence(quality, input.NowMS, input.RecoveryEvidenceTTLMS) {
 				return AdmissionWarming, false, ""
 			}
 			if recoveredRouteCooling(quality, input) {
@@ -728,8 +747,7 @@ func qualityAdmission(route CertifiedRoute, quality QualityState, input FilterIn
 		}
 		return AdmissionDegraded, false, ""
 	case QualityWarming:
-		if strategyDirectlyAdmitsFreshRecovery(input.Policy.EffectiveStrategy()) &&
-			hasFreshSuccessfulEvidence(quality, input.NowMS, input.RecoveryEvidenceTTLMS) {
+		if hasFreshSuccessfulEvidence(quality, input.NowMS, input.RecoveryEvidenceTTLMS) {
 			return AdmissionWarming, false, ""
 		}
 		// The single-flight sample lane remains available during the profile
@@ -763,15 +781,6 @@ func qualityAdmission(route CertifiedRoute, quality QualityState, input FilterIn
 		return "", false, RejectHealthUnavailable
 	default:
 		return "", false, RejectHealthUnavailable
-	}
-}
-
-func strategyDirectlyAdmitsFreshRecovery(strategy Strategy) bool {
-	switch strategy {
-	case StrategyPrice, StrategyLatency, StrategyManual:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -892,8 +901,8 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 			if left.Quality.ConsecutiveHardFailures != right.Quality.ConsecutiveHardFailures {
 				return left.Quality.ConsecutiveHardFailures < right.Quality.ConsecutiveHardFailures
 			}
-			if left.RatioPPM != right.RatioPPM {
-				return left.RatioPPM < right.RatioPPM
+			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+				return comparison < 0
 			}
 		case StrategyLatency:
 			leftKnown := left.TTFTKnowledge == TTFTKnown
@@ -907,19 +916,22 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 			if left.StabilityPPM != right.StabilityPPM {
 				return left.StabilityPPM > right.StabilityPPM
 			}
-			if left.RatioPPM != right.RatioPPM {
-				return left.RatioPPM < right.RatioPPM
+			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+				return comparison < 0
 			}
 		case StrategyBalanced:
 			if left.BalancedScorePPM != right.BalancedScorePPM {
 				return left.BalancedScorePPM > right.BalancedScorePPM
 			}
-			if left.RatioPPM != right.RatioPPM {
-				return left.RatioPPM < right.RatioPPM
+			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+				return comparison < 0
 			}
 		default: // StrategyPrice
-			if left.RatioPPM != right.RatioPPM {
-				return left.RatioPPM < right.RatioPPM
+			if left.priceClassRank != right.priceClassRank {
+				return left.priceClassRank < right.priceClassRank
+			}
+			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+				return comparison < 0
 			}
 			if left.StabilityPPM != right.StabilityPPM {
 				return left.StabilityPPM > right.StabilityPPM
@@ -964,14 +976,19 @@ func assignBalancedScores(candidates []Candidate, weights BalancedWeights) {
 	if len(candidates) == 0 {
 		return
 	}
-	minPrice, maxPrice := candidates[0].RatioPPM, candidates[0].RatioPPM
+	priceComparable := candidates[0].Price.StaticComparable
+	priceClass := candidates[0].Price.ComparisonClass
+	minPrice, maxPrice := candidates[0].Price.ScorePPM, candidates[0].Price.ScorePPM
 	minTTFT, maxTTFT := int64(0), int64(0)
 	for _, candidate := range candidates {
-		if candidate.RatioPPM < minPrice {
-			minPrice = candidate.RatioPPM
+		if !candidate.Price.StaticComparable || candidate.Price.ComparisonClass != priceClass {
+			priceComparable = false
 		}
-		if candidate.RatioPPM > maxPrice {
-			maxPrice = candidate.RatioPPM
+		if candidate.Price.ScorePPM < minPrice {
+			minPrice = candidate.Price.ScorePPM
+		}
+		if candidate.Price.ScorePPM > maxPrice {
+			maxPrice = candidate.Price.ScorePPM
 		}
 		if candidate.TTFTKnowledge == TTFTKnown {
 			if minTTFT == 0 || candidate.TTFTP95MS < minTTFT {
@@ -983,7 +1000,10 @@ func assignBalancedScores(candidates []Candidate, weights BalancedWeights) {
 		}
 	}
 	for index := range candidates {
-		priceScore := inverseRangeScore(candidates[index].RatioPPM, minPrice, maxPrice)
+		priceScore := int64(500_000)
+		if priceComparable {
+			priceScore = inverseRangeScore(candidates[index].Price.ScorePPM, minPrice, maxPrice)
+		}
 		ttftScore := int64(500_000)
 		if candidates[index].TTFTKnowledge == TTFTKnown {
 			ttftScore = inverseRangeScore(candidates[index].TTFTP95MS, minTTFT, maxTTFT)
@@ -1049,7 +1069,8 @@ func applyAffinity(
 		if strategy == StrategyManual {
 			return candidates, matchIndex == 0, economyDecision
 		}
-		if len(candidates) == 0 || candidates[matchIndex].RatioPPM > saturatingAdd(candidates[0].RatioPPM, weakTolerancePPM) {
+		matchedPrice, selectedPrice, comparable := comparableCandidatePriceScores(candidates[matchIndex], candidates[0])
+		if len(candidates) == 0 || !comparable || matchedPrice > saturatingAdd(selectedPrice, weakTolerancePPM) {
 			return candidates, true, economyDecision
 		}
 		result := append([]Candidate(nil), candidates...)
@@ -1069,35 +1090,44 @@ func applyAffinity(
 	}
 	if affinityMode == AffinityModeEconomicBreakEven && len(candidates) > 0 &&
 		!isRecoveryAttemptAdmission(candidates[0].Admission) {
-		economyDecision = EvaluateCacheEconomy(economy, estimatedContext, candidates[matchIndex], candidates[0])
-		switch economyDecision.Action {
-		case CacheEconomySwitch:
-			return candidates, false, economyDecision
-		case CacheEconomyKeep:
-			result := make([]Candidate, 0, len(candidates))
-			matched := candidates[matchIndex]
-			result = append(result, matched)
-			for index, candidate := range candidates {
-				if index != matchIndex && candidate.Route.CacheNamespaceIdentity() == matched.Route.CacheNamespaceIdentity() {
-					result = append(result, candidate)
+		matchedPrice := candidateRoutePrice(candidates[matchIndex])
+		selectedPrice := candidateRoutePrice(candidates[0])
+		if matchedPrice.Synthetic || selectedPrice.Synthetic {
+			economyDecision.Reason = CacheEconomyReasonSyntheticPrice
+		} else {
+			economyDecision = EvaluateCacheEconomy(economy, estimatedContext, candidates[matchIndex], candidates[0])
+			switch economyDecision.Action {
+			case CacheEconomySwitch:
+				return candidates, false, economyDecision
+			case CacheEconomyKeep:
+				result := make([]Candidate, 0, len(candidates))
+				matched := candidates[matchIndex]
+				result = append(result, matched)
+				for index, candidate := range candidates {
+					if index != matchIndex && candidate.Route.CacheNamespaceIdentity() == matched.Route.CacheNamespaceIdentity() {
+						result = append(result, candidate)
+					}
 				}
-			}
-			for index, candidate := range candidates {
-				if index != matchIndex && candidate.Route.CacheNamespaceIdentity() != matched.Route.CacheNamespaceIdentity() {
-					result = append(result, candidate)
+				for index, candidate := range candidates {
+					if index != matchIndex && candidate.Route.CacheNamespaceIdentity() != matched.Route.CacheNamespaceIdentity() {
+						result = append(result, candidate)
+					}
 				}
+				return result, true, economyDecision
 			}
-			return result, true, economyDecision
 		}
 	}
 	matched := candidates[matchIndex]
-	minimumRatio := matched.RatioPPM
+	if matchIndex != 0 && !matched.Price.ComparableWith(candidates[0].Price) {
+		return candidates, false, economyDecision
+	}
+	minimumPrice := matched.Price.ScorePPM
 	for _, candidate := range candidates {
-		if candidate.RatioPPM < minimumRatio {
-			minimumRatio = candidate.RatioPPM
+		if matched.Price.ComparableWith(candidate.Price) && candidate.Price.ScorePPM < minimumPrice {
+			minimumPrice = candidate.Price.ScorePPM
 		}
 	}
-	if !affinityWithinPremium(matched.RatioPPM, minimumRatio, maxPremiumPercent) {
+	if !affinityWithinPremium(matched.Price.ScorePPM, minimumPrice, maxPremiumPercent) {
 		// Cache affinity is valuable, but it must not silently defeat a user's
 		// configured price ceiling. Leave normal strategy ordering intact and
 		// let a successful request replace the stale affinity record.

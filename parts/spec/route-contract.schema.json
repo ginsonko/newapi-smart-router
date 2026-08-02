@@ -2,7 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:newapi-smart-router:schema:route-contract:v1",
   "title": "NewAPI Smart Router exact route contract",
-  "description": "Normative design schema for an exact model, endpoint and capability contract. This schema is not release evidence.",
+  "description": "Normative design schema for an exact model, endpoint and capability contract. Adapter support may only narrow this contract; it may never add an endpoint or capability that the channel did not certify. This schema is not release evidence.",
+  "$comment": "Host normalization classifies previous_response_id, conversation and upstream-bound files as state_bound before routing. store:true, background:true and hosted tools are side_effecting only when no state-bound signal exists; state_bound takes precedence.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -79,6 +80,44 @@
         "task_query_affinity"
       ]
     },
+    "planner_replay_class": {
+      "enum": ["unsupported", "safe_text", "safe_image", "safe_video", "safe_audio", "state_bound", "side_effecting"],
+      "description": "Planner-level classification. state_bound is rejected before upstream connection. side_effecting may select one initial route but may not select a second route after dispatch starts."
+    },
+    "adapter_endpoint_allow": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "openai-chat-completions-v1",
+          "openai-legacy-completions-v1",
+          "openai-responses-v1",
+          "anthropic-messages-v1",
+          "openai-image-generations-v1",
+          "openai-image-edits-v1",
+          "openai-video-generations-v1",
+          "openai-audio-speech-v1",
+          "openai-audio-transcriptions-v1",
+          "openai-audio-translations-v1"
+        ]
+      },
+      "description": "An adapter-local allowlist intersected with the certified endpoint. It is a narrowing fence, not a source of new capability."
+    },
+    "state_binding_fields": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["previous_response_id", "conversation", "upstream_bound_file"] }
+    },
+    "side_effecting_signals": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["store_true", "background_true", "hosted_tool"] }
+    },
+    "synthetic_probe_allowed": { "type": "boolean" },
+    "exhaustive_retry_allowed": {
+      "type": "boolean",
+      "description": "May be true only for replay-safe text and still requires sequential distinct-channel attempts within authorization and price/health/capability filters."
+    },
     "media": {
       "type": "object",
       "additionalProperties": false,
@@ -121,6 +160,25 @@
         "required": ["endpoint"]
       },
       "then": { "required": ["media"] }
+    },
+    {
+      "if": {
+        "required": ["planner_replay_class"],
+        "properties": { "planner_replay_class": { "enum": ["state_bound", "side_effecting", "safe_image", "safe_video", "safe_audio"] } }
+      },
+      "then": {
+        "properties": {
+          "synthetic_probe_allowed": { "const": false },
+          "exhaustive_retry_allowed": { "const": false }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["planner_replay_class", "exhaustive_retry_allowed"],
+        "properties": { "exhaustive_retry_allowed": { "const": true } }
+      },
+      "then": { "properties": { "planner_replay_class": { "const": "safe_text" } } }
     }
   ]
 }

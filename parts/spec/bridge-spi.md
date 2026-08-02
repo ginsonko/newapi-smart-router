@@ -1,7 +1,7 @@
 # NewAPI Smart Router Bridge SPI
 
 状态：`Normative design contract`  
-版本：`bridge-spi-v1-design`  
+版本：`bridge-spi-v1alpha2`
 运行边界：本文定义宿主接点，不证明任何宿主已经实现或认证  
 
 ## 1. 目的
@@ -118,6 +118,23 @@ policy_hash
 - 本请求记录已尝试 ChannelID/credential domain；
 - 路线 generation 与当前渠道不一致时拒绝执行并重新计划新请求；
 - 不把内部路线返回普通用户。
+
+### HOOK-PRICE-001: Effective route price snapshot
+
+调用时机：目录与用户可用分组已冻结后、planner 排序前。
+
+输入：canonical model、实际使用分组、用户分组、全局模型价格 revision、分组模型价格 revision、有效分组倍率。
+
+输出：符合 `route-price.schema.json` 的 RouteID -> RoutePrice 快照。
+
+约束：
+
+- 显式分组模型价格替换全局模型基础价；
+- inherit 使用真实全局模型价格，缺失时不可比，不合成 `1x`；
+- 有效分组倍率只组合一次；
+- 计费单位、固定时长和表达式等成本形状进入 comparison class；
+- planner、预扣、结算、退款和模型广场必须来自同一计费合同 revision；
+- 价格快照只用于选路，不得直接修改用户额度。
 
 ### HOOK-COMMIT-001: Semantic response commit
 
@@ -286,3 +303,23 @@ fail_closed
 - 迁移不能保证三数据库或安全回滚。
 
 可以降级为部分能力，但不能继续声称 Full Parity。
+
+## 10. v0.2 追加合同
+
+### 10.1 有效价格快照
+
+Bridge 必须从宿主真实计费解析器生成 `RoutePrice`。显式分组模型价格替换全局模型基础价；继承使用真实全局模型价格；最终只乘一次有效分组倍率。不同 `comparison_class` 不得按数值互相比价，缺少可靠价格时保持不可比。
+
+### 10.2 重放和派发
+
+- 关闭尝试次数限制时，仅 `safe_text` 获得顺序穷尽权限；
+- 每个物理 Channel 最多派发一次，不并发扩散；
+- `side_effecting` 可以选择一个初始渠道，但 upstream dispatch 开始后绝不选择第二渠道；
+- `state_bound` 在连接上游前拒绝，且优先级高于 `side_effecting`；
+- 媒体、后台任务、托管工具和已提交响应继续使用原有单派发/受理合同。
+
+### 10.3 Adapter 与 Worker
+
+Adapter endpoint allowlist 只能收窄目录合同。`convert_request_failed` 只有在 dispatch 前才能进入合同回退。HTTP 200 必须通过 transport、protocol 和 semantic 三层验证。Web 与专用 Smart Router Worker 必须运行同一不可变二进制和协议 revision；哈希不同即 `BLOCKED`。
+
+完整追加说明见 [v0.2 contract delta](../../docs/v0.2-contract-delta.md)。

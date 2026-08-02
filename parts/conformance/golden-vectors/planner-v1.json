@@ -85,6 +85,173 @@
         {"id": "route-virgin-plus", "group": "plus", "channel_id": 82, "ratio_ppm": 80000}
       ],
       "want_route": "route-virgin-cheap"
+    },
+    {
+      "id": "real_inherited_and_explicit_prices_share_billing_semantics",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "routes": [
+        {
+          "id": "route-inherited",
+          "group": "inherit",
+          "channel_id": 91,
+          "ratio_ppm": 150000,
+          "phase": "healthy",
+          "price": {
+            "billing_mode": "ratio",
+            "billing_unit": "token",
+            "comparison_class": "ratio:token",
+            "score_ppm": 375000,
+            "static_comparable": true,
+            "scope": "global_model"
+          }
+        },
+        {
+          "id": "route-explicit",
+          "group": "explicit",
+          "channel_id": 92,
+          "ratio_ppm": 200000,
+          "phase": "healthy",
+          "price": {
+            "billing_mode": "ratio",
+            "billing_unit": "token",
+            "comparison_class": "ratio:token",
+            "score_ppm": 300000,
+            "static_comparable": true,
+            "scope": "group_model"
+          }
+        }
+      ],
+      "want_route": "route-explicit",
+      "want_price_score_ppm": 300000,
+      "want_price_comparison_class": "ratio:token"
+    },
+    {
+      "id": "incompatible_billing_units_are_not_false_price_ordered",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "routes": [
+        {
+          "id": "route-per-second",
+          "group": "video",
+          "channel_id": 93,
+          "ratio_ppm": 100000,
+          "phase": "healthy",
+          "price": {
+            "billing_mode": "fixed_price",
+            "billing_unit": "per_second",
+            "comparison_class": "fixed:per_second",
+            "score_ppm": 900000,
+            "static_comparable": true
+          }
+        },
+        {
+          "id": "route-per-request",
+          "group": "image",
+          "channel_id": 94,
+          "ratio_ppm": 100000,
+          "phase": "healthy",
+          "price": {
+            "billing_mode": "fixed_price",
+            "billing_unit": "per_request",
+            "comparison_class": "fixed:per_request",
+            "score_ppm": 1000,
+            "static_comparable": true
+          }
+        }
+      ],
+      "want_route": "route-per-second",
+      "want_price_comparison_class": "fixed:per_second"
+    },
+    {
+      "id": "safe_text_can_exhaust_remaining_channels_after_eight",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "replay_class": "safe_text",
+      "max_attempts": 8,
+      "started_attempts": 8,
+      "exhaust_eligible_channels": true,
+      "attempted_channels": [101, 102, 103, 104, 105, 106, 107, 108],
+      "routes": [
+        {"id": "route-101", "group": "g", "channel_id": 101, "ratio_ppm": 10000, "phase": "healthy"},
+        {"id": "route-102", "group": "g", "channel_id": 102, "ratio_ppm": 20000, "phase": "healthy"},
+        {"id": "route-103", "group": "g", "channel_id": 103, "ratio_ppm": 30000, "phase": "healthy"},
+        {"id": "route-104", "group": "g", "channel_id": 104, "ratio_ppm": 40000, "phase": "healthy"},
+        {"id": "route-105", "group": "g", "channel_id": 105, "ratio_ppm": 50000, "phase": "healthy"},
+        {"id": "route-106", "group": "g", "channel_id": 106, "ratio_ppm": 60000, "phase": "healthy"},
+        {"id": "route-107", "group": "g", "channel_id": 107, "ratio_ppm": 70000, "phase": "healthy"},
+        {"id": "route-108", "group": "g", "channel_id": 108, "ratio_ppm": 80000, "phase": "healthy"},
+        {"id": "route-109", "group": "g", "channel_id": 109, "ratio_ppm": 90000, "phase": "healthy"},
+        {"id": "route-110", "group": "g", "channel_id": 110, "ratio_ppm": 100000, "phase": "healthy"}
+      ],
+      "want_route": "route-109"
+    },
+    {
+      "id": "numeric_attempt_limit_still_fails_closed_when_enabled",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "replay_class": "safe_text",
+      "max_attempts": 8,
+      "started_attempts": 8,
+      "routes": [
+        {"id": "route-after-limit", "group": "g", "channel_id": 111, "ratio_ppm": 10000, "phase": "healthy"}
+      ],
+      "want_error": "attempt budget is exhausted"
+    },
+    {
+      "id": "side_effecting_request_can_select_one_initial_route",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "replay_class": "side_effecting",
+      "routes": [
+        {"id": "route-side-effect", "group": "g", "channel_id": 112, "ratio_ppm": 10000, "phase": "healthy"}
+      ],
+      "want_route": "route-side-effect"
+    },
+    {
+      "id": "side_effecting_never_inherits_exhaustive_retry_authority",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "replay_class": "side_effecting",
+      "max_attempts": 1,
+      "started_attempts": 1,
+      "exhaust_eligible_channels": true,
+      "routes": [
+        {"id": "route-side-effect-second", "group": "g", "channel_id": 113, "ratio_ppm": 10000, "phase": "healthy"}
+      ],
+      "want_error": "attempt budget is exhausted"
+    },
+    {
+      "id": "state_bound_request_is_rejected_before_routing",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "replay_class": "state_bound",
+      "routes": [
+        {"id": "route-state-bound", "group": "g", "channel_id": 114, "ratio_ppm": 10000, "phase": "healthy"}
+      ],
+      "want_error": "request is not safe to replay"
+    },
+    {
+      "id": "fresh_success_re_admits_warming_route_without_second_gate",
+      "strategy": "price",
+      "max_ratio_ppm": 1000000,
+      "background_recovery": true,
+      "routes": [
+        {
+          "id": "route-fresh-warming",
+          "group": "cheap",
+          "channel_id": 115,
+          "ratio_ppm": 20000,
+          "phase": "warming",
+          "last_success_ms": 99000,
+          "last_failure_ms": 90000,
+          "warming_traffic_ppm": 0,
+          "warming_epoch": 2
+        },
+        {"id": "route-healthy", "group": "plus", "channel_id": 116, "ratio_ppm": 80000, "phase": "healthy"}
+      ],
+      "want_route": "route-fresh-warming",
+      "want_admission": "warming"
     }
   ]
 }

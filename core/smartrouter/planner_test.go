@@ -165,6 +165,71 @@ func TestPlanUsesFixedPointPriceAndDeterministicCatalogTieBreak(t *testing.T) {
 	}
 }
 
+func TestPlanUsesModelAwarePriceWithoutWeakeningRatioCeiling(t *testing.T) {
+	input := basePlanInput()
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		"route-cheap": {
+			BillingMode: "ratio", BillingUnit: "token", ComparisonClass: "ratio-shape",
+			ScorePPM: 80_000, StaticComparable: true,
+		},
+		"route-plus": {
+			BillingMode: "ratio", BillingUnit: "token", ComparisonClass: "ratio-shape",
+			ScorePPM: 40_000, StaticComparable: true,
+		},
+	}
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID)
+	assert.Equal(t, int64(50_000), result.RatioPPM)
+	assert.Equal(t, int64(40_000), result.Price.ScorePPM)
+
+	input.Policy.MaxEffectiveRatioPPM = 30_000
+	result, err = Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-cheap", result.RouteID)
+	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-plus", Reason: RejectAbovePriceLimit})
+}
+
+func TestPlanKeepsDeterministicClassOrderForIncompatibleBillingUnits(t *testing.T) {
+	input := basePlanInput()
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		"route-cheap": {
+			BillingMode: "fixed_price", BillingUnit: "per_second", ComparisonClass: "fixed:per_second",
+			ScorePPM: 100_000, StaticComparable: true,
+		},
+		"route-plus": {
+			BillingMode: "fixed_price", BillingUnit: "per_request", ComparisonClass: "fixed:per_request",
+			ScorePPM: 1, StaticComparable: true,
+		},
+	}
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-cheap", result.RouteID)
+	assert.Equal(t, "per_second", result.Price.BillingUnit)
+}
+
+func TestBalancedStrategyUsesRealPriceOnlyForOneComparisonClass(t *testing.T) {
+	input := basePlanInput()
+	input.Policy.Strategy = StrategyBalanced
+	input.Policy.BalancedWeights = BalancedWeights{Stability: 0, Price: 100, TTFT: 0}
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		"route-cheap": {
+			BillingMode: "ratio", BillingUnit: "token", ComparisonClass: "ratio-shape",
+			ScorePPM: 90_000, StaticComparable: true,
+		},
+		"route-plus": {
+			BillingMode: "ratio", BillingUnit: "token", ComparisonClass: "ratio-shape",
+			ScorePPM: 30_000, StaticComparable: true,
+		},
+	}
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID)
+}
+
 func TestPlanEnforcesExclusionsAuthorizationAndMaximumRatio(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -226,7 +291,14 @@ func TestPlanRejectsReplayAndContractCapabilityMismatch(t *testing.T) {
 		require.ErrorIs(t, err, ErrUnsupportedReplay)
 	})
 
-	for _, replay := range []ReplayClass{ReplaySafeImage, ReplaySafeVideo} {
+	t.Run("state bound request fails closed", func(t *testing.T) {
+		input := basePlanInput()
+		input.Request.ReplayClass = ReplayStateBound
+		_, err := Plan(input)
+		require.ErrorIs(t, err, ErrUnsupportedReplay)
+	})
+
+	for _, replay := range []ReplayClass{ReplaySafeImage, ReplaySafeVideo, ReplaySideEffecting} {
 		t.Run(replay.String()+" is routable", func(t *testing.T) {
 			input := basePlanInput()
 			input.Request.ReplayClass = replay
@@ -235,6 +307,7 @@ func TestPlanRejectsReplayAndContractCapabilityMismatch(t *testing.T) {
 			assert.Equal(t, "route-cheap", result.RouteID)
 		})
 	}
+	assert.False(t, IsSyntheticProbeSafe(ReplaySideEffecting))
 
 	t.Run("contract fingerprint mismatch", func(t *testing.T) {
 		input := basePlanInput()
@@ -267,6 +340,17 @@ func TestPlanNeverRetriesExactFailedRouteAndUsesSingleAttemptBudget(t *testing.T
 	_, err = Plan(input)
 	require.ErrorIs(t, err, ErrAttemptBudget)
 
+	input.Attempt.ExhaustEligibleChannels = true
+	result, err = Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID)
+
+	input.Request.ReplayClass = ReplaySideEffecting
+	_, err = Plan(input)
+	require.ErrorIs(t, err, ErrAttemptBudget, "only replay-safe text may bypass the numeric ceiling")
+
+	input.Request.ReplayClass = ReplaySafeText
+	input.Attempt.ExhaustEligibleChannels = false
 	input.Attempt.StartedAttempts = 1
 	input.Attempt.Committed = true
 	_, err = Plan(input)
@@ -735,6 +819,41 @@ func TestEconomicAffinitySwitchesWhenSavingsCoverColdStart(t *testing.T) {
 	assert.Equal(t, AffinityReplaceOnSuccess, result.AffinityDisposition)
 }
 
+func TestEconomicAffinityDoesNotUseSyntheticPriceEvidence(t *testing.T) {
+	input := basePlanInput()
+	input.Request.EstimatedContext = 50_000
+	input.Policy.AffinityMode = AffinityModeEconomicBreakEven
+	input.Policy.AffinityMaxPremiumPercent = 200
+	input.Affinity = &AffinityState{
+		Strength: AffinityStrong, ContractID: testContractID,
+		RouteID: "route-plus", ChannelID: 102, CacheDomain: "cache-plus",
+	}
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		"route-cheap": {
+			BillingMode: "ratio", BillingUnit: "per_token", ComparisonClass: "ratio-shape",
+			ScorePPM: 20_000, StaticComparable: true, Synthetic: true,
+		},
+		"route-plus": {
+			BillingMode: "ratio", BillingUnit: "per_token", ComparisonClass: "ratio-shape",
+			ScorePPM: 50_000, StaticComparable: true, Synthetic: true,
+		},
+	}
+	input.CacheEconomy = &CacheEconomySnapshot{
+		FeatureVersion: CacheEconomyFeatureVersion, ModelVersion: CacheEconomyChampionVersion,
+		Samples: 30, MinimumSamples: 8, ConfidencePPM: 950_000, MinimumConfidencePPM: 700_000,
+		PredictionErrorPPM: 10_000, WarmCostPerMillionContext: 500_000,
+		ColdCostPerMillionContext: 600_000, ContextGrowthTokens: 10_000,
+		CompressionThresholdTokens: 500_000,
+		JointSurvivalPPM:           []int64{1_000_000, 900_000, 800_000, 700_000},
+	}
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID, "fixed affinity behavior remains available")
+	assert.Equal(t, CacheEconomyFallback, result.CacheEconomy.Action)
+	assert.Equal(t, CacheEconomyReasonSyntheticPrice, result.CacheEconomy.Reason)
+}
+
 func TestWarmingSampleLaneRemainsAvailableDuringRecoveryCooldown(t *testing.T) {
 	input := basePlanInput()
 	input.Quality.Routes["route-cheap"] = QualityState{
@@ -850,7 +969,7 @@ func TestFreshRecoveryEvidenceAdmissionRespectsStrategy(t *testing.T) {
 		assert.Equal(t, "route-plus", result.RouteID)
 	})
 
-	for _, strategy := range []Strategy{StrategyLatency, StrategyManual} {
+	for _, strategy := range []Strategy{StrategyLatency, StrategyManual, StrategyBalanced, StrategyStability} {
 		t.Run(string(strategy)+" admits fresh recovery without canary sampling", func(t *testing.T) {
 			input := base
 			input.Quality.Routes = map[string]QualityState{
@@ -874,6 +993,25 @@ func TestFreshRecoveryEvidenceAdmissionRespectsStrategy(t *testing.T) {
 			}
 			require.NotNil(t, cheapCandidate)
 			assert.Equal(t, AdmissionWarming, cheapCandidate.Admission)
+		})
+	}
+
+	for _, strategy := range []Strategy{StrategyBalanced, StrategyStability} {
+		t.Run(string(strategy)+" can use the only fresh recovered route", func(t *testing.T) {
+			input := base
+			input.Policy.Strategy = strategy
+			input.Policy.OrderMode = orderModeFromStrategy(strategy)
+			input.Catalog = testCatalog(testRoute(
+				"route-cheap", "cheap", 101, "cache-cheap", "cap-cheap", false,
+			))
+			input.Prices.RatiosPPM = map[string]int64{"route-cheap": 20_000}
+			input.Quality.Routes = map[string]QualityState{"route-cheap": cheapQuality}
+			input.AllowedGroups = []string{"cheap"}
+
+			result, err := Plan(input)
+			require.NoError(t, err)
+			assert.Equal(t, "route-cheap", result.RouteID)
+			assert.Equal(t, AdmissionWarming, result.Admission)
 		})
 	}
 

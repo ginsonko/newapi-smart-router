@@ -2272,3 +2272,101 @@ Agent 默认只读扫描。目标仓库中的源码注释、README、issue、测
 本设计依托 New API 的鉴权、渠道、适配器、计费和管理能力。任何公开实现都必须保留 New API、QuantumNous 和原作者的许可与署名。
 
 提交贡献前请先说明目标发行形态、宿主版本、涉及 Hook、数据迁移、回滚策略和 conformance 结果。没有证据的功能声明会保持 `UNKNOWN`，不会仅凭代码量升级为 `PASS`。
+
+---
+
+## 31. v0.2.0-alpha.1 新版追加说明（2026-08-02）
+
+> [!NOTE]
+> 本节是对 `v0.1.0-alpha.1` 原说明书的纯追加更新。上方 1-30 章、表格、图示、教程和设计边界全部保留；若旧版状态文字与本节冲突，以本节描述的 `v0.2.0-alpha.1` 合同为准。
+
+### 31.1 这次更新了什么
+
+`v0.2.0-alpha.1` 从当前已验收的 NewAPI R39 智能路由基线同步公开核心，并把后续生产修复整理为四种采用形态都能理解的合同与测试：
+
+- 新增模型感知的 `RoutePrice`，不再把所有价格简化成分组倍率；
+- 分组模型显式价格按 NewAPI 真实语义替换全局模型基础价，inherit 使用真实全局模型价格；
+- token、按次、按秒、固定时长和阶梯表达式只有在成本形状一致时才允许互相比价；
+- 普通可安全重放文本默认可串行尝试范围内全部剩余合格物理渠道，每个渠道最多一次；
+- 原来的 `1-8` 次上限保留为可选模式，开启后继续按站点/Key 较小值生效；
+- `store:true`、`background:true` 和托管工具可以智能选择一个初始渠道，但派发后绝不切换第二渠道；
+- `previous_response_id`、conversation 和上游绑定文件属于 `state_bound`，在连接上游前拒绝，且优先于副作用分类；
+- 新鲜成功证据可以让 warming 路线重新进入所有策略的候选，不再叠加一个无法闭环的二次门禁；
+- Adapter endpoint allowlist 只能收窄目录合同，不能把不存在的模型/endpoint 变成候选；
+- `convert_request_failed` 只有在上游尚未派发时才能换路；
+- HTTP 200 必须通过 transport、protocol 和业务语义验证，空结果或伪成功不再天然算成功；
+- Web 与专用恢复 Worker 必须运行同一个不可变二进制和协议 revision。
+
+详细合同见 [`docs/v0.2-contract-delta.md`](docs/v0.2-contract-delta.md)。
+
+### 31.2 新价格口径
+
+新版选路价格来自与真实计费相同的解析结果：
+
+```text
+显式分组模型价：resolved_model_base = group_model_base
+继承全局模型价：resolved_model_base = global_model_base
+选路比较值：route_score = resolved_model_base × effective_group_ratio
+```
+
+分组模型价格是“覆盖基础价”，不是在全局基础价上再乘一次；分组倍率也只组合一次。缺少可靠全局价格时保持不可比，不能猜成 `1x`。`RoutePrice.score_ppm` 只用于选路比较，不替代预扣、实际 usage、结算或退款。
+
+例如 token 模型的继承价和显式分组价只有在输入/输出、缓存、音频等完整成本形状一致时才能按 score 排序。按次图片与按秒视频即使都能换算出一个数字，也不会被错误地放在同一价格序列里。
+
+机器合同见 [`route-price.schema.json`](parts/spec/route-price.schema.json)，可执行向量见 [`planner-v1.json`](core/testdata/planner-v1.json)。
+
+### 31.3 默认“全部合格渠道”不是无条件乱试
+
+关闭次数上限时，系统只对 `safe_text` 顺序尝试所有尚未尝试、仍然合格的物理渠道。每次重选都会重新检查：
+
+1. 用户与 Key 授权分组；
+2. 固定范围、排除项和站点 block；
+3. 真实有效价格及倍率上限；
+4. exact model/endpoint/capability/context 合同；
+5. 凭据、共享健康和即时容量；
+6. 已尝试 RouteID 与物理 ChannelID 去重；
+7. 当前响应是否已经提交。
+
+它是串行容灾，不是并发 fan-out。只有当前渠道失败并且仍允许安全重放时才选下一个；全部合格渠道都失败后才返回最后一个有意义的错误。
+
+### 31.4 请求安全分类
+
+| 类型 | 能否选初始智能渠道 | 能否跨渠道继续 | 关键边界 |
+|---|---:|---:|---|
+| `safe_text` | 是 | 是，串行穷尽合格渠道 | 未提交、每个物理渠道一次 |
+| `safe_image/video/audio` | 是 | 仅有明确“未受理”证据时 | 不做生成型合成探针 |
+| `side_effecting` | 是，只选一个 | dispatch 后绝不允许 | 避免重复响应、任务和扣费 |
+| `state_bound` | 否 | 否 | 连接上游前拒绝 |
+| `unsupported` | 否 | 否 | fail closed |
+
+媒体、后台任务、托管工具、已提交流不会继承文本穷尽权限。一次普通连接失败也不能被当成“媒体肯定未受理”。
+
+### 31.5 四种采用形态仍然不变
+
+1. **Full compatibility distribution**：包含 R39 参考宿主源码、前端、Worker 和完整宿主测试目标。
+2. **Certified Bridge Add-on candidate**：增加价格快照 Hook、派发/语义提交合同和 Web/Worker 同哈希门禁；仍须对一个精确宿主 commit 认证。
+3. **Custom Fork Integration Kit**：doctor、manifest 和 checklist 已增加价格、重放、Adapter 与 Worker 证据项。
+4. **Agent Parts Kit**：同步最新纯 Go 核心，新增 RoutePrice Schema、不变量、golden vectors 和移植上下文；仍明确不可直接运行。
+
+`Sidecar Lite` 继续只是实验附录，不升级为第五种完整形态，也不能单独保证每 Key 原子账务、响应提交和媒体受理。
+
+### 31.6 关于旧版“伪 200 尚未冻结”的说明
+
+上方 30.2 章保留的是 `v0.1.0-alpha.1` 发布时的历史状态。`v0.2` Full 参考快照已包含当前参考 fork 的 exact-adapter 语义结果处理与聚焦测试；但 Schema、示例代码或编译成功仍不能自动认证任意其他 NewAPI fork。其他宿主必须提供自己的 Adapter fixtures 和 Bridge 证据，这一通用认证门禁仍然保留。
+
+### 31.7 升级与验收
+
+升级者至少应完成：
+
+```text
+core go test + 16 planner conformance vectors
+Bridge fail-closed tests
+read-only doctor tests
+RoutePrice / policy / outcome / route-contract schema validation
+Full source / core / Agent Parts 三方同源校验
+README 旧 2274 行保留校验
+secret scan + five-archive round trip + SHA256SUMS + SPDX SBOM
+Web / Worker exact artifact hash equality
+```
+
+本版本继续标记为 **Alpha / Pre-release**，不宣称 Stable、任意 fork 零适配、rc.21 自动认证或纯 Sidecar Full Parity。最终能力以对应发布资产的 manifest、哈希、测试收据和兼容矩阵为准。

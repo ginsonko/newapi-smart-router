@@ -11,7 +11,7 @@ body:
     id: release
     attributes:
       label: Smart Router release and form
-      placeholder: v0.1.0-alpha.1 / Full, Bridge, Integration, or Agent Parts
+      placeholder: v0.2.0-alpha.1 / Full, Bridge, Integration, or Agent Parts
     validations:
       required: true
   - type: input

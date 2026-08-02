@@ -26,6 +26,7 @@ const (
 	CacheEconomyReasonLearning        CacheEconomyReason = "learning"
 	CacheEconomyReasonDrift           CacheEconomyReason = "drift_detected"
 	CacheEconomyReasonInvalidSnapshot CacheEconomyReason = "invalid_snapshot"
+	CacheEconomyReasonSyntheticPrice  CacheEconomyReason = "synthetic_price"
 	CacheEconomyReasonAlreadyCheapest CacheEconomyReason = "already_best_cost"
 	CacheEconomyReasonSharedCache     CacheEconomyReason = "shared_cache_cheaper"
 	CacheEconomyReasonKeepCostsLess   CacheEconomyReason = "keep_costs_less"
@@ -71,6 +72,9 @@ type CacheEconomyDecision struct {
 	TargetRouteID         string             `json:"target_route_id,omitempty"`
 	CurrentRatioPPM       int64              `json:"current_ratio_ppm,omitempty"`
 	TargetRatioPPM        int64              `json:"target_ratio_ppm,omitempty"`
+	CurrentPriceScorePPM  int64              `json:"current_price_score_ppm,omitempty"`
+	TargetPriceScorePPM   int64              `json:"target_price_score_ppm,omitempty"`
+	PriceComparisonClass  string             `json:"price_comparison_class,omitempty"`
 	CounterfactualKnown   bool               `json:"counterfactual_known,omitempty"`
 	UsedManualCompression bool               `json:"used_manual_compression,omitempty"`
 }
@@ -104,29 +108,39 @@ func EvaluateCacheEconomy(
 	decision.CurrentRatioPPM = current.RatioPPM
 	decision.TargetRatioPPM = target.RatioPPM
 	decision.UsedManualCompression = snapshot.ManualCompressionThreshold
+	currentRoutePrice := candidateRoutePrice(current)
+	targetRoutePrice := candidateRoutePrice(target)
 	if current.Route.RouteID == target.Route.RouteID && current.Route.ChannelID == target.Route.ChannelID {
 		decision.Action = CacheEconomyKeep
 		decision.Reason = CacheEconomyReasonAlreadyCheapest
-		if snapshot.WarmCostPerMillionContext > 0 && current.RatioPPM >= 0 {
-			decision.PredictedUnitCost = scaledCacheEconomyCost(snapshot.WarmCostPerMillionContext, current.RatioPPM)
+		if snapshot.WarmCostPerMillionContext > 0 && currentRoutePrice.StaticComparable {
+			decision.CurrentPriceScorePPM = currentRoutePrice.ScorePPM
+			decision.TargetPriceScorePPM = currentRoutePrice.ScorePPM
+			decision.PriceComparisonClass = currentRoutePrice.ComparisonClass
+			decision.PredictedUnitCost = scaledCacheEconomyCost(snapshot.WarmCostPerMillionContext, currentRoutePrice.ScorePPM)
 		}
 		return decision
 	}
-	if current.RatioPPM < 0 || target.RatioPPM < 0 || estimatedContext <= 0 {
+	if !currentRoutePrice.ComparableWith(targetRoutePrice) || estimatedContext <= 0 {
 		decision.Reason = CacheEconomyReasonInvalidSnapshot
 		return decision
 	}
+	currentPrice := currentRoutePrice.ScorePPM
+	targetPrice := targetRoutePrice.ScorePPM
+	decision.CurrentPriceScorePPM = currentPrice
+	decision.TargetPriceScorePPM = targetPrice
+	decision.PriceComparisonClass = currentRoutePrice.ComparisonClass
 	currentNamespace := current.Route.CacheNamespaceIdentity()
 	targetNamespace := target.Route.CacheNamespaceIdentity()
 	if currentNamespace != "" && currentNamespace == targetNamespace {
 		decision.Action = CacheEconomySwitch
 		decision.Reason = CacheEconomyReasonSharedCache
 		decision.CounterfactualKnown = true
-		if current.RatioPPM > target.RatioPPM {
+		if currentPrice > targetPrice {
 			decision.BenefitProbabilityPPM = CacheEconomyProbabilityScale
 		}
 		if snapshot.WarmCostPerMillionContext > 0 {
-			decision.PredictedUnitCost = scaledCacheEconomyCost(snapshot.WarmCostPerMillionContext, target.RatioPPM)
+			decision.PredictedUnitCost = scaledCacheEconomyCost(snapshot.WarmCostPerMillionContext, targetPrice)
 		}
 		return decision
 	}
@@ -183,14 +197,14 @@ func EvaluateCacheEconomy(
 	coldProbability := CacheEconomyProbabilityScale - clampProbability(targetCacheSurvival)
 	coldPenalty := saturatingMul(coldPremium, int64(estimatedContext))
 	coldPenalty = saturatingMul(coldPenalty, coldProbability) / CacheEconomyProbabilityScale
-	stayScore := saturatingMul(current.RatioPPM, warmBase)
-	switchScore := saturatingMul(target.RatioPPM, saturatingAdd(warmBase, coldPenalty))
-	stayUnitCost := scaledCacheEconomyCost(snapshot.WarmCostPerMillionContext, current.RatioPPM)
+	stayScore := saturatingMul(currentPrice, warmBase)
+	switchScore := saturatingMul(targetPrice, saturatingAdd(warmBase, coldPenalty))
+	stayUnitCost := scaledCacheEconomyCost(snapshot.WarmCostPerMillionContext, currentPrice)
 	switchUnitBase := saturatingAdd(
 		snapshot.WarmCostPerMillionContext,
 		saturatingMul(coldPremium, coldProbability)/CacheEconomyProbabilityScale,
 	)
-	switchUnitCost := scaledCacheEconomyCost(switchUnitBase, target.RatioPPM)
+	switchUnitCost := scaledCacheEconomyCost(switchUnitBase, targetPrice)
 	decision.StayCostScore = stayScore
 	decision.SwitchCostScore = switchScore
 	decision.BenefitProbabilityPPM = cacheEconomyBenefitProbability(snapshot, stayScore, switchScore)
