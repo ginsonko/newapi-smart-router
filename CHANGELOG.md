@@ -43,3 +43,25 @@ Additive Public Alpha update based on the accepted NewAPI R39 reference:
 
 This version remains Alpha/Pre-release. It does not certify arbitrary NewAPI
 forks, universal Bridge compatibility, or Stable supply-chain gates.
+
+## v0.3.0-alpha.1 - 2026-08-19
+
+Additive R52 Smart Router update:
+
+- synchronized the 20-file standalone/Agent Parts core, including actual
+  input-cost evidence and media price/route contracts;
+- documented real cache-rate evidence, output-price-aware ordering, and the rule that
+  ranking never changes billing;
+- added one-Key multimodal discovery, exact model mapping boundaries, and
+  media acceptance/replay safeguards;
+- added UI-only group colors and expanded route/user error taxonomy;
+- upgraded the Bridge candidate to `bridge-spi-v1alpha3` and extended doctor,
+  manifests, schemas and integration evidence;
+- changed the Full builder to use the published v0.2 archive plus an explicit
+  R52 overlay, build both frontends in isolation, and remove dependencies
+  before packaging;
+- retained Alpha/Pre-release and all v0.1/v0.2 README content as an immutable
+  prefix.
+
+This release does not claim universal fork compatibility, Stable status, or
+production deployment.

@@ -1,5 +1,5 @@
 {
-  "manifest_version": "1.0.0",
+  "manifest_version": "1.1.0",
   "integration_id": "synthetic-custom-fork-review",
   "host": {
     "project": "New API",
@@ -22,6 +22,16 @@
     {"hook_id": "HOOK-LOG-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-MEDIA-001", "status": "pending", "evidence": []}
   ],
+  "r52_evidence": {
+    "bridge_protocol": "bridge-spi-v1alpha3",
+    "actual_input_cost_snapshot": "pending",
+    "media_price_and_capability_contract": "pending",
+    "multimodal_models_discovery": "pending",
+    "exact_model_mapping": "pending",
+    "group_visual_metadata_is_ui_only": "pending",
+    "expanded_error_taxonomy": "pending",
+    "web_worker_same_artifact": "pending"
+  },
   "tests": [],
   "known_gaps": ["Host integration has not started."],
   "full_parity": false

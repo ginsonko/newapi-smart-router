@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:actual-input-cost:v1",
+  "title": "Ordering-only actual input cost estimate",
+  "description": "A redacted cache/input estimate used by the planner. It is not a billing receipt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["effective_ppm", "source", "has_real_evidence", "optimistic", "comparable"],
+  "properties": {
+    "effective_ppm": { "type": "integer", "minimum": 0 },
+    "cache_read_rate_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "observed_cache_read_rate_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "source": {
+      "enum": ["observed", "pooled_prior", "optimistic_unobserved", "unobservable_static", "static_fallback"]
+    },
+    "samples": { "type": "integer", "minimum": 0 },
+    "last_observed_at_ms": { "type": "integer", "minimum": 0 },
+    "evidence_age_ms": { "type": "integer", "minimum": 0 },
+    "has_real_evidence": { "type": "boolean" },
+    "optimistic": { "type": "boolean" },
+    "comparable": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "has_real_evidence": { "const": true } }, "required": ["has_real_evidence"] },
+      "then": { "required": ["observed_cache_read_rate_ppm", "samples", "last_observed_at_ms", "evidence_age_ms"] }
+    }
+  ]
+}

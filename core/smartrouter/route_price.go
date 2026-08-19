@@ -22,12 +22,22 @@ type RoutePrice struct {
 	BillingUnit          string `json:"billing_unit"`
 	FixedDurationSeconds int    `json:"fixed_duration_seconds,omitempty"`
 	ComparisonClass      string `json:"comparison_class,omitempty"`
-	ScorePPM             int64  `json:"score_ppm,omitempty"`
-	StaticComparable     bool   `json:"static_comparable"`
-	Synthetic            bool   `json:"synthetic,omitempty"`
-	Scope                string `json:"scope,omitempty"`
-	Revision             string `json:"revision,omitempty"`
-	IncomparableReason   string `json:"incomparable_reason,omitempty"`
+	// ActualInputComparisonClass is independent from the full static price
+	// class. Token routes with different cache read/write ratios can still be
+	// compared after those ratios are applied to a reliable observed mix.
+	ActualInputComparisonClass string `json:"actual_input_comparison_class,omitempty"`
+	ScorePPM                   int64  `json:"score_ppm,omitempty"`
+	StaticComparable           bool   `json:"static_comparable"`
+	Synthetic                  bool   `json:"synthetic,omitempty"`
+	// Cache pricing is an ordering-only descriptor. It is never used by
+	// pre-consume or settlement, which continue to use PriceData unchanged.
+	CachePricingKnown       bool   `json:"cache_pricing_known,omitempty"`
+	CacheReadRatioPPM       int64  `json:"cache_read_ratio_ppm,omitempty"`
+	CacheCreation5mRatioPPM int64  `json:"cache_creation_5m_ratio_ppm,omitempty"`
+	CacheCreation1hRatioPPM int64  `json:"cache_creation_1h_ratio_ppm,omitempty"`
+	Scope                   string `json:"scope,omitempty"`
+	Revision                string `json:"revision,omitempty"`
+	IncomparableReason      string `json:"incomparable_reason,omitempty"`
 }
 
 func LegacyRoutePrice(ratioPPM int64) RoutePrice {
@@ -47,6 +57,12 @@ func (price RoutePrice) Validate() error {
 	}
 	if price.FixedDurationSeconds < 0 {
 		return errors.New("smartrouter: route price fixed duration cannot be negative")
+	}
+	if price.CacheReadRatioPPM < 0 || price.CacheCreation5mRatioPPM < 0 || price.CacheCreation1hRatioPPM < 0 {
+		return errors.New("smartrouter: cache price ratios cannot be negative")
+	}
+	if price.CachePricingKnown && price.ActualInputComparisonClass == "" {
+		return errors.New("smartrouter: known cache pricing requires actual input comparison class")
 	}
 	if price.StaticComparable {
 		if price.ComparisonClass == "" {

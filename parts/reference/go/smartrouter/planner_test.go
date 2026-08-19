@@ -230,6 +230,84 @@ func TestBalancedStrategyUsesRealPriceOnlyForOneComparisonClass(t *testing.T) {
 	assert.Equal(t, "route-plus", result.RouteID)
 }
 
+func TestMediaKnownQuotesPrecedeUnknownQuotesAcrossStrategies(t *testing.T) {
+	strategies := []Strategy{
+		StrategyPrice,
+		StrategyBalanced,
+		StrategyLatency,
+		StrategyStability,
+		StrategyManual,
+	}
+	for _, strategy := range strategies {
+		t.Run(string(strategy), func(t *testing.T) {
+			input := mediaMixedQuotePlanInput(strategy)
+			result, err := Plan(input)
+			require.NoError(t, err)
+			assert.Equal(t, "route-plus", result.RouteID)
+			assert.True(t, result.Price.StaticComparable)
+		})
+	}
+
+	t.Run("unknown quote remains a fallback when the known route is unavailable", func(t *testing.T) {
+		input := mediaMixedQuotePlanInput(StrategyBalanced)
+		input.Quality.Routes["route-plus"] = QualityState{Phase: QualityHalfOpen}
+
+		result, err := Plan(input)
+		require.NoError(t, err)
+		assert.Equal(t, "route-cheap", result.RouteID)
+		assert.False(t, result.Price.StaticComparable)
+	})
+
+	t.Run("unknown health discovery cannot promote an unknown quote over a known quote", func(t *testing.T) {
+		input := mediaMixedQuotePlanInput(StrategyBalanced)
+		input.Quality.Routes["route-cheap"] = QualityState{Phase: QualityUnknown, Epoch: 1}
+		for index := 0; index < 10_000; index++ {
+			key := fmt.Sprintf("media-discovery-%d", index)
+			if DeterministicAdmission(key, "route-cheap", 1, unknownRouteProbeTrafficPPM) {
+				input.Request.AdmissionKey = key
+				break
+			}
+		}
+		require.NotEmpty(t, input.Request.AdmissionKey)
+
+		result, err := Plan(input)
+		require.NoError(t, err)
+		assert.Equal(t, "route-plus", result.RouteID)
+	})
+}
+
+func mediaMixedQuotePlanInput(strategy Strategy) PlanInput {
+	input := basePlanInput()
+	input.Policy.Strategy = strategy
+	input.Policy.BalancedWeights = BalancedWeights{Stability: 100, Price: 0, TTFT: 0}
+	input.Request.Media = &MediaRequestShape{Kind: MediaKindVideo}
+	input.Request.ReplayClass = ReplaySafeVideo
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		"route-cheap": {
+			BillingMode: "fixed_price", BillingUnit: "per_second", ComparisonClass: "fixed:per_second",
+			ScorePPM: 1, StaticComparable: true,
+		},
+		"route-plus": {
+			BillingMode: "fixed_price", BillingUnit: "per_request", ComparisonClass: "fixed:per_request",
+			ScorePPM: 300_000, StaticComparable: true,
+		},
+	}
+	input.Quality.Routes["route-cheap"] = QualityState{
+		Phase: QualityHealthy, ReliabilitySamples: 100, ReliabilityPPM: 990_000,
+	}
+	input.Quality.Routes["route-plus"] = QualityState{
+		Phase: QualityHealthy, ReliabilitySamples: 100, ReliabilityPPM: 100_000,
+	}
+	input.Policy.TTFTPolicy = TTFTPolicy{
+		Enabled: true, Metric: TTFTMetricP95, TargetMS: 5_000, HardMaxMS: 10_000, MinSamples: 1,
+	}
+	input.TTFT = TTFTSnapshot{Routes: map[string]TTFTState{
+		"route-cheap": {Samples: 100, P95MS: 100, FreshUntilMS: 200_000},
+		"route-plus":  {Samples: 100, P95MS: 4_000, FreshUntilMS: 200_000},
+	}}
+	return input
+}
+
 func TestPlanEnforcesExclusionsAuthorizationAndMaximumRatio(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1344,4 +1422,82 @@ func TestPlanErrorIdentityIsPreserved(t *testing.T) {
 	input.Policy.Enabled = false
 	_, err := Plan(input)
 	assert.True(t, errors.Is(err, ErrPolicyDisabled))
+}
+
+func TestActualInputCostColdStartUsesOneInflightThenRestoresNormalCapacity(t *testing.T) {
+	input := basePlanInput()
+	cheapRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[0]
+	plusRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[1]
+	cheapPrice := actualInputTestPrice()
+	cheapPrice.ScorePPM = 100_000
+	plusPrice := actualInputTestPrice()
+	plusPrice.ScorePPM = 30_000
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		cheapRoute.RouteID: cheapPrice,
+		plusRoute.RouteID:  plusPrice,
+	}
+	plusKey := ActualInputCostKey(
+		plusRoute.CacheNamespaceIdentity(), plusRoute.UpstreamModel,
+		input.Request.CanonicalModel, input.Request.Endpoint, input.Request.UsageSemantic(),
+	)
+	plusProfile := ApplyActualInputCostObservation(ActualInputCostProfile{}, ActualInputCostObservation{
+		Key: plusKey, TotalInputTokens: 100, RegularInputTokens: 100, Reliable: true,
+	}, input.NowMS)
+	input.ActualInputCosts = ActualInputCostSnapshot{plusKey: plusProfile}
+
+	first, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, cheapRoute.RouteID, first.RouteID, "the competitive no-sample route must get a real request")
+	assert.Equal(t, ActualInputCostOptimistic, first.Candidates[0].ActualInputCostSource)
+	assert.Equal(t, 1, first.MaxInflightHint, "the hidden optimistic prior must be limited to one shared inflight")
+
+	input.Capacity = CapacitySnapshot{Domains: map[string]CapacityState{
+		cheapRoute.CapacityDomain: {Known: true, MaxInflight: 1, Inflight: 1},
+	}}
+	second, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, plusRoute.RouteID, second.RouteID, "concurrent traffic must spill instead of stampeding the unmeasured route")
+
+	cheapKey := ActualInputCostKey(
+		cheapRoute.CacheNamespaceIdentity(), cheapRoute.UpstreamModel,
+		input.Request.CanonicalModel, input.Request.Endpoint, input.Request.UsageSemantic(),
+	)
+	cheapProfile := ApplyActualInputCostObservation(ActualInputCostProfile{}, ActualInputCostObservation{
+		Key: cheapKey, TotalInputTokens: 100, CacheReadTokens: 100, Reliable: true,
+	}, input.NowMS)
+	input.ActualInputCosts[cheapKey] = cheapProfile
+	input.Capacity = CapacitySnapshot{}
+	measured, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, cheapRoute.RouteID, measured.RouteID)
+	assert.Equal(t, ActualInputCostObserved, measured.Candidates[0].ActualInputCostSource)
+	assert.Zero(t, measured.MaxInflightHint, "the first reliable sample must immediately restore the route's configured capacity")
+}
+
+func TestActualInputCostLearnerNotReadyAndExplicitOptOutPreserveStaticOrdering(t *testing.T) {
+	input := basePlanInput()
+	cheapRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[0]
+	plusRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[1]
+	cheapPrice := actualInputTestPrice()
+	cheapPrice.ScorePPM = 100_000
+	plusPrice := actualInputTestPrice()
+	plusPrice.ScorePPM = 30_000
+	input.Prices.RoutePrices = map[string]RoutePrice{
+		cheapRoute.RouteID: cheapPrice,
+		plusRoute.RouteID:  plusPrice,
+	}
+	input.ActualInputCosts = nil
+
+	notReady, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, plusRoute.RouteID, notReady.RouteID)
+	assert.Equal(t, ActualInputCostStaticFallback, notReady.Candidates[0].ActualInputCostSource)
+
+	disabled := false
+	input.Policy.ActualInputCostRanking = &disabled
+	input.ActualInputCosts = ActualInputCostSnapshot{}
+	optedOut, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, plusRoute.RouteID, optedOut.RouteID)
+	assert.Zero(t, optedOut.MaxInflightHint)
 }

@@ -32,6 +32,18 @@
       "minimum": 0,
       "description": "Resolved model base price multiplied by the effective group ratio exactly once, encoded in fixed-point PPM. It is not a user balance mutation."
     },
+    "actual_input_comparison_class": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Exact class for ordering-only actual input/cache estimates. It never changes billing."
+    },
+    "cache_pricing_known": {
+      "type": "boolean",
+      "description": "True only when every cache input component required by the host contract is known."
+    },
+    "cache_read_ratio_ppm": { "type": "integer", "minimum": 0 },
+    "cache_creation_5m_ratio_ppm": { "type": "integer", "minimum": 0 },
+    "cache_creation_1h_ratio_ppm": { "type": "integer", "minimum": 0 },
     "static_comparable": { "type": "boolean" },
     "synthetic": {
       "type": "boolean",

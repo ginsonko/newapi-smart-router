@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-PROTOCOL_VERSION = "doctor-v1alpha1"
+PROTOCOL_VERSION = "doctor-v1alpha2"
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 SAFE_SUFFIXES = {".go", ".ts", ".tsx", ".json", ".md", ".mod", ".sum"}
 DENIED_NAMES = {
@@ -58,6 +58,42 @@ HOOKS = (
     HookSpec("HOOK-BILL-001", ("service/pre_consume_quota.go", "service/quota.go"), (r"SmartRoute", r"RouteReceipt")),
     HookSpec("HOOK-LOG-001", ("service/log_info_generate.go",), (r"SmartRouter", r"smart_router_receipt")),
     HookSpec("HOOK-MEDIA-001", ("controller/task_video.go", "relay/relay_task.go"), (r"SmartRoute", r"ReplaySafeMedia")),
+)
+
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    feature_id: str
+    paths: tuple[str, ...]
+    markers: tuple[str, ...]
+
+
+R52_FEATURES = (
+    FeatureSpec(
+        "actual_input_cost_and_cache_evidence",
+        ("service/smart_router_actual_input_cost.go", "pkg/smartrouter/actual_input_cost.go"),
+        (r"ActualInputCost", r"cache"),
+    ),
+    FeatureSpec(
+        "media_price_and_route_contract",
+        ("pkg/smartrouter/media_price.go", "pkg/smartrouter/media_route.go"),
+        (r"Media", r"RoutePrice"),
+    ),
+    FeatureSpec(
+        "multimodal_model_discovery",
+        ("controller/model.go", "router/api-router.go"),
+        (r"model", r"models"),
+    ),
+    FeatureSpec(
+        "group_visual_metadata",
+        ("setting/group_visuals.go", "model/group_visuals.go"),
+        (r"color", r"group"),
+    ),
+    FeatureSpec(
+        "expanded_error_taxonomy",
+        ("controller/smart_route_user_error.go", "service/error.go"),
+        (r"error", r"retry"),
+    ),
 )
 
 
@@ -104,6 +140,31 @@ def source_digest(root: Path, paths: Iterable[Path]) -> str:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return "sha256:" + digest.hexdigest()
+
+
+def inspect_features(root: Path) -> list[dict]:
+    """Report additive R52 markers without turning them into parity claims."""
+    results = []
+    for spec in R52_FEATURES:
+        present_paths = []
+        combined = ""
+        for relative in spec.paths:
+            path = root / relative
+            if path.is_file() and not is_denied(path, root):
+                present_paths.append(relative)
+                combined += "\n" + safe_read(path, root)
+        markers = sorted(
+            marker for marker in spec.markers
+            if re.search(marker, combined, flags=re.IGNORECASE)
+        )
+        results.append({
+            "feature_id": spec.feature_id,
+            "status": "observed_candidate" if present_paths and markers else "not_observed",
+            "paths": present_paths,
+            "markers": markers,
+            "certified": False,
+        })
+    return results
 
 
 def inspect(source: Path) -> tuple[dict, int]:
@@ -162,6 +223,7 @@ def inspect(source: Path) -> tuple[dict, int]:
             "source_anchor_digest": source_digest(root, fingerprint_paths),
         },
         "hooks": hook_results,
+        "r52_features": inspect_features(root),
         "summary": {
             "recognized_new_api_module": module == "github.com/QuantumNous/new-api",
             "critical_hook_count": len(HOOKS),
@@ -205,4 +267,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

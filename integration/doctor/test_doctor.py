@@ -43,6 +43,8 @@ class DoctorTest(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(len(doctor.HOOKS), report["summary"]["anchor_ready_count"])
             self.assertFalse(report["summary"]["certified"])
+            self.assertEqual(len(doctor.R52_FEATURES), len(report["r52_features"]))
+            self.assertTrue(all(not feature["certified"] for feature in report["r52_features"]))
 
     def test_unknown_module_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

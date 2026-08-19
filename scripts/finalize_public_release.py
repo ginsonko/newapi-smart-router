@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 
-RELEASE_NAME = "newapi-smart-router-v0.2.0-alpha.1"
+RELEASE_NAME = "newapi-smart-router-v0.3.0-alpha.1"
 
 
 def sha256_file(path: Path) -> str:

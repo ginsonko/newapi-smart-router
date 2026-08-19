@@ -210,3 +210,13 @@ HOOK-UI-001 (native UX claim)
 - Full 参考快照的宿主测试不自动认证其他 fork。
 
 详细版本增量见 [`docs/v0.2-contract-delta.md`](../../docs/v0.2-contract-delta.md)。
+
+## 18. v0.3 R52 增量
+
+- 实际输入成本与实时缓存率只用于排序，证据按物理缓存命名空间隔离并随时间老化；不得写入真实账务。
+- 一个智能 Key 可发现授权范围内的文本、图片、视频和音频模型；跨分组必须 exact canonical model、endpoint 和 capability fingerprint 同时匹配。
+- 媒体价格先按请求时长、数量和单位归一化；token、按次、按秒、固定时长和表达式不可跨 comparison class 猜价。
+- 429、容量、5xx、超时、传输和未知上游错误仅在未提交且 ReplayClass 允许时换路；用户格式、额度、内容、会话和取消终态不盲试。
+- 分组颜色是 UI 元数据；Web/Worker 继续要求同一 `bridge-spi-v1alpha3` 与同一二进制哈希。
+
+详细增量见 [`docs/v0.3-contract-delta.md`](../../docs/v0.3-contract-delta.md)。

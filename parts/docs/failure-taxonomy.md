@@ -206,3 +206,12 @@ HTTP 200 的 transport 可正常，但 protocol 或业务语义无有效结果�
 ### `runtime_revision_mismatch`
 
 Web 与 Smart Router Worker 二进制或协议 revision 不同。阻断发布/Worker 接管，避免旧合同写入新版共享状态。
+
+## 14. v0.3 错误分类补充
+
+`rate_limited`, `pending_capacity`, `overloaded`, `upstream_5xx`, `timeout` 和
+`transport_error` 在语义提交前属于可换路的上游故障域；每个物理渠道最多
+一次。未知上游错误默认健康中立，并可在 `safe_text` 中继续顺序尝试。
+`request_format`, `quota_exhausted`, `content_policy`, `session_state` 和
+`client_cancelled` 属于用户/客户端终态，不应盲目重试。最终错误必须脱敏、
+有界，包含尝试数和请求 ID，宿主可以本地化为中文。

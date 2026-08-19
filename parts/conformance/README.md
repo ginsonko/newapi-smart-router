@@ -23,3 +23,9 @@ state-bound pre-routing rejection, and fresh warming evidence.
 An alternative-language port must consume the same JSON vectors and match the
 same stable Route IDs, rejection reason codes, fixed-point values, and errors.
 It cannot replace the host black-box or billing tests.
+
+The v0.3 vectors and core tests additionally cover actual input-cost snapshots,
+cache evidence expiry, per-request/per-second/fixed-duration media prices,
+capability-compatible multimodal routes, and unknown-error recovery. Evidence
+must remain separate from real billing and side-effecting dispatch must remain
+single-send.

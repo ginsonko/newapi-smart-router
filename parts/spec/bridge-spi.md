@@ -1,7 +1,7 @@
 # NewAPI Smart Router Bridge SPI
 
 状态：`Normative design contract`  
-版本：`bridge-spi-v1alpha2`
+版本：`bridge-spi-v1alpha3`
 运行边界：本文定义宿主接点，不证明任何宿主已经实现或认证  
 
 ## 1. 目的
@@ -323,3 +323,22 @@ Bridge 必须从宿主真实计费解析器生成 `RoutePrice`。显式分组模
 Adapter endpoint allowlist 只能收窄目录合同。`convert_request_failed` 只有在 dispatch 前才能进入合同回退。HTTP 200 必须通过 transport、protocol 和 semantic 三层验证。Web 与专用 Smart Router Worker 必须运行同一不可变二进制和协议 revision；哈希不同即 `BLOCKED`。
 
 完整追加说明见 [v0.2 contract delta](../../docs/v0.2-contract-delta.md)。
+
+## 11. v0.3 追加合同
+
+`bridge-spi-v1alpha3` 在 v0.2 的 Hook 边界上增加以下可移植观察接口：
+
+- `ActualInputCostSnapshot`：提供脱敏的实际输入 token、缓存命中和证据时间，
+  只影响经济排序，不改变预扣、结算或退款；证据缺失或过期必须回到静态价格策略。
+- `MediaPriceSnapshot`：描述 token、按次、按秒、固定时长和阶梯表达式，只有同一
+  comparison class 才能排序；图片、视频、音频与文本合同不能因数值相似而串路。
+- `ModelDiscoverySnapshot`：为一个智能 Key 聚合其授权范围内的文本、图片、视频和
+  音频模型；仅完全同名或宿主明确映射后的同名模型可跨分组，模型列表不得扩大授权。
+- `GroupVisualMetadata`：颜色、同色聚类和倍率排序是宿主 UI 元数据，不参与 RouteID、
+  价格或健康状态。
+- `ErrorTaxonomyV2`：429、pending/capacity、5xx、超时和传输错误可在未提交边界换路；
+  用户格式、额度、内容安全、会话状态和客户端取消保持终态，并返回脱敏、有界、可本地化
+  的尝试链和请求 ID。
+
+这些接口均为快照输入或日志输出，不允许在每个请求热路径同步调用控制面。未知字段向后
+兼容地忽略，未知主版本仍 fail closed。

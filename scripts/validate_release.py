@@ -15,10 +15,11 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
-RELEASE_VERSION = "v0.2.0-alpha.1"
-FIXED_ZIP_TIME = (2026, 8, 2, 0, 0, 0)
-README_BASELINE_LINES = 2274
-README_BASELINE_SHA256 = "e03f7eef1143b7e0e8d31b36d062562131171a2d01de85b090aa3521196af054"
+RELEASE_VERSION = "v0.3.0-alpha.1"
+FIXED_ZIP_TIME = (2026, 8, 19, 0, 0, 0)
+EXPECTED_CORE_FILE_COUNT = 20
+README_BASELINE_LINES = 2372
+README_BASELINE_SHA256 = "6eaae6be969cc543f08215d7a87774c3c20c113b067bd07dda8827b4b61d118b"
 
 
 def sha256_file(path: Path) -> str:
@@ -37,13 +38,14 @@ def normalized_readme_prefix(path: Path) -> tuple[int, str]:
 
 
 class Validator:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, private_terms: list[str] | None = None):
         self.root = root.resolve(strict=True)
         self.repository = self.root / "repository"
         self.full = self.root / "full-source"
         self.artifacts = self.root / "artifacts"
         self.receipts = self.root / "receipts"
         self.checks: list[dict] = []
+        self.private_terms = list(private_terms or [])
 
     def check(self, name: str, condition: bool, detail: object = "") -> None:
         self.checks.append({"name": name, "status": "pass" if condition else "fail", "detail": detail})
@@ -101,6 +103,7 @@ class Validator:
         ), "public Go and Markdown files")
         self.check("public_origin_documented", expected_origin in readme and manifest.get("repository", {}).get("url") == expected_origin, manifest.get("repository"))
         self.check("public_version_documented", RELEASE_VERSION in readme and local_version_marker not in readme, "README release status")
+        self.check("v0_3_delta_documented", "docs/v0.3-contract-delta.md" in readme, "README v0.3 link")
         self.check("upstream_drift_disclosed", "v1.0.0-rc.21" in release_status and "rc.20" in release_status, "release compatibility boundary")
         self.check("agpl_license_preserved", "GNU AFFERO GENERAL PUBLIC LICENSE" in license_text and "Version 3" in license_text, "LICENSE")
         self.check("commercial_boundary_documented", all(value in commercial for value in (
@@ -108,9 +111,9 @@ class Validator:
         )), "COMMERCIAL-LICENSE.md")
         self.check("release_manifest_version", manifest.get("release") == RELEASE_VERSION, manifest.get("release"))
         line_count, prefix_digest = normalized_readme_prefix(self.repository / "README.md")
-        self.check("readme_v0_1_prefix_preserved", (
+        self.check("readme_v0_2_strict_prefix_preserved", (
             line_count > README_BASELINE_LINES and prefix_digest == README_BASELINE_SHA256
-        ), {"lines": line_count, "prefix_sha256": prefix_digest})
+        ), {"baseline_lines": README_BASELINE_LINES, "lines": line_count, "prefix_sha256": prefix_digest})
 
     def validate_json_yaml_schema(self) -> None:
         json_files = sorted(self.repository.rglob("*.json")) + sorted(self.artifacts.glob("*.json")) + sorted(self.receipts.glob("*.json"))
@@ -131,6 +134,12 @@ class Validator:
         for path in schemas:
             jsonschema.Draft202012Validator.check_schema(parsed[path])
         self.check("json_schema_valid", len(schemas) >= 9, {"schemas": len(schemas)})
+        parts_manifest = yaml.safe_load((self.repository / "parts" / "manifest" / "PARTS-MANIFEST.yaml").read_text(encoding="utf-8"))
+        capability_matrix = yaml.safe_load((self.repository / "parts" / "manifest" / "capability-matrix.yaml").read_text(encoding="utf-8"))
+        self.check("v0_3_parts_versions", (
+            parts_manifest.get("manifest_version") == "3.0.0-alpha.1"
+            and capability_matrix.get("matrix_version") == "3.0.0-alpha.1"
+        ), {"parts": parts_manifest.get("manifest_version"), "matrix": capability_matrix.get("matrix_version")})
         route_price_schema = parsed[self.repository / "parts" / "spec" / "route-price.schema.json"]
         route_price_validator = jsonschema.Draft202012Validator(route_price_schema)
         route_price_validator.validate({
@@ -147,6 +156,18 @@ class Validator:
         except jsonschema.ValidationError:
             rejected = True
         self.check("route_price_comparison_class_required", rejected, "comparable prices require an exact class")
+        actual_cost_schema = parsed[self.repository / "parts" / "spec" / "actual-input-cost.schema.json"]
+        jsonschema.Draft202012Validator(actual_cost_schema).validate({
+            "effective_ppm": 125000, "cache_read_rate_ppm": 900000,
+            "source": "optimistic_unobserved", "has_real_evidence": False,
+            "optimistic": True, "comparable": True,
+        })
+        media_schema = parsed[self.repository / "parts" / "spec" / "media-contract.schema.json"]
+        jsonschema.Draft202012Validator(media_schema).validate({
+            "kind": "video", "request": {"duration_seconds": 10, "duration_known": True},
+            "capability": {"reference_image": True, "revision": "fixture"},
+        })
+        self.check("v0_3_cost_and_media_schema_vectors", True, "actual input cost and media contract fixtures")
         outcome_schema = parsed[self.repository / "parts" / "spec" / "outcome.schema.json"]
         invalid_outcome = {
             "schema_version": "outcome-v1", "contract_id": "fixture", "route_id": "route_sha256_" + "a" * 64,
@@ -212,6 +233,8 @@ class Validator:
         receipt = json.loads((self.receipts / "source-snapshot.json").read_text(encoding="utf-8"))
         mismatches = []
         for entry in receipt["files"]:
+            if entry["path"].startswith("@public-base/"):
+                continue
             path = self.full / entry["path"]
             if not path.is_file() or sha256_file(path) != entry["sha256"]:
                 mismatches.append(entry["path"])
@@ -223,9 +246,19 @@ class Validator:
         core_files = {path.name: path for path in core_root.glob("*.go")}
         parts_files = {path.name: path for path in parts_root.glob("*.go")}
         self.check("core_extraction_file_set", (
-            len(full_files) == 15 and set(full_files) == set(core_files) == set(parts_files)
-            and "route_price.go" in full_files
+            len(full_files) == EXPECTED_CORE_FILE_COUNT
+            and set(full_files) == set(core_files) == set(parts_files)
+            and {"route_price.go", "actual_input_cost.go", "media_price.go", "media_route.go"}.issubset(full_files)
         ), {"full": sorted(full_files), "core": sorted(core_files), "parts": sorted(parts_files)})
+
+        frontend = receipt.get("frontend_build", {})
+        themes = frontend.get("themes", {})
+        self.check("isolated_frontend_builds", (
+            frontend.get("mode") == "isolated_full_tree_production_build"
+            and set(themes) == {"default", "classic"}
+            and all(themes[name].get("bundle_files", 0) > 0 for name in themes)
+            and not (self.full / "web" / "node_modules").exists()
+        ), frontend)
         core_mismatches = []
         for name in sorted(full_files):
             expected = sha256_file(full_files[name])
@@ -318,6 +351,8 @@ class Validator:
             "--root", str(self.receipts),
             "--archive-dir", str(self.artifacts), "--json", str(report_path),
         ]
+        for term in self.private_terms:
+            command.extend(["--deny-term", term])
         completed = subprocess.run(command, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
         report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
         self.check("local_secret_scan", completed.returncode == 0 and report.get("high_findings") == 0, {"exit": completed.returncode, "output": completed.stdout[-4000:], "findings": report.get("findings", [])[:20]})
@@ -356,8 +391,9 @@ class Validator:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-root", required=True, type=Path)
+    parser.add_argument("--deny-term", action="append", default=[], help="private literal to reject without storing it")
     args = parser.parse_args()
-    validator = Validator(args.release_root)
+    validator = Validator(args.release_root, args.deny_term)
     try:
         validator.validate_structure()
         validator.validate_public_metadata()

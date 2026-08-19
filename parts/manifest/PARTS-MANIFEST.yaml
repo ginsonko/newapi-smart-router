@@ -1,15 +1,15 @@
-manifest_version: "2.0.0-alpha.1"
+manifest_version: "3.0.0-alpha.1"
 project: "NewAPI Smart Router"
 artifact: "Agent Parts Kit"
 label: "Development Kit / Not runnable"
 runnable: false
-status: "public_alpha_v0_2_candidate"
+status: "public_alpha_v0_3_candidate"
 reference:
   host: "New API"
   organization: "QuantumNous"
-  baseline: "bound_by_v0_2_release_source_receipt"
-  core_sync: "NewAPI R39 accepted pkg/smartrouter snapshot"
-  note: "Public Alpha v0.2 candidate. The release builder binds the exact Full source snapshot. Generic host protocol certification, three-database round trips, external-site validation, and signed image gates remain open."
+  baseline: "bound_by_v0_3_release_source_receipt"
+  core_sync: "NewAPI R52 accepted pkg/smartrouter snapshot with cache-cost and media route contracts"
+  note: "Public Alpha v0.3 candidate. The release builder binds the exact Full source snapshot. Generic host protocol certification, three-database round trips, external-site validation, and signed image gates remain open."
 license:
   default_path: "AGPL-3.0-compatible"
   preserve_upstream_attribution: true
@@ -101,8 +101,20 @@ modules:
     outputs: ["keep_or_switch", "economic reason", "model version"]
     side_effects: ["enqueue bounded learning observation"]
     requires: ["MOD-PLANNER-001", "MOD-BILLING-001"]
+    schemas: ["../spec/actual-input-cost.schema.json"]
     invariants: ["INV-CACHE-001", "INV-CACHE-002", "INV-CACHE-003"]
     conformance: ["cache_fixed_premium", "cache_break_even", "cache_low_confidence_fallback", "cache_namespace_revision"]
+  - id: "MOD-MEDIA-001"
+    name: "media-contract-and-price"
+    status: "public_reference_core_extracted"
+    purpose: "Normalize image video and audio request shapes, match exact capabilities, and quote comparable request costs."
+    inputs: ["media request shape", "capability contract", "route price"]
+    outputs: ["eligibility rejection", "request-shaped route price"]
+    side_effects: []
+    requires: ["MOD-CATALOG-001", "MOD-PLANNER-001", "HOOK-MEDIA-001"]
+    schemas: ["../spec/media-contract.schema.json", "../spec/route-price.schema.json"]
+    invariants: ["INV-MEDIA-001", "INV-MEDIA-PRICE-001", "INV-MODEL-DISCOVERY-001"]
+    conformance: ["media_request_shape", "media_capability_match", "media_price_class", "media_acceptance_fence"]
   - id: "MOD-RETRY-001"
     name: "retry-and-outcome"
     status: "public_reference_host_contract_portable_certification_open"

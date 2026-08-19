@@ -14,9 +14,11 @@ import jsonschema
 import yaml
 
 
-RELEASE_VERSION = "v0.2.0-alpha.1"
-README_BASELINE_LINES = 2274
-README_BASELINE_SHA256 = "e03f7eef1143b7e0e8d31b36d062562131171a2d01de85b090aa3521196af054"
+RELEASE_VERSION = "v0.3.0-alpha.1"
+BRIDGE_PROTOCOL = "bridge-spi-v1alpha3"
+EXPECTED_CORE_FILE_COUNT = 20
+README_BASELINE_LINES = 2372
+README_BASELINE_SHA256 = "6eaae6be969cc543f08215d7a87774c3c20c113b067bd07dda8827b4b61d118b"
 
 
 def sha256_file(path: Path) -> str:
@@ -76,6 +78,12 @@ class RepositoryValidator:
         for path in schemas:
             jsonschema.Draft202012Validator.check_schema(parsed[path])
         self.check("json_schema_valid", len(schemas) >= 9, {"schemas": len(schemas)})
+        parts_manifest = yaml.safe_load((self.root / "parts" / "manifest" / "PARTS-MANIFEST.yaml").read_text(encoding="utf-8"))
+        capability_matrix = yaml.safe_load((self.root / "parts" / "manifest" / "capability-matrix.yaml").read_text(encoding="utf-8"))
+        self.check("v0_3_parts_versions", (
+            parts_manifest.get("manifest_version") == "3.0.0-alpha.1"
+            and capability_matrix.get("matrix_version") == "3.0.0-alpha.1"
+        ), {"parts": parts_manifest.get("manifest_version"), "matrix": capability_matrix.get("matrix_version")})
         route_price_schema = parsed[self.root / "parts" / "spec" / "route-price.schema.json"]
         route_price_validator = jsonschema.Draft202012Validator(route_price_schema)
         route_price_validator.validate({
@@ -92,6 +100,18 @@ class RepositoryValidator:
         except jsonschema.ValidationError:
             rejected = True
         self.check("route_price_comparison_class_required", rejected, "comparable prices require an exact class")
+        actual_cost_schema = parsed[self.root / "parts" / "spec" / "actual-input-cost.schema.json"]
+        jsonschema.Draft202012Validator(actual_cost_schema).validate({
+            "effective_ppm": 125000, "cache_read_rate_ppm": 900000,
+            "source": "optimistic_unobserved", "has_real_evidence": False,
+            "optimistic": True, "comparable": True,
+        })
+        media_schema = parsed[self.root / "parts" / "spec" / "media-contract.schema.json"]
+        jsonschema.Draft202012Validator(media_schema).validate({
+            "kind": "video", "request": {"duration_seconds": 10, "duration_known": True},
+            "capability": {"reference_image": True, "revision": "fixture"},
+        })
+        self.check("v0_3_cost_and_media_schema_vectors", True, "actual input cost and media contract fixtures")
 
         outcome_schema = parsed[self.root / "parts" / "spec" / "outcome.schema.json"]
         invalid_side_effecting = {
@@ -155,6 +175,7 @@ class RepositoryValidator:
                 local_markers.append(path.relative_to(self.root).as_posix())
         self.check("public_origin", expected_origin in readme, "README origin")
         self.check("public_release_version", RELEASE_VERSION in readme, "README version")
+        self.check("v0_3_delta_documented", "docs/v0.3-contract-delta.md" in readme, "README v0.3 link")
         self.check("public_core_module", core_mod.startswith(f"module {expected_core}\n"), core_mod.splitlines()[0])
         self.check("public_bridge_module", bridge_mod.startswith(f"module {expected_bridge}\n") and expected_core in bridge_mod, bridge_mod.splitlines()[:8])
         self.check("no_local_release_markers", not local_markers, local_markers)
@@ -164,16 +185,17 @@ class RepositoryValidator:
             "AGPL-3.0-only", "does not grant", "QuantumNous New API", "not a license grant",
         )), "COMMERCIAL-LICENSE.md")
         self.check("public_history_gate_closed", "public repository is not rebuilt from clean upstream history" not in matrix, "capability matrix")
-        self.check("bridge_protocol_v1alpha2", (
-            'ProtocolVersion = "bridge-spi-v1alpha2"' in bridge_source
-            and bridge_manifest.get("bridge_protocol") == "bridge-spi-v1alpha2"
+        self.check("bridge_protocol_v1alpha3", (
+            f'ProtocolVersion = "{BRIDGE_PROTOCOL}"' in bridge_source
+            and bridge_manifest.get("bridge_protocol") == BRIDGE_PROTOCOL
             and "HOOK-PRICE-001" in bridge_manifest.get("required_hooks", [])
+            and "multimodal_models_discovery" in bridge_manifest.get("observed_r52_capabilities", [])
         ), bridge_manifest.get("bridge_protocol"))
 
         line_count, prefix_digest = normalized_readme_prefix(self.root / "README.md")
-        self.check("readme_v0_1_prefix_preserved", (
+        self.check("readme_v0_2_strict_prefix_preserved", (
             line_count > README_BASELINE_LINES and prefix_digest == README_BASELINE_SHA256
-        ), {"lines": line_count, "prefix_sha256": prefix_digest})
+        ), {"baseline_lines": README_BASELINE_LINES, "lines": line_count, "prefix_sha256": prefix_digest})
 
     def validate_core_mirrors(self) -> None:
         core_root = self.root / "core" / "smartrouter"
@@ -181,7 +203,9 @@ class RepositoryValidator:
         core_files = {path.name: path for path in core_root.glob("*.go")}
         parts_files = {path.name: path for path in parts_root.glob("*.go")}
         self.check("smart_router_core_file_set", (
-            len(core_files) == 15 and set(core_files) == set(parts_files) and "route_price.go" in core_files
+            len(core_files) == EXPECTED_CORE_FILE_COUNT
+            and set(core_files) == set(parts_files)
+            and {"route_price.go", "actual_input_cost.go", "media_price.go", "media_route.go"}.issubset(core_files)
         ), {"core": sorted(core_files), "parts": sorted(parts_files)})
         mismatches = [
             name for name in sorted(core_files)

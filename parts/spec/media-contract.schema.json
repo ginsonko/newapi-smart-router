@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:newapi-smart-router:schema:media-contract:v1",
+  "title": "Media request and capability contract",
+  "description": "Exact image, video or audio request shape used for route eligibility and request-cost quoting.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "request", "capability"],
+  "properties": {
+    "kind": { "enum": ["image", "video", "audio"] },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "duration_seconds": { "type": "integer", "minimum": 0 },
+        "duration_known": { "type": "boolean" },
+        "output_count": { "type": "integer", "minimum": 0 },
+        "output_count_known": { "type": "boolean" },
+        "resolution": { "type": "string" },
+        "quality": { "type": "string" },
+        "aspect_ratio": { "type": "string" },
+        "estimated_tokens": { "type": "integer", "minimum": 0 },
+        "estimated_tokens_known": { "type": "boolean" },
+        "request_price_multiplier_ppm": { "type": "integer", "minimum": 0 },
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type"],
+            "properties": {
+              "type": { "enum": ["image", "video", "audio"] },
+              "role": { "type": "string" },
+              "size_bytes": { "type": "integer", "minimum": 0 },
+              "duration_seconds": { "type": "number", "minimum": 0 },
+              "metadata_trusted": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "reference_image": { "type": "boolean" },
+        "reference_video": { "type": "boolean" },
+        "reference_audio": { "type": "boolean" },
+        "max_total_references": { "type": "integer", "minimum": 0 },
+        "provider_contract": { "type": "string" },
+        "revision": { "type": "string" }
+      }
+    }
+  }
+}
