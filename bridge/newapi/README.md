@@ -30,3 +30,14 @@ billing, safe-text-only exhaustive fallback, the side-effecting post-dispatch
 single-send fence, state-bound pre-dispatch rejection, exact adapter semantic
 validation, and identical Web/Worker artifact hashes. See
 [`docs/v0.2-contract-delta.md`](../../docs/v0.2-contract-delta.md).
+
+## v0.3 additive contract
+
+The `bridge-spi-v1alpha3` candidate carries the R52 additions without changing
+the trusted transaction boundary: actual input-cost/cache evidence is a
+read-only ranking input, media price and capability contracts are explicit,
+and `/v1/models` discovery may expose authorized text, image, video, and audio
+models through one Smart Key. Group colors and expanded error explanations are
+UI/log metadata only; they never change route identity, authorization, billing,
+or retry safety. Unknown host revisions still fail closed, and every host must
+prove that its serving Web and recovery Worker artifacts are identical.

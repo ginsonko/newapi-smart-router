@@ -48,3 +48,13 @@ carries the synchronized core, RoutePrice schema, invariants and vectors.
 Sidecar Lite is unchanged and is not promoted to a fifth full-parity form.
 
 Read [the v0.2 contract delta](v0.2-contract-delta.md) before choosing a form.
+
+## v0.3 additions
+
+The `v0.3.0-alpha.1` update is additive to all four primary forms. It carries
+the R52 cache-economy and actual-input-cost evidence, explicit media price
+classes, one-Key multimodal discovery, exact model mapping boundaries, group
+visual metadata, and the expanded error taxonomy. Full remains a sanitized
+reference host; Bridge is `bridge-spi-v1alpha3`; Integration and Parts expose
+the same schemas and vectors. None of these additions changes host billing or
+turns the Agent Parts Kit into a runnable gateway.

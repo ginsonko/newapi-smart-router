@@ -10,7 +10,7 @@ import (
 	"github.com/ginsonko/newapi-smart-router/core/smartrouter"
 )
 
-const ProtocolVersion = "bridge-spi-v1alpha2"
+const ProtocolVersion = "bridge-spi-v1alpha3"
 
 type HookID string
 

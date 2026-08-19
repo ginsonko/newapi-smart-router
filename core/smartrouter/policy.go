@@ -75,19 +75,22 @@ type Policy struct {
 	PoolPolicy string   `json:"pool_policy"`
 	// OrderMode is retained for v3 policy compatibility. New policies use
 	// Strategy; a missing Strategy is conservatively derived from OrderMode.
-	OrderMode                  OrderMode                   `json:"order_mode"`
-	ManualGroupOrder           []string                    `json:"manual_group_order"`
-	MaxAttempts                int                         `json:"max_attempts,omitempty"`
-	FailureThreshold           int                         `json:"failure_threshold,omitempty"`
-	MaxEffectiveRatioPPM       int64                       `json:"max_effective_ratio_ppm"`
-	ExcludedGroups             []string                    `json:"excluded_groups"`
-	ExcludedRoutes             []string                    `json:"excluded_routes"`
-	ContractOverrides          map[string]ContractOverride `json:"contract_overrides"`
-	HealthGuard                bool                        `json:"health_guard"`
-	RecoveryProfile            RecoveryProfile             `json:"recovery_profile"`
-	TTFTPolicy                 TTFTPolicy                  `json:"ttft_policy"`
-	QueuePolicy                QueuePolicy                 `json:"queue_policy"`
-	BalancedWeights            BalancedWeights             `json:"balanced_weights,omitempty"`
+	OrderMode            OrderMode                   `json:"order_mode"`
+	ManualGroupOrder     []string                    `json:"manual_group_order"`
+	MaxAttempts          int                         `json:"max_attempts,omitempty"`
+	FailureThreshold     int                         `json:"failure_threshold,omitempty"`
+	MaxEffectiveRatioPPM int64                       `json:"max_effective_ratio_ppm"`
+	ExcludedGroups       []string                    `json:"excluded_groups"`
+	ExcludedRoutes       []string                    `json:"excluded_routes"`
+	ContractOverrides    map[string]ContractOverride `json:"contract_overrides"`
+	HealthGuard          bool                        `json:"health_guard"`
+	RecoveryProfile      RecoveryProfile             `json:"recovery_profile"`
+	TTFTPolicy           TTFTPolicy                  `json:"ttft_policy"`
+	QueuePolicy          QueuePolicy                 `json:"queue_policy"`
+	BalancedWeights      BalancedWeights             `json:"balanced_weights,omitempty"`
+	// Nil means the field was absent in a legacy policy and therefore keeps the
+	// reviewed default-on behavior. An explicit false is the only opt-out.
+	ActualInputCostRanking     *bool                       `json:"actual_input_cost_ranking,omitempty"`
 	AffinityEnabled            bool                        `json:"affinity_enabled,omitempty"`
 	AffinityMode               AffinityMode                `json:"affinity_mode,omitempty"`
 	AffinityMaxPremiumPercent  int                         `json:"affinity_max_premium_percent,omitempty"`
@@ -95,6 +98,10 @@ type Policy struct {
 	CompressionThresholds      []ModelCompressionThreshold `json:"compression_thresholds,omitempty"`
 	AllowFutureGroups          bool                        `json:"allow_future_groups,omitempty"`
 	AllowFutureCertifiedRoutes bool                        `json:"allow_future_certified_routes"`
+}
+
+func (policy Policy) EffectiveActualInputCostRanking() bool {
+	return policy.ActualInputCostRanking == nil || *policy.ActualInputCostRanking
 }
 
 type ContractOverride struct {

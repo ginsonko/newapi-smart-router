@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // Unknown routes need a small, deterministic exploration lane when a strategy
@@ -42,7 +43,22 @@ type RouteRequest struct {
 	// ClientClass is an irreversible coarse fingerprint used only for partial
 	// pooling of cache-economy statistics. Raw User-Agent values are never kept.
 	ClientClass string `json:"-"`
-	DeadlineMS  int64  `json:"deadline_ms,omitempty"`
+	// UsageSemantic separates OpenAI-style and Anthropic-style cache fields in
+	// the shared learner. It is internal and never supplied by the client.
+	UsageSemanticValue string             `json:"-"`
+	DeadlineMS         int64              `json:"deadline_ms,omitempty"`
+	Media              *MediaRequestShape `json:"media,omitempty"`
+}
+
+func (request RouteRequest) UsageSemantic() string {
+	if value := strings.TrimSpace(request.UsageSemanticValue); value != "" {
+		return value
+	}
+	endpoint := strings.ToLower(strings.TrimSpace(request.Endpoint))
+	if strings.Contains(endpoint, "anthropic") || strings.Contains(endpoint, "messages") {
+		return "anthropic"
+	}
+	return "openai"
 }
 
 type AttemptState struct {
@@ -106,6 +122,7 @@ type PlanInput struct {
 	AllowedGroups            []string
 	Affinity                 *AffinityState
 	CacheEconomy             *CacheEconomySnapshot
+	ActualInputCosts         ActualInputCostSnapshot
 	WeakAffinityTolerancePPM int64
 	Attempt                  AttemptState
 	// BackgroundRecovery keeps unknown and known-bad recovery off the request
@@ -136,46 +153,66 @@ const (
 )
 
 type Candidate struct {
-	Route            CertifiedRoute
-	RatioPPM         int64
-	Price            RoutePrice
-	PoolIndex        int
-	ManualIndex      int
-	Quality          QualityState
-	Credential       CredentialState
-	CredentialDomain string
-	Admission        AdmissionKind
-	KeySuppressed    bool
-	StabilityPPM     int64
-	BalancedScorePPM int64
-	TTFTKnowledge    TTFTKnowledge
-	TTFTP95MS        int64
-	TTFTSlow         bool
-	TTFTAboveTarget  bool
-	priceClassRank   int
+	Route                     CertifiedRoute
+	RatioPPM                  int64
+	Price                     RoutePrice
+	PoolIndex                 int
+	ManualIndex               int
+	Quality                   QualityState
+	Credential                CredentialState
+	CredentialDomain          string
+	Admission                 AdmissionKind
+	KeySuppressed             bool
+	StabilityPPM              int64
+	BalancedScorePPM          int64
+	TTFTKnowledge             TTFTKnowledge
+	TTFTP95MS                 int64
+	TTFTSlow                  bool
+	TTFTAboveTarget           bool
+	ActualInputCostPPM        int64
+	ActualInputCostSource     string
+	ActualInputCostObservedMS int64
+	ActualInputCostComparable bool
+	priceClassRank            int
+	mediaQuoteRank            uint8
 }
+
+const (
+	mediaQuoteNone uint8 = iota
+	mediaQuoteKnown
+	mediaQuoteUnknown
+)
 
 type RejectReason string
 
 const (
-	RejectGroupUnauthorized   RejectReason = "group_unauthorized"
-	RejectGroupNotSelected    RejectReason = "group_not_selected"
-	RejectGroupExcluded       RejectReason = "group_excluded"
-	RejectRouteExcluded       RejectReason = "route_excluded"
-	RejectAlreadyAttempted    RejectReason = "already_attempted"
-	RejectChannelAttempted    RejectReason = "channel_already_attempted"
-	RejectPriceMissing        RejectReason = "price_missing"
-	RejectAbovePriceLimit     RejectReason = "above_price_limit"
-	RejectCapabilityMismatch  RejectReason = "capability_mismatch"
-	RejectContextTooLarge     RejectReason = "context_too_large"
-	RejectHealthUnavailable   RejectReason = "health_unavailable"
-	RejectRecoveryBudget      RejectReason = "recovery_budget_exhausted"
-	RejectRecoveryCooling     RejectReason = "recovery_cooling"
-	RejectKeySuppressed       RejectReason = "key_suppressed"
-	RejectQuarantined         RejectReason = "quarantined"
-	RejectCredentialBlocked   RejectReason = "credential_blocked"
-	RejectUnlistedManualRoute RejectReason = "unlisted_manual_route"
-	RejectTTFTSlow            RejectReason = "ttft_slow"
+	RejectGroupUnauthorized         RejectReason = "group_unauthorized"
+	RejectGroupNotSelected          RejectReason = "group_not_selected"
+	RejectGroupExcluded             RejectReason = "group_excluded"
+	RejectRouteExcluded             RejectReason = "route_excluded"
+	RejectAlreadyAttempted          RejectReason = "already_attempted"
+	RejectChannelAttempted          RejectReason = "channel_already_attempted"
+	RejectPriceMissing              RejectReason = "price_missing"
+	RejectAbovePriceLimit           RejectReason = "above_price_limit"
+	RejectCapabilityMismatch        RejectReason = "capability_mismatch"
+	RejectContextTooLarge           RejectReason = "context_too_large"
+	RejectHealthUnavailable         RejectReason = "health_unavailable"
+	RejectRecoveryBudget            RejectReason = "recovery_budget_exhausted"
+	RejectRecoveryCooling           RejectReason = "recovery_cooling"
+	RejectKeySuppressed             RejectReason = "key_suppressed"
+	RejectQuarantined               RejectReason = "quarantined"
+	RejectCredentialBlocked         RejectReason = "credential_blocked"
+	RejectUnlistedManualRoute       RejectReason = "unlisted_manual_route"
+	RejectTTFTSlow                  RejectReason = "ttft_slow"
+	RejectMediaReferenceUnsupported RejectReason = "media_reference_unsupported"
+	RejectMediaReferenceRole        RejectReason = "media_reference_role_unsupported"
+	RejectMediaReferenceLimit       RejectReason = "media_reference_limit"
+	RejectMediaDurationMismatch     RejectReason = "media_duration_mismatch"
+	RejectMediaOutputCountMismatch  RejectReason = "media_output_count_mismatch"
+	RejectMediaResolutionMismatch   RejectReason = "media_resolution_mismatch"
+	RejectMediaAspectRatioMismatch  RejectReason = "media_aspect_ratio_mismatch"
+	RejectMediaQualityMismatch      RejectReason = "media_quality_mismatch"
+	RejectMediaPriceUnavailable     RejectReason = "media_request_price_unavailable"
 )
 
 type Rejection struct {
@@ -195,6 +232,7 @@ type FilterInput struct {
 	Credentials           CredentialSnapshot
 	AllowedGroups         []string
 	Affinity              *AffinityState
+	ActualInputCosts      ActualInputCostSnapshot
 	Attempt               AttemptState
 	BackgroundRecovery    bool
 }
@@ -342,6 +380,9 @@ func Filter(input FilterInput) (FilterResult, error) {
 		case input.Request.EstimatedContext < 0 || input.Request.EstimatedContext > route.MaxContext:
 			reason = RejectContextTooLarge
 		}
+		if reason == "" && input.Request.Media != nil {
+			reason = MatchMediaRequest(route.Media, input.Request.Media)
+		}
 		ratio, hasPrice := input.Prices.RatiosPPM[route.RouteID]
 		if reason == "" && (!hasPrice || ratio < 0) {
 			reason = RejectPriceMissing
@@ -352,6 +393,15 @@ func Filter(input FilterInput) (FilterResult, error) {
 		if reason != "" {
 			result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: reason})
 			continue
+		}
+		routePrice := routePriceForCandidate(input.Prices, route.RouteID, ratio)
+		if input.Request.Media != nil {
+			var quoteReason RejectReason
+			routePrice, quoteReason = routePrice.QuoteMedia(input.Request.Media)
+			if quoteReason != "" {
+				result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: quoteReason})
+				continue
+			}
 		}
 
 		quality, found := input.Quality.Routes[route.RouteID]
@@ -388,15 +438,27 @@ func Filter(input FilterInput) (FilterResult, error) {
 			continue
 		}
 		manualIndex := manualCandidateIndex(route, index, len(pool.Candidates), manualRanks, manualGroupRanks)
-		routePrice := routePriceForCandidate(input.Prices, route.RouteID, ratio)
-		priceClass := routePrice.ComparisonClass
-		if !routePrice.StaticComparable {
-			priceClass = "incomparable:" + route.RouteID
-		}
-		priceClassRank, exists := priceClassRanks[priceClass]
-		if !exists {
-			priceClassRank = len(priceClassRanks)
-			priceClassRanks[priceClass] = priceClassRank
+		priceClassRank := 0
+		mediaQuoteRank := mediaQuoteNone
+		if input.Request.Media != nil {
+			mediaQuoteRank = mediaQuoteKnown
+			// All comparable media quotes share one request-cost unit. Unknown
+			// prices remain usable fallbacks but can never outrank a known quote.
+			if !routePrice.StaticComparable {
+				mediaQuoteRank = mediaQuoteUnknown
+				priceClassRank = 1 + index
+			}
+		} else {
+			priceClass := routePrice.ComparisonClass
+			if !routePrice.StaticComparable {
+				priceClass = "incomparable:" + route.RouteID
+			}
+			var exists bool
+			priceClassRank, exists = priceClassRanks[priceClass]
+			if !exists {
+				priceClassRank = len(priceClassRanks)
+				priceClassRanks[priceClass] = priceClassRank
+			}
 		}
 		candidate := Candidate{
 			Route:            route,
@@ -411,6 +473,21 @@ func Filter(input FilterInput) (FilterResult, error) {
 			KeySuppressed:    suppressed,
 			StabilityPPM:     qualityStabilityPPM(quality),
 			priceClassRank:   priceClassRank,
+			mediaQuoteRank:   mediaQuoteRank,
+		}
+		if input.Request.Media == nil {
+			actualKey := ActualInputCostKey(
+				route.CacheNamespaceIdentity(), route.UpstreamModel,
+				input.Request.CanonicalModel, input.Request.Endpoint, input.Request.UsageSemantic(),
+			)
+			poolKey := ActualInputCostPoolKey(
+				route.UpstreamModel, input.Request.CanonicalModel, input.Request.Endpoint, input.Request.UsageSemantic(),
+			)
+			actual := EstimateActualInputCostAt(routePrice, routePrice.ScorePPM, actualKey, poolKey, input.ActualInputCosts, input.NowMS)
+			candidate.ActualInputCostPPM = actual.EffectivePPM
+			candidate.ActualInputCostSource = actual.Source
+			candidate.ActualInputCostObservedMS = actual.LastObservedAtMS
+			candidate.ActualInputCostComparable = actual.Comparable
 		}
 		applyTTFTKnowledge(&candidate, input.TTFT.Routes[route.RouteID], metricPolicy, input.NowMS)
 		if bootstrapUnknown {
@@ -432,8 +509,9 @@ func Filter(input FilterInput) (FilterResult, error) {
 	}
 
 	result.Candidates, result.TTFTFallback = applyTTFTPolicy(result.Candidates, input.Policy.TTFTPolicy, &result.Rejections)
-	assignBalancedScores(result.Candidates, input.Policy.EffectiveBalancedWeights())
-	sortCandidates(result.Candidates, strategy, result.TTFTFallback, input.BackgroundRecovery)
+	actualCostRanking := input.Policy.EffectiveActualInputCostRanking()
+	assignBalancedScores(result.Candidates, input.Policy.EffectiveBalancedWeights(), actualCostRanking)
+	sortCandidates(result.Candidates, strategy, result.TTFTFallback, input.BackgroundRecovery, actualCostRanking)
 	result.Candidates = promoteUnknownProbeCandidate(result.Candidates, input.Request, strategy)
 	result.Candidates = limitRecoveryProbeCandidates(
 		result.Candidates,
@@ -500,6 +578,9 @@ func promoteUnknownProbeCandidate(candidates []Candidate, request RouteRequest, 
 		if index == 0 || !isRecoveryAttemptAdmission(candidate.Admission) || candidate.Quality.Phase != QualityUnknown {
 			continue
 		}
+		if candidates[0].mediaQuoteRank == mediaQuoteKnown && candidate.mediaQuoteRank == mediaQuoteUnknown {
+			continue
+		}
 		epoch := candidate.Quality.Epoch
 		if epoch == 0 {
 			epoch = 1
@@ -562,6 +643,7 @@ func Plan(input PlanInput) (PlanResult, error) {
 		Credentials:           input.Credentials,
 		AllowedGroups:         input.AllowedGroups,
 		Affinity:              input.Affinity,
+		ActualInputCosts:      input.ActualInputCosts,
 		Attempt:               input.Attempt,
 		BackgroundRecovery:    input.BackgroundRecovery,
 	})
@@ -587,6 +669,11 @@ func Plan(input PlanInput) (PlanResult, error) {
 	}
 	disposition := affinityDisposition(input.Affinity, choice.Candidate, affinityEligible)
 	overflow := input.Affinity != nil && input.Affinity.Strength == AffinityStrong && affinityEligible && choice.Candidate.Route.RouteID != input.Affinity.RouteID
+	maxInflightHint := admissionCapacityLimit(choice.Candidate.Admission)
+	if input.Policy.EffectiveActualInputCostRanking() && choice.Candidate.ActualInputCostSource == ActualInputCostOptimistic &&
+		(maxInflightHint == 0 || maxInflightHint > 1) {
+		maxInflightHint = 1
+	}
 	return PlanResult{
 		Kind:                choice.Kind,
 		ContractID:          filtered.ContractID,
@@ -603,7 +690,7 @@ func Plan(input PlanInput) (PlanResult, error) {
 		CapacityDomain:      choice.Candidate.Route.CapacityDomain,
 		Admission:           choice.Candidate.Admission,
 		RouteEpoch:          choice.Candidate.Quality.Epoch,
-		MaxInflightHint:     admissionCapacityLimit(choice.Candidate.Admission),
+		MaxInflightHint:     maxInflightHint,
 		MaxQueueWaitMS:      choice.MaxQueueWaitMS,
 		AffinityDisposition: disposition,
 		CacheEconomy:        economyDecision,
@@ -869,7 +956,7 @@ func applyTTFTPolicy(candidates []Candidate, policy TTFTPolicy, rejections *[]Re
 	return filtered, false
 }
 
-func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, backgroundRecovery bool) {
+func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, backgroundRecovery, actualCostRanking bool) {
 	sort.SliceStable(candidates, func(leftIndex, rightIndex int) bool {
 		left := candidates[leftIndex]
 		right := candidates[rightIndex]
@@ -879,6 +966,10 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 			if leftLastResort != rightLastResort {
 				return !leftLastResort
 			}
+		}
+		if left.mediaQuoteRank != mediaQuoteNone && right.mediaQuoteRank != mediaQuoteNone &&
+			left.mediaQuoteRank != right.mediaQuoteRank {
+			return left.mediaQuoteRank < right.mediaQuoteRank
 		}
 		if ttftFallback && left.TTFTP95MS != right.TTFTP95MS {
 			return left.TTFTP95MS < right.TTFTP95MS
@@ -901,7 +992,7 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 			if left.Quality.ConsecutiveHardFailures != right.Quality.ConsecutiveHardFailures {
 				return left.Quality.ConsecutiveHardFailures < right.Quality.ConsecutiveHardFailures
 			}
-			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+			if comparison, comparable := comparableCandidateOrderingPrice(left, right, actualCostRanking); comparable && comparison != 0 {
 				return comparison < 0
 			}
 		case StrategyLatency:
@@ -916,25 +1007,48 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 			if left.StabilityPPM != right.StabilityPPM {
 				return left.StabilityPPM > right.StabilityPPM
 			}
-			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+			if comparison, comparable := comparableCandidateOrderingPrice(left, right, actualCostRanking); comparable && comparison != 0 {
 				return comparison < 0
 			}
 		case StrategyBalanced:
 			if left.BalancedScorePPM != right.BalancedScorePPM {
 				return left.BalancedScorePPM > right.BalancedScorePPM
 			}
-			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+			if comparison, comparable := comparableCandidateOrderingPrice(left, right, actualCostRanking); comparable && comparison != 0 {
 				return comparison < 0
 			}
 		default: // StrategyPrice
-			if left.priceClassRank != right.priceClassRank {
-				return left.priceClassRank < right.priceClassRank
+			actualCompared := false
+			if actualCostRanking {
+				if comparison, comparable := comparableCandidateActualInputCost(left, right); comparable {
+					actualCompared = true
+					if comparison != 0 {
+						return comparison < 0
+					}
+				}
 			}
-			if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
-				return comparison < 0
+			if !actualCompared {
+				if left.priceClassRank != right.priceClassRank {
+					return left.priceClassRank < right.priceClassRank
+				}
+				if comparison, comparable := comparableCandidatePrice(left, right); comparable && comparison != 0 {
+					return comparison < 0
+				}
+			}
+			if actualCompared {
+				if comparison := compareActualInputCostEvidencePriority(left, right); comparison != 0 {
+					return comparison < 0
+				}
 			}
 			if left.StabilityPPM != right.StabilityPPM {
 				return left.StabilityPPM > right.StabilityPPM
+			}
+		}
+		if actualCostRanking {
+			if comparison, comparable := comparableCandidateActualInputCost(left, right); comparable && comparison == 0 {
+				if evidenceComparison := compareActualInputCostEvidencePriority(left, right); evidenceComparison != 0 {
+					return evidenceComparison < 0
+				}
 			}
 		}
 		if left.PoolIndex != right.PoolIndex {
@@ -945,6 +1059,55 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 		}
 		return left.Route.ChannelID < right.Route.ChannelID
 	})
+}
+
+func comparableCandidateOrderingPrice(left, right Candidate, actualCostRanking bool) (int, bool) {
+	if actualCostRanking {
+		if comparison, comparable := comparableCandidateActualInputCost(left, right); comparable {
+			return comparison, true
+		}
+	}
+	return comparableCandidatePrice(left, right)
+}
+
+func comparableCandidateActualInputCost(left, right Candidate) (int, bool) {
+	leftPrice := candidateRoutePrice(left)
+	rightPrice := candidateRoutePrice(right)
+	if left.ActualInputCostComparable && right.ActualInputCostComparable &&
+		leftPrice.ActualInputComparisonClass != "" &&
+		leftPrice.ActualInputComparisonClass == rightPrice.ActualInputComparisonClass {
+		switch {
+		case left.ActualInputCostPPM < right.ActualInputCostPPM:
+			return -1, true
+		case left.ActualInputCostPPM > right.ActualInputCostPPM:
+			return 1, true
+		default:
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
+func compareActualInputCostEvidencePriority(left, right Candidate) int {
+	leftOptimistic := left.ActualInputCostSource == ActualInputCostOptimistic
+	rightOptimistic := right.ActualInputCostSource == ActualInputCostOptimistic
+	if leftOptimistic != rightOptimistic {
+		if leftOptimistic {
+			return -1
+		}
+		return 1
+	}
+	if leftOptimistic {
+		return 0
+	}
+	if left.ActualInputCostSource == ActualInputCostObserved && right.ActualInputCostSource == ActualInputCostObserved &&
+		left.ActualInputCostObservedMS != right.ActualInputCostObservedMS {
+		if left.ActualInputCostObservedMS < right.ActualInputCostObservedMS {
+			return -1
+		}
+		return 1
+	}
+	return 0
 }
 
 func qualityStabilityPPM(state QualityState) int64 {
@@ -972,23 +1135,24 @@ func qualityStabilityPPM(state QualityState) int64 {
 	return base
 }
 
-func assignBalancedScores(candidates []Candidate, weights BalancedWeights) {
+func assignBalancedScores(candidates []Candidate, weights BalancedWeights, actualCostRanking bool) {
 	if len(candidates) == 0 {
 		return
 	}
-	priceComparable := candidates[0].Price.StaticComparable
-	priceClass := candidates[0].Price.ComparisonClass
-	minPrice, maxPrice := candidates[0].Price.ScorePPM, candidates[0].Price.ScorePPM
+	firstPrice, priceComparable := candidateOrderingPrice(candidates[0], actualCostRanking)
+	priceClass := candidateOrderingPriceClass(candidates[0], actualCostRanking)
+	minPrice, maxPrice := firstPrice, firstPrice
 	minTTFT, maxTTFT := int64(0), int64(0)
 	for _, candidate := range candidates {
-		if !candidate.Price.StaticComparable || candidate.Price.ComparisonClass != priceClass {
+		candidatePrice, comparable := candidateOrderingPrice(candidate, actualCostRanking)
+		if !comparable || candidateOrderingPriceClass(candidate, actualCostRanking) != priceClass {
 			priceComparable = false
 		}
-		if candidate.Price.ScorePPM < minPrice {
-			minPrice = candidate.Price.ScorePPM
+		if candidatePrice < minPrice {
+			minPrice = candidatePrice
 		}
-		if candidate.Price.ScorePPM > maxPrice {
-			maxPrice = candidate.Price.ScorePPM
+		if candidatePrice > maxPrice {
+			maxPrice = candidatePrice
 		}
 		if candidate.TTFTKnowledge == TTFTKnown {
 			if minTTFT == 0 || candidate.TTFTP95MS < minTTFT {
@@ -1002,7 +1166,8 @@ func assignBalancedScores(candidates []Candidate, weights BalancedWeights) {
 	for index := range candidates {
 		priceScore := int64(500_000)
 		if priceComparable {
-			priceScore = inverseRangeScore(candidates[index].Price.ScorePPM, minPrice, maxPrice)
+			candidatePrice, _ := candidateOrderingPrice(candidates[index], actualCostRanking)
+			priceScore = inverseRangeScore(candidatePrice, minPrice, maxPrice)
 		}
 		ttftScore := int64(500_000)
 		if candidates[index].TTFTKnowledge == TTFTKnown {
@@ -1012,6 +1177,22 @@ func assignBalancedScores(candidates []Candidate, weights BalancedWeights) {
 			(candidates[index].StabilityPPM*int64(weights.Stability) +
 				priceScore*int64(weights.Price) + ttftScore*int64(weights.TTFT)) / 100
 	}
+}
+
+func candidateOrderingPrice(candidate Candidate, actualCostRanking bool) (int64, bool) {
+	price := candidateRoutePrice(candidate)
+	if actualCostRanking && candidate.ActualInputCostComparable && price.ActualInputComparisonClass != "" {
+		return candidate.ActualInputCostPPM, true
+	}
+	return price.ScorePPM, price.StaticComparable
+}
+
+func candidateOrderingPriceClass(candidate Candidate, actualCostRanking bool) string {
+	price := candidateRoutePrice(candidate)
+	if actualCostRanking && candidate.ActualInputCostComparable && price.ActualInputComparisonClass != "" {
+		return price.ActualInputComparisonClass
+	}
+	return price.ComparisonClass
 }
 
 func inverseRangeScore(value, minimum, maximum int64) int64 {

@@ -221,3 +221,16 @@
 - [ ] `convert_request_failed` 仅在 dispatch 前可回退
 - [ ] HTTP 200 通过 exact semantic fixtures
 - [ ] Web 与 Smart Router Worker 完整 artifact SHA-256 一致
+
+## S. v0.3 R52 增量门禁
+
+- [ ] 实时缓存率和实际输入成本按物理缓存命名空间隔离，过期/缺失有静态回退
+- [ ] 排序证据不进入预扣、结算、退款或其他宿主账务金额
+- [ ] 标准 `/v1/models` 只聚合智能 Key 已授权的文本、图片、视频和音频模型
+- [ ] 跨分组只接受完全同名或明确映射后的 canonical model，并同时匹配 endpoint/capability
+- [ ] token、按次、按秒、固定时长、阶梯表达式按真实请求形状生成 comparison class
+- [ ] 媒体受理不明、异步任务、后台、托管工具和已提交响应保持单派发
+- [ ] 429、pending/capacity、5xx、超时、传输和未知上游错误在安全边界换路
+- [ ] 用户格式、额度、内容安全、会话和客户端取消返回脱敏中文终态，不盲目重试
+- [ ] 分组颜色只影响 UI 聚类，组内倍率排序不改变授权或账务
+- [ ] Bridge、Web、Worker 使用 `bridge-spi-v1alpha3` 且 artifact SHA-256 一致

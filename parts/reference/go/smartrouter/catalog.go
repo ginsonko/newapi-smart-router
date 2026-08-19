@@ -48,9 +48,10 @@ type CertifiedRoute struct {
 	// only for recovery coverage; dispatch and billing still operate on the
 	// exact physical route. When omitted, RouteFailureDomain falls back to the
 	// credential/channel identity so old catalogs remain safe.
-	FailureDomain  string `json:"failure_domain,omitempty"`
-	MaxInflight    int    `json:"max_inflight"`
-	StableFallback bool   `json:"stable_fallback"`
+	FailureDomain  string                   `json:"failure_domain,omitempty"`
+	MaxInflight    int                      `json:"max_inflight"`
+	StableFallback bool                     `json:"stable_fallback"`
+	Media          *MediaCapabilityContract `json:"media,omitempty"`
 }
 
 func (route CertifiedRoute) CacheNamespaceIdentity() string {
@@ -156,6 +157,11 @@ func validateRoute(route CertifiedRoute) error {
 	}
 	if route.MaxInflight < 0 {
 		return fmt.Errorf("route %q has invalid max_inflight", route.RouteID)
+	}
+	if route.Media != nil {
+		if err := route.Media.Validate(); err != nil {
+			return fmt.Errorf("route %q has invalid media contract: %w", route.RouteID, err)
+		}
 	}
 	return nil
 }

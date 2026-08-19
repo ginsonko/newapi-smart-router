@@ -20,21 +20,12 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 
-RELEASE_VERSION = "v0.2.0-alpha.1"
+RELEASE_VERSION = "v0.3.0-alpha.1"
 RELEASE_NAME = f"newapi-smart-router-{RELEASE_VERSION}"
 MARKER_NAME = ".smart-router-release-root"
-FIXED_ZIP_TIME = (2026, 8, 2, 0, 0, 0)
-ALLOWED_UNTRACKED_ROOTS = {
-    "common", "constant", "controller", "docs", "middleware", "model",
-    "pkg", "relay", "router", "service", "setting", "types", "web",
-}
-ALLOWED_UNTRACKED_SUFFIXES = {
-    ".go", ".ts", ".tsx", ".js", ".mjs", ".json", ".md", ".sql",
-    ".yaml", ".yml", ".toml", ".css", ".scss", ".html", ".svg",
-    ".png", ".jpg", ".jpeg", ".webp", ".ico", ".woff", ".woff2", ".ttf",
-}
+FIXED_ZIP_TIME = (2026, 8, 19, 0, 0, 0)
 DENIED_COMPONENTS = {
-    ".git", ".tmp", ".cache", "node_modules", "coverage", "logs", "log",
+    ".git", ".tmp", ".cache", "node_modules", "coverage",
     "backup", "backups", "vendor",
 }
 DENIED_SUFFIXES = {
@@ -103,6 +94,350 @@ def git_lines(reference: Path, *args: str) -> list[str]:
     return [line for line in completed.stdout.splitlines() if line]
 
 
+def load_overlay_manifest(path: Path) -> dict:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != "full-reference-overlay-v1":
+        raise RuntimeError("unexpected Full reference overlay schema")
+    if manifest.get("release") != RELEASE_VERSION:
+        raise RuntimeError("Full reference overlay release does not match builder")
+    base = manifest.get("base")
+    if not isinstance(base, dict) or not base.get("archive_root") or not base.get("sha256"):
+        raise RuntimeError("Full reference overlay base is incomplete")
+    if not isinstance(manifest.get("include"), list) or not manifest["include"]:
+        raise RuntimeError("Full reference overlay include list is empty")
+    restore = manifest.get("restore_from_reference_head")
+    if not isinstance(restore, dict) or not re.fullmatch(r"[0-9a-f]{40}", str(restore.get("commit", ""))):
+        raise RuntimeError("Full reference restore commit must be an exact lowercase SHA-1")
+    if not isinstance(restore.get("files"), list) or not restore["files"]:
+        raise RuntimeError("Full reference restore file list is empty")
+    translations = manifest.get("translation_overlay")
+    if not isinstance(translations, dict) or not isinstance(translations.get("files"), list):
+        raise RuntimeError("Full translation overlay is incomplete")
+    return manifest
+
+
+def manifest_relative(value: object, label: str) -> Path:
+    pure = PurePosixPath(str(value))
+    if pure.is_absolute() or not pure.parts or ".." in pure.parts or "." in pure.parts:
+        raise RuntimeError(f"unsafe {label} path: {value}")
+    relative = Path(*pure.parts)
+    if is_denied_relative(relative):
+        raise RuntimeError(f"denied {label} path: {pure.as_posix()}")
+    return relative
+
+
+def git_blob(reference: Path, commit: str, relative: Path) -> bytes:
+    spec = f"{commit}:{relative.as_posix()}"
+    completed = subprocess.run(
+        ["git", "show", spec], cwd=reference, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"cannot read fixed reference blob {spec}: {message}")
+    return completed.stdout
+
+
+def select_reference_head_restores(reference: Path, manifest: dict) -> list[dict]:
+    config = manifest["restore_from_reference_head"]
+    commit = str(config["commit"])
+    completed = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=reference,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"fixed reference commit is unavailable: {commit}")
+    selected = []
+    seen = set()
+    for value in config["files"]:
+        relative = manifest_relative(value, "reference restore")
+        key = relative.as_posix()
+        if key in seen:
+            raise RuntimeError(f"duplicate reference restore path: {key}")
+        seen.add(key)
+        data = git_blob(reference, commit, relative)
+        selected.append({
+            "relative": relative,
+            "data": data,
+            "commit": commit,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+    return selected
+
+
+def reference_restore_entries(items: list[dict]) -> list[dict]:
+    return [
+        {
+            "path": f"@reference-head/{item['commit']}/{item['relative'].as_posix()}",
+            "kind": "fixed_public_reference_blob",
+            "size": item["size"],
+            "sha256": item["sha256"],
+        }
+        for item in items
+    ]
+
+
+def apply_reference_head_restores(target: Path, items: list[dict]) -> None:
+    for item in items:
+        destination = target / item["relative"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(item["data"])
+
+
+def select_translation_sources(reference: Path, manifest: dict) -> list[tuple[Path, Path, str]]:
+    selected = []
+    seen = set()
+    for value in manifest["translation_overlay"]["files"]:
+        relative = manifest_relative(value, "translation source")
+        if relative.suffix.lower() != ".json" or relative.as_posix() in seen:
+            raise RuntimeError(f"invalid or duplicate translation source: {relative.as_posix()}")
+        source = reference / relative
+        if not source.is_file():
+            raise RuntimeError(f"translation source is missing: {relative.as_posix()}")
+        seen.add(relative.as_posix())
+        selected.append((source, relative, "r52_translation_source"))
+    return selected
+
+
+def merge_referenced_translations(
+    target: Path,
+    translation_sources: list[tuple[Path, Path, str]],
+    selected: list[tuple[Path, Path, str]],
+    manifest: dict,
+) -> dict:
+    source_text = "\n".join(
+        source.read_text(encoding="utf-8")
+        for source, relative, _kind in selected
+        if relative.suffix.lower() in {".ts", ".tsx", ".js", ".jsx"}
+        and relative.as_posix().startswith("web/default/src/")
+    )
+    explicit = {str(value) for value in manifest["translation_overlay"].get("explicit_keys", [])}
+    denied = [str(value).lower() for value in manifest["translation_overlay"].get("deny_contains", [])]
+    receipts = []
+    union_keys = set()
+    for source, relative, _kind in translation_sources:
+        destination = target / relative
+        if not destination.is_file():
+            raise RuntimeError(f"base Full translation is missing: {relative.as_posix()}")
+        source_document = json.loads(source.read_text(encoding="utf-8"))
+        target_document = json.loads(destination.read_text(encoding="utf-8"))
+        source_values = source_document.get("translation")
+        target_values = target_document.get("translation")
+        if not isinstance(source_values, dict) or not isinstance(target_values, dict):
+            raise RuntimeError(f"translation object is missing: {relative.as_posix()}")
+        referenced = set(explicit)
+        for key in source_values:
+            double_quoted = json.dumps(key, ensure_ascii=False)
+            single_quoted = "'" + key.replace("\\", "\\\\").replace("'", "\\'") + "'"
+            if double_quoted in source_text or single_quoted in source_text:
+                referenced.add(key)
+        selected_keys = sorted(key for key in referenced if key in source_values)
+        for key in selected_keys:
+            rendered = (key + "\n" + str(source_values[key])).lower()
+            if any(term in rendered for term in denied):
+                raise RuntimeError(f"denied private translation selected in {relative.as_posix()}: {key}")
+            target_values[key] = source_values[key]
+        destination.write_bytes(canonical_json(target_document))
+        union_keys.update(selected_keys)
+        receipts.append({
+            "path": relative.as_posix(),
+            "source_sha256": sha256_file(source),
+            "assembled_sha256": sha256_file(destination),
+            "selected_key_count": len(selected_keys),
+            "selected_keys_sha256": hashlib.sha256("\n".join(selected_keys).encode("utf-8")).hexdigest(),
+        })
+    return {
+        "mode": "referenced_keys_only",
+        "selected_key_count": len(union_keys),
+        "selected_keys_sha256": hashlib.sha256("\n".join(sorted(union_keys)).encode("utf-8")).hexdigest(),
+        "files": receipts,
+    }
+
+
+def extract_verified_base(archive_path: Path, target: Path, manifest: dict) -> dict:
+    expected = manifest["base"]["sha256"].lower()
+    actual = sha256_file(archive_path)
+    if actual != expected:
+        raise RuntimeError(f"base Full archive SHA-256 mismatch: {actual}")
+    archive_root = manifest["base"]["archive_root"]
+    extracted = 0
+    with zipfile.ZipFile(archive_path) as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError("base Full archive failed CRC validation")
+        for info in archive.infolist():
+            pure = PurePosixPath(info.filename)
+            if info.is_dir():
+                continue
+            if pure.is_absolute() or ".." in pure.parts or len(pure.parts) < 2 or pure.parts[0] != archive_root:
+                raise RuntimeError(f"unsafe or unexpected base Full archive path: {info.filename}")
+            relative = Path(*pure.parts[1:])
+            if is_denied_relative(relative):
+                raise RuntimeError(f"denied file found in public v0.2 Full base: {relative.as_posix()}")
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(archive.read(info))
+            extracted += 1
+    if extracted == 0:
+        raise RuntimeError("base Full archive contained no files")
+    return {
+        "release": manifest["base"].get("release"),
+        "asset": manifest["base"].get("asset"),
+        "sha256": actual,
+        "files": extracted,
+    }
+
+
+def select_overlay_files(reference: Path, manifest: dict) -> list[tuple[Path, Path, str]]:
+    selected: dict[str, tuple[Path, Path, str]] = {}
+    denied = [str(value).lower() for value in manifest.get("deny_path_contains", []) if str(value).strip()]
+    for pattern in manifest["include"]:
+        for source in reference.glob(str(pattern)):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(reference)
+            normalized = "/" + relative.as_posix().lower()
+            if is_denied_relative(relative) or any(value in normalized for value in denied):
+                raise RuntimeError(f"overlay include matched a denied path: {relative.as_posix()}")
+            selected[relative.as_posix()] = (source, relative, "r52_overlay")
+    missing = [
+        value for value in manifest.get("required", [])
+        if value not in selected
+    ]
+    if missing:
+        raise RuntimeError(f"required Full overlay files are missing: {missing}")
+    if not selected:
+        raise RuntimeError("Full overlay selected no files")
+    return [selected[key] for key in sorted(selected)]
+
+
+def apply_overlay(target: Path, items: list[tuple[Path, Path, str]]) -> None:
+    for source, relative, _kind in items:
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
+PUBLIC_TEXT_SUFFIXES = {
+    ".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".json", ".yaml", ".yml",
+    ".md", ".html", ".css", ".scss", ".txt", ".toml", ".mod", ".sum",
+}
+
+
+def sanitize_full_source(target: Path, private_terms: list[str]) -> list[dict]:
+    """Apply caller-supplied private-term substitutions without recording terms."""
+    changed = []
+    terms = [term.strip() for term in private_terms if term.strip()]
+    for path in sorted(item for item in target.rglob("*") if item.is_file()):
+        if path.suffix.lower() not in PUBLIC_TEXT_SUFFIXES:
+            continue
+        relative = path.relative_to(target)
+        original = path.read_text(encoding="utf-8")
+        updated = original
+        replacement_count = 0
+        for term in terms:
+            updated, count = re.subn(re.escape(term), "ExampleProvider", updated, flags=re.IGNORECASE)
+            replacement_count += count
+        if updated != original:
+            path.write_text(updated, encoding="utf-8", newline="\n")
+            changed.append({
+                "path": relative.as_posix(),
+                "source_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                "assembled_sha256": sha256_file(path),
+                "replacement_count": replacement_count,
+            })
+    return changed
+
+
+def create_dependency_link(link: Path, target: Path) -> None:
+    if not target.is_dir():
+        raise RuntimeError(f"frontend dependency directory is missing: {target}")
+    if link.exists() or link.is_symlink():
+        raise RuntimeError(f"refusing to replace existing frontend dependency path: {link}")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"cannot create temporary frontend junction: {completed.stdout}")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def remove_dependency_link(link: Path) -> None:
+    if not link.exists() and not link.is_symlink():
+        return
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "rmdir", str(link)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"cannot remove temporary frontend junction: {completed.stdout}")
+    else:
+        link.unlink()
+
+
+def build_frontends(full_source: Path, reference: Path, private_terms: list[str]) -> list[dict]:
+    """Build both public themes in the assembled tree, never in the reference tree."""
+    full_web = full_source / "web"
+    reference_web = reference / "web"
+    links = [(full_web / "node_modules", reference_web / "node_modules")]
+    for theme in ("default", "classic"):
+        links.append((full_web / theme / "node_modules", reference_web / theme / "node_modules"))
+    for link, target in links:
+        create_dependency_link(link, target)
+    receipts = []
+    try:
+        for theme in ("default", "classic"):
+            theme_root = full_web / theme
+            dist = theme_root / "dist"
+            if dist.exists():
+                shutil.rmtree(dist)
+            rsbuild = full_web / "node_modules" / ".bin" / ("rsbuild.cmd" if os.name == "nt" else "rsbuild")
+            command = [str(rsbuild), "build"]
+            if os.name == "nt":
+                command = ["cmd", "/d", "/s", "/c", str(rsbuild), "build"]
+            receipts.append(run(
+                command,
+                theme_root,
+                {**os.environ, "CI": "true", "NODE_ENV": "production"},
+                timeout=1800,
+            ))
+            if not (dist / "index.html").is_file():
+                raise RuntimeError(f"frontend build did not produce {dist / 'index.html'}")
+            files = [path for path in dist.rglob("*") if path.is_file()]
+            marker_hits = []
+            for path in files:
+                data = path.read_bytes()
+                text = data.decode("utf-8", errors="ignore")
+                for marker in private_terms:
+                    if marker.lower() in text.lower():
+                        marker_hits.append({"path": path.relative_to(full_source).as_posix(), "marker": marker})
+            if marker_hits:
+                raise RuntimeError(f"private branding marker found in {theme} bundle: {marker_hits[:5]}")
+    finally:
+        for link, _target in reversed(links):
+            remove_dependency_link(link)
+    return receipts
+
+
+def select_tree_files(root: Path) -> list[tuple[Path, Path, str]]:
+    selected = []
+    for source in root.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(root)
+        if is_denied_relative(relative):
+            raise RuntimeError(f"denied file found in assembled Full source: {relative.as_posix()}")
+        selected.append((source, relative, "assembled_full"))
+    return sorted(selected, key=lambda item: item[1].as_posix())
+
+
 def is_denied_relative(relative: Path) -> bool:
     lowered = {part.lower() for part in relative.parts}
     if lowered & DENIED_COMPONENTS:
@@ -111,34 +446,6 @@ def is_denied_relative(relative: Path) -> bool:
     if name == ".env" or name.startswith(".env."):
         return True
     return relative.suffix.lower() in DENIED_SUFFIXES
-
-
-def select_reference_files(reference: Path) -> list[tuple[Path, Path, str]]:
-    selected: dict[str, tuple[Path, Path, str]] = {}
-    for value in git_lines(reference, "ls-files"):
-        relative = Path(value)
-        source = reference / relative
-        if source.is_file() and not is_denied_relative(relative):
-            selected[relative.as_posix()] = (source, relative, "tracked")
-    for value in git_lines(reference, "ls-files", "--others", "--exclude-standard"):
-        relative = Path(value)
-        if not relative.parts or relative.parts[0] not in ALLOWED_UNTRACKED_ROOTS:
-            if relative.as_posix() != "main_migration_test.go":
-                continue
-        if is_denied_relative(relative) or relative.suffix.lower() not in ALLOWED_UNTRACKED_SUFFIXES:
-            continue
-        source = reference / relative
-        if source.is_file():
-            selected[relative.as_posix()] = (source, relative, "untracked_source")
-    for dist_relative in (Path("web/default/dist"), Path("web/classic/dist")):
-        dist = reference / dist_relative
-        if not dist.is_dir():
-            raise RuntimeError(f"required built frontend is missing: {dist}")
-        for source in dist.rglob("*"):
-            if source.is_file():
-                relative = source.relative_to(reference)
-                selected[relative.as_posix()] = (source, relative, "generated_frontend")
-    return [selected[key] for key in sorted(selected)]
 
 
 def snapshot_entries(items: list[tuple[Path, Path, str]]) -> list[dict]:
@@ -192,12 +499,12 @@ def copy_tree(source: Path, target: Path, ignore_names: set[str] | None = None) 
 def update_parts_manifest(path: Path, source_snapshot_id: str) -> None:
     text = path.read_text(encoding="utf-8")
     manifest = yaml.safe_load(text)
-    if manifest.get("manifest_version") != "2.0.0-alpha.1":
+    if manifest.get("manifest_version") != "3.0.0-alpha.1":
         raise RuntimeError("unexpected Agent Parts manifest version")
     reference = manifest.get("reference")
     if not isinstance(reference, dict):
         raise RuntimeError("Agent Parts reference contract is missing")
-    placeholder = "bound_by_v0_2_release_source_receipt"
+    placeholder = "bound_by_v0_3_release_source_receipt"
     if reference.get("baseline") != placeholder:
         raise RuntimeError("Agent Parts source baseline placeholder is missing or already bound")
     needle = f'  baseline: "{placeholder}"'
@@ -244,13 +551,7 @@ def assemble_repository(template: Path, reference: Path, target: Path, source_sn
     update_capability_matrix(target / "parts" / "manifest" / "capability-matrix.yaml")
 
 
-def assemble_full_source(
-    reference: Path, target: Path, items: list[tuple[Path, Path, str]], source_receipt: dict, repository: Path
-) -> None:
-    for source, relative, _kind in items:
-        destination = target / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+def attach_full_release_docs(target: Path, source_receipt: dict, repository: Path) -> None:
     release_docs = target / "smart-router-release"
     release_docs.mkdir(parents=True, exist_ok=True)
     for relative in (
@@ -267,6 +568,36 @@ def assemble_full_source(
         encoding="utf-8", newline="\n",
     )
     write_json(target / "SMART-ROUTER-SOURCE-SNAPSHOT.json", source_receipt)
+
+
+def frontend_source_digest(full_source: Path, relative: Path) -> str:
+    digest = hashlib.sha256()
+    root = full_source / relative
+    for source in sorted(path for path in root.rglob("*") if path.is_file() and "dist" not in path.parts):
+        path = source.relative_to(full_source).as_posix()
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256_file(source).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def verify_frontend_builds(full_source: Path) -> dict:
+    receipt = {"mode": "isolated_full_tree_production_build", "themes": {}}
+    for relative in (Path("web/default"), Path("web/classic")):
+        built = full_source / relative / "dist"
+        if not (built / "index.html").is_file():
+            raise RuntimeError(f"required isolated frontend build is missing: {built}")
+        source_digest = frontend_source_digest(full_source, relative)
+        receipt["themes"][relative.name] = {
+            "source_sha256": source_digest,
+            "bundle_files": len([path for path in built.rglob("*") if path.is_file()]),
+            "bundle_sha256": snapshot_id(snapshot_entries([
+                (path, path.relative_to(built), "frontend_bundle")
+                for path in sorted(item for item in built.rglob("*") if item.is_file())
+            ])),
+        }
+    return receipt
 
 
 def command_receipts(repository: Path, full_source: Path, go_binary: Path, run_full_tests: bool, build_linux: bool, binaries: Path) -> list[dict]:
@@ -403,13 +734,13 @@ def make_spdx(full_source: Path, source_snapshot_id: str) -> dict:
         "SPDXID": "SPDXRef-DOCUMENT",
         "name": f"NewAPI-Smart-Router-{RELEASE_VERSION}",
         "documentNamespace": f"https://github.com/ginsonko/newapi-smart-router/releases/tag/{RELEASE_VERSION}#{source_snapshot_id}",
-        "creationInfo": {"created": "2026-08-02T00:00:00Z", "creators": ["Tool: local-build-release-v1"]},
+        "creationInfo": {"created": "2026-08-19T00:00:00Z", "creators": ["Tool: local-build-release-v2"]},
         "packages": packages,
         "relationships": relationships,
         "annotations": [{
-            "annotationDate": "2026-08-02T00:00:00Z",
+            "annotationDate": "2026-08-19T00:00:00Z",
             "annotationType": "OTHER",
-            "annotator": "Tool: local-build-release-v1",
+            "annotator": "Tool: local-build-release-v2",
             "comment": "Public Alpha source SBOM. Image-layer, signature, and resolved-license certification remain Stable gates.",
         }],
     }
@@ -427,22 +758,41 @@ def archive_inventory(path: Path) -> dict:
 
 def main() -> int:
     script_root = Path(__file__).resolve().parent.parent
-    default_work = script_root.parent
+    default_work = script_root.parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", type=Path, default=script_root)
     parser.add_argument("--reference", type=Path, default=default_work / "new-api-smart-router")
+    parser.add_argument(
+        "--base-full-archive",
+        type=Path,
+        default=default_work / "publication" / "baselines" / "v0.2.0-alpha.1" /
+        "newapi-smart-router-v0.2.0-alpha.1-full-source.zip",
+    )
+    parser.add_argument(
+        "--overlay-manifest",
+        type=Path,
+        default=script_root / "full" / "reference-overlay-v0.3.json",
+    )
     parser.add_argument("--output", type=Path, default=default_work / "releases" / RELEASE_NAME)
     parser.add_argument("--go", type=Path, required=True)
+    parser.add_argument(
+        "--redact-term", action="append", default=[],
+        help="private literal to replace in assembled public Full text; values are never written to receipts",
+    )
     parser.add_argument("--run-full-tests", action="store_true")
     parser.add_argument("--build-linux", action="store_true")
     args = parser.parse_args()
 
     template = args.template.resolve(strict=True)
     reference = args.reference.resolve(strict=True)
+    base_full_archive = args.base_full_archive.resolve(strict=True)
+    overlay_manifest_path = args.overlay_manifest.resolve(strict=True)
     output = args.output.resolve()
     releases_root = output.parent.resolve()
     if template == reference or reference in output.parents or output in reference.parents:
         raise RuntimeError("template, reference, and output must be independent")
+    if output in base_full_archive.parents or output in overlay_manifest_path.parents:
+        raise RuntimeError("release inputs must not be nested inside output")
     if not args.go.resolve(strict=True).is_file():
         raise RuntimeError("Go executable was not found")
     ensure_safe_generated_root(output, releases_root)
@@ -452,8 +802,24 @@ def main() -> int:
     (staging / MARKER_NAME).write_text(RELEASE_NAME + "\n", encoding="utf-8")
 
     try:
-        selected = select_reference_files(reference)
-        before_entries = snapshot_entries(selected)
+        overlay_manifest = load_overlay_manifest(overlay_manifest_path)
+        selected = select_overlay_files(reference, overlay_manifest)
+        restored = select_reference_head_restores(reference, overlay_manifest)
+        translation_sources = select_translation_sources(reference, overlay_manifest)
+        overlay_entries = snapshot_entries(selected)
+        restore_entries = reference_restore_entries(restored)
+        translation_entries = snapshot_entries(translation_sources)
+        selected_paths = {relative.as_posix() for _source, relative, _kind in selected}
+        restore_paths = {item["relative"].as_posix() for item in restored}
+        if selected_paths & restore_paths:
+            raise RuntimeError(f"overlay and fixed-reference paths overlap: {sorted(selected_paths & restore_paths)}")
+        base_entry = {
+            "path": "@public-base/" + overlay_manifest["base"]["asset"],
+            "kind": "public_release_base",
+            "size": base_full_archive.stat().st_size,
+            "sha256": sha256_file(base_full_archive),
+        }
+        before_entries = [base_entry, *overlay_entries, *restore_entries, *translation_entries]
         current_snapshot_id = snapshot_id(before_entries)
         head = git_lines(reference, "rev-parse", "HEAD")[0]
         describe = git_lines(reference, "describe", "--tags", "--always", "--dirty")[0]
@@ -466,6 +832,12 @@ def main() -> int:
             "reference_describe": describe,
             "reference_dirty": bool(status_lines),
             "reference_status_sha256": hashlib.sha256("\n".join(status_lines).encode("utf-8")).hexdigest(),
+            "base_full": {
+                "release": overlay_manifest["base"].get("release"),
+                "asset": overlay_manifest["base"].get("asset"),
+                "sha256": base_entry["sha256"],
+            },
+            "overlay_manifest": overlay_manifest_path.relative_to(template).as_posix(),
             "source_snapshot_id": current_snapshot_id,
             "selected_file_count": len(before_entries),
             "files": before_entries,
@@ -481,15 +853,47 @@ def main() -> int:
         artifacts.mkdir()
         receipts.mkdir()
         assemble_repository(template, reference, repository, current_snapshot_id)
-        assemble_full_source(reference, full_source, selected, source_receipt, repository)
+        base_receipt = extract_verified_base(base_full_archive, full_source, overlay_manifest)
+        apply_overlay(full_source, selected)
+        apply_reference_head_restores(full_source, restored)
+        translation_receipt = merge_referenced_translations(
+            full_source, translation_sources, selected, overlay_manifest,
+        )
+        source_receipt["base_full"].update(base_receipt)
+        source_receipt["public_sanitization"] = sanitize_full_source(full_source, args.redact_term)
+        assembled_paths = sorted(
+            selected_paths |
+            restore_paths |
+            {relative.as_posix() for _source, relative, _kind in translation_sources}
+        )
+        assembled_overlay_items = [
+            (full_source / Path(relative), Path(relative), "r52_public_assembly")
+            for relative in assembled_paths
+        ]
+        source_receipt["overlay_sources"] = overlay_entries
+        source_receipt["fixed_reference_sources"] = restore_entries
+        source_receipt["translation_sources"] = translation_entries
+        source_receipt["translation_overlay"] = translation_receipt
+        source_receipt["files"] = [base_entry, *snapshot_entries(assembled_overlay_items)]
+        source_receipt["assembled_overlay_file_count"] = len(assembled_overlay_items)
+        frontend_receipts = build_frontends(full_source, reference, args.redact_term)
+        source_receipt["frontend_build"] = verify_frontend_builds(full_source)
+        source_receipt["assembled_full_file_count"] = len(select_tree_files(full_source))
+        attach_full_release_docs(full_source, source_receipt, repository)
         after_entries = snapshot_entries(selected)
-        if before_entries != after_entries:
+        after_restores = reference_restore_entries(select_reference_head_restores(reference, overlay_manifest))
+        after_translations = snapshot_entries(select_translation_sources(reference, overlay_manifest))
+        if (
+            overlay_entries != after_entries or restore_entries != after_restores or
+            translation_entries != after_translations or
+            base_entry["sha256"] != sha256_file(base_full_archive)
+        ):
             raise RuntimeError("reference source changed during snapshot; retry after parallel work settles")
         write_json(receipts / "source-snapshot.json", source_receipt)
 
-        build_receipts = command_receipts(
+        build_receipts = [*frontend_receipts, *command_receipts(
             repository, full_source, args.go, args.run_full_tests, args.build_linux, binaries,
-        )
+        )]
         python = sys.executable
         python_env = os.environ.copy()
         python_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -505,6 +909,8 @@ def main() -> int:
             (str(output), "<RELEASE_ROOT>"),
             (str(reference), "<REFERENCE_ROOT>"),
             (str(template), "<TEMPLATE_ROOT>"),
+            (str(base_full_archive), "<PUBLIC_BASE_ARCHIVE>"),
+            (str(overlay_manifest_path), "<OVERLAY_MANIFEST>"),
             (str(Path.home()), "<USER_HOME>"),
         ])
         write_json(receipts / "build-and-test.json", {"release": RELEASE_VERSION, "commands": build_receipts})

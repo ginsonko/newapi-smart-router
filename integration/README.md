@@ -40,3 +40,19 @@ An R39-equivalent integration additionally proves:
 
 See [the v0.2 contract delta](../docs/v0.2-contract-delta.md) before filling a
 host integration or parity manifest.
+
+## v0.3 integration evidence
+
+An R52-equivalent integration additionally records:
+
+- actual input/cache evidence and its expiry, proving it changes ordering only;
+- media price classes and capability contracts for token, per-request,
+  per-second, fixed-duration, and tiered pricing;
+- one-Key `/v1/models` discovery for authorized text, image, video, and audio
+  models, with exact-name or explicit-mapping-only cross-group routing;
+- group color metadata as UI-only state and the expanded retry/terminal error
+  taxonomy;
+- Web/Worker protocol `bridge-spi-v1alpha3` and identical artifact digests.
+
+These are evidence fields, not blanket parity claims. Unknown host revisions,
+missing hooks, or mismatched artifacts remain blocked.

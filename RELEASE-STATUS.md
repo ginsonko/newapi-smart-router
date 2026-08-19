@@ -1,6 +1,6 @@
 # Release status
 
-This tree is the public source repository for `v0.1.0-alpha.1`.
+This tree is the public source repository for `v0.3.0-alpha.1`.
 
 | Form | Runnable | Current status | Production claim |
 |---|---:|---|---|
@@ -55,3 +55,20 @@ The release remains a Pre-release. Stable still requires an exact current
 upstream Bridge certification, multi-database and lifecycle round trips,
 external non-production validation, signed artifacts and complete container
 supply-chain evidence.
+
+## v0.3.0-alpha.1 additive status
+
+The v0.3 candidate preserves the four primary forms and adds the R52 contract:
+
+| Form | v0.3 content | Remaining boundary |
+|---|---|---|
+| Full compatibility distribution | Published v0.2 Full base plus explicit R52 overlay and isolated default/classic builds | Exact reference-host acceptance; no universal fork claim |
+| Certified Bridge Add-on candidate | `bridge-spi-v1alpha3`, actual-cost/media/discovery/UI/error observations | Exact host commit and all semantic Hook gates are still uncertified |
+| Custom Fork Integration Kit | R52 doctor notes, schemas, vectors and multimodal/error checklist | Host Hooks and database/lifecycle evidence remain required |
+| Agent Parts Kit | 20-file synchronized core with cost/cache/media modules and vectors | Development Kit / Not runnable |
+
+The public release documents real cache-rate evidence, output-price-aware ordering,
+group colors, exact model mapping, one-Key multimodal discovery and expanded
+retry/error handling. These features do not change the host's actual billing
+formula. Sidecar Lite remains an experimental appendix and is not a fifth
+Full-parity form.
