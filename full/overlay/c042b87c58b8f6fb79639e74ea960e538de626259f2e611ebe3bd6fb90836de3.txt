@@ -1,0 +1,1792 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/go-redis/redis/v8"
+)
+
+const smartRouteRecoveryHintFreshness = 15 * time.Minute
+
+var ErrSmartRouteProbeExecutorUnavailable = errors.New("smart router probe executor is unavailable")
+
+// SmartRouteRecoveryHintSink is deliberately non-blocking. Foreground request
+// handling only publishes immutable route metadata; it never waits for the
+// background worker or an upstream recovery attempt.
+type SmartRouteRecoveryHintSink interface {
+	Hint(SmartRouteRecoveryHint)
+}
+
+type SmartRouteColdStartSuccessSink interface {
+	ColdStartSucceeded(smartrouter.RouteRequest, string)
+}
+
+type SmartRouteProbeEnqueueDisposition string
+
+const (
+	SmartRouteProbeEnqueued          SmartRouteProbeEnqueueDisposition = "queued"
+	SmartRouteProbeAlreadyQueued     SmartRouteProbeEnqueueDisposition = "already_queued"
+	SmartRouteProbeQueueFull         SmartRouteProbeEnqueueDisposition = "queue_full"
+	SmartRouteProbeWorkerUnavailable SmartRouteProbeEnqueueDisposition = "worker_unavailable"
+	SmartRouteProbeUnsupported       SmartRouteProbeEnqueueDisposition = "unsupported"
+	SmartRouteProbeNotDue            SmartRouteProbeEnqueueDisposition = "not_due"
+)
+
+type SmartRouteManualProbeSink interface {
+	ScheduleRoute(string, smartrouter.RouteContract, smartrouter.CertifiedRoute) SmartRouteProbeEnqueueDisposition
+}
+
+// RedisSmartRouteRecoveryHintPublisher is installed on Web-only processes. It
+// performs no probes; it only publishes bounded, non-sensitive demand hints
+// for a separately running worker.
+type RedisSmartRouteRecoveryHintPublisher struct {
+	settings   func() smartroutersetting.Setting
+	sem        chan struct{}
+	successSem chan struct{}
+}
+
+func NewRedisSmartRouteRecoveryHintPublisher(settings func() smartroutersetting.Setting) *RedisSmartRouteRecoveryHintPublisher {
+	if settings == nil {
+		settings = smartroutersetting.GetSmartRouterSettingSnapshot
+	}
+	return &RedisSmartRouteRecoveryHintPublisher{
+		settings: settings, sem: make(chan struct{}, 4), successSem: make(chan struct{}, 8),
+	}
+}
+
+func (publisher *RedisSmartRouteRecoveryHintPublisher) Hint(hint SmartRouteRecoveryHint) {
+	if publisher == nil || common.RDB == nil || !common.RedisEnabled ||
+		!smartrouter.IsSyntheticProbeSafe(hint.Request.ReplayClass) {
+		return
+	}
+	setting := smartroutersetting.Normalize(publisher.settings())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return
+	}
+	if jobs, _, hasVirgin := smartRouteColdStartJobs(hint); hasVirgin && len(jobs) > 0 &&
+		strings.TrimSpace(hint.ForegroundPhysicalKey) == "" {
+		// The pre-plan hint cannot know which virgin route the foreground owns.
+		// Publish existing failures now, but wait for the post-plan hint before
+		// turning virgin routes into a durable discovery wave.
+		hint = smartRouteRecoveryHintWithoutVirginRoutes(hint)
+		if len(hint.Routes) == 0 {
+			return
+		}
+	}
+	if !SmartRouteSyntheticProbeAllowed(hint.Request.Endpoint, hint.Request.CanonicalModel, hint.Routes...) ||
+		!smartRouteRecoveryHintHasScheduledWork(hint, time.Now().UnixMilli()) {
+		return
+	}
+	persistSmartRouteRecoveryHintAsync(publisher.sem, hint, setting.ProbeQueueCapacity)
+}
+
+func (publisher *RedisSmartRouteRecoveryHintPublisher) ColdStartSucceeded(
+	request smartrouter.RouteRequest,
+	physicalKey string,
+) {
+	if publisher == nil {
+		return
+	}
+	persistSmartRouteColdStartSuccess(publisher.successSem, request, physicalKey)
+}
+
+func (publisher *RedisSmartRouteRecoveryHintPublisher) ScheduleRoute(
+	catalogVersion string,
+	contract smartrouter.RouteContract,
+	route smartrouter.CertifiedRoute,
+) SmartRouteProbeEnqueueDisposition {
+	if publisher == nil || !supportedSyntheticTextProbeEndpoint(contract.Endpoint) {
+		return SmartRouteProbeUnsupported
+	}
+	setting := smartroutersetting.Normalize(publisher.settings())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled || common.RDB == nil || !common.RedisEnabled {
+		return SmartRouteProbeWorkerUnavailable
+	}
+	hint := manualSmartRouteRecoveryHint(catalogVersion, contract, route, setting.DefaultPolicy)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	disposition, err := persistSmartRouteRecoveryHint(ctx, hint, setting.ProbeQueueCapacity)
+	if err != nil {
+		return SmartRouteProbeWorkerUnavailable
+	}
+	return disposition
+}
+
+type SmartRouteRecoveryHint struct {
+	CatalogVersion string
+	ScopeKey       string
+	// ForegroundPhysicalKey is the exact physical route selected by the planner
+	// for the request that opened an all-virgin discovery wave.
+	ForegroundPhysicalKey string
+	Request               smartrouter.RouteRequest
+	Policy                smartrouter.Policy
+	ForceProbe            bool
+	UserGroup             string
+	AllowedGroups         []string
+	Routes                []smartrouter.CertifiedRoute
+	Prices                smartrouter.PriceSnapshot
+	Runtime               SmartRouteRuntimeSnapshot
+	ExcludedRoutes        []string
+	DurableKey            string `json:"-"`
+}
+
+type SmartRouteProbeExecutionRequest struct {
+	CatalogVersion   string
+	ContractID       string
+	CanonicalModel   string
+	Endpoint         string
+	Route            smartrouter.CertifiedRoute
+	FirstTextTimeout time.Duration
+	CompletionGrace  time.Duration
+}
+
+type SmartRouteProbeExecutionResult struct {
+	Outcome      SmartRouteOutcome
+	RetryAfter   time.Duration
+	TTFE         time.Duration
+	TTFEObserved bool
+	TTFT         time.Duration
+	TTFTObserved bool
+	Completed    bool
+}
+
+type SmartRouteProbeExecutor interface {
+	ExecuteSmartRouteProbe(context.Context, SmartRouteProbeExecutionRequest) SmartRouteProbeExecutionResult
+}
+
+type SmartRouteProbeExecutorFunc func(context.Context, SmartRouteProbeExecutionRequest) SmartRouteProbeExecutionResult
+
+func (execute SmartRouteProbeExecutorFunc) ExecuteSmartRouteProbe(
+	ctx context.Context,
+	request SmartRouteProbeExecutionRequest,
+) SmartRouteProbeExecutionResult {
+	return execute(ctx, request)
+}
+
+type SmartRouteProbeWorkerStats struct {
+	HeartbeatAtMS             int64  `json:"heartbeat_at_ms"`
+	Queued                    int64  `json:"queued"`
+	Running                   int64  `json:"running"`
+	Limit                     int64  `json:"limit"`
+	BudgetPerMinute           int64  `json:"budget_per_minute"`
+	Succeeded                 int64  `json:"succeeded"`
+	Failed                    int64  `json:"failed"`
+	Deferred                  int64  `json:"deferred"`
+	Dropped                   int64  `json:"dropped"`
+	LastDeferReason           string `json:"last_defer_reason,omitempty"`
+	LastTTFEMS                int64  `json:"last_ttfe_ms,omitempty"`
+	LastTTFTMS                int64  `json:"last_ttft_ms,omitempty"`
+	LastRunAtMS               int64  `json:"last_run_at_ms"`
+	LastRecoverySweepAtMS     int64  `json:"last_recovery_sweep_at_ms"`
+	LastRecoverySweepDoneAtMS int64  `json:"last_recovery_sweep_done_at_ms"`
+	RecoverySweepScheduled    int64  `json:"recovery_sweep_scheduled"`
+	RecoverySweepFailures     int64  `json:"recovery_sweep_failures"`
+}
+
+type smartRouteProbeJob struct {
+	key             string
+	catalogVersion  string
+	contractID      string
+	canonicalModel  string
+	endpoint        string
+	route           smartrouter.CertifiedRoute
+	aliases         map[string]smartrouter.CertifiedRoute
+	ratioPPM        int64
+	priceKnown      bool
+	forceProbe      bool
+	notBefore       time.Time
+	lastHint        time.Time
+	coldStartWaves  map[string]struct{}
+	coldStartRank   int
+	coldStartManual bool
+	coverageRank    int
+	// durableKey is the physical schedule identity stored in Redis. The item is
+	// acknowledged only after authoritative state says recovery is no longer
+	// due; merely handing it to an in-memory worker never deletes it.
+	durableKey  string
+	durableKeys map[string]struct{}
+}
+
+func cloneSmartRouteProbeJob(job *smartRouteProbeJob) *smartRouteProbeJob {
+	if job == nil {
+		return nil
+	}
+	cloned := *job
+	if job.aliases != nil {
+		cloned.aliases = make(map[string]smartrouter.CertifiedRoute, len(job.aliases))
+		for routeID, route := range job.aliases {
+			cloned.aliases[routeID] = route
+		}
+	}
+	if job.coldStartWaves != nil {
+		cloned.coldStartWaves = make(map[string]struct{}, len(job.coldStartWaves))
+		for waveKey := range job.coldStartWaves {
+			cloned.coldStartWaves[waveKey] = struct{}{}
+		}
+	}
+	if job.durableKeys != nil {
+		cloned.durableKeys = make(map[string]struct{}, len(job.durableKeys))
+		for durableKey := range job.durableKeys {
+			cloned.durableKeys[durableKey] = struct{}{}
+		}
+	}
+	return &cloned
+}
+
+type SmartRouteProbeWorker struct {
+	engine   *SmartRouterEngine
+	executor SmartRouteProbeExecutor
+	settings func() smartroutersetting.Setting
+
+	mu               sync.Mutex
+	pending          map[string]*smartRouteProbeJob
+	running          map[string]struct{}
+	runningColdStart map[string]*smartRouteProbeJob
+	coldStartWaves   map[string]*smartRouteColdStartWave
+	closed           bool
+	lastDeferReason  string
+	wake             chan struct{}
+	done             chan struct{}
+	stop             chan struct{}
+	ctx              context.Context
+	cancel           context.CancelFunc
+	owner            string
+	wg               sync.WaitGroup
+	start            sync.Once
+	close            sync.Once
+	persistSem       chan struct{}
+	successSem       chan struct{}
+
+	succeeded   atomic.Int64
+	failed      atomic.Int64
+	deferred    atomic.Int64
+	dropped     atomic.Int64
+	lastRunMS   atomic.Int64
+	heartbeatMS atomic.Int64
+	lastTTFEMS  atomic.Int64
+	lastTTFTMS  atomic.Int64
+
+	recoverySweepRunning    atomic.Bool
+	lastRecoverySweepMS     atomic.Int64
+	lastRecoverySweepDoneMS atomic.Int64
+	recoverySweepScheduled  atomic.Int64
+	recoverySweepFailures   atomic.Int64
+}
+
+func NewSmartRouteProbeWorker(
+	engine *SmartRouterEngine,
+	executor SmartRouteProbeExecutor,
+) (*SmartRouteProbeWorker, error) {
+	if engine == nil || engine.State == nil || engine.Settings == nil {
+		return nil, errors.New("smart router probe worker dependencies are incomplete")
+	}
+	if executor == nil {
+		return nil, ErrSmartRouteProbeExecutorUnavailable
+	}
+	return &SmartRouteProbeWorker{
+		engine: engine, executor: executor, settings: engine.Settings,
+		pending: make(map[string]*smartRouteProbeJob), running: make(map[string]struct{}),
+		runningColdStart: make(map[string]*smartRouteProbeJob),
+		coldStartWaves:   make(map[string]*smartRouteColdStartWave),
+		wake:             make(chan struct{}, 1), done: make(chan struct{}), stop: make(chan struct{}),
+		persistSem: make(chan struct{}, 4), successSem: make(chan struct{}, 8),
+		owner: common.NodeName + ":" + common.NewRequestId(),
+	}, nil
+}
+
+func (worker *SmartRouteProbeWorker) Start() {
+	if worker == nil {
+		return
+	}
+	worker.start.Do(func() {
+		worker.mu.Lock()
+		if worker.closed {
+			worker.mu.Unlock()
+			close(worker.done)
+			return
+		}
+		worker.ctx, worker.cancel = context.WithCancel(context.Background())
+		worker.heartbeatMS.Store(time.Now().UnixMilli())
+		worker.mu.Unlock()
+		worker.engine.SetRecoveryHintSink(worker)
+		worker.restoreDurableHints()
+		worker.publishStats()
+		worker.wg.Add(1)
+		go worker.heartbeatLoop()
+		go worker.loop()
+	})
+}
+
+func (worker *SmartRouteProbeWorker) Close() {
+	if worker == nil {
+		return
+	}
+	worker.close.Do(func() {
+		worker.mu.Lock()
+		worker.closed = true
+		cancel := worker.cancel
+		worker.mu.Unlock()
+		// Release v4.3 wave ownership before the old worker disappears so a blue/
+		// green successor does not wait for the two-minute Redis TTL.
+		ownedWaveKeys := worker.pauseColdStartWaves()
+		if common.RedisEnabled && common.RDB != nil {
+			worker.engine.SetRecoveryHintSink(NewRedisSmartRouteRecoveryHintPublisher(worker.settings))
+		} else {
+			worker.engine.SetRecoveryHintSink(nil)
+		}
+		if cancel != nil {
+			cancel()
+		}
+		close(worker.stop)
+		worker.start.Do(func() { close(worker.done) })
+		<-worker.done
+		worker.wg.Wait()
+		// A heartbeat that was already in flight when shutdown began may have
+		// renewed a lock after the first release. No goroutine can renew again at
+		// this point, so the second bounded batch release is the final hand-off.
+		worker.releaseColdStartWaveOwnershipsNow(ownedWaveKeys)
+		worker.clearPublishedStats()
+	})
+}
+
+func (worker *SmartRouteProbeWorker) Hint(hint SmartRouteRecoveryHint) {
+	_ = worker.hint(hint, true)
+}
+
+func (worker *SmartRouteProbeWorker) hint(
+	hint SmartRouteRecoveryHint,
+	persist bool,
+) SmartRouteProbeEnqueueDisposition {
+	if worker == nil || !smartrouter.IsSyntheticProbeSafe(hint.Request.ReplayClass) ||
+		!SmartRouteSyntheticProbeAllowed(hint.Request.Endpoint, hint.Request.CanonicalModel, hint.Routes...) {
+		return SmartRouteProbeUnsupported
+	}
+	setting := smartroutersetting.Normalize(worker.settings())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return SmartRouteProbeWorkerUnavailable
+	}
+	coldStartDisposition, coldStartHandled := worker.handleColdStartHint(hint, setting)
+	allowed := stringSetService(hint.AllowedGroups)
+	excludedGroups := stringSetService(hint.Policy.ExcludedGroups)
+	excluded := stringSetService(append(append([]string(nil), hint.Policy.ExcludedRoutes...), hint.ExcludedRoutes...))
+	aliasesByPhysicalKey := make(map[string]map[string]smartrouter.CertifiedRoute)
+	for _, route := range hint.Routes {
+		key := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		if key == "" || route.RouteID == "" {
+			continue
+		}
+		aliases := aliasesByPhysicalKey[key]
+		if aliases == nil {
+			aliases = make(map[string]smartrouter.CertifiedRoute)
+			aliasesByPhysicalKey[key] = aliases
+		}
+		aliases[route.RouteID] = route
+	}
+	now := time.Now()
+	disposition := coldStartDisposition
+	generalScheduled := false
+	for _, route := range hint.Routes {
+		if !allowed[route.Group] || !hint.Policy.AllowsGroup(route.Group) || excludedGroups[route.Group] || excluded[route.RouteID] {
+			continue
+		}
+		ratio, priced := hint.Prices.RatiosPPM[route.RouteID]
+		if len(hint.Prices.RatiosPPM) > 0 {
+			if !priced || (hint.Policy.MaxEffectiveRatioPPM > 0 && ratio > hint.Policy.MaxEffectiveRatioPPM) {
+				continue
+			}
+		}
+		if route.RouteID == "" {
+			continue
+		}
+		quality, ok := hint.Runtime.Quality.Routes[route.RouteID]
+		if !ok {
+			quality = smartrouter.InitialQuality(route.StableFallback)
+		}
+		// A selected virgin route belongs to the foreground plus the bounded
+		// cold-start wave. Keeping it out of the ordinary recovery queue avoids
+		// racing the foreground probe lease and avoids probing every virgin route
+		// before the planner has established which one the user request owns.
+		if coldStartHandled && !hint.ForceProbe && smartrouter.IsVirginUnknown(quality) {
+			continue
+		}
+		if !hint.ForceProbe && !smartRouteRecoveryDue(quality, now.UnixMilli()) {
+			continue
+		}
+		probeAt := smartRouteSyntheticRecoveryAt(quality, setting)
+		if probeAt < 0 {
+			continue
+		}
+		generalScheduled = true
+		notBefore := now
+		if !hint.ForceProbe {
+			notBefore = smartRouteRecoveryNotBefore(quality, now)
+		}
+		if probeAt > notBefore.UnixMilli() {
+			notBefore = time.UnixMilli(probeAt)
+		}
+		physicalKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		durableKey := hint.DurableKey
+		if durableKey == "" {
+			durableKey = physicalKey
+		}
+		current := worker.enqueue(smartRouteProbeJob{
+			key:            physicalKey,
+			catalogVersion: hint.CatalogVersion, contractID: hint.Request.ContractID,
+			canonicalModel: hint.Request.CanonicalModel, endpoint: hint.Request.Endpoint,
+			route: route, aliases: aliasesByPhysicalKey[physicalKey],
+			ratioPPM: ratio, priceKnown: priced, forceProbe: hint.ForceProbe,
+			notBefore: notBefore, lastHint: now, durableKey: durableKey,
+			durableKeys: map[string]struct{}{durableKey: {}},
+		}, setting.ProbeQueueCapacity)
+		if current == SmartRouteProbeEnqueued || disposition == SmartRouteProbeNotDue {
+			disposition = current
+		}
+	}
+	if persist && (generalScheduled || coldStartDisposition == SmartRouteProbeEnqueued ||
+		coldStartDisposition == SmartRouteProbeAlreadyQueued || coldStartDisposition == SmartRouteProbeQueueFull) {
+		// Foreground routing publishes a recovery hint on every re-plan. Persist
+		// only work actually owned by either the ordinary recovery queue or a
+		// post-plan cold-start wave; healthy and pre-plan virgin snapshots are not
+		// durable jobs.
+		worker.persistDurableHint(hint)
+	}
+	return disposition
+}
+
+// ScheduleRoute queues an administrator-triggered synthetic check. Media
+// routes return an explicit unsupported disposition and recover through
+// natural traffic.
+func (worker *SmartRouteProbeWorker) ScheduleRoute(
+	catalogVersion string,
+	contract smartrouter.RouteContract,
+	route smartrouter.CertifiedRoute,
+) SmartRouteProbeEnqueueDisposition {
+	if worker == nil || !supportedSyntheticTextProbeEndpoint(contract.Endpoint) {
+		return SmartRouteProbeUnsupported
+	}
+	setting := smartroutersetting.Normalize(worker.settings())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return SmartRouteProbeWorkerUnavailable
+	}
+	worker.mu.Lock()
+	available := !worker.closed && worker.ctx != nil
+	worker.mu.Unlock()
+	if !available {
+		return SmartRouteProbeWorkerUnavailable
+	}
+	hint := manualSmartRouteRecoveryHint(catalogVersion, contract, route, setting.DefaultPolicy)
+	hint.Routes = worker.physicalProbeAliases(catalogVersion, contract.ContractID, route)
+	hint.AllowedGroups = make([]string, 0, len(hint.Routes))
+	for _, alias := range hint.Routes {
+		hint.AllowedGroups = append(hint.AllowedGroups, alias.Group)
+	}
+	if common.RedisEnabled && common.RDB != nil {
+		// The HTTP action is acknowledged only after the operation is durable.
+		// The local enqueue is an optimization; a worker crash after this write
+		// leaves the due item available to another worker after its lease expires.
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		durableDisposition, err := persistSmartRouteRecoveryHint(ctx, hint, setting.ProbeQueueCapacity)
+		cancel()
+		if err != nil {
+			return SmartRouteProbeWorkerUnavailable
+		}
+		if durableDisposition == SmartRouteProbeQueueFull || durableDisposition == SmartRouteProbeNotDue {
+			return durableDisposition
+		}
+		localDisposition := worker.hint(hint, false)
+		if localDisposition == SmartRouteProbeUnsupported || localDisposition == SmartRouteProbeWorkerUnavailable {
+			return localDisposition
+		}
+		return durableDisposition
+	}
+	return worker.hint(hint, false)
+}
+
+func (worker *SmartRouteProbeWorker) physicalProbeAliases(
+	catalogVersion string,
+	contractID string,
+	primary smartrouter.CertifiedRoute,
+) []smartrouter.CertifiedRoute {
+	result := []smartrouter.CertifiedRoute{primary}
+	if worker == nil || worker.engine == nil || worker.engine.Catalogs == nil {
+		return result
+	}
+	catalog, ok := worker.engine.Catalogs.Current()
+	if !ok || catalog == nil || catalog.Version != catalogVersion {
+		return result
+	}
+	entry, ok := catalog.Contracts[contractID]
+	if !ok {
+		return result
+	}
+	aliases := make(map[string]smartrouter.CertifiedRoute)
+	for _, pool := range entry.Pools {
+		for _, route := range pool.Candidates {
+			if route.RouteID == primary.RouteID || route.ChannelID != primary.ChannelID ||
+				route.ChannelGeneration != primary.ChannelGeneration || route.UpstreamModel != primary.UpstreamModel {
+				continue
+			}
+			aliases[route.RouteID] = route
+		}
+	}
+	ordered := mapSmartRouteAliases(aliases)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].RouteID < ordered[j].RouteID })
+	return append(result, ordered...)
+}
+
+func (worker *SmartRouteProbeWorker) enqueue(
+	job smartRouteProbeJob,
+	capacity int,
+) SmartRouteProbeEnqueueDisposition {
+	if job.key == "" || capacity < 1 {
+		return SmartRouteProbeQueueFull
+	}
+	worker.mu.Lock()
+	if worker.closed {
+		worker.mu.Unlock()
+		return SmartRouteProbeWorkerUnavailable
+	}
+	if current := worker.pending[job.key]; current != nil {
+		mergeSmartRouteProbeJob(current, &job)
+		current.forceProbe = current.forceProbe || job.forceProbe
+		worker.mu.Unlock()
+		worker.signal()
+		return SmartRouteProbeAlreadyQueued
+	}
+	if _, running := worker.running[job.key]; running {
+		worker.mu.Unlock()
+		return SmartRouteProbeAlreadyQueued
+	}
+	if len(worker.pending) >= capacity {
+		worker.mu.Unlock()
+		worker.dropped.Add(1)
+		return SmartRouteProbeQueueFull
+	}
+	copyJob := job
+	worker.pending[job.key] = &copyJob
+	worker.mu.Unlock()
+	worker.signal()
+	return SmartRouteProbeEnqueued
+}
+
+func (worker *SmartRouteProbeWorker) signal() {
+	select {
+	case worker.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (worker *SmartRouteProbeWorker) loop() {
+	defer close(worker.done)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-worker.stop:
+			return
+		case <-worker.wake:
+		case <-timer.C:
+		}
+		setting := smartroutersetting.Normalize(worker.settings())
+		if !setting.Enabled || !setting.BackgroundProbeEnabled {
+			worker.pauseColdStartWaves()
+			delay := time.Duration(setting.ProbeScanIntervalMS) * time.Millisecond
+			if delay < 100*time.Millisecond {
+				delay = 100 * time.Millisecond
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(delay)
+			continue
+		}
+		worker.restoreDurableHints()
+		worker.maybeScheduleCatalogRecoverySweep(setting)
+		worker.dispatch(setting)
+		delay := time.Duration(setting.ProbeScanIntervalMS) * time.Millisecond
+		if delay < 100*time.Millisecond {
+			delay = 100 * time.Millisecond
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(delay)
+	}
+}
+
+func (worker *SmartRouteProbeWorker) heartbeatLoop() {
+	defer worker.wg.Done()
+	interval := 15 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-worker.stop:
+			return
+		case <-ticker.C:
+			setting := smartroutersetting.Normalize(worker.settings())
+			if setting.Enabled && setting.BackgroundProbeEnabled {
+				worker.renewActiveColdStartWaveOwnerships(setting)
+			} else {
+				worker.pauseColdStartWaves()
+			}
+			worker.publishStats()
+		}
+	}
+}
+
+func (worker *SmartRouteProbeWorker) dispatch(setting smartroutersetting.Setting) {
+	worker.heartbeatMS.Store(time.Now().UnixMilli())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		worker.pauseColdStartWaves()
+		return
+	}
+	now := time.Now()
+	worker.mu.Lock()
+	worker.pruneStaleColdStartWavesLocked(now)
+	worker.scheduleAllColdStartWavesLocked(setting)
+	coldRunning := len(worker.runningColdStart)
+	normalRunning := len(worker.running) - coldRunning
+	coldAvailable := setting.ColdStartWaveMaxConcurrency - coldRunning
+	normalAvailable := setting.ProbeMaxConcurrency - normalRunning
+	if coldAvailable < 0 {
+		coldAvailable = 0
+	}
+	if normalAvailable < 0 {
+		normalAvailable = 0
+	}
+	if coldAvailable+normalAvailable <= 0 {
+		worker.mu.Unlock()
+		return
+	}
+	due := make([]*smartRouteProbeJob, 0, len(worker.pending))
+	for _, job := range worker.pending {
+		if !job.notBefore.After(now) {
+			due = append(due, job)
+		}
+	}
+	sort.SliceStable(due, func(left, right int) bool {
+		return smartRouteProbeJobLess(due[left], due[right])
+	})
+	jobs := make([]*smartRouteProbeJob, 0, coldAvailable+normalAvailable)
+	selectedByWave := make(map[string]int)
+	selectNamespace := func(cold bool, limit int) {
+		selected := 0
+		for _, job := range due {
+			if selected >= limit || (len(job.coldStartWaves) > 0) != cold {
+				continue
+			}
+			if _, stillPending := worker.pending[job.key]; !stillPending ||
+				!worker.coldStartDispatchAllowedLocked(job, selectedByWave, setting) {
+				continue
+			}
+			key := job.key
+			delete(worker.pending, key)
+			worker.running[key] = struct{}{}
+			worker.markColdStartJobRunningLocked(job)
+			for waveKey := range job.coldStartWaves {
+				selectedByWave[waveKey]++
+			}
+			if cold {
+				worker.runningColdStart[key] = job
+			}
+			jobs = append(jobs, cloneSmartRouteProbeJob(job))
+			selected++
+		}
+	}
+	// Each namespace keeps its own dispatch lane; a large ordinary recovery
+	// backlog cannot consume the slots reserved for first-call discovery.
+	selectNamespace(true, coldAvailable)
+	selectNamespace(false, normalAvailable)
+	worker.mu.Unlock()
+	for _, job := range jobs {
+		worker.wg.Add(1)
+		go func(job *smartRouteProbeJob) {
+			defer worker.wg.Done()
+			worker.execute(job, setting)
+		}(job)
+	}
+}
+
+// RunOne executes one due job synchronously. It is used by isolated workers,
+// deterministic verification, and operational drain commands; normal service
+// mode uses Start and the concurrent dispatcher.
+func (worker *SmartRouteProbeWorker) RunOne() bool {
+	if worker == nil {
+		return false
+	}
+	setting := smartroutersetting.Normalize(worker.settings())
+	worker.heartbeatMS.Store(time.Now().UnixMilli())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		worker.pauseColdStartWaves()
+		return false
+	}
+	now := time.Now()
+	worker.mu.Lock()
+	jobs := make([]*smartRouteProbeJob, 0, len(worker.pending))
+	for _, job := range worker.pending {
+		if !job.notBefore.After(now) {
+			jobs = append(jobs, job)
+		}
+	}
+	sort.SliceStable(jobs, func(left, right int) bool {
+		return smartRouteProbeJobLess(jobs[left], jobs[right])
+	})
+	if len(jobs) == 0 {
+		worker.mu.Unlock()
+		return false
+	}
+	var job *smartRouteProbeJob
+	for _, candidate := range jobs {
+		if worker.coldStartDispatchAllowedLocked(candidate, map[string]int{}, setting) {
+			job = candidate
+			break
+		}
+	}
+	if job == nil {
+		worker.mu.Unlock()
+		return false
+	}
+	delete(worker.pending, job.key)
+	worker.running[job.key] = struct{}{}
+	worker.markColdStartJobRunningLocked(job)
+	if len(job.coldStartWaves) > 0 {
+		worker.runningColdStart[job.key] = job
+	}
+	executionJob := cloneSmartRouteProbeJob(job)
+	worker.mu.Unlock()
+	worker.execute(executionJob, setting)
+	return true
+}
+
+func (worker *SmartRouteProbeWorker) execute(job *smartRouteProbeJob, setting smartroutersetting.Setting) {
+	defer func() {
+		worker.coldStartJobStopped(job)
+		worker.mu.Lock()
+		delete(worker.running, job.key)
+		delete(worker.runningColdStart, job.key)
+		if setting.Enabled && setting.BackgroundProbeEnabled {
+			worker.scheduleAllColdStartWavesLocked(setting)
+		}
+		worker.mu.Unlock()
+		worker.signal()
+	}()
+	// Recheck after queue restore/selection: neither a stale hint nor a hot
+	// configuration change may authorize a media generation.
+	setting = smartroutersetting.Normalize(worker.settings())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return
+	}
+	if !SmartRouteSyntheticProbeAllowed(job.endpoint, job.canonicalModel, mapSmartRouteAliases(job.aliases)...) ||
+		!SmartRouteSyntheticProbeAllowed(job.endpoint, job.canonicalModel, job.route) {
+		worker.ackDurableRecovery(job)
+		worker.dropped.Add(1)
+		return
+	}
+	worker.lastRunMS.Store(time.Now().UnixMilli())
+
+	worker.mu.Lock()
+	workerContext := worker.ctx
+	worker.mu.Unlock()
+	if workerContext == nil {
+		workerContext = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(workerContext,
+		time.Duration(setting.ProbeTimeoutSeconds+setting.ProbeCompletionGraceSeconds+15)*time.Second)
+	defer cancel()
+	if !worker.renewColdStartJobOwnership(job, setting) {
+		worker.abandonColdStartJobWaves(job)
+		return
+	}
+	if worker.absorbSharedColdStartSuccesses(job, setting) {
+		return
+	}
+	runtime, err := worker.engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(mapSmartRouteAliases(job.aliases)),
+	})
+	if err != nil {
+		worker.noteDeferred("state_unavailable")
+		delay := smartRouteProbeRetryDelay(setting, "state_unavailable")
+		if !worker.deferColdStartJob(job, setting, delay) {
+			worker.requeue(job, setting, delay)
+		}
+		worker.rescheduleDurableRecovery(job, time.Now().Add(delay), nil)
+		return
+	}
+	if len(job.coldStartWaves) > 0 && smartRouteJobHasCurrentSuccess(runtime, job) {
+		worker.completeColdStartSuccess(smartrouter.RouteRequest{
+			ContractID: job.contractID, CanonicalModel: job.canonicalModel, Endpoint: job.endpoint,
+		}, job.key)
+		return
+	}
+	quality := runtime.Quality.Routes[job.route.RouteID]
+	probeAt := smartRouteSyntheticRecoveryAt(quality, setting)
+	if probeAt < 0 {
+		worker.ackDurableRecovery(job)
+		return
+	}
+	if probeAt > time.Now().UnixMilli() {
+		delay := time.Until(time.UnixMilli(probeAt))
+		worker.requeue(job, setting, delay)
+		worker.rescheduleDurableRecovery(job, time.UnixMilli(probeAt), &runtime)
+		return
+	}
+	if !job.forceProbe && !smartRouteRecoveryDue(quality, time.Now().UnixMilli()) {
+		if len(job.coldStartWaves) > 0 {
+			if smartRouteQualityHasCurrentSuccess(quality) {
+				worker.completeColdStartSuccess(smartrouter.RouteRequest{
+					ContractID: job.contractID, CanonicalModel: job.canonicalModel, Endpoint: job.endpoint,
+				}, job.key)
+			} else {
+				worker.finishColdStartJob(job, false, setting)
+			}
+		} else {
+			worker.ackDurableRecovery(job)
+		}
+		return
+	}
+	capacity, err := worker.engine.State.TryAcquireCapacity(ctx, SmartRouteCapacityRequest{
+		CapacityDomain: job.route.CapacityDomain, MaxInflight: job.route.MaxInflight,
+		StableFallback: job.route.StableFallback, QueueMode: smartrouter.QueueModeNoQueue,
+		IdleOnly: true,
+	})
+	if err != nil || !capacity.Granted() {
+		worker.noteDeferred("capacity_busy")
+		delay := smartRouteProbeRetryDelay(setting, "capacity_busy")
+		if !worker.deferColdStartJob(job, setting, delay) {
+			worker.requeue(job, setting, delay)
+		}
+		worker.rescheduleDurableRecovery(job, time.Now().Add(delay), &runtime)
+		return
+	}
+	budgetLimit := setting.ProbeBudgetPerMinute
+	maxConcurrency := setting.ProbeMaxConcurrency
+	budgetNamespace := SmartRouteProbeBudgetRecovery
+	if len(job.coldStartWaves) > 0 {
+		budgetLimit = setting.ColdStartProbeBudgetPerMinute
+		maxConcurrency = setting.ColdStartWaveMaxConcurrency
+		budgetNamespace = SmartRouteProbeBudgetColdStart
+	}
+	probe, acquired, err := worker.engine.State.TryAcquireProbe(ctx, SmartRouteProbeRequest{
+		RouteID: job.route.RouteID, LeaseKey: job.key, StableFallback: job.route.StableFallback,
+		SubjectKey: "background:" + job.key, ExpectedEpoch: quality.Epoch,
+		TTL:         time.Duration(setting.EffectiveProbeLeaseTTLSeconds()) * time.Second,
+		BudgetLimit: budgetLimit, MaxConcurrency: maxConcurrency, BudgetNamespace: budgetNamespace,
+		BudgetWindow: time.Minute, SubjectCooldown: time.Duration(setting.ProbeInitialBackoffSeconds) * time.Second,
+		Force: job.forceProbe,
+	})
+	if err != nil || !acquired {
+		releaseSmartRouteLease(capacity.Lease)
+		worker.noteDeferred("probe_lease_or_budget")
+		delay := smartRouteProbeRetryDelay(setting, "probe_lease_or_budget")
+		if !worker.deferColdStartJob(job, setting, delay) {
+			worker.requeue(job, setting, delay)
+		}
+		worker.rescheduleDurableRecovery(job, time.Now().Add(delay), &runtime)
+		return
+	}
+	handle := &SmartRouteAttemptHandle{
+		startedAt: time.Now(), probe: probe, capacity: capacity.Lease,
+		stop: make(chan struct{}), done: make(chan struct{}),
+	}
+	handle.startHeartbeat(ctx)
+	if worker.absorbSharedColdStartSuccesses(job, setting) {
+		handle.stopAndRelease()
+		return
+	}
+	currentSetting := smartroutersetting.Normalize(worker.settings())
+	if !currentSetting.Enabled || !currentSetting.BackgroundProbeEnabled {
+		handle.stopAndRelease()
+		return
+	}
+	execution := worker.executor.ExecuteSmartRouteProbe(ctx, SmartRouteProbeExecutionRequest{
+		CatalogVersion: job.catalogVersion, ContractID: job.contractID,
+		CanonicalModel: job.canonicalModel, Endpoint: job.endpoint, Route: job.route,
+		FirstTextTimeout: time.Duration(setting.ProbeTimeoutSeconds) * time.Second,
+		CompletionGrace:  time.Duration(setting.ProbeCompletionGraceSeconds) * time.Second,
+	})
+	if execution.TTFEObserved {
+		worker.lastTTFEMS.Store(execution.TTFE.Milliseconds())
+	}
+	if execution.TTFTObserved {
+		worker.lastTTFTMS.Store(execution.TTFT.Milliseconds())
+	}
+	if execution.Outcome.Outcome == "" {
+		execution.Outcome = backgroundProbeFailure(ctx.Err(), "probe executor returned no outcome")
+	}
+	if execution.Outcome.Outcome == smartrouter.OutcomeSuccess && !execution.Completed {
+		// A provider may complete a reachability probe without emitting a text
+		// token. Terminal completion is sufficient evidence for recovery; TTFT
+		// is optional telemetry and must not keep a healthy route red.
+		execution.Outcome = backgroundProbeFailure(nil, "probe ended without a terminal response")
+	}
+	// The probe context may already be canceled by a first-text/completion
+	// deadline. Persist its classified result with an independent bounded
+	// control-plane context; otherwise the timeout that opened the circuit can
+	// itself be lost and no next recovery deadline will be scheduled.
+	recordCtx, recordCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	worker.recordProbeResult(recordCtx, job, runtime, probe, execution)
+	recordCancel()
+	handle.stopAndRelease()
+	if execution.Outcome.Outcome == smartrouter.OutcomeSuccess {
+		worker.succeeded.Add(1)
+		successRequest := smartrouter.RouteRequest{
+			ContractID: job.contractID, CanonicalModel: job.canonicalModel, Endpoint: job.endpoint,
+		}
+		if len(job.coldStartWaves) > 0 {
+			persistSmartRouteColdStartSuccess(worker.successSem, successRequest, job.key)
+			worker.completeColdStartSuccess(successRequest, job.key)
+		} else {
+			worker.ackDurableRecovery(job)
+		}
+	} else {
+		worker.failed.Add(1)
+		worker.finishColdStartJob(job, false, setting)
+	}
+	worker.scheduleNextRecovery(job, setting, execution.Outcome.Outcome)
+}
+
+func smartRouteProbeJobLess(left, right *smartRouteProbeJob) bool {
+	// A route that has already waited past its recovery deadline must not be
+	// starved by a cheaper route that has only just become due. Price remains a
+	// useful tie-breaker for equally urgent work, but recovery deadlines are the
+	// scheduling contract.
+	if !left.notBefore.Equal(right.notBefore) {
+		return left.notBefore.Before(right.notBefore)
+	}
+	if left.priceKnown != right.priceKnown {
+		return left.priceKnown
+	}
+	if left.priceKnown && left.ratioPPM != right.ratioPPM {
+		return left.ratioPPM < right.ratioPPM
+	}
+	return left.key < right.key
+}
+
+// scheduleNextRecovery keeps one bounded state-machine job alive while a route
+// is still unavailable. A successful synthetic probe hands recovery to real
+// warming traffic, so it must not create another paid synthetic sample.
+func (worker *SmartRouteProbeWorker) scheduleNextRecovery(
+	job *smartRouteProbeJob,
+	setting smartroutersetting.Setting,
+	outcome smartrouter.QualityOutcome,
+) {
+	if worker == nil || job == nil {
+		return
+	}
+	if outcome == smartrouter.OutcomeSuccess {
+		if len(job.coldStartWaves) == 0 {
+			worker.ackDurableRecovery(job)
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	runtime, err := worker.engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(mapSmartRouteAliases(job.aliases)),
+	})
+	if err != nil {
+		worker.noteDeferred("state_unavailable_after_probe")
+		copyJob := *job
+		copyJob.coldStartWaves = nil
+		copyJob.forceProbe = false
+		copyJob.lastHint = time.Now()
+		worker.requeue(&copyJob, setting, smartRouteProbeRetryDelay(setting, "state_unavailable"))
+		worker.rescheduleDurableRecovery(&copyJob, time.Now().Add(smartRouteProbeRetryDelay(setting, "state_unavailable")), nil)
+		return
+	}
+	quality, ok := runtime.Quality.Routes[job.route.RouteID]
+	if !ok {
+		worker.ackDurableRecovery(job)
+		return
+	}
+	dueAtMS := int64(0)
+	switch quality.Phase {
+	case smartrouter.QualityOpen:
+		dueAtMS = quality.NextProbeAtMS
+	default:
+		worker.ackDurableRecovery(job)
+		return
+	}
+	now := time.Now()
+	delay := time.Until(time.UnixMilli(dueAtMS))
+	if dueAtMS <= 0 || delay < 100*time.Millisecond {
+		delay = 100 * time.Millisecond
+	}
+	copyJob := *job
+	copyJob.coldStartWaves = nil
+	copyJob.forceProbe = false
+	copyJob.lastHint = now
+	worker.requeue(&copyJob, setting, delay)
+	worker.rescheduleDurableRecovery(&copyJob, now.Add(delay), &runtime)
+}
+
+func (worker *SmartRouteProbeWorker) recordProbeResult(
+	ctx context.Context,
+	job *smartRouteProbeJob,
+	runtime SmartRouteRuntimeSnapshot,
+	probe *SmartRouteLease,
+	result SmartRouteProbeExecutionResult,
+) {
+	routes := mapSmartRouteAliases(job.aliases)
+	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteID < routes[j].RouteID })
+	for _, route := range routes {
+		quality := runtime.Quality.Routes[route.RouteID]
+		healthNeutral := result.Outcome.Outcome != smartrouter.OutcomeSuccess &&
+			!result.Outcome.AffectsRouteHealth
+		admission := smartrouter.AdmissionProbe
+		if len(job.coldStartWaves) > 0 {
+			admission = smartrouter.AdmissionVirginBootstrap
+		}
+		record := SmartRouteAttemptRecord{
+			CatalogVersion: job.catalogVersion,
+			RouteID:        route.RouteID, Group: route.Group, Model: job.canonicalModel,
+			ChannelID: route.ChannelID, ContractID: job.contractID, Endpoint: job.endpoint,
+			CapacityDomain: route.CapacityDomain, CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			StableFallback: route.StableFallback, Outcome: result.Outcome.Outcome,
+			RetryAfter: result.RetryAfter, TTFT: result.TTFT, TTFTObserved: result.TTFTObserved,
+			DemandRecovery: smartroutersetting.Normalize(worker.settings()).TextProbeDelayMS() > 0,
+			Admission:      admission, RouteEpoch: quality.Epoch, SyntheticProbe: true,
+			// Probe failures never enter real-request stability, but an already-open
+			// route must return from half-open to the next bounded recovery deadline.
+			// The reducer keeps a virgin/healthy route neutral when the probe itself
+			// has no preceding confirmed outage.
+			HTTPStatus: result.Outcome.HTTPStatus, ErrorSummary: result.Outcome.ErrorSummary,
+			SkipHealthUpdate: healthNeutral,
+		}
+		if healthNeutral {
+			record.SkipDomainUpdate = true
+		}
+		if route.RouteID == job.route.RouteID {
+			record.ProbeLeaseID = smartRouteLeaseID(probe)
+		} else {
+			// Every alias describes the same physical upstream attempt. Keep its
+			// route-local health in sync, but update shared credential/capacity
+			// domains exactly once for the primary route.
+			record.SkipDomainUpdate = true
+		}
+		_ = worker.engine.State.RecordAttempt(ctx, record)
+	}
+}
+
+func (worker *SmartRouteProbeWorker) requeue(job *smartRouteProbeJob, setting smartroutersetting.Setting, delay time.Duration) {
+	if delay < 100*time.Millisecond {
+		delay = 100 * time.Millisecond
+	}
+	copyJob := *job
+	copyJob.notBefore = time.Now().Add(delay)
+	worker.mu.Lock()
+	if !worker.closed && len(worker.pending) < setting.ProbeQueueCapacity {
+		if current := worker.pending[copyJob.key]; current != nil {
+			mergeSmartRouteProbeJob(current, &copyJob)
+		} else {
+			worker.pending[copyJob.key] = &copyJob
+		}
+	}
+	worker.mu.Unlock()
+	worker.signal()
+}
+
+func smartRouteProbeRetryDelay(setting smartroutersetting.Setting, reason string) time.Duration {
+	delay := time.Duration(setting.ProbeScanIntervalMS) * time.Millisecond
+	minimum := time.Second
+	if reason == "probe_lease_or_budget" {
+		// Lease, subject cooldown, concurrency and the one-minute global budget
+		// currently share one fail-closed result. A 15-second floor bounds the
+		// worst-case retry rate until that result becomes typed, while still
+		// allowing four recovery opportunities per minute.
+		minimum = 15 * time.Second
+	}
+	if reason == "capacity_busy" && minimum < 2*time.Second {
+		minimum = 2 * time.Second
+	}
+	if delay < minimum {
+		return minimum
+	}
+	return delay
+}
+
+func (worker *SmartRouteProbeWorker) Stats() SmartRouteProbeWorkerStats {
+	if worker == nil {
+		return SmartRouteProbeWorkerStats{}
+	}
+	worker.mu.Lock()
+	queued, running := len(worker.pending), len(worker.running)
+	lastDeferReason := worker.lastDeferReason
+	worker.mu.Unlock()
+	setting := smartroutersetting.Normalize(worker.settings())
+	return SmartRouteProbeWorkerStats{
+		HeartbeatAtMS: worker.heartbeatMS.Load(),
+		Queued:        int64(queued), Running: int64(running),
+		Limit:           int64(setting.ProbeMaxConcurrency + setting.ColdStartWaveMaxConcurrency),
+		BudgetPerMinute: int64(setting.ProbeBudgetPerMinute),
+		Succeeded:       worker.succeeded.Load(), Failed: worker.failed.Load(),
+		Deferred: worker.deferred.Load(), Dropped: worker.dropped.Load(),
+		LastDeferReason: lastDeferReason,
+		LastTTFEMS:      worker.lastTTFEMS.Load(), LastTTFTMS: worker.lastTTFTMS.Load(),
+		LastRunAtMS:               worker.lastRunMS.Load(),
+		LastRecoverySweepAtMS:     worker.lastRecoverySweepMS.Load(),
+		LastRecoverySweepDoneAtMS: worker.lastRecoverySweepDoneMS.Load(),
+		RecoverySweepScheduled:    worker.recoverySweepScheduled.Load(),
+		RecoverySweepFailures:     worker.recoverySweepFailures.Load(),
+	}
+}
+
+const smartRouteWorkerStatsKeyPart = "probe-worker:stats"
+const smartRouteWorkerHeartbeatFreshness = 45 * time.Second
+
+func smartRouteWorkerStatsKey() string {
+	return smartRouteRedisKey(smartRouteWorkerStatsKeyPart)
+}
+
+func smartRouteWorkerStatsTTL(setting smartroutersetting.Setting) time.Duration {
+	setting = smartroutersetting.Normalize(setting)
+	probeWindow := time.Duration(setting.ProbeTimeoutSeconds+setting.ProbeCompletionGraceSeconds+15) * time.Second
+	ttl := probeWindow * 2
+	if ttl < time.Minute {
+		ttl = time.Minute
+	}
+	if ttl > 10*time.Minute {
+		ttl = 10 * time.Minute
+	}
+	return ttl
+}
+
+func (worker *SmartRouteProbeWorker) publishStats() {
+	if worker == nil || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	stats := worker.Stats()
+	stats.HeartbeatAtMS = time.Now().UnixMilli()
+	worker.heartbeatMS.Store(stats.HeartbeatAtMS)
+	payload, err := common.Marshal(struct {
+		Owner string                     `json:"owner"`
+		Stats SmartRouteProbeWorkerStats `json:"stats"`
+	}{Owner: worker.owner, Stats: stats})
+	if err != nil {
+		return
+	}
+	setting := smartroutersetting.Normalize(worker.settings())
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_ = common.RDB.Set(ctx, smartRouteWorkerStatsKey(), payload, smartRouteWorkerStatsTTL(setting)).Err()
+}
+
+func (worker *SmartRouteProbeWorker) clearPublishedStats() {
+	if worker == nil || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	const compareAndDelete = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	// Read the current value first so a replacement worker is never deleted.
+	current, err := common.RDB.Get(ctx, smartRouteWorkerStatsKey()).Bytes()
+	if err != nil {
+		return
+	}
+	var envelope struct {
+		Owner string `json:"owner"`
+	}
+	if common.Unmarshal(current, &envelope) != nil || envelope.Owner != worker.owner {
+		return
+	}
+	_ = common.RDB.Eval(ctx, compareAndDelete, []string{smartRouteWorkerStatsKey()}, current).Err()
+}
+
+func readSmartRouteWorkerStats(ctx context.Context) (SmartRouteProbeWorkerStats, bool) {
+	if common.RDB == nil || !common.RedisEnabled {
+		return SmartRouteProbeWorkerStats{}, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	payload, err := common.RDB.Get(ctx, smartRouteWorkerStatsKey()).Bytes()
+	if err != nil {
+		return SmartRouteProbeWorkerStats{}, false
+	}
+	var envelope struct {
+		Stats SmartRouteProbeWorkerStats `json:"stats"`
+	}
+	if common.Unmarshal(payload, &envelope) != nil || envelope.Stats.HeartbeatAtMS <= 0 {
+		return SmartRouteProbeWorkerStats{}, false
+	}
+	heartbeatAge := time.Since(time.UnixMilli(envelope.Stats.HeartbeatAtMS))
+	if heartbeatAge < 0 || heartbeatAge > smartRouteWorkerHeartbeatFreshness {
+		return SmartRouteProbeWorkerStats{}, false
+	}
+	return envelope.Stats, true
+}
+
+func (worker *SmartRouteProbeWorker) persistDurableHint(hint SmartRouteRecoveryHint) {
+	setting := smartroutersetting.Normalize(worker.settings())
+	persistSmartRouteRecoveryHintAsync(worker.persistSem, hint, setting.ProbeQueueCapacity)
+}
+
+func persistSmartRouteRecoveryHintAsync(
+	semaphore chan struct{},
+	hint SmartRouteRecoveryHint,
+	queueCapacity int,
+) {
+	if common.RDB == nil || !common.RedisEnabled || semaphore == nil {
+		return
+	}
+	select {
+	case semaphore <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-semaphore }()
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		_, _ = persistSmartRouteRecoveryHint(ctx, hint, queueCapacity)
+	}()
+}
+
+const persistSmartRouteRecoveryHintScript = `
+local due = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+if redis.call('EXISTS', KEYS[2]) == 1 then
+	redis.call('SET', KEYS[2], ARGV[3])
+	redis.call('ZADD', KEYS[1], due, KEYS[2])
+	return 2
+end
+if redis.call('ZCARD', KEYS[1]) >= capacity then return -1 end
+redis.call('SET', KEYS[2], ARGV[3])
+redis.call('ZADD', KEYS[1], due, KEYS[2])
+return 1
+`
+
+// persistSmartRouteRecoveryHint is the durable acknowledgement boundary used
+// by administrator-triggered checks. Foreground hints continue to call it in
+// a bounded goroutine, while a manual request waits only for this Redis write
+// and never for the upstream probe itself.
+func persistSmartRouteRecoveryHint(
+	ctx context.Context,
+	hint SmartRouteRecoveryHint,
+	capacity int,
+) (SmartRouteProbeEnqueueDisposition, error) {
+	if !SmartRouteSyntheticProbeAllowed(hint.Request.Endpoint, hint.Request.CanonicalModel, hint.Routes...) {
+		return SmartRouteProbeUnsupported, nil
+	}
+	if common.RDB == nil || !common.RedisEnabled {
+		return SmartRouteProbeWorkerUnavailable, ErrSmartRouteProbeExecutorUnavailable
+	}
+	if capacity < 1 {
+		return SmartRouteProbeQueueFull, nil
+	}
+	nowMS := time.Now().UnixMilli()
+	result := SmartRouteProbeNotDue
+	routesByPhysicalKey := make(map[string][]smartrouter.CertifiedRoute)
+	jobs, scopePhysical, hasVirgin := smartRouteColdStartJobs(hint)
+	foregroundKey := strings.TrimSpace(hint.ForegroundPhysicalKey)
+	_, foregroundIsVirgin := scopePhysical[foregroundKey]
+	if !hint.ForceProbe && hasVirgin && len(jobs) > 1 && foregroundIsVirgin {
+		// Preserve the complete ordered candidate set across a dedicated worker
+		// hand-off. Splitting the virgin subset into per-route Redis records would
+		// lose the Key strategy order before the discovery wave is formed.
+		routesByPhysicalKey["cold-start\x00"+smartRouteColdStartWaveKey(hint, jobs)] = append(
+			[]smartrouter.CertifiedRoute(nil), hint.Routes...,
+		)
+	}
+	for _, route := range hint.Routes {
+		quality, ok := hint.Runtime.Quality.Routes[route.RouteID]
+		if !ok {
+			quality = smartrouter.InitialQuality(route.StableFallback)
+		}
+		if !hint.ForceProbe && smartrouter.IsVirginUnknown(quality) {
+			// Virgin work is persisted only as a post-plan ordered discovery wave.
+			// A one-route virgin attempt is owned entirely by foreground traffic.
+			continue
+		}
+		physicalKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		if physicalKey == "" {
+			continue
+		}
+		routesByPhysicalKey[physicalKey] = append(routesByPhysicalKey[physicalKey], route)
+	}
+	for physicalKey, routes := range routesByPhysicalKey {
+		routeHint := hint
+		routeHint.Routes = append([]smartrouter.CertifiedRoute(nil), routes...)
+		routeHint.Runtime = SmartRouteRuntimeSnapshot{
+			Quality: smartrouter.QualitySnapshot{
+				Version: hint.Runtime.Quality.Version,
+				Routes:  make(map[string]smartrouter.QualityState, len(routes)),
+			},
+		}
+		routeHint.Prices = smartrouter.PriceSnapshot{
+			Version: hint.Prices.Version, RatiosPPM: make(map[string]int64, len(routes)),
+		}
+		for _, route := range routes {
+			if quality, ok := hint.Runtime.Quality.Routes[route.RouteID]; ok {
+				routeHint.Runtime.Quality.Routes[route.RouteID] = quality
+			}
+			if ratio, ok := hint.Prices.RatiosPPM[route.RouteID]; ok {
+				routeHint.Prices.RatiosPPM[route.RouteID] = ratio
+			}
+		}
+		dueAtMS, scheduled := smartRouteRecoveryHintDueAtMS(routeHint, nowMS)
+		if !scheduled {
+			continue
+		}
+		payload, err := common.Marshal(routeHint)
+		if err != nil {
+			return SmartRouteProbeWorkerUnavailable, err
+		}
+		key := smartRouteDurableHintKey(physicalKey)
+		code, evalErr := common.RDB.Eval(
+			ctx,
+			persistSmartRouteRecoveryHintScript,
+			[]string{smartRouteRecoveryHintRedisKey(), key},
+			dueAtMS,
+			capacity,
+			payload,
+		).Int64()
+		if evalErr != nil {
+			return SmartRouteProbeWorkerUnavailable, evalErr
+		}
+		switch code {
+		case 1:
+			result = SmartRouteProbeEnqueued
+		case 2:
+			if result != SmartRouteProbeEnqueued {
+				result = SmartRouteProbeAlreadyQueued
+			}
+		case -1:
+			if result == SmartRouteProbeNotDue {
+				result = SmartRouteProbeQueueFull
+			}
+		}
+	}
+	return result, nil
+}
+
+func (worker *SmartRouteProbeWorker) restoreDurableHints() {
+	if worker == nil || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	now := time.Now()
+	members, err := common.RDB.ZRangeByScore(ctx, smartRouteRecoveryHintRedisKey(), &redis.ZRangeBy{
+		Min:    "-inf",
+		Max:    fmt.Sprintf("%d", now.UnixMilli()),
+		Offset: 0,
+		Count:  256,
+	}).Result()
+	if err != nil {
+		return
+	}
+	for _, member := range members {
+		leaseTTL := time.Duration(smartroutersetting.Normalize(worker.settings()).EffectiveProbeLeaseTTLSeconds()) * time.Second
+		if !worker.claimDurableRecovery(ctx, member, leaseTTL) {
+			continue
+		}
+		payload, getErr := common.RDB.Get(ctx, member).Bytes()
+		if getErr != nil {
+			worker.ackDurableRecoveryMember(member)
+			continue
+		}
+		var hint SmartRouteRecoveryHint
+		if common.Unmarshal(payload, &hint) != nil {
+			worker.ackDurableRecoveryMember(member)
+			continue
+		}
+		durablePhysicalKey := smartRouteRecoveryHintStorageIdentity(hint)
+		if durablePhysicalKey == "" {
+			worker.ackDurableRecoveryMember(member)
+			continue
+		}
+		hint.DurableKey = durablePhysicalKey
+		hint.ScopeKey = strings.TrimSpace(hint.ScopeKey)
+		disposition := worker.hint(hint, false)
+		switch disposition {
+		case SmartRouteProbeUnsupported, SmartRouteProbeNotDue:
+			worker.ackDurableRecoveryKey(durablePhysicalKey)
+		case SmartRouteProbeQueueFull, SmartRouteProbeWorkerUnavailable:
+			worker.rescheduleDurableRecoveryKey(
+				durablePhysicalKey,
+				time.Now().Add(smartRouteProbeRetryDelay(smartroutersetting.Normalize(worker.settings()), "queue_unavailable")),
+				nil,
+			)
+		}
+	}
+}
+
+func (worker *SmartRouteProbeWorker) claimDurableRecovery(
+	ctx context.Context,
+	itemKey string,
+	ttl time.Duration,
+) bool {
+	if worker == nil || common.RDB == nil || !common.RedisEnabled || itemKey == "" {
+		return false
+	}
+	if ttl < 5*time.Second {
+		ttl = 5 * time.Second
+	}
+	claimed, err := common.RDB.SetNX(
+		ctx,
+		smartRouteDurableHintLeaseKey(itemKey),
+		worker.owner,
+		ttl,
+	).Result()
+	return err == nil && claimed
+}
+
+func (worker *SmartRouteProbeWorker) ackDurableRecoveryMember(itemKey string) {
+	if worker == nil || itemKey == "" || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	leaseKey := smartRouteDurableHintLeaseKey(itemKey)
+	const acknowledge = `
+if redis.call('GET', KEYS[3]) == ARGV[1] or redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('ZREM', KEYS[1], KEYS[2])
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  return 1
+end
+return 0
+`
+	_ = common.RDB.Eval(
+		ctx,
+		acknowledge,
+		[]string{smartRouteRecoveryHintRedisKey(), itemKey, leaseKey},
+		worker.owner,
+	).Err()
+}
+
+func (worker *SmartRouteProbeWorker) ackDurableRecovery(job *smartRouteProbeJob) {
+	if job == nil {
+		return
+	}
+	for _, durableKey := range smartRouteJobDurableKeys(job) {
+		worker.ackDurableRecoveryKey(durableKey)
+	}
+}
+
+func (worker *SmartRouteProbeWorker) ackDurableRecoveryKey(durableKey string) {
+	durableKey = strings.TrimSpace(durableKey)
+	if worker == nil || durableKey == "" || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	worker.ackDurableRecoveryMember(smartRouteDurableHintKey(durableKey))
+}
+
+func (worker *SmartRouteProbeWorker) rescheduleDurableRecovery(
+	job *smartRouteProbeJob,
+	due time.Time,
+	runtime *SmartRouteRuntimeSnapshot,
+) {
+	if worker == nil || job == nil || len(smartRouteJobDurableKeys(job)) == 0 ||
+		common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	for _, durableKey := range smartRouteJobDurableKeys(job) {
+		worker.rescheduleDurableRecoveryKey(durableKey, due, runtime)
+	}
+}
+
+func smartRouteJobDurableKeys(job *smartRouteProbeJob) []string {
+	if job == nil {
+		return nil
+	}
+	keys := make(map[string]struct{}, len(job.durableKeys)+1)
+	if key := strings.TrimSpace(job.durableKey); key != "" {
+		keys[key] = struct{}{}
+	}
+	for key := range job.durableKeys {
+		if key = strings.TrimSpace(key); key != "" {
+			keys[key] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	return ordered
+}
+
+func (worker *SmartRouteProbeWorker) rescheduleDurableRecoveryKey(
+	durableKey string,
+	due time.Time,
+	runtime *SmartRouteRuntimeSnapshot,
+) {
+	if worker == nil || strings.TrimSpace(durableKey) == "" || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	itemKey := smartRouteDurableHintKey(durableKey)
+	payload, err := common.RDB.Get(ctx, itemKey).Bytes()
+	if err != nil {
+		return
+	}
+	var hint SmartRouteRecoveryHint
+	if common.Unmarshal(payload, &hint) != nil {
+		worker.ackDurableRecoveryKey(durableKey)
+		return
+	}
+	hint.ForceProbe = false
+	if runtime != nil {
+		if hint.Runtime.Quality.Routes == nil {
+			hint.Runtime.Quality.Routes = make(map[string]smartrouter.QualityState)
+		}
+		for routeID, quality := range runtime.Quality.Routes {
+			hint.Runtime.Quality.Routes[routeID] = quality
+		}
+		hint.Runtime.Quality.Version = runtime.Quality.Version
+	}
+	payload, err = common.Marshal(hint)
+	if err != nil {
+		return
+	}
+	if due.Before(time.Now()) {
+		due = time.Now()
+	}
+	leaseKey := smartRouteDurableHintLeaseKey(itemKey)
+	const reschedule = `
+if redis.call('GET', KEYS[3]) ~= ARGV[1] and redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('ZADD', KEYS[1], ARGV[3], KEYS[2])
+redis.call('DEL', KEYS[3])
+return 1
+`
+	_ = common.RDB.Eval(
+		ctx,
+		reschedule,
+		[]string{smartRouteRecoveryHintRedisKey(), itemKey, leaseKey},
+		worker.owner,
+		payload,
+		due.UnixMilli(),
+	).Err()
+}
+
+func smartRouteRecoveryHintStorageIdentity(hint SmartRouteRecoveryHint) string {
+	jobs, scopePhysical, hasVirgin := smartRouteColdStartJobs(hint)
+	_, foregroundIsVirgin := scopePhysical[strings.TrimSpace(hint.ForegroundPhysicalKey)]
+	if hasVirgin && foregroundIsVirgin && len(jobs) > 1 {
+		if waveKey := smartRouteColdStartWaveKey(hint, jobs); waveKey != "" {
+			return "cold-start\x00" + waveKey
+		}
+	}
+	identity := ""
+	for _, route := range hint.Routes {
+		physicalKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		if physicalKey == "" {
+			continue
+		}
+		if identity == "" {
+			identity = physicalKey
+			continue
+		}
+		if identity != physicalKey {
+			return ""
+		}
+	}
+	return identity
+}
+
+func smartRouteRecoveryHintDueAtMS(hint SmartRouteRecoveryHint, nowMS int64) (int64, bool) {
+	if hint.ForceProbe {
+		return nowMS, true
+	}
+	allowed := stringSetService(hint.AllowedGroups)
+	excludedGroups := stringSetService(hint.Policy.ExcludedGroups)
+	excluded := stringSetService(append(append([]string(nil), hint.Policy.ExcludedRoutes...), hint.ExcludedRoutes...))
+	dueAtMS := int64(0)
+	for _, route := range hint.Routes {
+		if route.RouteID == "" || !allowed[route.Group] || !hint.Policy.AllowsGroup(route.Group) ||
+			excludedGroups[route.Group] || excluded[route.RouteID] {
+			continue
+		}
+		if len(hint.Prices.RatiosPPM) > 0 {
+			ratio, priced := hint.Prices.RatiosPPM[route.RouteID]
+			if !priced || (hint.Policy.MaxEffectiveRatioPPM > 0 && ratio > hint.Policy.MaxEffectiveRatioPPM) {
+				continue
+			}
+		}
+		quality, ok := hint.Runtime.Quality.Routes[route.RouteID]
+		if !ok {
+			quality = smartrouter.InitialQuality(route.StableFallback)
+		}
+		quality, _ = smartrouter.NormalizeAutomaticRecoveryState(quality, nowMS)
+		candidateDue := int64(0)
+		switch quality.Phase {
+		case smartrouter.QualityOpen:
+			candidateDue = quality.NextProbeAtMS
+		}
+		if candidateDue == 0 && quality.Phase == smartrouter.QualityOpen {
+			candidateDue = nowMS
+		}
+		if candidateDue > 0 && (dueAtMS == 0 || candidateDue < dueAtMS) {
+			dueAtMS = candidateDue
+		}
+	}
+	return dueAtMS, dueAtMS > 0
+}
+
+func smartRouteDurableHintKey(physicalKey string) string {
+	return smartRouteRecoveryHintRedisKey() + ":item:" + smartRouteRedisComponent(physicalKey)
+}
+
+func smartRouteDurableHintLeaseKey(itemKey string) string {
+	return itemKey + ":lease"
+}
+
+func smartRouteRecoveryHintRedisKey() string {
+	return smartRouteRedisKey("recovery-hints", smartRouteRecoveryHintNamespace())
+}
+
+func manualSmartRouteRecoveryHint(
+	catalogVersion string,
+	contract smartrouter.RouteContract,
+	route smartrouter.CertifiedRoute,
+	policy smartrouter.Policy,
+) SmartRouteRecoveryHint {
+	// This is an administrator-selected physical route already admitted to the
+	// active catalog. Per-key defaults must not accidentally turn the manual
+	// recovery action into a hidden group allow-list.
+	policy = smartrouter.NormalizePolicy(policy)
+	policy.Version = smartrouter.PolicyVersion
+	policy.Enabled = true
+	policy.ExcludedGroups = nil
+	policy.ExcludedRoutes = nil
+	policy.ManualGroupOrder = nil
+	policy.AllowFutureGroups = true
+	policy.AllowFutureCertifiedRoutes = true
+	return SmartRouteRecoveryHint{
+		CatalogVersion: catalogVersion, ScopeKey: "admin",
+		Request: smartrouter.RouteRequest{
+			ContractID: contract.ContractID, CanonicalModel: contract.CanonicalModel,
+			Endpoint: contract.Endpoint, CapabilityFingerprint: contract.CapabilityFingerprint,
+			ReplayClass: smartrouter.ReplaySafeText,
+		},
+		Policy: policy, ForceProbe: true, AllowedGroups: []string{route.Group}, Routes: []smartrouter.CertifiedRoute{route},
+		Runtime: SmartRouteRuntimeSnapshot{Quality: smartrouter.QualitySnapshot{Routes: map[string]smartrouter.QualityState{
+			route.RouteID: {Phase: smartrouter.QualityUnknown, Epoch: 1},
+		}}},
+	}
+}
+
+func (worker *SmartRouteProbeWorker) noteDeferred(reason string) {
+	worker.deferred.Add(1)
+	worker.mu.Lock()
+	worker.lastDeferReason = reason
+	worker.mu.Unlock()
+}
+
+func smartRouteRecoveryDue(quality smartrouter.QualityState, nowMS int64) bool {
+	dueAtMS, scheduled := smartRouteRecoveryDueAtMS(quality, nowMS)
+	return scheduled && dueAtMS <= nowMS
+}
+
+func smartRouteRecoveryNotBefore(quality smartrouter.QualityState, now time.Time) time.Time {
+	dueAtMS, scheduled := smartRouteRecoveryDueAtMS(quality, now.UnixMilli())
+	if !scheduled || dueAtMS <= 0 {
+		return now
+	}
+	return time.UnixMilli(dueAtMS)
+}
+
+func smartRouteRecoveryDueAtMS(quality smartrouter.QualityState, nowMS int64) (int64, bool) {
+	quality, _ = smartrouter.NormalizeAutomaticRecoveryState(quality, nowMS)
+	switch quality.Phase {
+	case smartrouter.QualityOpen:
+		if quality.NextProbeAtMS <= 0 {
+			return nowMS, true
+		}
+		return quality.NextProbeAtMS, true
+	default:
+		return 0, false
+	}
+}
+
+func smartRouteRecoveryHintHasDueWork(hint SmartRouteRecoveryHint, nowMS int64) bool {
+	dueAtMS, scheduled := smartRouteRecoveryHintDueAtMS(hint, nowMS)
+	return scheduled && dueAtMS <= nowMS
+}
+
+func smartRouteRecoveryHintHasScheduledWork(hint SmartRouteRecoveryHint, nowMS int64) bool {
+	_, scheduled := smartRouteRecoveryHintDueAtMS(hint, nowMS)
+	return scheduled
+}
+
+func smartRouteHasRecoverySuccess(quality smartrouter.QualityState) bool {
+	if quality.LastSuccessMS > quality.LastFailureMS {
+		return true
+	}
+	return quality.LastSuccessMS > 0 && quality.LastSuccessMS == quality.LastFailureMS &&
+		quality.LastOutcome == smartrouter.OutcomeSuccess
+}
+
+func supportedSyntheticTextProbeEndpoint(endpoint string) bool {
+	switch endpoint {
+	case SmartEndpointChat, SmartEndpointCompletions, SmartEndpointResponses, SmartEndpointMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+func smartRoutePhysicalProbeKey(contractID, endpoint string, route smartrouter.CertifiedRoute) string {
+	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s",
+		route.ChannelID, route.ChannelGeneration, route.UpstreamModel, contractID, endpoint)
+}
+
+func mapSmartRouteAliases(aliases map[string]smartrouter.CertifiedRoute) []smartrouter.CertifiedRoute {
+	routes := make([]smartrouter.CertifiedRoute, 0, len(aliases))
+	for _, route := range aliases {
+		routes = append(routes, route)
+	}
+	return routes
+}
+
+func stringSetService(values []string) map[string]bool {
+	result := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			result[value] = true
+		}
+	}
+	return result
+}
+
+func backgroundProbeFailure(contextErr error, summary string) SmartRouteOutcome {
+	if contextErr != nil {
+		summary = contextErr.Error()
+	}
+	return SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, FailureScope: SmartFailureInfrastructure,
+		// The probe executor itself is not evidence that the provider route is
+		// unhealthy. Keep this failure health-neutral and let the bounded worker
+		// reschedule the probe; otherwise one local EOF/cleanup error can mark
+		// every route sharing the executor as open.
+		RouteFailure: false, RetryNextRoute: false, AffectsRouteHealth: false,
+		ErrorSummary: sanitizeSmartRouteErrorSummary(summary),
+	}
+}

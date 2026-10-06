@@ -1,0 +1,173 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type { LeaderboardMetric } from './leaderboard-evidence'
+
+export type LeaderboardModelOption = {
+  model: string
+  endpoint: string
+  displayName: string
+  family: string
+  modality: string
+  aliases: string[]
+  recentUsageCount: number
+}
+
+export type LeaderboardPreferencesV3 = {
+  version: 3
+  model: string
+  endpoint: string
+  metric: LeaderboardMetric
+  favoriteContracts: string[]
+  recentContracts: string[]
+  weightPanelOpen: boolean
+  lastWeightTokenId?: number
+  routeRange: '1h' | '24h' | '3d'
+  keyRange: '1h' | '1d' | '7d'
+  keyTokenId?: number
+  keyModel: string
+}
+
+const METRICS = new Set<LeaderboardMetric>([
+  'usage',
+  'cache',
+  'cost',
+  'ttft',
+  'stability',
+  'weighted',
+])
+
+export function leaderboardModelOptionKey(
+  option: Pick<LeaderboardModelOption, 'model' | 'endpoint'>
+) {
+  return `${option.model}\u0000${option.endpoint}`
+}
+
+export function defaultLeaderboardPreferencesV3(): LeaderboardPreferencesV3 {
+  return {
+    version: 3,
+    model: 'gpt-5.6-sol',
+    endpoint: 'openai-responses-v1',
+    metric: 'cost',
+    favoriteContracts: [],
+    recentContracts: [],
+    weightPanelOpen: false,
+    routeRange: '1h',
+    keyRange: '1h',
+    keyModel: '',
+  }
+}
+
+export function leaderboardPreferencesStorageKeyV3(userId: number) {
+  return `smart-router-leaderboard-preferences-v3:${userId}`
+}
+
+function stringList(value: unknown, maximum: number) {
+  if (!Array.isArray(value)) return []
+  return [
+    ...new Set(
+      value.filter(
+        (item): item is string => typeof item === 'string' && item.length <= 512
+      )
+    ),
+  ].slice(0, maximum)
+}
+
+function positiveInteger(value: unknown) {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+    ? value
+    : undefined
+}
+
+export function normalizeLeaderboardPreferencesV3(
+  value: unknown
+): LeaderboardPreferencesV3 {
+  const fallback = defaultLeaderboardPreferencesV3()
+  if (!value || typeof value !== 'object') return fallback
+  const current = value as Partial<LeaderboardPreferencesV3>
+  const metric = METRICS.has(current.metric as LeaderboardMetric)
+    ? (current.metric as LeaderboardMetric)
+    : fallback.metric
+  const routeRange = ['1h', '24h', '3d'].includes(current.routeRange ?? '')
+    ? (current.routeRange as LeaderboardPreferencesV3['routeRange'])
+    : fallback.routeRange
+  const keyRange = ['1h', '1d', '7d'].includes(current.keyRange ?? '')
+    ? (current.keyRange as LeaderboardPreferencesV3['keyRange'])
+    : fallback.keyRange
+  return {
+    version: 3,
+    model:
+      typeof current.model === 'string' && current.model.trim()
+        ? current.model.trim()
+        : fallback.model,
+    endpoint:
+      typeof current.endpoint === 'string'
+        ? current.endpoint.trim()
+        : fallback.endpoint,
+    metric,
+    favoriteContracts: stringList(current.favoriteContracts, 100),
+    recentContracts: stringList(current.recentContracts, 8),
+    weightPanelOpen: current.weightPanelOpen === true,
+    lastWeightTokenId: positiveInteger(current.lastWeightTokenId),
+    routeRange,
+    keyRange,
+    keyTokenId: positiveInteger(current.keyTokenId),
+    keyModel:
+      typeof current.keyModel === 'string' ? current.keyModel.trim() : '',
+  }
+}
+
+export function readLeaderboardPreferencesV3(userId: number) {
+  if (typeof window === 'undefined' || userId <= 0) {
+    return defaultLeaderboardPreferencesV3()
+  }
+  try {
+    const raw = window.localStorage.getItem(
+      leaderboardPreferencesStorageKeyV3(userId)
+    )
+    return raw
+      ? normalizeLeaderboardPreferencesV3(JSON.parse(raw))
+      : defaultLeaderboardPreferencesV3()
+  } catch {
+    return defaultLeaderboardPreferencesV3()
+  }
+}
+
+export function writeLeaderboardPreferencesV3(
+  userId: number,
+  preferences: LeaderboardPreferencesV3
+) {
+  if (typeof window === 'undefined' || userId <= 0) return
+  window.localStorage.setItem(
+    leaderboardPreferencesStorageKeyV3(userId),
+    JSON.stringify(normalizeLeaderboardPreferencesV3(preferences))
+  )
+}
+
+export function rememberLeaderboardContractV3(
+  preferences: LeaderboardPreferencesV3,
+  contractKey: string
+) {
+  return {
+    ...preferences,
+    recentContracts: [
+      contractKey,
+      ...preferences.recentContracts.filter((item) => item !== contractKey),
+    ].slice(0, 8),
+  }
+}

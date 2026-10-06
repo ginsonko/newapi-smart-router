@@ -1,0 +1,99 @@
+package service
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+)
+
+func ObserveImageAttemptPending(info *relaycommon.RelayInfo, requestPath string) {
+	if info == nil || info.ChannelMeta == nil || info.RequestId == "" {
+		return
+	}
+	channel, err := model.GetChannelById(info.ChannelId, true)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = ObserveSmartRouteExternalFailure(ctx, SmartRouteExternalFailure{
+		SmartRouteExternalSuccess: SmartRouteExternalSuccess{
+			ChannelID: info.ChannelId, ChannelGeneration: SmartRouteChannelGeneration(*channel),
+			CanonicalModel: info.OriginModelName, UpstreamModel: info.UpstreamModelName,
+			RequestPath: requestPath, ObservationID: info.RequestId, StartedAtMS: time.Now().UnixMilli(),
+		}, Outcome: smartrouter.OutcomeImagePending,
+	})
+}
+
+func ObserveImageTaskTerminal(task *model.Task, success bool) {
+	if task == nil || task.PrivateData.ImageTask == nil {
+		return
+	}
+	if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+		return
+	}
+	if success != (task.Status == model.TaskStatusSuccess) {
+		return
+	}
+	if task.PrivateData.BillingRequestID == "" {
+		return
+	}
+	image := task.PrivateData.ImageTask
+	if !success && !image.RetryableFailure {
+		return
+	}
+	terminalAtMS := image.TerminalAtMS
+	if terminalAtMS <= 0 {
+		terminalAtMS = task.FinishTime * 1000
+	}
+	if terminalAtMS <= 0 {
+		return
+	}
+	observation := SmartRouteExternalSuccess{
+		ChannelID: task.ChannelId, ChannelGeneration: image.ChannelGeneration,
+		CanonicalModel: task.Properties.OriginModelName, UpstreamModel: task.Properties.UpstreamModelName,
+		RequestPath: image.RequestPath, ObservationID: task.PrivateData.BillingRequestID,
+		StartedAtMS: task.SubmitTime * 1000, AtMS: terminalAtMS,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if success {
+		_, _ = ObserveSmartRouteExternalSuccess(ctx, observation)
+	} else {
+		outcome := smartrouter.QualityOutcome(image.HealthOutcome)
+		switch outcome {
+		case smartrouter.OutcomeInfrastructure, smartrouter.OutcomeCredential, smartrouter.OutcomeCapacityLimited,
+			smartrouter.OutcomeContentRejected, smartrouter.OutcomeUserRejected, smartrouter.OutcomeClientCancelled:
+		default:
+			outcome = ClassifyImageTaskFailure(0, nil, task.FailReason)
+		}
+		_, _ = ObserveSmartRouteExternalFailure(ctx, SmartRouteExternalFailure{SmartRouteExternalSuccess: observation, Outcome: outcome, ErrorSummary: task.FailReason})
+	}
+}
+
+func ClassifyImageTaskFailure(status int, raw []byte, reason string) smartrouter.QualityOutcome {
+	diagnostic := mediaservice.VideoFailureDetails(reason, raw)
+	details := strings.ToLower(diagnostic.Code + " " + diagnostic.Message)
+	if containsAnySmartError(details, "审核未通过", "内容审核", "安全审核", "内容违规", "content_policy_violation", "content_filter", "safety_blocked", "prompt_blocked") {
+		return smartrouter.OutcomeContentRejected
+	}
+	if status <= 0 {
+		status = http.StatusBadRequest
+		if containsAnySmartError(details, "server_error", "internal_server_error", "service_unavailable", "upstream temporarily unavailable") {
+			status = http.StatusBadGateway
+		}
+	}
+	failure := types.WithOpenAIError(types.OpenAIError{Code: diagnostic.Code, Message: diagnostic.Message}, status, types.ErrOptionWithUpstreamResponseReceived())
+	outcome := ClassifySmartRouteOutcome(failure, nil)
+	if !outcome.AffectsRouteHealth && outcome.Outcome == smartrouter.OutcomeInfrastructure {
+		return smartrouter.OutcomeClientCancelled
+	}
+	return outcome.Outcome
+}

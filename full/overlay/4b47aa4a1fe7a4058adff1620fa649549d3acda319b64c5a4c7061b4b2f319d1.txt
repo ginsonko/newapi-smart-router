@@ -1,0 +1,275 @@
+package ratio_setting
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/types"
+)
+
+var defaultGroupRatio = map[string]float64{
+	"default": 1,
+	"vip":     1,
+	"svip":    1,
+}
+
+var groupRatioMap = types.NewRWMap[string, float64]()
+
+var defaultGroupGroupRatio = map[string]map[string]float64{
+	"vip": {
+		"edit_this": 0.9,
+	},
+}
+
+var groupGroupRatioMap = types.NewRWMap[string, map[string]float64]()
+
+var groupRatioStateMu sync.RWMutex
+
+// groupRatioRevision lets routing snapshots cheaply detect pricing changes.
+// It is process-local and monotonic; callers still use the persisted option
+// values as the source of truth when rebuilding a snapshot.
+var groupRatioRevision atomic.Uint64
+var groupRatioContentRevision atomic.Value
+var groupRatioRuntimeSignature atomic.Value
+
+var defaultGroupSpecialUsableGroup = map[string]map[string]string{
+	"vip": {
+		"append_1":   "vip_special_group_1",
+		"-:remove_1": "vip_removed_group_1",
+	},
+}
+
+type GroupRatioSetting struct {
+	GroupRatio              *types.RWMap[string, float64]            `json:"group_ratio"`
+	GroupGroupRatio         *types.RWMap[string, map[string]float64] `json:"group_group_ratio"`
+	GroupSpecialUsableGroup *types.RWMap[string, map[string]string]  `json:"group_special_usable_group"`
+}
+
+var groupRatioSetting GroupRatioSetting
+
+func init() {
+	groupRatioRevision.Store(1)
+	groupSpecialUsableGroup := types.NewRWMap[string, map[string]string]()
+	groupSpecialUsableGroup.AddAll(defaultGroupSpecialUsableGroup)
+
+	groupRatioMap.AddAll(defaultGroupRatio)
+	groupGroupRatioMap.AddAll(defaultGroupGroupRatio)
+
+	groupRatioSetting = GroupRatioSetting{
+		GroupSpecialUsableGroup: groupSpecialUsableGroup,
+		GroupRatio:              groupRatioMap,
+		GroupGroupRatio:         groupGroupRatioMap,
+	}
+	refreshGroupRatioRevisionsLocked(false)
+
+	config.GlobalConfig.Register("group_ratio_setting", &groupRatioSetting)
+}
+
+func GetGroupRatioSetting() *GroupRatioSetting {
+	if groupRatioSetting.GroupSpecialUsableGroup == nil {
+		groupRatioSetting.GroupSpecialUsableGroup = types.NewRWMap[string, map[string]string]()
+		groupRatioSetting.GroupSpecialUsableGroup.AddAll(defaultGroupSpecialUsableGroup)
+	}
+	return &groupRatioSetting
+}
+
+func GetGroupRatioCopy() map[string]float64 {
+	return groupRatioMap.ReadAll()
+}
+
+func ContainsGroupRatio(name string) bool {
+	_, ok := groupRatioMap.Get(name)
+	return ok
+}
+
+func GroupRatio2JSONString() string {
+	return groupRatioMap.MarshalJSONString()
+}
+
+func UpdateGroupRatioByJSONString(jsonStr string) error {
+	next, err := parseGroupRatios(jsonStr)
+	if err != nil {
+		return err
+	}
+	groupRatioStateMu.Lock()
+	groupRatioMap.Replace(next)
+	refreshGroupRatioRevisionsLocked(true)
+	groupRatioStateMu.Unlock()
+	return nil
+}
+
+func GetGroupRatio(name string) float64 {
+	ratio, ok := groupRatioMap.Get(name)
+	if !ok {
+		logMissingGroupRatio(name)
+		return 1
+	}
+	return ratio
+}
+
+func GetGroupGroupRatio(userGroup, usingGroup string) (float64, bool) {
+	gp, ok := groupGroupRatioMap.Get(userGroup)
+	if !ok {
+		return -1, false
+	}
+	ratio, ok := gp[usingGroup]
+	if !ok {
+		return -1, false
+	}
+	return ratio, true
+}
+
+func GroupGroupRatio2JSONString() string {
+	return groupGroupRatioMap.MarshalJSONString()
+}
+
+func UpdateGroupGroupRatioByJSONString(jsonStr string) error {
+	next, err := parseGroupGroupRatios(jsonStr)
+	if err != nil {
+		return err
+	}
+	groupRatioStateMu.Lock()
+	groupGroupRatioMap.Replace(next)
+	refreshGroupRatioRevisionsLocked(true)
+	groupRatioStateMu.Unlock()
+	return nil
+}
+
+func GetGroupRatioRevision() uint64 {
+	return groupRatioRevision.Load()
+}
+
+// GetGroupRatioContentRevision returns a process-independent revision derived
+// from the complete base and user-group override maps.
+func GetGroupRatioContentRevision() string {
+	if value, ok := groupRatioContentRevision.Load().(string); ok {
+		return value
+	}
+	return ""
+}
+
+// ResolveConfiguredGroupRatio freezes the effective ratio and its stable
+// content revision under one read lock. The configured result lets routing
+// fail closed for an unknown physical group without doing a second map read.
+func ResolveConfiguredGroupRatio(userGroup, usingGroup string) (float64, float64, bool, bool, string) {
+	groupRatioStateMu.RLock()
+	defer groupRatioStateMu.RUnlock()
+	if overrides, ok := groupGroupRatioMap.Get(userGroup); ok {
+		if ratio, exists := overrides[usingGroup]; exists {
+			return ratio, ratio, true, true, GetGroupRatioContentRevision()
+		}
+	}
+	ratio, ok := groupRatioMap.Get(usingGroup)
+	if !ok {
+		return 0, -1, false, false, GetGroupRatioContentRevision()
+	}
+	return ratio, -1, false, true, GetGroupRatioContentRevision()
+}
+
+// ResolveEffectiveGroupRatio preserves the legacy request behavior for an
+// unconfigured group while still freezing the ratio and revision together.
+func ResolveEffectiveGroupRatio(userGroup, usingGroup string) (float64, float64, bool, string) {
+	ratio, special, hasSpecial, configured, revision := ResolveConfiguredGroupRatio(userGroup, usingGroup)
+	if !configured {
+		logMissingGroupRatio(usingGroup)
+		return 1, -1, false, revision
+	}
+	return ratio, special, hasSpecial, revision
+}
+
+// MarkGroupRatioUpdated is also used by the structured configuration loader,
+// which updates the registered ratio maps without calling the legacy JSON
+// update functions above.
+func MarkGroupRatioUpdated() {
+	groupRatioStateMu.Lock()
+	refreshGroupRatioRevisionsLocked(true)
+	groupRatioStateMu.Unlock()
+}
+
+func CheckGroupRatio(jsonStr string) error {
+	_, err := parseGroupRatios(jsonStr)
+	return err
+}
+
+func CheckGroupGroupRatio(jsonStr string) error {
+	_, err := parseGroupGroupRatios(jsonStr)
+	return err
+}
+
+func parseGroupRatios(raw string) (map[string]float64, error) {
+	next := make(map[string]float64)
+	if err := common.Unmarshal([]byte(raw), &next); err != nil {
+		return nil, err
+	}
+	if next == nil {
+		return nil, errors.New("group ratio map cannot be null")
+	}
+	for name, ratio := range next {
+		if name == "" {
+			return nil, errors.New("group ratio name cannot be empty")
+		}
+		if ratio < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+			return nil, errors.New("group ratio must be finite and not less than 0: " + name)
+		}
+	}
+	return next, nil
+}
+
+func parseGroupGroupRatios(raw string) (map[string]map[string]float64, error) {
+	next := make(map[string]map[string]float64)
+	if err := common.Unmarshal([]byte(raw), &next); err != nil {
+		return nil, err
+	}
+	if next == nil {
+		return nil, errors.New("group override map cannot be null")
+	}
+	for userGroup, ratios := range next {
+		if userGroup == "" || ratios == nil {
+			return nil, fmt.Errorf("group override for %q is invalid", userGroup)
+		}
+		for group, ratio := range ratios {
+			if group == "" || ratio < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+				return nil, fmt.Errorf("group override %q -> %q must be finite and not less than 0", userGroup, group)
+			}
+		}
+	}
+	return next, nil
+}
+
+func stableGroupRatioHash(kind string, value any) string {
+	encoded, err := common.Marshal(struct {
+		Kind  string `json:"kind"`
+		Value any    `json:"value"`
+	}{Kind: kind, Value: value})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func refreshGroupRatioRevisionsLocked(increment bool) {
+	content := struct {
+		GroupRatio      map[string]float64            `json:"group_ratio"`
+		GroupGroupRatio map[string]map[string]float64 `json:"group_group_ratio"`
+	}{GroupRatio: groupRatioMap.ReadAll(), GroupGroupRatio: groupGroupRatioMap.ReadAll()}
+	contentRevision := stableGroupRatioHash("group-ratio-cost-v1", content)
+	runtime := struct {
+		Content      any                          `json:"content"`
+		UsableGroups map[string]map[string]string `json:"group_special_usable_group"`
+	}{Content: content, UsableGroups: groupRatioSetting.GroupSpecialUsableGroup.ReadAll()}
+	runtimeSignature := stableGroupRatioHash("group-ratio-runtime-v1", runtime)
+	previous, _ := groupRatioRuntimeSignature.Load().(string)
+	groupRatioContentRevision.Store(contentRevision)
+	groupRatioRuntimeSignature.Store(runtimeSignature)
+	if increment && previous != "" && previous != runtimeSignature {
+		groupRatioRevision.Add(1)
+	}
+}

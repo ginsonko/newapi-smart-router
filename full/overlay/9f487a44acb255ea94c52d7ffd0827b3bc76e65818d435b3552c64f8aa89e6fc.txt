@@ -1,0 +1,231 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestImageHealthStoresPendingTerminalAndCanonicalIdentity(t *testing.T) {
+	for _, backend := range []string{"memory", "redis"} {
+		t.Run(backend, func(test *testing.T) {
+			clock := newSmartRouteTestClock()
+			config := DefaultSmartRouteStateConfig()
+			config.Clock = clock.Now
+			var first, second SmartRouteStateStore
+			var server *miniredis.Miniredis
+			if backend == "memory" {
+				store, err := NewMemorySmartRouteStateStore(config)
+				require.NoError(test, err)
+				first, second = store, store
+			} else {
+				server = miniredis.RunT(test)
+				server.SetTime(clock.Now())
+				firstClient := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				secondClient := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				test.Cleanup(func() { _ = firstClient.Close(); _ = secondClient.Close() })
+				var err error
+				first, err = NewRedisSmartRouteStateStore(firstClient, config)
+				require.NoError(test, err)
+				second, err = NewRedisSmartRouteStateStore(secondClient, config)
+				require.NoError(test, err)
+			}
+			ctx := context.Background()
+			route := SmartRouteStateRoute{RouteID: "image-route", CapacityDomain: "image-capacity", CredentialDomain: "image-credential"}
+			request := SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}}
+			record := SmartRouteAttemptRecord{
+				Endpoint: SmartEndpointImages, RouteID: route.RouteID, CapacityDomain: route.CapacityDomain, CredentialDomain: route.CredentialDomain,
+				ObservationID: "billing-pending", Outcome: smartrouter.OutcomeImagePending,
+				AtMS: clock.Now().UnixMilli(), StartedAtMS: clock.Now().UnixMilli(),
+			}
+			require.NoError(test, first.RecordAttempt(ctx, record))
+			for index := 0; index < 11; index++ {
+				failure := record
+				failure.ObservationID = fmt.Sprintf("billing-%d", index)
+				failure.Outcome = smartrouter.OutcomeInfrastructure
+				require.NoError(test, second.RecordAttempt(ctx, failure))
+			}
+			snapshot, err := second.Snapshot(ctx, request)
+			require.NoError(test, err)
+			state := snapshot.Quality.Routes[route.RouteID]
+			assert.False(test, state.ImageUnavailable)
+			assert.Equal(test, uint64(11), state.RealHardFailures)
+			assert.Equal(test, 11, snapshot.Recent.Routes[route.RouteID].StabilitySamples)
+			assert.NotContains(test, state.ImageAttemptEvidence, "billing-")
+			var evidence map[string]any
+			require.NoError(test, common.UnmarshalJsonStr(state.ImageAttemptEvidence, &evidence))
+			assert.Len(test, evidence, 12)
+			assert.Contains(test, evidence, smartRouteObservationDigest(smartRouteCanonicalObservationID("request", "billing-pending")))
+			record.Outcome = smartrouter.OutcomeClientCancelled
+			record.ObservationID = SmartRouteImageObservationID(record.ObservationID)
+			require.NoError(test, second.RecordAttempt(ctx, record))
+			record.Outcome = smartrouter.OutcomeInfrastructure
+			require.NoError(test, second.RecordAttempt(ctx, record))
+			require.NoError(test, first.RecordAttempt(ctx, record))
+			snapshot, err = first.Snapshot(ctx, request)
+			require.NoError(test, err)
+			state = snapshot.Quality.Routes[route.RouteID]
+			assert.True(test, state.ImageUnavailable)
+			assert.Equal(test, uint64(12), state.RealHardFailures)
+			assert.Equal(test, 12, snapshot.Recent.Routes[route.RouteID].StabilitySamples)
+			record.Outcome = smartrouter.OutcomeImagePending
+			require.NoError(test, first.RecordAttempt(ctx, record))
+			record.Outcome = smartrouter.OutcomeSuccess
+			record.ObservationID = "billing-pending"
+			require.NoError(test, first.RecordAttempt(ctx, record))
+			require.NoError(test, second.RecordAttempt(ctx, record))
+			snapshot, err = second.Snapshot(ctx, request)
+			require.NoError(test, err)
+			state = snapshot.Quality.Routes[route.RouteID]
+			assert.False(test, state.ImageUnavailable)
+			assert.Equal(test, smartrouter.QualityHealthy, state.Phase)
+			assert.Equal(test, uint64(1), state.RealSuccesses)
+			assert.Equal(test, uint64(11), state.RealHardFailures)
+			clock.Advance(time.Duration(smartrouter.DefaultImageFailureWindowMS) * time.Millisecond)
+			if server != nil {
+				server.SetTime(clock.Now())
+			}
+			snapshot, err = second.Snapshot(ctx, request)
+			require.NoError(test, err)
+			assert.False(test, snapshot.Quality.Routes[route.RouteID].ImageUnavailable)
+			for index := 0; index < 11; index++ {
+				failure := record
+				failure.AtMS = clock.Now().UnixMilli()
+				failure.StartedAtMS = failure.AtMS
+				failure.Outcome = smartrouter.OutcomeInfrastructure
+				failure.ObservationID = fmt.Sprintf("new-outage-%d", index)
+				require.NoError(test, second.RecordAttempt(ctx, failure))
+			}
+			require.NoError(test, first.RecordAttempt(ctx, record))
+			snapshot, err = second.Snapshot(ctx, request)
+			require.NoError(test, err)
+			assert.True(test, snapshot.Quality.Routes[route.RouteID].ImageUnavailable)
+			assert.Equal(test, uint64(1), snapshot.Quality.Routes[route.RouteID].RealSuccesses)
+			record.ObservationID = "fresh-success"
+			record.AtMS = clock.Now().UnixMilli()
+			record.StartedAtMS = record.AtMS
+			require.NoError(test, first.RecordAttempt(ctx, record))
+			snapshot, err = second.Snapshot(ctx, request)
+			require.NoError(test, err)
+			assert.False(test, snapshot.Quality.Routes[route.RouteID].ImageUnavailable)
+		})
+	}
+}
+
+func TestImageHealthRedisConcurrentPendingTerminalCAS(t *testing.T) {
+	server := miniredis.RunT(t)
+	clock := newSmartRouteTestClock()
+	server.SetTime(clock.Now())
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	first, err := NewRedisSmartRouteStateStore(client, config)
+	require.NoError(t, err)
+	second, err := NewRedisSmartRouteStateStore(client, config)
+	require.NoError(t, err)
+	var workers sync.WaitGroup
+	errors := make(chan error, 22)
+	for index := 0; index < 11; index++ {
+		for _, store := range []*RedisSmartRouteStateStore{first, second} {
+			workers.Add(1)
+			go func(store *RedisSmartRouteStateStore, index int) {
+				defer workers.Done()
+				record := SmartRouteAttemptRecord{
+					ImageAttempt: true, RouteID: "concurrent-image", ObservationID: fmt.Sprint(index),
+					Outcome: smartrouter.OutcomeImagePending, StartedAtMS: clock.Now().UnixMilli(),
+				}
+				if err := store.RecordAttempt(context.Background(), record); err != nil {
+					errors <- err
+					return
+				}
+				record.Outcome = smartrouter.OutcomeInfrastructure
+				errors <- store.RecordAttempt(context.Background(), record)
+			}(store, index)
+		}
+	}
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	snapshot, err := second.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{RouteID: "concurrent-image", CapacityDomain: "capacity"}}})
+	require.NoError(t, err)
+	state := snapshot.Quality.Routes["concurrent-image"]
+	assert.True(t, state.ImageUnavailable)
+	assert.Equal(t, uint64(11), state.RealHardFailures)
+	assert.Equal(t, 11, snapshot.Recent.Routes["concurrent-image"].StabilitySamples)
+}
+
+func TestImageHealthRedisNamespaceSurvivesLegacyProcessWrites(t *testing.T) {
+	server := miniredis.RunT(t)
+	clock := newSmartRouteTestClock()
+	server.SetTime(clock.Now())
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	first, err := NewRedisSmartRouteStateStore(client, config)
+	require.NoError(t, err)
+	second, err := NewRedisSmartRouteStateStore(client, config)
+	require.NoError(t, err)
+	ctx := context.Background()
+	route := SmartRouteStateRoute{RouteID: "image-isolated", CapacityDomain: "image-capacity"}
+	request := SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}}
+	for index := 0; index < 11; index++ {
+		require.NoError(t, first.RecordAttempt(ctx, SmartRouteAttemptRecord{
+			RouteID: route.RouteID, Endpoint: SmartEndpointImages, ObservationID: fmt.Sprint(index), Outcome: smartrouter.OutcomeInfrastructure,
+		}))
+	}
+	require.True(t, server.Exists(first.redisImageRouteKey(route.RouteID)))
+	require.False(t, server.Exists(first.redisRouteKey(route.RouteID)))
+	legacy, err := common.Marshal(redisSmartRouteState{Quality: smartrouter.QualityState{Phase: smartrouter.QualityHealthy, Epoch: 1}})
+	require.NoError(t, err)
+	server.Set(first.redisRouteKey(route.RouteID), string(legacy))
+	snapshot, err := second.Snapshot(ctx, request)
+	require.NoError(t, err)
+	require.False(t, snapshot.FailClosed)
+	assert.True(t, snapshot.Quality.Routes[route.RouteID].ImageUnavailable)
+	assert.Equal(t, uint64(11), snapshot.Quality.Routes[route.RouteID].RealHardFailures)
+	require.NoError(t, second.RecordAttempt(ctx, SmartRouteAttemptRecord{RouteID: "text-route", Endpoint: SmartEndpointChat, ObservationID: "text-success", Outcome: smartrouter.OutcomeSuccess}))
+	assert.True(t, server.Exists(first.redisRouteKey("text-route")))
+	assert.False(t, server.Exists(first.redisImageRouteKey("text-route")))
+	clock.Advance(time.Millisecond)
+	server.SetTime(clock.Now())
+	require.NoError(t, second.RecordAttempt(ctx, SmartRouteAttemptRecord{RouteID: route.RouteID, Endpoint: SmartEndpointImages, ObservationID: "fixed-success", Outcome: smartrouter.OutcomeSuccess}))
+	server.Set(first.redisRouteKey(route.RouteID), `{"Quality":{"phase":"open","epoch":1}}`)
+	snapshot, err = first.Snapshot(ctx, request)
+	require.NoError(t, err)
+	assert.False(t, snapshot.Quality.Routes[route.RouteID].ImageUnavailable)
+	assert.Equal(t, uint64(1), snapshot.Quality.Routes[route.RouteID].RealSuccesses)
+	clock.Advance((time.Duration(smartrouter.DefaultImageFailureWindowMS)*time.Millisecond + time.Second))
+	server.SetTime(clock.Now())
+	for index := 0; index < 11; index++ {
+		require.NoError(t, first.RecordAttempt(ctx, SmartRouteAttemptRecord{RouteID: route.RouteID, Endpoint: SmartEndpointImages, ObservationID: fmt.Sprintf("later-%d", index), Outcome: smartrouter.OutcomeInfrastructure}))
+	}
+	snapshot, err = second.Snapshot(ctx, request)
+	require.NoError(t, err)
+	state := snapshot.Quality.Routes[route.RouteID]
+	require.True(t, state.ImageUnavailable)
+	for repeat := 0; repeat < 2; repeat++ {
+		require.NoError(t, second.RecordAttempt(ctx, SmartRouteAttemptRecord{RouteID: route.RouteID, Endpoint: SmartEndpointImages, ObservationID: "0", AtMS: clock.Now().Add(-(time.Duration(smartrouter.DefaultImageFailureWindowMS)*time.Millisecond + time.Second)).UnixMilli() - 1, Outcome: smartrouter.OutcomeInfrastructure}))
+	}
+	snapshot, err = first.Snapshot(ctx, request)
+	require.NoError(t, err)
+	assert.Equal(t, state, snapshot.Quality.Routes[route.RouteID])
+}
+
+func TestImageHealthRecordValidation(t *testing.T) {
+	store := newTestMemorySmartRouteStateStore(t, newSmartRouteTestClock())
+	require.Error(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{RouteID: "image", Outcome: smartrouter.OutcomeImagePending}))
+	require.Error(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{ImageAttempt: true, RouteID: "image", Outcome: smartrouter.OutcomeImagePending}))
+}

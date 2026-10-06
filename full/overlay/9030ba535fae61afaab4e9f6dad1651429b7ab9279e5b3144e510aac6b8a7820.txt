@@ -1,0 +1,82 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestImageRouteSpoolResultHeldBeforePOST(t *testing.T) {
+	var posts atomic.Int64
+	fixture, _, guard := newImageRouteLocalUpstreamFixture(t, func(fixture *imageRouteReconcileFixture) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			posts.Add(1)
+			var job model.ImageRouteJob
+			if assert.NoError(t, fixture.database.First(&job, fixture.job.ID).Error) {
+				var reservation model.MediaStorageReservation
+				if assert.NoError(t, fixture.database.Where("token = ?", job.ResultReservation).First(&reservation).Error) {
+					assert.Equal(t, model.ImageRouteSpoolReservationExpiresAt, reservation.ExpiresAt)
+					assert.Equal(t, "reserved", reservation.State)
+					assert.Zero(t, reservation.UserID)
+				}
+				assert.Equal(t, model.ImageRouteJobWaiting, job.State)
+				assert.Equal(t, ".json", filepath.Ext(job.ResultPath))
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"id":"local-held-task","status":"queued"}`))
+		})
+	})
+	executeImageRouteJob(context.Background(), fixture.job)
+	require.EqualValues(t, 1, posts.Load())
+	require.Zero(t, guard.blocked.Load())
+}
+
+func TestImageRouteSpoolResultBindingFailureRollsBackWithoutPOST(t *testing.T) {
+	for _, scenario := range []string{"hold_failure", "persist_failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			var posts atomic.Int64
+			fixture, _, guard := newImageRouteLocalUpstreamFixture(t, func(*imageRouteReconcileFixture) http.Handler {
+				return http.HandlerFunc(func(http.ResponseWriter, *http.Request) { posts.Add(1) })
+			})
+			injected := errors.New("output binding failure")
+			var failures atomic.Int64
+			require.NoError(t, fixture.database.Callback().Update().Before("gorm:update").Register("fail_output_binding", func(tx *gorm.DB) {
+				updates, ok := tx.Statement.Dest.(map[string]interface{})
+				if !ok {
+					return
+				}
+				_, resultBinding := updates["result_reservation"]
+				isHold := updates["expires_at"] == model.ImageRouteSpoolReservationExpiresAt
+				if (scenario == "hold_failure" && isHold) || (scenario == "persist_failure" && resultBinding) {
+					failures.Add(1)
+					tx.AddError(injected)
+				}
+			}))
+			executeImageRouteJob(context.Background(), fixture.job)
+			require.EqualValues(t, 1, failures.Load())
+			require.Zero(t, posts.Load())
+			require.Zero(t, guard.blocked.Load())
+			job := fixture.loadJob(t)
+			require.Equal(t, model.ImageRouteJobDispatching, job.State)
+			require.Empty(t, job.ResultPath)
+			require.Empty(t, job.ResultReservation)
+			var reservations []model.MediaStorageReservation
+			require.NoError(t, fixture.database.Find(&reservations).Error)
+			require.Len(t, reservations, 1)
+			require.Equal(t, "released", reservations[0].State)
+			require.Less(t, reservations[0].ExpiresAt, model.ImageRouteSpoolReservationExpiresAt)
+			files, err := os.ReadDir(filepath.Dir(job.BodyPath))
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+		})
+	}
+}

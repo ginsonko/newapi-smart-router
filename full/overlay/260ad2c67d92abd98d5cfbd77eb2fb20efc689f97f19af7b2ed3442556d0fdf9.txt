@@ -1,0 +1,512 @@
+package service
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupRouteAnalyticsProjectionTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previousDB := model.DB
+	dsn := fmt.Sprintf("file:route-analytics-service-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(
+		&model.RouteAnalyticsDimensionV1{},
+		&model.RouteAnalyticsObservationV1{},
+		&model.RouteAnalyticsBucketV1{},
+		&model.KeyUsageAnalyticsBucketV1{},
+		&model.RouteAnalyticsHistoryV1{},
+		&model.RouteAnalyticsWorkerStateV1{},
+	))
+	model.DB = db
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	})
+	return db
+}
+
+func routeAnalyticsProjectionTestCatalog(t *testing.T) (smartrouter.CertifiedRouteCatalog, smartrouter.CertifiedRoute) {
+	t.Helper()
+	contractID, fingerprint, err := BuildSmartContractIdentity("gpt-5.6-sol", SmartEndpointResponses)
+	require.NoError(t, err)
+	route := smartrouter.CertifiedRoute{
+		RouteID: "route-1", ChannelGeneration: "generation-1", Group: "Example Discount  GPT",
+		ChannelID: 11, UpstreamModel: "gpt-5.6-sol", Capabilities: SmartCapabilityText,
+		MaxContext: 200_000, CacheDomain: "cache-1", CapacityDomain: "capacity-1", MaxInflight: 8,
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog-v1",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			contractID: {
+				Contract: smartrouter.RouteContract{
+					ContractID: contractID, CanonicalModel: "gpt-5.6-sol",
+					Endpoint: SmartEndpointResponses, CapabilityFingerprint: fingerprint,
+				},
+				Pools: map[string]smartrouter.CertifiedPool{"pool": {Candidates: []smartrouter.CertifiedRoute{route}}},
+			},
+		},
+	}
+	require.NoError(t, catalog.Validate())
+	return catalog, route
+}
+
+func routeAnalyticsProjectionTestLog(
+	t *testing.T,
+	createdAt int64,
+	logType int,
+	requestID string,
+	attempts []SmartRouteAttemptAudit,
+) *model.Log {
+	t.Helper()
+	other := map[string]any{
+		"request_path":       "/v1/responses",
+		"frt":                2_000,
+		"cache_tokens":       900,
+		"input_tokens_total": 1_000,
+		"pricing_revision":   "price-v2",
+		"admin_info": map[string]any{
+			"smart_router_attempts": attempts,
+		},
+		"stream_status": map[string]any{
+			"transport_status": "client_gone",
+			"provider_status":  "completed",
+		},
+	}
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	quota := 0
+	if logType == model.LogTypeConsume {
+		quota = 500
+	}
+	return &model.Log{
+		Id: 0, UserId: 7, CreatedAt: createdAt, Type: logType, ModelName: "gpt-5.6-sol",
+		Quota: quota, PromptTokens: 1_000, CompletionTokens: 100, ChannelId: 11,
+		TokenId: 42, Group: "Example Discount  GPT", RequestId: requestID, Other: string(encoded), IsStream: true,
+	}
+}
+
+func routeAnalyticsProjectionTestAttempts(route smartrouter.CertifiedRoute, recovered bool) []SmartRouteAttemptAudit {
+	price := smartrouter.RoutePrice{
+		BillingMode: "ratio", BillingUnit: "per_token", ComparisonClass: "ratio-v1",
+		ActualInputComparisonClass: "ratio-v1", ScorePPM: 1_000_000, StaticComparable: true,
+		CachePricingKnown: true, CacheReadRatioPPM: 100_000, Revision: "price-v2",
+	}
+	attempts := []SmartRouteAttemptAudit{{
+		Attempt: 1, RouteID: route.RouteID, ChannelID: route.ChannelID, Group: route.Group,
+		RatioPPM: 55_000, Price: price, CatalogVersion: "catalog-v1", PriceVersion: "price-v1",
+		Outcome: smartrouter.OutcomeInfrastructure, StatusCode: 503,
+	}}
+	if recovered {
+		attempts = append(attempts, SmartRouteAttemptAudit{
+			Attempt: 2, RouteID: route.RouteID, ChannelID: route.ChannelID, Group: route.Group,
+			RatioPPM: 55_000, Price: price, CatalogVersion: "catalog-v1", PriceVersion: "price-v2",
+			Outcome: smartrouter.OutcomeSuccess, StatusCode: 200, Committed: true,
+		})
+	}
+	return attempts
+}
+
+func applyRouteAnalyticsProjectionBuildResult(
+	t *testing.T,
+	result routeAnalyticsProjectionBuildResultV1,
+) int {
+	t.Helper()
+	detailIDs := make(map[string]string, len(result.Dimensions))
+	for _, dimension := range result.Dimensions {
+		stored, err := model.EnsureRouteAnalyticsDimensionV1(context.Background(), dimension)
+		require.NoError(t, err)
+		detailIDs[stored.RouteFingerprintDigest] = stored.DetailID
+	}
+	require.NoError(t, attachRouteAnalyticsDetailIDsV1(result.Projections, detailIDs))
+	applied, err := model.ApplyRouteAnalyticsProjectionsV1(context.Background(), result.Projections)
+	require.NoError(t, err)
+	return applied
+}
+
+func TestRouteAnalyticsProjectionCorrectsErrorToRecoveredConsume(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	requestID := "raw-request-must-not-persist"
+	errorLog := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeError, requestID, routeAnalyticsProjectionTestAttempts(route, false))
+	consumeLog := routeAnalyticsProjectionTestLog(t, 1_801, model.LogTypeConsume, requestID, routeAnalyticsProjectionTestAttempts(route, true))
+
+	result := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{errorLog, consumeLog})
+	assert.Zero(t, result.Skipped)
+	assert.NotEmpty(t, result.Dimensions)
+	assert.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, result), 0)
+
+	var routeBucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&routeBucket).Error)
+	assert.Equal(t, int64(1), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+	assert.Zero(t, routeBucket.FirstHitSuccesses)
+	assert.Equal(t, int64(1), routeBucket.RetryRecoveries)
+	assert.Zero(t, routeBucket.ConfirmedFailures)
+	assert.Equal(t, int64(1), routeBucket.TTFTCount)
+	assert.Equal(t, int64(2_000), routeBucket.TTFTSumMS)
+	assert.Equal(t, int64(900), routeBucket.CacheReadTokens)
+	assert.Equal(t, int64(1_000), routeBucket.TotalInputTokens)
+	assert.Equal(t, int64(190_000_000), routeBucket.PredictedInputMicros)
+	assert.Equal(t, int64(1_000), routeBucket.PredictedInputTokens)
+	assert.JSONEq(t, `{"price-v2":1}`, routeBucket.PriceRevisionCountsJSON)
+
+	var keyBucket model.KeyUsageAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&keyBucket).Error)
+	assert.Equal(t, int64(1), keyBucket.LogicalRequests)
+	assert.Equal(t, int64(1), keyBucket.Successes)
+	assert.Zero(t, keyBucket.Failures)
+	assert.Equal(t, int64(500), keyBucket.PositiveQuota)
+	assert.Equal(t, int64(1_000), keyBucket.InputTokens)
+	assert.Equal(t, int64(100), keyBucket.OutputTokens)
+	assert.Equal(t, int64(900), keyBucket.CacheReadTokens)
+	assert.Equal(t, route.Group, keyBucket.Group)
+
+	var observations []model.RouteAnalyticsObservationV1
+	require.NoError(t, db.Find(&observations).Error)
+	encoded, err := common.Marshal(observations)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), requestID)
+	assert.NotContains(t, string(encoded), "client_gone")
+}
+
+func TestRouteAnalyticsFrozenPriceRebuildsIncompleteRatioDescriptor(t *testing.T) {
+	recorded := smartrouter.LegacyRoutePrice(60_000)
+	other := map[string]any{
+		"billing_mode": "ratio",
+		"model_ratio":  1.25,
+		"group_ratio":  0.06,
+		"cache_ratio":  0.1,
+	}
+	price := routeAnalyticsFrozenRequestPriceV1(recorded, other)
+	assert.Equal(t, "ratio", price.BillingMode)
+	assert.Equal(t, "per_token", price.BillingUnit)
+	assert.True(t, smartrouter.SupportsActualInputCost(price))
+	assert.Equal(t, int64(75_000), price.ScorePPM)
+}
+
+func TestRouteAnalyticsFrozenPriceDefaultsMissingCachePrice(t *testing.T) {
+	recorded := smartrouter.LegacyRoutePrice(60_000)
+	price := routeAnalyticsFrozenRequestPriceV1(recorded, map[string]any{
+		"billing_mode": "ratio",
+		"model_ratio":  1.25,
+		"group_ratio":  0.06,
+	})
+	assert.True(t, smartrouter.SupportsActualInputCost(price))
+	assert.Equal(t, int64(1_000_000), price.CacheReadRatioPPM)
+}
+
+func TestRouteAnalyticsFrozenPriceUsesLoggedModelPriceWhenRatioIsZero(t *testing.T) {
+	price := routeAnalyticsFrozenRequestPriceV1(smartrouter.LegacyRoutePrice(60_000), map[string]any{
+		"billing_mode": "ratio",
+		"model_ratio":  0.0,
+		"model_price":  0.30,
+		"group_ratio":  0.13,
+		"cache_ratio":  0.10,
+	})
+	require.True(t, smartrouter.SupportsActualInputCost(price))
+	// model_price is USD per million input tokens; ratio units use USD 2/M.
+	assert.Equal(t, int64(19_500), price.ScorePPM)
+}
+
+func TestRouteAnalyticsFrozenPriceRejectsMalformedCacheMultiplier(t *testing.T) {
+	price := routeAnalyticsFrozenRequestPriceV1(smartrouter.LegacyRoutePrice(60_000), map[string]any{
+		"billing_mode": "ratio",
+		"model_ratio":  1.25,
+		"group_ratio":  0.06,
+		"cache_ratio":  "not-a-number",
+	})
+	assert.False(t, smartrouter.SupportsActualInputCost(price))
+}
+
+func TestRouteAnalyticsProjectionPredictsInputCostForLegacySpecialGPTAttempt(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "special-gpt-legacy-price", []SmartRouteAttemptAudit{{
+		Attempt: 1, RouteID: route.RouteID, ChannelID: route.ChannelID, Group: route.Group,
+		RatioPPM: 60_000, Price: smartrouter.LegacyRoutePrice(60_000),
+		Outcome: smartrouter.OutcomeSuccess, Committed: true,
+	}})
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	other["billing_mode"] = "ratio"
+	other["model_ratio"] = 1.25
+	other["group_ratio"] = 0.06
+	other["cache_ratio"] = 0.1
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	result := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{entry})
+	require.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, result), 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Greater(t, bucket.PredictedInputMicros, int64(0))
+	assert.Equal(t, int64(1_000), bucket.PredictedInputTokens)
+}
+
+func TestRouteAnalyticsProjectionUsesExplicitInputTotalWhenCacheFieldsAreOmitted(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "special-gpt-explicit-input", []SmartRouteAttemptAudit{{
+		Attempt: 1, RouteID: route.RouteID, ChannelID: route.ChannelID, Group: route.Group,
+		RatioPPM: 60_000, Price: smartrouter.LegacyRoutePrice(60_000),
+		Outcome: smartrouter.OutcomeSuccess, Committed: true,
+	}})
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	delete(other, "cache_tokens")
+	other["billing_mode"] = "ratio"
+	other["model_ratio"] = 1.25
+	other["group_ratio"] = 0.06
+	other["cache_ratio"] = 0.1
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	result := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{entry})
+	require.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, result), 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Equal(t, int64(1_000), bucket.TotalInputTokens)
+	assert.Equal(t, int64(1_000), bucket.PredictedInputTokens)
+	assert.Greater(t, bucket.PredictedInputMicros, int64(0))
+}
+
+func TestRouteAnalyticsProjectionUsesLoggedPromptTokensWhenInputFieldsAreOmitted(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "legacy-prompt-only", []SmartRouteAttemptAudit{{
+		Attempt: 1, RouteID: route.RouteID, ChannelID: route.ChannelID, Group: route.Group,
+		RatioPPM: 60_000, Price: smartrouter.LegacyRoutePrice(60_000),
+		Outcome: smartrouter.OutcomeSuccess, Committed: true,
+	}})
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	delete(other, "cache_tokens")
+	delete(other, "input_tokens_total")
+	delete(other, "cache_creation_tokens")
+	delete(other, "cache_creation_tokens_5m")
+	delete(other, "cache_creation_tokens_1h")
+	other["billing_mode"] = "ratio"
+	other["model_ratio"] = 1.25
+	other["cache_ratio"] = 0.1
+	other["group_ratio"] = 0.06
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	result := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{entry})
+	require.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, result), 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Equal(t, int64(1_000), bucket.PredictedInputTokens)
+	assert.Greater(t, bucket.PredictedInputMicros, int64(0))
+}
+
+func TestRouteAnalyticsProjectionSelfHealsPrunedBucketsDuringReplay(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	requestID := "pruned-bucket-replay"
+	errorLog := routeAnalyticsProjectionTestLog(
+		t, 1_800, model.LogTypeError, requestID, routeAnalyticsProjectionTestAttempts(route, false),
+	)
+	consumeLog := routeAnalyticsProjectionTestLog(
+		t, 1_801, model.LogTypeConsume, requestID, routeAnalyticsProjectionTestAttempts(route, true),
+	)
+
+	initial := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{errorLog})
+	assert.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, initial), 0)
+	require.NoError(t, db.Where("1 = 1").Delete(&model.RouteAnalyticsBucketV1{}).Error)
+	require.NoError(t, db.Where("1 = 1").Delete(&model.KeyUsageAnalyticsBucketV1{}).Error)
+
+	recovered := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{consumeLog})
+	assert.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, recovered), 0)
+	assert.Zero(t, applyRouteAnalyticsProjectionBuildResult(t, recovered))
+
+	var routeBuckets []model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Order("granularity ASC").Find(&routeBuckets).Error)
+	require.Len(t, routeBuckets, 2)
+	for _, bucket := range routeBuckets {
+		assert.Equal(t, int64(1), bucket.LogicalRequests)
+		assert.Equal(t, int64(1), bucket.FinalSuccesses)
+		assert.Zero(t, bucket.ConfirmedFailures)
+		assert.Equal(t, int64(1), bucket.RetryRecoveries)
+	}
+
+	var keyBuckets []model.KeyUsageAnalyticsBucketV1
+	require.NoError(t, db.Order("granularity ASC").Find(&keyBuckets).Error)
+	require.Len(t, keyBuckets, 2)
+	for _, bucket := range keyBuckets {
+		assert.Equal(t, int64(1), bucket.LogicalRequests)
+		assert.Equal(t, int64(1), bucket.Successes)
+		assert.Zero(t, bucket.Failures)
+		assert.Equal(t, int64(500), bucket.PositiveQuota)
+	}
+}
+
+func TestRouteAnalyticsProjectionUsesUnifiedTwoPriceMetricForTieredExpression(t *testing.T) {
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, time.Unix(1_800, 0).UTC())
+	db := model.DB
+	expression := `tier("base", p * 2 + c * 10 + cr * 0.2)`
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "fixed-tiered", nil)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	other["billing_mode"] = "tiered_expr"
+	other["expr_b64"] = base64.StdEncoding.EncodeToString([]byte(expression))
+	other["model_ratio"] = 0
+	other["group_ratio"] = 0.13
+	other["cache_ratio"] = 0.1
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	processed, err := worker.processLogsV1(context.Background(), []*model.Log{entry})
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Equal(t, int64(1_000), bucket.PredictedInputTokens)
+	assert.Greater(t, bucket.PredictedInputMicros, int64(0))
+}
+
+func TestRouteAnalyticsProjectionKeepsFixedPriceInputCostUnknown(t *testing.T) {
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, time.Unix(1_800, 0).UTC())
+	db := model.DB
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "fixed-price", nil)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	other["billing_mode"] = "fixed_price"
+	other["model_ratio"] = 0
+	other["group_ratio"] = 0.13
+	other["cache_ratio"] = 0
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	processed, err := worker.processLogsV1(context.Background(), []*model.Log{entry})
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Equal(t, int64(1_000), bucket.TotalInputTokens)
+	assert.Zero(t, bucket.PredictedInputTokens)
+	assert.Zero(t, bucket.PredictedInputMicros)
+}
+
+func TestRouteAnalyticsProjectionRejectsMismatchedFrozenTieredExpression(t *testing.T) {
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, time.Unix(1_800, 0).UTC())
+	db := model.DB
+	_, route := routeAnalyticsProjectionTestCatalog(t)
+	recordedExpression := `tier("recorded", p * 2 + cr * 0.2)`
+	price := smartrouter.RoutePrice{
+		BillingMode: "tiered_expr", BillingUnit: "per_token", ComparisonClass: "tiered",
+		ActualInputComparisonClass: "normalized-input-v2", ScorePPM: 130_000, StaticComparable: true,
+		TieredExpression: recordedExpression, TieredExpressionHash: billingexpr.ExprHashString(recordedExpression),
+		TieredInputPredictable: true,
+	}
+	attempts := []SmartRouteAttemptAudit{{
+		Attempt: 1, RouteID: route.RouteID, ChannelID: route.ChannelID, Group: route.Group,
+		RatioPPM: 130_000, Price: price, Outcome: smartrouter.OutcomeSuccess, Committed: true,
+	}}
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "tiered-hash-mismatch", attempts)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	other["billing_mode"] = "tiered_expr"
+	other["expr_b64"] = base64.StdEncoding.EncodeToString([]byte(`tier("different", p * 9)`))
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	processed, err := worker.processLogsV1(context.Background(), []*model.Log{entry})
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Equal(t, int64(1_000), bucket.TotalInputTokens)
+	assert.Zero(t, bucket.PredictedInputTokens)
+	assert.Zero(t, bucket.PredictedInputMicros)
+}
+
+func TestRouteAnalyticsProjectionPredictsRequestConditionalTieredCost(t *testing.T) {
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, time.Unix(1_800, 0).UTC())
+	db := model.DB
+	expression := `tier("conditional", p * (header("x-priority") == "fast" ? 8 : 2))`
+	entry := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "tiered-request-condition", nil)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(entry.Other, &other))
+	other["billing_mode"] = "tiered_expr"
+	other["expr_b64"] = base64.StdEncoding.EncodeToString([]byte(expression))
+	other["model_ratio"] = 0
+	other["group_ratio"] = 0.13
+	encoded, err := common.Marshal(other)
+	require.NoError(t, err)
+	entry.Other = string(encoded)
+
+	processed, err := worker.processLogsV1(context.Background(), []*model.Log{entry})
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	var bucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&bucket).Error)
+	assert.Equal(t, int64(1_000), bucket.TotalInputTokens)
+	assert.Equal(t, int64(1_000), bucket.PredictedInputTokens)
+	assert.Greater(t, bucket.PredictedInputMicros, int64(0))
+}
+
+func TestRouteAnalyticsProjectionDoesNotDowngradeConsumeWithLaterError(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	requestID := "request-rank-fence"
+	consumeLog := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, requestID, routeAnalyticsProjectionTestAttempts(route, true))
+	errorLog := routeAnalyticsProjectionTestLog(t, 1_801, model.LogTypeError, requestID, routeAnalyticsProjectionTestAttempts(route, false))
+
+	consume := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{consumeLog})
+	assert.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, consume), 0)
+	laterError := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{errorLog})
+	applyRouteAnalyticsProjectionBuildResult(t, laterError)
+
+	var routeBucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&routeBucket).Error)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+	assert.Zero(t, routeBucket.ConfirmedFailures)
+
+	var keyBucket model.KeyUsageAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&keyBucket).Error)
+	assert.Equal(t, int64(1), keyBucket.Successes)
+	assert.Zero(t, keyBucket.Failures)
+}
+
+func TestRouteAnalyticsLegacyClickHouseReplayIsIdempotent(t *testing.T) {
+	db := setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	legacy := routeAnalyticsProjectionTestLog(t, 1_800, model.LogTypeConsume, "", routeAnalyticsProjectionTestAttempts(route, true))
+	legacy.Id = 0
+
+	result := buildRouteAnalyticsProjectionsV1(catalog, []*model.Log{legacy, legacy})
+	assert.Greater(t, applyRouteAnalyticsProjectionBuildResult(t, result), 0)
+
+	var routeBucket model.RouteAnalyticsBucketV1
+	require.NoError(t, db.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&routeBucket).Error)
+	assert.Equal(t, int64(1), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+
+	var observations []model.RouteAnalyticsObservationV1
+	require.NoError(t, db.Find(&observations).Error)
+	for _, observation := range observations {
+		assert.True(t, observation.LegacyIdentity)
+	}
+}

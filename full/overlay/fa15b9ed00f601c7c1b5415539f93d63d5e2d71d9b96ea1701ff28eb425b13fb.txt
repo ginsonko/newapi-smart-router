@@ -1,0 +1,87 @@
+package relay
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestTaskModel2DtoKeepsFinalizingInternal(t *testing.T) {
+	task := &model.Task{
+		TaskID: "task-finalizing-dto", Status: model.TaskStatusFinalizing,
+		Progress: "99%",
+	}
+
+	result := TaskModel2Dto(task)
+
+	assert.Equal(t, "IN_PROGRESS", result.Status)
+	assert.Equal(t, "99%", result.Progress)
+}
+
+func TestClassifyTaskSubmissionErrorExtractsSafeAspectRatioDiagnostic(t *testing.T) {
+	body := []byte(`{"detail":[{"type":"missing","loc":["body","aspect_ratio"],"msg":"Field required","input":{"prompt":"private prompt","url":"https://signed.example/video?token=secret"}}],"request_id":"req_123"}`)
+
+	taskErr := classifyTaskSubmissionError(http.StatusUnprocessableEntity, body)
+
+	assert.Equal(t, "submission_parameter_incompatible", taskErr.Code)
+	assert.Equal(t, "此视频线路需要画面比例，请选择比例后重试。 原因：Field required", taskErr.Message)
+	assert.NotContains(t, taskErr.Message, "private prompt")
+	assert.NotContains(t, taskErr.Message, "token=secret")
+	data := taskErr.Data.(map[string]any)
+	assert.Equal(t, "aspect_ratio", data["field"])
+	assert.Equal(t, "req_123", data["request_id"])
+}
+
+func TestClassifyTaskSubmissionErrorNeverReturnsRawNestedPayload(t *testing.T) {
+	raw := `{"error":{"message":"invalid prompt: private launch phrase at https://signed.example/file?token=secret"}}`
+	taskErr := classifyTaskSubmissionError(http.StatusBadRequest, []byte(raw))
+
+	assert.Equal(t, "upstream_submission_rejected", taskErr.Code)
+	assert.NotContains(t, taskErr.Message, "private launch phrase")
+	assert.False(t, strings.Contains(taskErr.Message, "signed.example"))
+	assert.False(t, strings.Contains(taskErr.Message, "token=secret"))
+	_, hasDetail := taskErr.Data.(map[string]any)["detail"]
+	assert.False(t, hasDetail)
+}
+
+func TestMediaRejectionKeepsChineseAndUnknownReasonsAcrossSites(t *testing.T) {
+	for _, reason := range []string{"模型已禁用", "模型未禁用，但当前时段暂未开放", "参考图片数量超过上限", "供应商暂不接受此组合"} {
+		raw := `{"message":"The upstream service rejected this media request.","data":{"detail":"` + reason + `","request_id":"provider-42"}}`
+		err := classifyTaskSubmissionError(http.StatusBadRequest, []byte(raw))
+		assert.Equal(t, http.StatusBadRequest, err.StatusCode)
+		assert.Contains(t, err.Message, reason)
+		assert.Equal(t, "provider-42", err.Data.(map[string]any)["request_id"])
+	}
+}
+func TestMediaRejectionRedactsCredentialsAndDoesNotExposeEchoedPrompt(t *testing.T) {
+	err := classifyTaskSubmissionError(http.StatusForbidden, []byte(`{"error":{"message":"credential rejected sk-private123 Bearer private456"}}`))
+	assert.NotContains(t, err.Message, "private123")
+	assert.NotContains(t, err.Message, "private456")
+	assert.Contains(t, err.Message, "[凭据已隐藏]")
+	for _, raw := range []string{
+		`{"error":{"message":"提示词：秘密产品规划"}}`,
+		`{"error":{"message":"invalid prompt: secret product"}}`,
+		`{"error":{"message":"<html>provider error</html>"}}`,
+	} {
+		err := classifyTaskSubmissionError(http.StatusBadRequest, []byte(raw))
+		_, detail := err.Data.(map[string]any)["detail"]
+		assert.False(t, detail)
+		assert.NotContains(t, err.Message, "秘密")
+		assert.NotContains(t, err.Message, "secret product")
+	}
+}
+func TestMediaRejectionHandlesPlainReasonAndPreservesFailure(t *testing.T) {
+	err := classifyTaskSubmissionError(http.StatusBadGateway, []byte("服务器暂时繁忙"))
+	assert.Equal(t, http.StatusBadGateway, err.StatusCode)
+	assert.Equal(t, "upstream_submission_unavailable", err.Code)
+	assert.Contains(t, err.Message, "服务器暂时繁忙")
+}
+
+func TestMediaRejectionRedactsQuotedCredential(t *testing.T) {
+	err := classifyTaskSubmissionError(http.StatusForbidden, []byte(`{"error":{"message":"api_key=\"private-value\" invalid"}}`))
+	assert.NotContains(t, err.Message, "private-value")
+	assert.Contains(t, err.Message, "[凭据已隐藏]")
+}

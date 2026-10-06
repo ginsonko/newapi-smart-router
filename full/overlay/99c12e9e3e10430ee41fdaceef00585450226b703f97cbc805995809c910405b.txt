@@ -1,0 +1,439 @@
+package model
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	CommissionSchemaVersion = 1
+
+	CommissionModeDark      = "dark"
+	CommissionModeCapture   = "capture"
+	CommissionModeActive    = "active"
+	CommissionModeSuspended = "suspended"
+
+	CommissionSpendFirst    = "commission_first"
+	CommissionOrdinaryFirst = "ordinary_first"
+
+	CommissionProgramDraft     = "draft"
+	CommissionProgramPublished = "published"
+	CommissionProgramRetired   = "retired"
+
+	CommissionProfileEnabled = "enabled"
+	CommissionProfilePaused  = "paused"
+
+	CommissionFinancialReserved = "reserved"
+	CommissionFinancialSettled  = "settled"
+	CommissionFinancialRefunded = "refunded"
+
+	CommissionProjectionNone      = "none"
+	CommissionProjectionPending   = "pending"
+	CommissionProjectionApplying  = "applying"
+	CommissionProjectionApplied   = "applied"
+	CommissionProjectionRetryable = "retryable"
+	CommissionProjectionReview    = "review"
+
+	CommissionWithdrawalStatusSubmitted      = "submitted"
+	CommissionWithdrawalStatusApproved       = "approved"
+	CommissionWithdrawalStatusPaid           = "paid"
+	CommissionWithdrawalStatusRejected       = "rejected"
+	CommissionWithdrawalStatusCanceled       = "canceled"
+	CommissionWithdrawalStatusReviewRequired = "review_required"
+
+	CommissionRoleLegacy           = "legacy"
+	CommissionRoleCaptureCandidate = "capture_candidate"
+
+	commissionRateBase = int64(10_000)
+)
+
+var (
+	ErrCommissionCaptureNotArmed        = errors.New("r29_capture_not_armed")
+	ErrCommissionSuspended              = errors.New("r29_billing_suspended")
+	ErrCommissionInvariant              = errors.New("commission accounting invariant violated")
+	ErrCommissionInsufficientOrdinary   = errors.New("ordinary wallet quota is insufficient")
+	ErrCommissionOperationConflict      = errors.New("commission operation identity conflict")
+	ErrCommissionOperationFinalized     = errors.New("commission operation is already finalized")
+	ErrCommissionVersionConflict        = errors.New("commission version conflict")
+	ErrCommissionWithdrawalTransition   = errors.New("commission withdrawal transition is invalid")
+	ErrCommissionWithdrawalConservation = errors.New("commission withdrawal hold is not conserved")
+	ErrCommissionInviterReferenced      = errors.New("inviter_still_referenced")
+	ErrCommissionIdempotencyConflict    = errors.New("commission idempotency key was reused with different input")
+	ErrCommissionInvalidInput           = errors.New("commission request is invalid")
+	ErrCommissionInsufficientAvailable  = errors.New("commission available balance is insufficient")
+	ErrCommissionLegacyPathUnsupported  = errors.New("r29_midjourney_operation_required")
+)
+
+var commissionRuntimeRole = normalizeCommissionRuntimeRole(os.Getenv("COMMISSION_RUNTIME_ROLE"))
+
+func normalizeCommissionRuntimeRole(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), CommissionRoleCaptureCandidate) {
+		return CommissionRoleCaptureCandidate
+	}
+	return CommissionRoleLegacy
+}
+
+func CommissionRuntimeRole() string { return commissionRuntimeRole }
+
+type CommissionSettingsV1 struct {
+	ID               int64  `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	SchemaVersion    int    `json:"schema_version" gorm:"not null"`
+	Mode             string `json:"mode" gorm:"type:varchar(24);not null;index"`
+	SpendPriority    string `json:"spend_priority" gorm:"type:varchar(32);not null"`
+	CurrentProgramID int64  `json:"current_program_id" gorm:"index"`
+	CaptureEpoch     int64  `json:"capture_epoch" gorm:"not null"`
+	AccrualEpoch     int64  `json:"accrual_epoch" gorm:"not null"`
+	LegacyWatermark  string `json:"legacy_watermark" gorm:"type:text"`
+	Version          int64  `json:"version" gorm:"not null"`
+	CreatedAt        int64  `json:"created_at" gorm:"autoCreateTime:milli"`
+	UpdatedAt        int64  `json:"updated_at" gorm:"autoUpdateTime:milli;index"`
+}
+
+func (CommissionSettingsV1) TableName() string { return "commission_settings" }
+
+type CommissionProgramV1 struct {
+	ID            int64  `json:"id" gorm:"primaryKey"`
+	PublicID      string `json:"public_id" gorm:"type:varchar(48);uniqueIndex;not null"`
+	Name          string `json:"name" gorm:"type:varchar(128);not null"`
+	TiersJSON     string `json:"tiers_json" gorm:"type:text;not null"`
+	ContentSHA256 string `json:"content_sha256" gorm:"type:char(64);uniqueIndex;not null"`
+	Status        string `json:"status" gorm:"type:varchar(24);not null;index"`
+	CreatedBy     int    `json:"created_by" gorm:"not null"`
+	PublishedBy   int    `json:"published_by"`
+	PublishedAt   int64  `json:"published_at"`
+	Version       int64  `json:"version" gorm:"not null"`
+	CreatedAt     int64  `json:"created_at" gorm:"autoCreateTime:milli"`
+	UpdatedAt     int64  `json:"updated_at" gorm:"autoUpdateTime:milli;index"`
+}
+
+func (CommissionProgramV1) TableName() string { return "commission_programs" }
+
+type CommissionProfileV1 struct {
+	ID        int64  `json:"id" gorm:"primaryKey"`
+	PublicID  string `json:"public_id" gorm:"type:varchar(48);uniqueIndex;not null"`
+	UserID    int    `json:"user_id" gorm:"uniqueIndex;not null"`
+	Status    string `json:"status" gorm:"type:varchar(24);not null;index"`
+	ProgramID int64  `json:"program_id" gorm:"not null;index"`
+	Version   int64  `json:"version" gorm:"not null"`
+	CreatedAt int64  `json:"created_at" gorm:"autoCreateTime:milli"`
+	UpdatedAt int64  `json:"updated_at" gorm:"autoUpdateTime:milli;index"`
+}
+
+func (CommissionProfileV1) TableName() string { return "commission_profiles" }
+
+type CommissionAccountV1 struct {
+	ID                          int64  `json:"id" gorm:"primaryKey"`
+	PublicID                    string `json:"public_id" gorm:"type:varchar(48);uniqueIndex;not null"`
+	UserID                      int    `json:"user_id" gorm:"uniqueIndex;not null"`
+	AvailableQuota              int64  `json:"available_quota" gorm:"not null"`
+	UsageReservedQuota          int64  `json:"usage_reserved_quota" gorm:"not null"`
+	WithdrawalHeldQuota         int64  `json:"withdrawal_held_quota" gorm:"not null"`
+	DebtQuota                   int64  `json:"debt_quota" gorm:"not null"`
+	PendingCapacityQuota        int64  `json:"pending_capacity_quota" gorm:"not null"`
+	GrossLifetimeEligibleQuota  int64  `json:"gross_lifetime_eligible_quota" gorm:"not null"`
+	NetEntitledQuota            int64  `json:"net_entitled_quota" gorm:"not null"`
+	FractionalNumerator         int64  `json:"fractional_numerator" gorm:"not null"`
+	LifetimeEarnedQuota         int64  `json:"lifetime_earned_quota" gorm:"not null"`
+	LifetimeSpentQuota          int64  `json:"lifetime_spent_quota" gorm:"not null"`
+	LifetimeSpendRefundedQuota  int64  `json:"lifetime_spend_refunded_quota" gorm:"not null"`
+	LifetimeWithdrawalPaidQuota int64  `json:"lifetime_withdrawal_paid_quota" gorm:"not null"`
+	NetManualAdjustmentQuota    int64  `json:"net_manual_adjustment_quota" gorm:"not null"`
+	Version                     int64  `json:"version" gorm:"not null"`
+	CreatedAt                   int64  `json:"created_at" gorm:"autoCreateTime:milli"`
+	UpdatedAt                   int64  `json:"updated_at" gorm:"autoUpdateTime:milli;index"`
+}
+
+func (CommissionAccountV1) TableName() string { return "commission_accounts" }
+
+type CommissionOperationV1 struct {
+	ID                        int64   `json:"id" gorm:"primaryKey"`
+	PublicID                  string  `json:"public_id" gorm:"type:varchar(48);uniqueIndex;not null"`
+	OperationKeyHash          string  `json:"-" gorm:"type:char(64);uniqueIndex;not null"`
+	RequestHash               string  `json:"-" gorm:"type:char(64);not null"`
+	Source                    string  `json:"source" gorm:"type:varchar(24);not null;index"`
+	SourceStableID            string  `json:"source_stable_id" gorm:"type:varchar(191);not null;index"`
+	ConsumerUserID            int     `json:"consumer_user_id" gorm:"not null;index"`
+	TokenID                   int     `json:"token_id" gorm:"index"`
+	UserSubscriptionID        int     `json:"user_subscription_id" gorm:"index"`
+	BeneficiaryUserID         int     `json:"beneficiary_user_id" gorm:"index"`
+	ProfileID                 int64   `json:"profile_id" gorm:"index"`
+	ProgramID                 int64   `json:"program_id" gorm:"index"`
+	ProgramVersion            int64   `json:"program_version" gorm:"not null"`
+	ProgramTiersJSON          string  `json:"-" gorm:"type:text"`
+	SpendPriority             string  `json:"spend_priority" gorm:"type:varchar(32);not null"`
+	CommissionSpendEnabled    bool    `json:"commission_spend_enabled" gorm:"not null"`
+	Commissionable            bool    `json:"commissionable" gorm:"not null"`
+	FinancialStatus           string  `json:"financial_status" gorm:"type:varchar(24);not null;index"`
+	ProjectionStatus          string  `json:"projection_status" gorm:"type:varchar(24);not null;index"`
+	ReservedTotalQuota        int64   `json:"reserved_total_quota" gorm:"not null"`
+	ReservedCommissionQuota   int64   `json:"reserved_commission_quota" gorm:"not null"`
+	ReservedOrdinaryQuota     int64   `json:"reserved_ordinary_quota" gorm:"not null"`
+	ReservedSubscriptionQuota int64   `json:"reserved_subscription_quota" gorm:"not null"`
+	FinalTotalQuota           int64   `json:"final_total_quota" gorm:"not null"`
+	FinalCommissionQuota      int64   `json:"final_commission_quota" gorm:"not null"`
+	FinalOrdinaryQuota        int64   `json:"final_ordinary_quota" gorm:"not null"`
+	FinalSubscriptionQuota    int64   `json:"final_subscription_quota" gorm:"not null"`
+	EligibleOrdinaryQuota     int64   `json:"eligible_ordinary_quota" gorm:"not null"`
+	AwardNumerator            int64   `json:"award_numerator" gorm:"not null"`
+	AwardQuota                int64   `json:"award_quota" gorm:"not null"`
+	CorrectedNumerator        int64   `json:"corrected_numerator" gorm:"not null"`
+	ReservationCorrections    *string `json:"-" gorm:"type:text"`
+	SiteUnfundedCostQuota     int64   `json:"site_unfunded_cost_quota" gorm:"not null"`
+	ProjectionPayload         string  `json:"-" gorm:"type:text"`
+	ErrorCode                 string  `json:"error_code" gorm:"type:varchar(64)"`
+	Version                   int64   `json:"version" gorm:"not null"`
+	ReservedAt                int64   `json:"reserved_at" gorm:"not null;index"`
+	FinalizedAt               int64   `json:"finalized_at" gorm:"index"`
+	CreatedAt                 int64   `json:"created_at" gorm:"autoCreateTime:milli"`
+	UpdatedAt                 int64   `json:"updated_at" gorm:"autoUpdateTime:milli;index"`
+}
+
+func (CommissionOperationV1) TableName() string { return "commission_operations" }
+
+type CommissionLedgerV1 struct {
+	ID                    int64  `json:"id" gorm:"primaryKey"`
+	EventUUID             string `json:"event_uuid" gorm:"type:varchar(48);uniqueIndex;not null"`
+	EventKeyHash          string `json:"-" gorm:"type:char(64);uniqueIndex;not null"`
+	OperationID           int64  `json:"operation_id" gorm:"index"`
+	WithdrawalID          int64  `json:"withdrawal_id" gorm:"index"`
+	AccountID             int64  `json:"account_id" gorm:"index"`
+	ConsumerUserID        int    `json:"consumer_user_id" gorm:"index"`
+	EventType             string `json:"event_type" gorm:"type:varchar(48);not null;index"`
+	AvailableDelta        int64  `json:"available_delta" gorm:"not null"`
+	UsageReservedDelta    int64  `json:"usage_reserved_delta" gorm:"not null"`
+	WithdrawalHeldDelta   int64  `json:"withdrawal_held_delta" gorm:"not null"`
+	DebtDelta             int64  `json:"debt_delta" gorm:"not null"`
+	PendingCapacityDelta  int64  `json:"pending_capacity_delta" gorm:"not null"`
+	UserQuotaDelta        int64  `json:"user_quota_delta" gorm:"not null"`
+	EligibleOrdinaryQuota int64  `json:"eligible_ordinary_quota" gorm:"not null"`
+	RateBps               int64  `json:"rate_bps" gorm:"not null"`
+	TierThreshold         int64  `json:"tier_threshold" gorm:"not null"`
+	NumeratorDelta        int64  `json:"numerator_delta" gorm:"not null"`
+	AvailableAfter        int64  `json:"available_after" gorm:"not null"`
+	UsageReservedAfter    int64  `json:"usage_reserved_after" gorm:"not null"`
+	WithdrawalHeldAfter   int64  `json:"withdrawal_held_after" gorm:"not null"`
+	DebtAfter             int64  `json:"debt_after" gorm:"not null"`
+	PendingCapacityAfter  int64  `json:"pending_capacity_after" gorm:"not null"`
+	UserQuotaAfter        int64  `json:"user_quota_after" gorm:"not null"`
+	RelatedEventID        *int64 `json:"related_event_id" gorm:"index"`
+	ActorUserID           int    `json:"actor_user_id" gorm:"index"`
+	ReasonCode            string `json:"reason_code" gorm:"type:varchar(64)"`
+	RequestHash           string `json:"-" gorm:"type:char(64)"`
+	CreatedAt             int64  `json:"created_at" gorm:"autoCreateTime:milli;index"`
+}
+
+func (CommissionLedgerV1) TableName() string { return "commission_ledger" }
+
+type CommissionWithdrawalV1 struct {
+	ID                     int64  `json:"id" gorm:"primaryKey"`
+	PublicID               string `json:"public_id" gorm:"type:varchar(48);uniqueIndex;not null"`
+	UserID                 int    `json:"user_id" gorm:"not null;index"`
+	AmountQuota            int64  `json:"amount_quota" gorm:"not null"`
+	Status                 string `json:"status" gorm:"type:varchar(32);not null;index"`
+	RequestHash            string `json:"-" gorm:"type:char(64);not null"`
+	IdempotencyKeyHash     string `json:"-" gorm:"type:char(64);uniqueIndex;not null"`
+	Version                int64  `json:"version" gorm:"not null"`
+	MaskedContact          string `json:"masked_contact" gorm:"type:varchar(128)"`
+	MaskedPaymentReference string `json:"masked_payment_reference" gorm:"type:varchar(128)"`
+	ReviewFromStatus       string `json:"review_from_status" gorm:"type:varchar(32)"`
+	ReviewReasonCode       string `json:"review_reason_code" gorm:"type:varchar(64)"`
+	ReviewEnteredVersion   int64  `json:"review_entered_version"`
+	ReviewEnteredAt        int64  `json:"review_entered_at"`
+	SubmittedAt            int64  `json:"submitted_at" gorm:"index"`
+	ApprovedAt             int64  `json:"approved_at"`
+	PaidAt                 int64  `json:"paid_at"`
+	RejectedAt             int64  `json:"rejected_at"`
+	CanceledAt             int64  `json:"canceled_at"`
+	ActorUserID            int    `json:"actor_user_id" gorm:"index"`
+	CreatedAt              int64  `json:"created_at" gorm:"autoCreateTime:milli"`
+	UpdatedAt              int64  `json:"updated_at" gorm:"autoUpdateTime:milli;index"`
+}
+
+func (CommissionWithdrawalV1) TableName() string { return "commission_withdrawals" }
+
+var commissionMigrationModels = []interface{}{
+	&CommissionSettingsV1{},
+	&CommissionProgramV1{},
+	&CommissionProfileV1{},
+	&CommissionAccountV1{},
+	&CommissionOperationV1{},
+	&CommissionLedgerV1{},
+	&CommissionWithdrawalV1{},
+}
+
+func migrateCommissionSchema() error {
+	if err := DB.AutoMigrate(commissionMigrationModels...); err != nil {
+		return fmt.Errorf("migrate commission schema: %w", err)
+	}
+	now := time.Now().UnixMilli()
+	settings := CommissionSettingsV1{
+		ID:            1,
+		SchemaVersion: CommissionSchemaVersion,
+		Mode:          CommissionModeDark,
+		SpendPriority: CommissionSpendFirst,
+		Version:       1,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&settings).Error; err != nil {
+		return fmt.Errorf("initialize commission settings: %w", err)
+	}
+	return validateCommissionSchemaReadiness(DB)
+}
+
+func validateCommissionSchemaReadiness(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	for _, item := range commissionMigrationModels {
+		if !db.Migrator().HasTable(item) {
+			return fmt.Errorf("commission schema table missing for %T", item)
+		}
+	}
+	if !db.Migrator().HasColumn(&CommissionOperationV1{}, "ReservationCorrections") {
+		return errors.New("commission reservation corrections column is missing; run the deployment migration")
+	}
+	var settings CommissionSettingsV1
+	if err := db.First(&settings, 1).Error; err != nil {
+		return err
+	}
+	if settings.SchemaVersion != CommissionSchemaVersion {
+		return fmt.Errorf("unsupported commission schema version %d", settings.SchemaVersion)
+	}
+	if !validCommissionMode(settings.Mode) || !validCommissionSpendPriority(settings.SpendPriority) {
+		return ErrCommissionInvariant
+	}
+	return nil
+}
+
+func validCommissionMode(mode string) bool {
+	switch mode {
+	case CommissionModeDark, CommissionModeCapture, CommissionModeActive, CommissionModeSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+func validCommissionSpendPriority(priority string) bool {
+	return priority == CommissionSpendFirst || priority == CommissionOrdinaryFirst
+}
+
+func GetCommissionSettings() (*CommissionSettingsV1, error) {
+	var settings CommissionSettingsV1
+	if err := DB.First(&settings, 1).Error; err != nil {
+		return nil, err
+	}
+	return &settings, nil
+}
+
+func CommissionBillingMode() (string, string, error) {
+	settings, err := GetCommissionSettings()
+	if err != nil {
+		return "", "", err
+	}
+	return settings.Mode, settings.SpendPriority, nil
+}
+
+func CommissionBillableAdmission() (bool, error) {
+	settings, err := GetCommissionSettings()
+	if err != nil {
+		if CommissionRuntimeRole() == CommissionRoleCaptureCandidate {
+			return false, ErrCommissionCaptureNotArmed
+		}
+		return false, nil
+	}
+	if settings.SchemaVersion != CommissionSchemaVersion || !validCommissionMode(settings.Mode) {
+		return false, ErrCommissionInvariant
+	}
+	return settings.CurrentProgramID > 0, nil
+}
+
+func ValidateLegacyMidjourneyCommissionAdmission() error {
+	_, err := CommissionBillableAdmission()
+	return err
+}
+
+func commissionSchemaAvailableTx(tx *gorm.DB) bool {
+	return tx != nil && tx.Migrator().HasTable(&CommissionSettingsV1{}) && tx.Migrator().HasTable(&CommissionOperationV1{})
+}
+
+func commissionHash(parts ...string) string {
+	h := sha256.New()
+	for _, part := range parts {
+		_, _ = h.Write([]byte(part))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func commissionPublicID(prefix string) string {
+	return prefix + "_" + common.GetUUID()
+}
+
+func commissionCheckedQuota(value int64) (int, error) {
+	if value < int64(common.MinQuota) || value > int64(common.MaxQuota) {
+		return 0, ErrCommissionInvariant
+	}
+	return int(value), nil
+}
+
+// A request-level quota is capped at common.MaxQuota, but a user's wallet may
+// legitimately exceed that after multiple grants or commission transfers.
+func commissionCheckedWalletBalance(value int64) (int, error) {
+	maxInt := int64(^uint(0) >> 1)
+	if value < 0 || value > maxInt {
+		return 0, ErrCommissionInvariant
+	}
+	return int(value), nil
+}
+
+func commissionSafeAdd(left, right int64) (int64, error) {
+	if (right > 0 && left > math.MaxInt64-right) || (right < 0 && left < math.MinInt64-right) {
+		return 0, ErrCommissionInvariant
+	}
+	return left + right, nil
+}
+
+type commissionTierV1 struct {
+	ThresholdQuota int64 `json:"threshold_quota"`
+	RateBps        int64 `json:"rate_bps"`
+}
+
+func normalizeCommissionTierJSON(tiersJSON string) ([]commissionTierV1, string, error) {
+	var tiers []commissionTierV1
+	if err := common.Unmarshal([]byte(tiersJSON), &tiers); err != nil {
+		return nil, "", err
+	}
+	if len(tiers) == 0 {
+		return nil, "", errors.New("at least one commission tier is required")
+	}
+	sort.Slice(tiers, func(i, j int) bool { return tiers[i].ThresholdQuota < tiers[j].ThresholdQuota })
+	if tiers[0].ThresholdQuota != 0 {
+		return nil, "", errors.New("the first commission threshold must be zero")
+	}
+	for i, tier := range tiers {
+		if tier.ThresholdQuota < 0 || tier.RateBps < 0 || tier.RateBps > commissionRateBase {
+			return nil, "", errors.New("commission tier is outside the supported range")
+		}
+		if i > 0 && tiers[i-1].ThresholdQuota == tier.ThresholdQuota {
+			return nil, "", errors.New("commission thresholds must be unique")
+		}
+	}
+	canonical, err := common.Marshal(tiers)
+	if err != nil {
+		return nil, "", err
+	}
+	return tiers, string(canonical), nil
+}

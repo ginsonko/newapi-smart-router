@@ -1,0 +1,1114 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel/openrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/reasonmap"
+	"github.com/samber/lo"
+)
+
+func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {
+	openAIRequest := dto.GeneralOpenAIRequest{
+		Model:       claudeRequest.Model,
+		Temperature: claudeRequest.Temperature,
+	}
+	if claudeRequest.MaxTokens != nil {
+		openAIRequest.MaxTokens = lo.ToPtr(lo.FromPtr(claudeRequest.MaxTokens))
+	}
+	if claudeRequest.TopP != nil {
+		openAIRequest.TopP = lo.ToPtr(lo.FromPtr(claudeRequest.TopP))
+	}
+	if claudeRequest.TopK != nil {
+		openAIRequest.TopK = lo.ToPtr(lo.FromPtr(claudeRequest.TopK))
+	}
+	if claudeRequest.Stream != nil {
+		openAIRequest.Stream = lo.ToPtr(lo.FromPtr(claudeRequest.Stream))
+	}
+
+	isOpenRouter := info.ChannelType == constant.ChannelTypeOpenRouter
+
+	if isOpenRouter {
+		if effort := claudeRequest.GetEfforts(); effort != "" {
+			effortBytes, _ := json.Marshal(effort)
+			openAIRequest.Verbosity = effortBytes
+		}
+		if claudeRequest.Thinking != nil {
+			var reasoning openrouter.RequestReasoning
+			if claudeRequest.Thinking.Type == "enabled" {
+				reasoning = openrouter.RequestReasoning{
+					Enabled:   true,
+					MaxTokens: claudeRequest.Thinking.GetBudgetTokens(),
+				}
+			} else if claudeRequest.Thinking.Type == "adaptive" {
+				reasoning = openrouter.RequestReasoning{
+					Enabled: true,
+				}
+			}
+			reasoningJSON, err := json.Marshal(reasoning)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal reasoning: %w", err)
+			}
+			openAIRequest.Reasoning = reasoningJSON
+		}
+	} else {
+		thinkingSuffix := "-thinking"
+		if strings.HasSuffix(info.OriginModelName, thinkingSuffix) &&
+			!strings.HasSuffix(openAIRequest.Model, thinkingSuffix) {
+			openAIRequest.Model = openAIRequest.Model + thinkingSuffix
+		}
+	}
+
+	// Convert stop sequences
+	if len(claudeRequest.StopSequences) == 1 {
+		openAIRequest.Stop = claudeRequest.StopSequences[0]
+	} else if len(claudeRequest.StopSequences) > 1 {
+		openAIRequest.Stop = claudeRequest.StopSequences
+	}
+
+	// Convert tools
+	tools, _ := common.Any2Type[[]dto.Tool](claudeRequest.Tools)
+	openAITools := make([]dto.ToolCallRequest, 0)
+	for _, claudeTool := range tools {
+		openAITool := dto.ToolCallRequest{
+			Type: "function",
+			Function: dto.FunctionRequest{
+				Name:        claudeTool.Name,
+				Description: claudeTool.Description,
+				Parameters:  claudeTool.InputSchema,
+			},
+		}
+		openAITools = append(openAITools, openAITool)
+	}
+	openAIRequest.Tools = openAITools
+
+	// Convert messages
+	openAIMessages := make([]dto.Message, 0)
+
+	// Add system message if present
+	if claudeRequest.System != nil {
+		if claudeRequest.IsStringSystem() && claudeRequest.GetStringSystem() != "" {
+			openAIMessage := dto.Message{
+				Role: "system",
+			}
+			openAIMessage.SetStringContent(claudeRequest.GetStringSystem())
+			openAIMessages = append(openAIMessages, openAIMessage)
+		} else {
+			systems := claudeRequest.ParseSystem()
+			if len(systems) > 0 {
+				openAIMessage := dto.Message{
+					Role: "system",
+				}
+				isOpenRouterClaude := isOpenRouter && strings.HasPrefix(info.UpstreamModelName, "anthropic/claude")
+				if isOpenRouterClaude {
+					systemMediaMessages := make([]dto.MediaContent, 0, len(systems))
+					for _, system := range systems {
+						message := dto.MediaContent{
+							Type:         "text",
+							Text:         system.GetText(),
+							CacheControl: system.CacheControl,
+						}
+						systemMediaMessages = append(systemMediaMessages, message)
+					}
+					openAIMessage.SetMediaContent(systemMediaMessages)
+				} else {
+					systemStr := ""
+					for _, system := range systems {
+						if system.Text != nil {
+							systemStr += *system.Text
+						}
+					}
+					openAIMessage.SetStringContent(systemStr)
+				}
+				openAIMessages = append(openAIMessages, openAIMessage)
+			}
+		}
+	}
+	for _, claudeMessage := range claudeRequest.Messages {
+		openAIMessage := dto.Message{
+			Role: claudeMessage.Role,
+		}
+
+		//log.Printf("claudeMessage.Content: %v", claudeMessage.Content)
+		if claudeMessage.IsStringContent() {
+			openAIMessage.SetStringContent(claudeMessage.GetStringContent())
+		} else {
+			content, err := claudeMessage.ParseContent()
+			if err != nil {
+				return nil, err
+			}
+			contents := content
+			var toolCalls []dto.ToolCallRequest
+			mediaMessages := make([]dto.MediaContent, 0, len(contents))
+
+			for _, mediaMsg := range contents {
+				switch mediaMsg.Type {
+				case "text", "input_text":
+					message := dto.MediaContent{
+						Type:         "text",
+						Text:         mediaMsg.GetText(),
+						CacheControl: mediaMsg.CacheControl,
+					}
+					mediaMessages = append(mediaMessages, message)
+				case "image":
+					image, err := claudeImageToOpenAI(mediaMsg)
+					if err != nil {
+						return nil, err
+					}
+					mediaMessages = append(mediaMessages, image)
+				case "tool_use":
+					toolCall := dto.ToolCallRequest{
+						ID:   mediaMsg.Id,
+						Type: "function",
+						Function: dto.FunctionRequest{
+							Name:      mediaMsg.Name,
+							Arguments: toJSONString(mediaMsg.Input),
+						},
+					}
+					toolCalls = append(toolCalls, toolCall)
+				case "tool_result":
+					// Add tool result as a separate message
+					toolName := mediaMsg.Name
+					if toolName == "" {
+						toolName = claudeRequest.SearchToolNameByToolCallId(mediaMsg.ToolUseId)
+					}
+					oaiToolMessage := dto.Message{
+						Role:       "tool",
+						ToolCallId: mediaMsg.ToolUseId,
+					}
+					if toolName != "" {
+						oaiToolMessage.Name = &toolName
+					}
+					if mediaMsg.Content == nil {
+						oaiToolMessage.SetStringContent("")
+					} else if mediaMsg.IsStringContent() {
+						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
+					} else {
+						mediaContents, err := common.Any2Type[[]dto.ClaudeMediaMessage](mediaMsg.Content)
+						if err != nil {
+							return nil, fmt.Errorf("invalid Claude tool_result content: %w", err)
+						}
+						toolContents := make([]dto.MediaContent, 0, len(mediaContents))
+						var textContents strings.Builder
+						hasImage := false
+						hasCacheControl := false
+						for _, block := range mediaContents {
+							switch block.Type {
+							case "text":
+								toolContents = append(toolContents, dto.MediaContent{Type: "text", Text: block.GetText(), CacheControl: block.CacheControl})
+								textContents.WriteString(block.GetText())
+								hasCacheControl = hasCacheControl || len(block.CacheControl) > 0
+							case "image":
+								image, err := claudeImageToOpenAI(block)
+								if err != nil {
+									return nil, fmt.Errorf("invalid Claude tool_result image: %w", err)
+								}
+								toolContents = append(toolContents, image)
+								hasImage = true
+							default:
+								return nil, fmt.Errorf("Claude tool_result block %q cannot be represented by OpenAI-compatible tool content; use a native Anthropic channel", block.Type)
+							}
+						}
+						if hasImage || (isOpenRouter && hasCacheControl) {
+							oaiToolMessage.SetMediaContent(toolContents)
+						} else {
+							oaiToolMessage.SetStringContent(textContents.String())
+						}
+					}
+					openAIMessages = append(openAIMessages, oaiToolMessage)
+				}
+			}
+
+			if len(toolCalls) > 0 {
+				openAIMessage.SetToolCalls(toolCalls)
+			}
+
+			if len(mediaMessages) > 0 {
+				openAIMessage.SetMediaContent(mediaMessages)
+			}
+		}
+		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 {
+			openAIMessages = append(openAIMessages, openAIMessage)
+		}
+	}
+
+	openAIRequest.Messages = openAIMessages
+
+	return &openAIRequest, nil
+}
+
+func claudeImageToOpenAI(block dto.ClaudeMediaMessage) (dto.MediaContent, error) {
+	if block.Source == nil {
+		return dto.MediaContent{}, fmt.Errorf("Claude image is missing source")
+	}
+	var imageURL string
+	switch block.Source.Type {
+	case "base64":
+		data, ok := block.Source.Data.(string)
+		if !ok || data == "" || block.Source.MediaType == "" {
+			return dto.MediaContent{}, fmt.Errorf("Claude base64 image requires media_type and data")
+		}
+		imageURL = fmt.Sprintf("data:%s;base64,%s", block.Source.MediaType, data)
+	case "url":
+		if block.Source.Url == "" {
+			return dto.MediaContent{}, fmt.Errorf("Claude URL image is missing url")
+		}
+		imageURL = block.Source.Url
+	default:
+		return dto.MediaContent{}, fmt.Errorf("Claude image source %q is unsupported by OpenAI-compatible channels; use a native Anthropic channel", block.Source.Type)
+	}
+	return dto.MediaContent{Type: "image_url", ImageUrl: &dto.MessageImageUrl{Url: imageURL}, CacheControl: block.CacheControl}, nil
+}
+
+func generateStopBlock(index int) *dto.ClaudeResponse {
+	return &dto.ClaudeResponse{
+		Type:  "content_block_stop",
+		Index: common.GetPointer[int](index),
+	}
+}
+
+func buildClaudeUsageFromOpenAIUsage(oaiUsage *dto.Usage) *dto.ClaudeUsage {
+	if oaiUsage == nil {
+		return nil
+	}
+	cacheCreation5m, cacheCreation1h := NormalizeCacheCreationSplit(
+		oaiUsage.PromptTokensDetails.CachedCreationTokens,
+		oaiUsage.ClaudeCacheCreation5mTokens,
+		oaiUsage.ClaudeCacheCreation1hTokens,
+	)
+	usage := &dto.ClaudeUsage{
+		InputTokens:              oaiUsage.PromptTokens,
+		OutputTokens:             oaiUsage.CompletionTokens,
+		CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
+		CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
+	}
+	if cacheCreation5m > 0 || cacheCreation1h > 0 {
+		usage.CacheCreation = &dto.ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: cacheCreation5m,
+			Ephemeral1hInputTokens: cacheCreation1h,
+		}
+	}
+	return usage
+}
+
+func NormalizeCacheCreationSplit(totalTokens int, tokens5m int, tokens1h int) (int, int) {
+	remainder := lo.Max([]int{totalTokens - tokens5m - tokens1h, 0})
+	return tokens5m + remainder, tokens1h
+}
+
+const maxClaudePendingToolArgumentBytes = 4 << 20
+
+func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) []*dto.ClaudeResponse {
+	if openAIResponse == nil || info == nil {
+		return nil
+	}
+	if info.ClaudeConvertInfo == nil {
+		info.ClaudeConvertInfo = relaycommon.NewClaudeConvertInfo()
+	}
+	convertInfo := info.ClaudeConvertInfo
+	convertInfo.EnsureInitialized()
+	if convertInfo.ProtocolError != nil {
+		return nil
+	}
+
+	hasSemanticPayload := false
+	for _, choice := range openAIResponse.Choices {
+		if choice.Delta.GetReasoningContent() != "" || choice.Delta.GetContentString() != "" || len(choice.Delta.ToolCalls) > 0 {
+			hasSemanticPayload = true
+			break
+		}
+	}
+	if convertInfo.Done {
+		if hasSemanticPayload {
+			convertInfo.ProtocolError = fmt.Errorf("claude stream conversion: received content after message_stop")
+		}
+		return nil
+	}
+
+	var claudeResponses []*dto.ClaudeResponse
+	fail := func(format string, args ...any) bool {
+		if convertInfo.ProtocolError == nil {
+			convertInfo.ProtocolError = fmt.Errorf("claude stream conversion: "+format, args...)
+		}
+		convertInfo.Done = true
+		claudeResponses = nil
+		return false
+	}
+
+	if !convertInfo.MessageStarted {
+		msg := &dto.ClaudeMediaMessage{
+			Id:    openAIResponse.Id,
+			Model: openAIResponse.Model,
+			Type:  "message",
+			Role:  "assistant",
+			Usage: &dto.ClaudeUsage{
+				InputTokens:  info.GetEstimatePromptTokens(),
+				OutputTokens: 0,
+			},
+		}
+		msg.SetContent(make([]any, 0))
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Type:    "message_start",
+			Message: msg,
+		})
+		convertInfo.MessageStarted = true
+	}
+
+	closeOpenBlocks := func() {
+		for _, index := range convertInfo.OpenBlockOrder {
+			if _, ok := convertInfo.OpenBlocks[index]; !ok {
+				continue
+			}
+			claudeResponses = append(claudeResponses, generateStopBlock(index))
+			delete(convertInfo.OpenBlocks, index)
+			for toolIndex := range convertInfo.ToolBlocks {
+				toolBlock := &convertInfo.ToolBlocks[toolIndex]
+				if toolBlock.Started && !toolBlock.Closed && toolBlock.Index == index {
+					toolBlock.Closed = true
+				}
+			}
+		}
+		convertInfo.OpenBlockOrder = convertInfo.OpenBlockOrder[:0]
+		convertInfo.HasActiveBlock = false
+		convertInfo.LastMessagesType = relaycommon.LastMessageTypeNone
+		convertInfo.Index = convertInfo.NextIndex
+	}
+
+	validatePendingTools := func() bool {
+		for toolIndex := range convertInfo.ToolBlocks {
+			toolBlock := &convertInfo.ToolBlocks[toolIndex]
+			if toolBlock.Closed || toolBlock.Started {
+				continue
+			}
+			return fail("tool call %d ended before a valid name was received", toolIndex)
+		}
+		return true
+	}
+
+	transitionTo := func(messageType string) bool {
+		if convertInfo.LastMessagesType == messageType {
+			return true
+		}
+		if convertInfo.LastMessagesType == relaycommon.LastMessageTypeTools && !validatePendingTools() {
+			return false
+		}
+		closeOpenBlocks()
+		convertInfo.LastMessagesType = messageType
+		return true
+	}
+
+	startBlock := func(messageType string, contentBlock *dto.ClaudeMediaMessage) int {
+		index := convertInfo.NextIndex
+		convertInfo.NextIndex++
+		convertInfo.Index = index
+		convertInfo.OpenBlocks[index] = relaycommon.ClaudeOpenBlock{Type: messageType}
+		convertInfo.OpenBlockOrder = append(convertInfo.OpenBlockOrder, index)
+		convertInfo.ActiveBlockIndex = index
+		convertInfo.HasActiveBlock = true
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Index:        common.GetPointer(index),
+			Type:         "content_block_start",
+			ContentBlock: contentBlock,
+		})
+		return index
+	}
+
+	emitScalarDelta := func(messageType string, value string) bool {
+		if value == "" {
+			return true
+		}
+		if convertInfo.LastMessagesType != messageType || !convertInfo.HasActiveBlock {
+			if !transitionTo(messageType) {
+				return false
+			}
+			contentBlock := &dto.ClaudeMediaMessage{Type: messageType}
+			if messageType == relaycommon.LastMessageTypeThinking {
+				contentBlock.Thinking = common.GetPointer("")
+			} else {
+				contentBlock.Text = common.GetPointer("")
+			}
+			startBlock(messageType, contentBlock)
+		}
+		openBlock, ok := convertInfo.OpenBlocks[convertInfo.ActiveBlockIndex]
+		if !ok || openBlock.Type != messageType {
+			return fail("%s delta has no matching open block", messageType)
+		}
+		delta := &dto.ClaudeMediaMessage{Type: "text_delta", Text: common.GetPointer(value)}
+		if messageType == relaycommon.LastMessageTypeThinking {
+			delta = &dto.ClaudeMediaMessage{Type: "thinking_delta", Thinking: common.GetPointer(value)}
+		}
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Index: common.GetPointer(convertInfo.ActiveBlockIndex),
+			Type:  "content_block_delta",
+			Delta: delta,
+		})
+		return true
+	}
+
+	resolveToolBlock := func(toolCall dto.ToolCallResponse, fallbackPosition int) (int, bool) {
+		candidate := -1
+		mergeCandidate := func(mapped int) bool {
+			if candidate >= 0 && candidate != mapped {
+				return fail("conflicting tool identity mappings")
+			}
+			candidate = mapped
+			return true
+		}
+		if toolCall.ID != "" {
+			if mapped, ok := convertInfo.ToolBlockByID[toolCall.ID]; ok && !mergeCandidate(mapped) {
+				return -1, false
+			}
+		}
+		if toolCall.Index != nil {
+			if mapped, ok := convertInfo.ToolBlockByProviderIndex[*toolCall.Index]; ok && !mergeCandidate(mapped) {
+				return -1, false
+			}
+		}
+		if candidate < 0 {
+			if mapped, ok := convertInfo.ToolBlockByFallbackPosition[fallbackPosition]; ok {
+				// Array position is local to a chunk. A new explicit ID/index
+				// must not collide with a different tool emitted at that position
+				// in an earlier chunk. Anonymous blocks may acquire late identity.
+				block := &convertInfo.ToolBlocks[mapped]
+				idCompatible := toolCall.ID == "" || block.ProviderID == "" || block.ProviderID == toolCall.ID
+				indexCompatible := toolCall.Index == nil || !block.HasProviderIndex || block.ProviderIndex == *toolCall.Index
+				if !block.Closed && idCompatible && indexCompatible {
+					candidate = mapped
+				}
+			}
+		}
+		if candidate < 0 {
+			candidate = len(convertInfo.ToolBlocks)
+			convertInfo.ToolBlocks = append(convertInfo.ToolBlocks, relaycommon.ClaudeToolBlock{
+				Index:            -1,
+				ProviderIndex:    -1,
+				FallbackPosition: fallbackPosition,
+			})
+		}
+		if candidate >= len(convertInfo.ToolBlocks) {
+			return -1, fail("tool mapping points outside request state")
+		}
+
+		toolBlock := &convertInfo.ToolBlocks[candidate]
+		if toolBlock.Closed {
+			return -1, fail("received a delta for closed tool call %d", candidate)
+		}
+		if toolCall.ID != "" {
+			if mapped, ok := convertInfo.ToolBlockByID[toolCall.ID]; ok && mapped != candidate {
+				return -1, fail("tool id maps to multiple blocks")
+			}
+			if toolBlock.ProviderID != "" && toolBlock.ProviderID != toolCall.ID {
+				return -1, fail("provider changed tool id for block %d", candidate)
+			}
+			convertInfo.ToolBlockByID[toolCall.ID] = candidate
+			toolBlock.ProviderID = toolCall.ID
+			if !toolBlock.Started && !toolBlock.SyntheticID {
+				toolBlock.ID = toolCall.ID
+			}
+		}
+		if toolCall.Index != nil {
+			if mapped, ok := convertInfo.ToolBlockByProviderIndex[*toolCall.Index]; ok && mapped != candidate {
+				return -1, fail("provider index maps to multiple tool blocks")
+			}
+			if toolBlock.HasProviderIndex && toolBlock.ProviderIndex != *toolCall.Index && toolCall.ID == "" {
+				return -1, fail("provider changed index for tool block %d", candidate)
+			}
+			convertInfo.ToolBlockByProviderIndex[*toolCall.Index] = candidate
+			toolBlock.ProviderIndex = *toolCall.Index
+			toolBlock.HasProviderIndex = true
+		}
+		if mapped, ok := convertInfo.ToolBlockByFallbackPosition[fallbackPosition]; !ok {
+			convertInfo.ToolBlockByFallbackPosition[fallbackPosition] = candidate
+			toolBlock.FallbackPosition = fallbackPosition
+			toolBlock.HasFallbackPosition = true
+		} else if mapped != candidate {
+			if toolCall.ID == "" && toolCall.Index == nil {
+				return -1, fail("identifier-free tool fragment is ambiguous at position %d", fallbackPosition)
+			}
+			// An explicit ID/index is authoritative. Keep the old position
+			// mapping only for its already-resolved stream, and point this
+			// position at the explicit identity for subsequent fragments.
+			convertInfo.ToolBlockByFallbackPosition[fallbackPosition] = candidate
+		}
+		return candidate, true
+	}
+
+	emitToolArgument := func(toolBlock *relaycommon.ClaudeToolBlock, argument string) bool {
+		if argument == "" {
+			return true
+		}
+		if !toolBlock.Started {
+			if convertInfo.PendingToolArgumentBytes+len(argument) > maxClaudePendingToolArgumentBytes {
+				return fail("pending tool arguments exceeded %d bytes", maxClaudePendingToolArgumentBytes)
+			}
+			toolBlock.PendingArguments = append(toolBlock.PendingArguments, argument)
+			toolBlock.PendingArgumentBytes += len(argument)
+			convertInfo.PendingToolArgumentBytes += len(argument)
+			return true
+		}
+		if _, ok := convertInfo.OpenBlocks[toolBlock.Index]; !ok {
+			return fail("tool argument delta has no matching open block")
+		}
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Index: common.GetPointer(toolBlock.Index),
+			Type:  "content_block_delta",
+			Delta: &dto.ClaudeMediaMessage{
+				Type:        "input_json_delta",
+				PartialJson: common.GetPointer(argument),
+			},
+		})
+		return true
+	}
+
+	startToolBlock := func(toolBlock *relaycommon.ClaudeToolBlock) bool {
+		if toolBlock.Started {
+			return true
+		}
+		if toolBlock.Name == "" {
+			return true
+		}
+		index := convertInfo.NextIndex
+		convertInfo.NextIndex++
+		convertInfo.Index = index
+		if toolBlock.ID == "" {
+			toolBlock.ID = fmt.Sprintf("toolu_newapi_%d", index)
+			toolBlock.SyntheticID = true
+		}
+		toolBlock.Index = index
+		toolBlock.Started = true
+		convertInfo.OpenBlocks[index] = relaycommon.ClaudeOpenBlock{
+			Type:       relaycommon.LastMessageTypeTools,
+			ToolCallID: toolBlock.ID,
+			ToolName:   toolBlock.Name,
+		}
+		convertInfo.OpenBlockOrder = append(convertInfo.OpenBlockOrder, index)
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Index: common.GetPointer(index),
+			Type:  "content_block_start",
+			ContentBlock: &dto.ClaudeMediaMessage{
+				Id:    toolBlock.ID,
+				Type:  "tool_use",
+				Name:  toolBlock.Name,
+				Input: map[string]interface{}{},
+			},
+		})
+		for _, argument := range toolBlock.PendingArguments {
+			if !emitToolArgument(toolBlock, argument) {
+				return false
+			}
+		}
+		convertInfo.PendingToolArgumentBytes -= toolBlock.PendingArgumentBytes
+		toolBlock.PendingArguments = nil
+		toolBlock.PendingArgumentBytes = 0
+		return true
+	}
+
+	processToolCalls := func(toolCalls []dto.ToolCallResponse) bool {
+		if len(toolCalls) == 0 {
+			return true
+		}
+		if !transitionTo(relaycommon.LastMessageTypeTools) {
+			return false
+		}
+		activeTools := 0
+		for toolIndex := range convertInfo.ToolBlocks {
+			if !convertInfo.ToolBlocks[toolIndex].Closed {
+				activeTools++
+			}
+		}
+		if activeTools > 1 && len(toolCalls) != activeTools {
+			for _, toolCall := range toolCalls {
+				if toolCall.ID == "" && toolCall.Index == nil {
+					return fail("identifier-free tool fragment cannot be assigned among %d active tools", activeTools)
+				}
+			}
+		}
+		for position, toolCall := range toolCalls {
+			toolIndex, ok := resolveToolBlock(toolCall, position)
+			if !ok {
+				return false
+			}
+			toolBlock := &convertInfo.ToolBlocks[toolIndex]
+			if toolCall.Function.Name != "" {
+				if toolBlock.Name != "" && toolBlock.Name != toolCall.Function.Name {
+					return fail("provider changed name for tool block %d", toolIndex)
+				}
+				toolBlock.Name = toolCall.Function.Name
+			}
+			if !startToolBlock(toolBlock) {
+				return false
+			}
+			if !emitToolArgument(toolBlock, toolCall.Function.Arguments) {
+				return false
+			}
+		}
+		return true
+	}
+
+	finalize := func(usage *dto.Usage) bool {
+		if convertInfo.LastMessagesType == relaycommon.LastMessageTypeTools && !validatePendingTools() {
+			return false
+		}
+		closeOpenBlocks()
+		stopReason := stopReasonOpenAI2Claude(convertInfo.FinishReason)
+		if stopReason == "" {
+			stopReason = "end_turn"
+		}
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Type:  "message_delta",
+			Usage: buildClaudeUsageFromOpenAIUsage(usage),
+			Delta: &dto.ClaudeMediaMessage{StopReason: common.GetPointer(stopReason)},
+		})
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{Type: "message_stop"})
+		convertInfo.Done = true
+		return true
+	}
+
+	if openAIResponse.Usage != nil {
+		convertInfo.Usage = openAIResponse.Usage
+	}
+	if len(openAIResponse.Choices) == 0 {
+		if convertInfo.Usage != nil {
+			if !finalize(convertInfo.Usage) {
+				return nil
+			}
+		}
+		return claudeResponses
+	}
+
+	chosenChoice := openAIResponse.Choices[0]
+	if reasoning := chosenChoice.Delta.GetReasoningContent(); reasoning != "" {
+		if !emitScalarDelta(relaycommon.LastMessageTypeThinking, reasoning) {
+			return nil
+		}
+	}
+	if content := chosenChoice.Delta.GetContentString(); content != "" {
+		if !emitScalarDelta(relaycommon.LastMessageTypeText, content) {
+			return nil
+		}
+	}
+	if !processToolCalls(chosenChoice.Delta.ToolCalls) {
+		return nil
+	}
+
+	if chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != "" {
+		convertInfo.FinishReason = *chosenChoice.FinishReason
+		info.FinishReason = *chosenChoice.FinishReason
+		if convertInfo.Usage == nil {
+			// OpenAI-compatible streams commonly send usage in a following chunk.
+			// The handler's EOF finalizer supplies estimated usage if it never arrives.
+			return claudeResponses
+		}
+		if !finalize(convertInfo.Usage) {
+			return nil
+		}
+	}
+
+	return claudeResponses
+}
+
+func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relaycommon.RelayInfo) *dto.ClaudeResponse {
+	var stopReason string
+	contents := make([]dto.ClaudeMediaMessage, 0)
+	claudeResponse := &dto.ClaudeResponse{
+		Id:    openAIResponse.Id,
+		Type:  "message",
+		Role:  "assistant",
+		Model: openAIResponse.Model,
+	}
+	for _, choice := range openAIResponse.Choices {
+		stopReason = stopReasonOpenAI2Claude(choice.FinishReason)
+		textContent := choice.Message.StringContent()
+		toolCalls := choice.Message.ParseToolCalls()
+		if textContent != "" || len(toolCalls) == 0 {
+			claudeContent := dto.ClaudeMediaMessage{}
+			claudeContent.Type = "text"
+			claudeContent.SetText(textContent)
+			contents = append(contents, claudeContent)
+		}
+		for _, toolUse := range toolCalls {
+			claudeContent := dto.ClaudeMediaMessage{}
+			claudeContent.Type = "tool_use"
+			claudeContent.Id = toolUse.ID
+			claudeContent.Name = toolUse.Function.Name
+			mapParams := map[string]interface{}{}
+			if strings.TrimSpace(toolUse.Function.Arguments) != "" {
+				var parsed map[string]interface{}
+				if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &parsed); err == nil && parsed != nil {
+					mapParams = parsed
+				}
+			}
+			claudeContent.Input = mapParams
+			contents = append(contents, claudeContent)
+		}
+	}
+	claudeResponse.Content = contents
+	claudeResponse.StopReason = stopReason
+	claudeResponse.Usage = buildClaudeUsageFromOpenAIUsage(&openAIResponse.Usage)
+
+	return claudeResponse
+}
+
+func stopReasonOpenAI2Claude(reason string) string {
+	return reasonmap.OpenAIFinishReasonToClaudeStopReason(reason)
+}
+
+func toJSONString(v interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {
+	openaiRequest := &dto.GeneralOpenAIRequest{
+		Model:  info.UpstreamModelName,
+		Stream: lo.ToPtr(info.IsStream),
+	}
+
+	// 转换 messages
+	var messages []dto.Message
+	for _, content := range geminiRequest.Contents {
+		message := dto.Message{
+			Role: convertGeminiRoleToOpenAI(content.Role),
+		}
+
+		// 处理 parts
+		var mediaContents []dto.MediaContent
+		var toolCalls []dto.ToolCallRequest
+		for _, part := range content.Parts {
+			if part.Text != "" {
+				mediaContent := dto.MediaContent{
+					Type: "text",
+					Text: part.Text,
+				}
+				mediaContents = append(mediaContents, mediaContent)
+			} else if part.InlineData != nil {
+				mediaContent := dto.MediaContent{
+					Type: "image_url",
+					ImageUrl: &dto.MessageImageUrl{
+						Url:      fmt.Sprintf("data:%s;base64,%s", part.InlineData.MimeType, part.InlineData.Data),
+						Detail:   "auto",
+						MimeType: part.InlineData.MimeType,
+					},
+				}
+				mediaContents = append(mediaContents, mediaContent)
+			} else if part.FileData != nil {
+				mediaContent := dto.MediaContent{
+					Type: "image_url",
+					ImageUrl: &dto.MessageImageUrl{
+						Url:      part.FileData.FileUri,
+						Detail:   "auto",
+						MimeType: part.FileData.MimeType,
+					},
+				}
+				mediaContents = append(mediaContents, mediaContent)
+			} else if part.FunctionCall != nil {
+				// 处理 Gemini 的工具调用
+				toolCall := dto.ToolCallRequest{
+					ID:   fmt.Sprintf("call_%d", len(toolCalls)+1), // 生成唯一ID
+					Type: "function",
+					Function: dto.FunctionRequest{
+						Name:      part.FunctionCall.FunctionName,
+						Arguments: toJSONString(part.FunctionCall.Arguments),
+					},
+				}
+				toolCalls = append(toolCalls, toolCall)
+			} else if part.FunctionResponse != nil {
+				// 处理 Gemini 的工具响应，创建单独的 tool 消息
+				toolMessage := dto.Message{
+					Role:       "tool",
+					ToolCallId: fmt.Sprintf("call_%d", len(toolCalls)), // 使用对应的调用ID
+				}
+				toolMessage.SetStringContent(toJSONString(part.FunctionResponse.Response))
+				messages = append(messages, toolMessage)
+			}
+		}
+
+		// 设置消息内容
+		if len(toolCalls) > 0 {
+			// 如果有工具调用，设置工具调用
+			message.SetToolCalls(toolCalls)
+		} else if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
+			// 如果只有一个文本内容，直接设置字符串
+			message.Content = mediaContents[0].Text
+		} else if len(mediaContents) > 0 {
+			// 如果有多个内容或包含媒体，设置为数组
+			message.SetMediaContent(mediaContents)
+		}
+
+		// 只有当消息有内容或工具调用时才添加
+		if len(message.ParseContent()) > 0 || len(message.ToolCalls) > 0 {
+			messages = append(messages, message)
+		}
+	}
+
+	openaiRequest.Messages = messages
+
+	if geminiRequest.GenerationConfig.Temperature != nil {
+		openaiRequest.Temperature = geminiRequest.GenerationConfig.Temperature
+	}
+	if geminiRequest.GenerationConfig.TopP != nil && *geminiRequest.GenerationConfig.TopP > 0 {
+		openaiRequest.TopP = lo.ToPtr(*geminiRequest.GenerationConfig.TopP)
+	}
+	if geminiRequest.GenerationConfig.TopK != nil && *geminiRequest.GenerationConfig.TopK > 0 {
+		openaiRequest.TopK = lo.ToPtr(int(*geminiRequest.GenerationConfig.TopK))
+	}
+	if geminiRequest.GenerationConfig.MaxOutputTokens != nil && *geminiRequest.GenerationConfig.MaxOutputTokens > 0 {
+		openaiRequest.MaxTokens = lo.ToPtr(*geminiRequest.GenerationConfig.MaxOutputTokens)
+	}
+	// gemini stop sequences 最多 5 个，openai stop 最多 4 个
+	if len(geminiRequest.GenerationConfig.StopSequences) > 0 {
+		openaiRequest.Stop = geminiRequest.GenerationConfig.StopSequences[:4]
+	}
+	if geminiRequest.GenerationConfig.CandidateCount != nil && *geminiRequest.GenerationConfig.CandidateCount > 0 {
+		openaiRequest.N = lo.ToPtr(*geminiRequest.GenerationConfig.CandidateCount)
+	}
+
+	// 转换工具调用
+	if len(geminiRequest.GetTools()) > 0 {
+		var tools []dto.ToolCallRequest
+		for _, tool := range geminiRequest.GetTools() {
+			if tool.FunctionDeclarations != nil {
+				functionDeclarations, err := common.Any2Type[[]dto.FunctionRequest](tool.FunctionDeclarations)
+				if err != nil {
+					common.SysError(fmt.Sprintf("failed to parse gemini function declarations: %v (type=%T)", err, tool.FunctionDeclarations))
+					continue
+				}
+				for _, function := range functionDeclarations {
+					openAITool := dto.ToolCallRequest{
+						Type: "function",
+						Function: dto.FunctionRequest{
+							Name:        function.Name,
+							Description: function.Description,
+							Parameters:  function.Parameters,
+						},
+					}
+					tools = append(tools, openAITool)
+				}
+			}
+		}
+		if len(tools) > 0 {
+			openaiRequest.Tools = tools
+		}
+	}
+
+	// gemini system instructions
+	if geminiRequest.SystemInstructions != nil {
+		// 将系统指令作为第一条消息插入
+		systemMessage := dto.Message{
+			Role:    "system",
+			Content: extractTextFromGeminiParts(geminiRequest.SystemInstructions.Parts),
+		}
+		openaiRequest.Messages = append([]dto.Message{systemMessage}, openaiRequest.Messages...)
+	}
+
+	return openaiRequest, nil
+}
+
+func convertGeminiRoleToOpenAI(geminiRole string) string {
+	switch geminiRole {
+	case "user":
+		return "user"
+	case "model":
+		return "assistant"
+	case "function":
+		return "function"
+	default:
+		return "user"
+	}
+}
+
+func extractTextFromGeminiParts(parts []dto.GeminiPart) string {
+	var texts []string
+	for _, part := range parts {
+		if part.Text != "" {
+			texts = append(texts, part.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// ResponseOpenAI2Gemini 将 OpenAI 响应转换为 Gemini 格式
+func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relaycommon.RelayInfo) *dto.GeminiChatResponse {
+	geminiResponse := &dto.GeminiChatResponse{
+		Candidates: make([]dto.GeminiChatCandidate, 0, len(openAIResponse.Choices)),
+		UsageMetadata: dto.GeminiUsageMetadata{
+			PromptTokenCount:     openAIResponse.PromptTokens,
+			CandidatesTokenCount: openAIResponse.CompletionTokens,
+			TotalTokenCount:      openAIResponse.PromptTokens + openAIResponse.CompletionTokens,
+		},
+	}
+
+	for _, choice := range openAIResponse.Choices {
+		candidate := dto.GeminiChatCandidate{
+			Index:         int64(choice.Index),
+			SafetyRatings: []dto.GeminiChatSafetyRating{},
+		}
+
+		// 设置结束原因
+		var finishReason string
+		switch choice.FinishReason {
+		case "stop":
+			finishReason = "STOP"
+		case "length":
+			finishReason = "MAX_TOKENS"
+		case "content_filter":
+			finishReason = "SAFETY"
+		case "tool_calls":
+			finishReason = "STOP"
+		default:
+			finishReason = "STOP"
+		}
+		candidate.FinishReason = &finishReason
+
+		// 转换消息内容
+		content := dto.GeminiChatContent{
+			Role:  "model",
+			Parts: make([]dto.GeminiPart, 0),
+		}
+
+		textContent := choice.Message.StringContent()
+		if textContent != "" {
+			part := dto.GeminiPart{
+				Text: textContent,
+			}
+			content.Parts = append(content.Parts, part)
+		}
+
+		toolCalls := choice.Message.ParseToolCalls()
+		for _, toolCall := range toolCalls {
+			var args map[string]interface{}
+			if toolCall.Function.Arguments != "" {
+				if err := common.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+					args = map[string]interface{}{"arguments": toolCall.Function.Arguments}
+				}
+			} else {
+				args = make(map[string]interface{})
+			}
+
+			part := dto.GeminiPart{
+				FunctionCall: &dto.FunctionCall{
+					FunctionName: toolCall.Function.Name,
+					Arguments:    args,
+				},
+			}
+			content.Parts = append(content.Parts, part)
+		}
+
+		candidate.Content = content
+		geminiResponse.Candidates = append(geminiResponse.Candidates, candidate)
+	}
+
+	return geminiResponse
+}
+
+// StreamResponseOpenAI2Gemini 将 OpenAI 流式响应转换为 Gemini 格式
+func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) *dto.GeminiChatResponse {
+	// 检查是否有实际内容或结束标志
+	hasContent := false
+	hasFinishReason := false
+	for _, choice := range openAIResponse.Choices {
+		if len(choice.Delta.GetContentString()) > 0 || (choice.Delta.ToolCalls != nil && len(choice.Delta.ToolCalls) > 0) {
+			hasContent = true
+		}
+		if choice.FinishReason != nil {
+			hasFinishReason = true
+		}
+	}
+
+	// 如果没有实际内容且没有结束标志，跳过。主要针对 openai 流响应开头的空数据
+	if !hasContent && !hasFinishReason {
+		return nil
+	}
+
+	geminiResponse := &dto.GeminiChatResponse{
+		Candidates: make([]dto.GeminiChatCandidate, 0, len(openAIResponse.Choices)),
+		UsageMetadata: dto.GeminiUsageMetadata{
+			PromptTokenCount:     info.GetEstimatePromptTokens(),
+			CandidatesTokenCount: 0, // 流式响应中可能没有完整的 usage 信息
+			TotalTokenCount:      info.GetEstimatePromptTokens(),
+		},
+	}
+
+	if openAIResponse.Usage != nil {
+		geminiResponse.UsageMetadata.PromptTokenCount = openAIResponse.Usage.PromptTokens
+		geminiResponse.UsageMetadata.CandidatesTokenCount = openAIResponse.Usage.CompletionTokens
+		geminiResponse.UsageMetadata.TotalTokenCount = openAIResponse.Usage.TotalTokens
+	}
+
+	for _, choice := range openAIResponse.Choices {
+		candidate := dto.GeminiChatCandidate{
+			Index:         int64(choice.Index),
+			SafetyRatings: []dto.GeminiChatSafetyRating{},
+		}
+
+		// 设置结束原因
+		if choice.FinishReason != nil {
+			var finishReason string
+			switch *choice.FinishReason {
+			case "stop":
+				finishReason = "STOP"
+			case "length":
+				finishReason = "MAX_TOKENS"
+			case "content_filter":
+				finishReason = "SAFETY"
+			case "tool_calls":
+				finishReason = "STOP"
+			default:
+				finishReason = "STOP"
+			}
+			candidate.FinishReason = &finishReason
+		}
+
+		// 转换消息内容
+		content := dto.GeminiChatContent{
+			Role:  "model",
+			Parts: make([]dto.GeminiPart, 0),
+		}
+
+		// 处理工具调用
+		if choice.Delta.ToolCalls != nil {
+			for _, toolCall := range choice.Delta.ToolCalls {
+				// 解析参数
+				var args map[string]interface{}
+				if toolCall.Function.Arguments != "" {
+					if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+						args = map[string]interface{}{"arguments": toolCall.Function.Arguments}
+					}
+				} else {
+					args = make(map[string]interface{})
+				}
+
+				part := dto.GeminiPart{
+					FunctionCall: &dto.FunctionCall{
+						FunctionName: toolCall.Function.Name,
+						Arguments:    args,
+					},
+				}
+				content.Parts = append(content.Parts, part)
+			}
+		} else {
+			// 处理文本内容
+			textContent := choice.Delta.GetContentString()
+			if textContent != "" {
+				part := dto.GeminiPart{
+					Text: textContent,
+				}
+				content.Parts = append(content.Parts, part)
+			}
+		}
+
+		candidate.Content = content
+		geminiResponse.Candidates = append(geminiResponse.Candidates, candidate)
+	}
+
+	return geminiResponse
+}

@@ -1,0 +1,73 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { api } from '@/lib/api'
+
+import type { ParameterPricingContract } from './parameter-pricing-contract'
+
+export const PARAMETER_PRICING_QUERY_KEY = ['parameter-pricing'] as const
+
+export type ParameterPricingData = {
+  supported: boolean
+  schema_version: number
+  revision: string
+  entry_count: number
+  contract: ParameterPricingContract
+  changed?: boolean
+  current_revision?: string
+  expected_revision_matches?: boolean
+}
+
+export type ParameterPricingResponse = {
+  success: boolean
+  message?: string
+  code?: string
+  data: ParameterPricingData
+}
+
+export async function getParameterPricing(): Promise<ParameterPricingResponse> {
+  const response = await api.get<ParameterPricingResponse>(
+    '/api/option/parameter-pricing',
+    { disableDuplicate: true, skipErrorHandler: true }
+  )
+  return response.data
+}
+
+export async function previewParameterPricing(
+  expectedRevision: string,
+  contract: ParameterPricingContract
+): Promise<ParameterPricingResponse> {
+  const response = await api.post<ParameterPricingResponse>(
+    '/api/option/parameter-pricing/preview',
+    { expected_revision: expectedRevision, contract },
+    { skipErrorHandler: true }
+  )
+  return response.data
+}
+
+export async function updateParameterPricing(
+  expectedRevision: string,
+  contract: ParameterPricingContract
+): Promise<ParameterPricingResponse> {
+  const response = await api.put<ParameterPricingResponse>(
+    '/api/option/parameter-pricing',
+    { expected_revision: expectedRevision, contract },
+    { skipErrorHandler: true }
+  )
+  return response.data
+}

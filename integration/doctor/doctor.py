@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-PROTOCOL_VERSION = "doctor-v1alpha2"
+PROTOCOL_VERSION = "doctor-v1alpha3"
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 SAFE_SUFFIXES = {".go", ".ts", ".tsx", ".json", ".md", ".mod", ".sum"}
 DENIED_NAMES = {
@@ -50,6 +50,10 @@ class HookSpec:
 
 
 HOOKS = (
+    HookSpec("HOOK-PRICE-001", ("service/smart_router_catalog_price.go",), (r"Price", r"Revision")),
+    HookSpec("HOOK-POLICY-MEMORY-001", ("model/token.go", "model/token_routing_memory.go", "controller/token.go"), (r"routing_policy_memory", r"ResolveTokenRoutingPolicyMemory")),
+    HookSpec("HOOK-CATALOG-SCOPE-001", ("middleware/auth.go", "controller/token.go", "service/smart_router_catalog.go"), (r"GetUserGroup", r"GroupInUserUsableGroups")),
+    HookSpec("HOOK-IMAGE-JOB-001", ("controller/image_route_job.go", "model/image_route_job.go"), (r"[Rr]efund", r"[Uu]nknown")),
     HookSpec("HOOK-AUTH-001", ("middleware/auth.go", "model/token.go"), (r"routing_policy", r"TokenRoutingPolicy")),
     HookSpec("HOOK-CONTRACT-001", ("relay/common/relay_info.go",), (r"SmartRoute", r"ContractID")),
     HookSpec("HOOK-ROUTE-001", ("middleware/distributor.go", "controller/relay.go"), (r"SmartRoute", r"ExactRoute")),

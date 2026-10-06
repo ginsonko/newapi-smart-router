@@ -1,0 +1,290 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/cachex"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/samber/hot"
+)
+
+const standaloneSearchResultTTL = 5 * time.Minute
+
+type StandaloneSearchCacheEntry struct {
+	RequestDigest string `json:"request_digest"`
+	Body          []byte `json:"body"`
+}
+
+var (
+	standaloneSearchCacheOnce sync.Once
+	standaloneSearchCache     *cachex.HybridCache[StandaloneSearchCacheEntry]
+	standaloneSearchPending   *cachex.HybridCache[string]
+	standaloneSearchLocal     *hot.HotCache[string, StandaloneSearchCacheEntry]
+	standaloneSearchLocks     [256]sync.Mutex
+)
+
+const (
+	StandaloneSearchIdentityContextKey      = "standalone_search_identity"
+	StandaloneSearchDigestContextKey        = "standalone_search_request_digest"
+	StandaloneSearchDispatchOwnerContextKey = "standalone_search_dispatch_owner"
+	StandaloneSearchSubmittedContextKey     = "standalone_search_submitted"
+)
+
+func standaloneSearchResultCache() *cachex.HybridCache[StandaloneSearchCacheEntry] {
+	standaloneSearchCacheOnce.Do(func() {
+		standaloneSearchLocal = hot.NewHotCache[string, StandaloneSearchCacheEntry](hot.LRU, 10_000).
+			WithTTL(standaloneSearchResultTTL).WithJanitor().Build()
+		standaloneSearchCache = cachex.NewHybridCache(cachex.HybridCacheConfig[StandaloneSearchCacheEntry]{
+			Namespace: cachex.Namespace("standalone_search:v1:result"),
+			Redis:     common.RDB,
+			RedisEnabled: func() bool {
+				return common.RedisEnabled && common.RDB != nil
+			},
+			RedisCodec: cachex.JSONCodec[StandaloneSearchCacheEntry]{},
+			Memory: func() *hot.HotCache[string, StandaloneSearchCacheEntry] {
+				return hot.NewHotCache[string, StandaloneSearchCacheEntry](hot.LRU, 10_000).
+					WithTTL(standaloneSearchResultTTL).WithJanitor().Build()
+			},
+		})
+		standaloneSearchPending = cachex.NewHybridCache(cachex.HybridCacheConfig[string]{
+			Namespace: cachex.Namespace("standalone_search:v1:pending"), Redis: common.RDB,
+			RedisEnabled: func() bool { return common.RedisEnabled && common.RDB != nil },
+			RedisCodec:   cachex.StringCodec{},
+			Memory: func() *hot.HotCache[string, string] {
+				return hot.NewHotCache[string, string](hot.LRU, 10_000).
+					WithTTL(standaloneSearchResultTTL).WithJanitor().Build()
+			},
+		})
+	})
+	return standaloneSearchCache
+}
+
+// StandaloneSearchIdentity scopes the opaque client search id to the
+// authenticated user and token. Hashing keeps raw ids out of Redis key names.
+func StandaloneSearchIdentity(userID, tokenID int, searchID string) string {
+	digest := sha256.Sum256([]byte(strconv.Itoa(userID) + "\x00" + strconv.Itoa(tokenID) + "\x00" + searchID))
+	return hex.EncodeToString(digest[:])
+}
+
+func StandaloneSearchRequestDigest(body []byte) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) == nil {
+		// Model mapping is an upstream transport detail. The client-visible
+		// idempotency contract is defined by its original request.
+		if normalized, err := json.Marshal(fields); err == nil {
+			body = normalized
+		}
+	}
+	digest := sha256.Sum256(body)
+	return hex.EncodeToString(digest[:])
+}
+
+func LockStandaloneSearch(identity string) func() {
+	digest := sha256.Sum256([]byte(identity))
+	lock := &standaloneSearchLocks[int(digest[0])]
+	lock.Lock()
+	return lock.Unlock
+}
+
+func GetStandaloneSearchResult(identity string) (StandaloneSearchCacheEntry, bool, error) {
+	cache := standaloneSearchResultCache()
+	if value, found, _ := standaloneSearchLocal.Get(identity); found {
+		return value, true, nil
+	}
+	value, found, err := cache.Get(identity)
+	if found && err == nil {
+		standaloneSearchLocal.SetWithTTL(identity, value, standaloneSearchResultTTL)
+	}
+	return value, found, err
+}
+
+func PutStandaloneSearchResult(identity, requestDigest string, body []byte) error {
+	entry := StandaloneSearchCacheEntry{RequestDigest: requestDigest, Body: append([]byte(nil), body...)}
+	standaloneSearchResultCache()
+	// In clustered mode the shared success result is the only safe replacement
+	// for the pending replay fence. Never publish only to the process-local L1 or
+	// delete pending when Redis persistence failed: another Web node could then
+	// issue and charge the same search again.
+	if err := standaloneSearchResultCache().SetWithTTL(identity, entry, standaloneSearchResultTTL); err != nil {
+		return err
+	}
+	standaloneSearchLocal.SetWithTTL(identity, entry, standaloneSearchResultTTL)
+	if _, err := standaloneSearchPending.DeleteMany([]string{identity}); err != nil {
+		// The result is already shared and ServeCachedStandaloneSearch checks it
+		// before pending. A stale pending key is therefore safe until its TTL and
+		// must not turn the successfully persisted response into an error.
+		common.SysLog("standalone search pending cleanup deferred: " + err.Error())
+	}
+	return nil
+}
+
+func ServeCachedStandaloneSearch(c *gin.Context, identity, requestDigest string) (bool, error) {
+	entry, found, err := GetStandaloneSearchResult(identity)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		if pending, pendingFound, pendingErr := standaloneSearchPending.Get(identity); pendingErr != nil {
+			return false, pendingErr
+		} else if pendingFound {
+			if pending != requestDigest {
+				return false, errors.New("standalone search id was reused with a different request")
+			}
+			return false, errors.New("standalone search result is uncertain; retry with a new search id only after checking the prior result")
+		}
+		return false, nil
+	}
+	if entry.RequestDigest != requestDigest {
+		return false, errors.New("standalone search id was reused with a different request")
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", entry.Body)
+	return true, nil
+}
+
+func CommitStandaloneSearchResult(c *gin.Context, body []byte) error {
+	if c == nil {
+		return errors.New("standalone search context is nil")
+	}
+	identity := c.GetString(StandaloneSearchIdentityContextKey)
+	digest := c.GetString(StandaloneSearchDigestContextKey)
+	if identity == "" || digest == "" {
+		return errors.New("standalone search cache identity is missing")
+	}
+	return PutStandaloneSearchResult(identity, digest, body)
+}
+
+func MarkStandaloneSearchPending(identity, requestDigest string) error {
+	if identity == "" || requestDigest == "" {
+		return errors.New("standalone search pending identity is missing")
+	}
+	standaloneSearchResultCache()
+	if common.RedisEnabled && common.RDB != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		claimed, err := common.RDB.SetNX(ctx, standaloneSearchPending.FullKey(identity), requestDigest, standaloneSearchResultTTL).Result()
+		if err != nil {
+			return err
+		}
+		if claimed {
+			return nil
+		}
+		current, getErr := common.RDB.Get(ctx, standaloneSearchPending.FullKey(identity)).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if current != requestDigest {
+			return errors.New("standalone search id was reused with a different request")
+		}
+		return errors.New("standalone search is already in progress or its result is uncertain; refusing to replay")
+	}
+	if current, found, err := standaloneSearchPending.Get(identity); err != nil {
+		return err
+	} else if found {
+		if current != requestDigest {
+			return errors.New("standalone search id was reused with a different request")
+		}
+		return errors.New("standalone search is already in progress or its result is uncertain; refusing to replay")
+	}
+	if err := standaloneSearchPending.SetWithTTL(identity, requestDigest, standaloneSearchResultTTL); err != nil {
+		return err
+	}
+	return nil
+}
+
+// PrepareStandaloneSearchDispatch is called by the shared HTTP transport at
+// the last local boundary before client.Do. Local URL/header/OAuth failures
+// therefore do not leave a false uncertain marker, while every possibly sent
+// request does.
+func PrepareStandaloneSearchDispatch(c *gin.Context) error {
+	if c == nil {
+		return errors.New("standalone search context is nil")
+	}
+	if c.GetBool(StandaloneSearchDispatchOwnerContextKey) {
+		if err := MarkStandaloneSearchPending(
+			c.GetString(StandaloneSearchIdentityContextKey),
+			c.GetString(StandaloneSearchDigestContextKey),
+		); err != nil {
+			return err
+		}
+		c.Set(StandaloneSearchDispatchOwnerContextKey, false)
+		c.Set(StandaloneSearchSubmittedContextKey, true)
+		return nil
+	}
+	// A smart-routing preparation/replan path may invoke the transport again in
+	// the same request. Only the one controller-authorized dispatch may cross
+	// this side-effect boundary.
+	return errors.New("standalone search dispatch was already attempted; refusing to replay")
+}
+
+// StandaloneSearchSubmissionStarted reports whether the current physical
+// route crossed the shared pending fence immediately before client.Do.
+func StandaloneSearchSubmissionStarted(c *gin.Context) bool {
+	return c != nil && c.GetBool(StandaloneSearchSubmittedContextKey)
+}
+
+// ReleaseStandaloneSearchAfterExplicitRejection permits exactly one new
+// physical dispatch after an upstream HTTP non-2xx proves the prior search was
+// rejected. Timeouts, disconnects and malformed 2xx responses never call this
+// function and therefore retain the replay fence.
+func ReleaseStandaloneSearchAfterExplicitRejection(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	ClearStandaloneSearchPending(c.GetString(StandaloneSearchIdentityContextKey))
+	c.Set(StandaloneSearchSubmittedContextKey, false)
+	c.Set(StandaloneSearchDispatchOwnerContextKey, true)
+}
+
+func ClearStandaloneSearchPending(identity string) {
+	standaloneSearchResultCache()
+	_, _ = standaloneSearchPending.DeleteMany([]string{identity})
+}
+
+func PostStandaloneSearchConsume(c *gin.Context, info *relaycommon.RelayInfo) error {
+	if info == nil {
+		return errors.New("standalone search relay info is nil")
+	}
+	quota := info.PriceData.QuotaToPreConsume
+	if err := SettleBilling(c, info, quota); err != nil {
+		return err
+	}
+	if BillingOwnsUsageProjection(info) {
+		billing, ok := info.Billing.(*SmartRouteBillingSession)
+		if !ok {
+			return errors.New("standalone search smart-route billing session is unavailable")
+		}
+		if err := ProjectSmartRouteCommittedSettlement(c, billing, info, nil); err != nil {
+			return err
+		}
+		return nil
+	} else {
+		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, quota)
+		model.UpdateChannelUsedQuota(info.ChannelId, quota)
+	}
+	pricePerThousand := operation_setting.GetToolPriceForModel("web_search", info.OriginModelName)
+	other := GenerateTextOtherInfo(c, info, 0, info.PriceData.GroupRatioInfo.GroupRatio, 0, 0, 0, info.PriceData.ModelPrice, info.PriceData.GroupRatioInfo.GroupSpecialRatio)
+	other["web_search"] = true
+	other["web_search_call_count"] = 1
+	other["web_search_price"] = pricePerThousand
+	other["standalone_search"] = true
+	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
+		ChannelId: info.ChannelId, ModelName: info.OriginModelName, TokenName: c.GetString("token_name"),
+		Quota: quota, Content: fmt.Sprintf("Standalone Web Search 调用 1 次，调用花费 %d quota", quota),
+		TokenId: info.TokenId, UseTimeSeconds: int(time.Since(info.StartTime).Seconds()),
+		Group: info.UsingGroup, Other: other,
+	})
+	return nil
+}

@@ -1,0 +1,338 @@
+package controller
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+
+	"github.com/gin-gonic/gin"
+)
+
+type capabilityBundleEnvelope struct {
+	Bundle           json.RawMessage `json:"bundle"`
+	ExpectedRevision string          `json:"expected_revision,omitempty"`
+}
+
+type capabilityStageRequest struct {
+	OperationKey string                      `json:"operation_key"`
+	Bundle       model.ModelCapabilityBundle `json:"bundle"`
+}
+
+type capabilityActivateRequest struct {
+	OperationKey            string `json:"operation_key"`
+	ExpectedCatalogRevision string `json:"expected_catalog_revision,omitempty"`
+	ExpectedPricingRevision string `json:"expected_pricing_revision,omitempty"`
+}
+
+type capabilityRollbackRequest struct {
+	ChangeSetID             int64  `json:"change_set_id"`
+	ExpectedCurrentRevision string `json:"expected_current_revision,omitempty"`
+}
+
+func decodeCapabilityJSON(c *gin.Context, destination any) error {
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(destination)
+}
+
+// GetModelCapabilities returns the active administrative bundle. This is a
+// read-only operation; it never fetches an upstream or performs a probe.
+func GetModelCapabilities(c *gin.Context) {
+	bundle, err := model.GetActiveModelCapabilityBundle()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": bundle})
+}
+
+func PreviewModelCapabilities(c *gin.Context) {
+	var request capabilityBundleEnvelope
+	if err := decodeCapabilityJSON(c, &request); err != nil || len(request.Bundle) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "bundle is required"})
+		return
+	}
+	bundle, currentRevision, casOK, changed, err := model.PreviewModelCapabilityBundle(request.Bundle, request.ExpectedRevision)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"bundle":                    bundle,
+			"current_revision":          currentRevision,
+			"expected_revision_matches": casOK,
+			"changed":                   changed,
+			"validation":                "schema_only_no_network_probe",
+		},
+	})
+}
+
+func StageModelCapabilities(c *gin.Context) {
+	var request capabilityStageRequest
+	if err := decodeCapabilityJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	record, replayed, err := model.StageModelCapabilityBundle(request.OperationKey, request.Bundle)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"record": record, "replayed": replayed}})
+}
+
+func ActivateModelCapabilities(c *gin.Context) {
+	var request capabilityActivateRequest
+	if err := decodeCapabilityJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	result, err := model.ActivateModelCapabilityBundle(request.OperationKey, request.ExpectedCatalogRevision, request.ExpectedPricingRevision)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func RollbackModelCapabilities(c *gin.Context) {
+	var request capabilityRollbackRequest
+	if err := decodeCapabilityJSON(c, &request); err != nil || request.ChangeSetID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "change_set_id is required"})
+		return
+	}
+	result, err := model.RollbackModelCapabilityChangeSet(request.ChangeSetID, request.ExpectedCurrentRevision)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+type publicModelCapabilityContract struct {
+	SchemaVersion   string                     `json:"schema_version"`
+	ContractID      string                     `json:"contract_id"`
+	Revision        string                     `json:"revision"`
+	RuntimeEnforced bool                       `json:"runtime_enforced,omitempty"`
+	Target          model.CapabilityTarget     `json:"target"`
+	Provider        model.CapabilityProvider   `json:"provider"`
+	Generation      model.CapabilityGeneration `json:"generation"`
+	References      model.CapabilityReferences `json:"references,omitempty"`
+	Commercial      publicCapabilityCommercial `json:"commercial,omitempty"`
+	Routing         model.CapabilityRouting    `json:"routing"`
+	Provenance      publicCapabilityProvenance `json:"provenance"`
+}
+
+type publicCapabilityCommercial struct {
+	ConsumerOffer model.CapabilityPrice `json:"consumer_offer,omitempty"`
+}
+
+type publicCapabilityProvenance struct {
+	SourceKind       string    `json:"source_kind"`
+	GeneratedAt      time.Time `json:"generated_at"`
+	ValidationStatus string    `json:"validation_status"`
+	ObservedAt       time.Time `json:"observed_at,omitempty"`
+}
+
+type publicModelCapabilityEntry struct {
+	Group             string                               `json:"group"`
+	Model             string                               `json:"model"`
+	ContractStatus    string                               `json:"contract_status"`
+	Capabilities      *publicModelCapabilityContract       `json:"capabilities"`
+	LocalPricing      billing_setting.ResolvedModelPricing `json:"local_pricing"`
+	AutomaticEligible bool                                 `json:"automatic_eligible"`
+}
+
+type publicModelCapabilityResponse struct {
+	SchemaVersion           string                       `json:"schema_version"`
+	CatalogRevision         string                       `json:"catalog_revision"`
+	GeneratedAt             time.Time                    `json:"generated_at"`
+	Groups                  []string                     `json:"groups"`
+	Models                  []publicModelCapabilityEntry `json:"models"`
+	CapabilityDataAvailable bool                         `json:"capability_data_available"`
+	Advisory                string                       `json:"advisory,omitempty"`
+}
+
+func sanitizePublicCapabilityContract(contract model.ModelCapabilityContract) *publicModelCapabilityContract {
+	return &publicModelCapabilityContract{
+		SchemaVersion:   contract.SchemaVersion,
+		ContractID:      contract.ContractID,
+		Revision:        contract.Revision,
+		RuntimeEnforced: contract.RuntimeEnforced,
+		Target:          contract.Target,
+		Provider:        contract.Provider,
+		Generation:      contract.Generation,
+		References:      contract.References,
+		Commercial:      publicCapabilityCommercial{ConsumerOffer: contract.Commercial.ConsumerOffer},
+		Routing:         contract.Routing,
+		Provenance: publicCapabilityProvenance{
+			SourceKind:       contract.Provenance.SourceKind,
+			GeneratedAt:      contract.Provenance.GeneratedAt,
+			ValidationStatus: contract.Provenance.ValidationStatus,
+			ObservedAt:       contract.Provenance.ObservedAt,
+		},
+	}
+}
+
+// Share scope resolution with /v1/models, including smart-key policies and
+// the authenticated user's group lookup when TokenAuth has not populated it.
+func capabilityRequestGroups(c *gin.Context) ([]string, error) {
+	groups, err := getModelListGroups(c)
+	if err != nil {
+		return nil, err
+	}
+	return groups.ownerGroups, nil
+}
+
+func validatedCapabilityToken(c *gin.Context) *model.Token {
+	if value, ok := c.Get("validated_token"); ok {
+		if token, ok := value.(*model.Token); ok {
+			return token
+		}
+	}
+	return nil
+}
+
+func buildPublicModelCapabilityCatalog(c *gin.Context, modelFilter string) (publicModelCapabilityResponse, string, error) {
+	groups, err := capabilityRequestGroups(c)
+	if err != nil {
+		return publicModelCapabilityResponse{}, "", err
+	}
+	models, err := model.GetEnabledCapabilityCatalogModels(groups)
+	if err != nil {
+		return publicModelCapabilityResponse{}, "", err
+	}
+	activeBundle, capabilityErr := model.GetActiveModelCapabilityBundle()
+	return buildPublicModelCapabilityCatalogFromSources(c, modelFilter, groups, models, activeBundle, capabilityErr)
+}
+
+func buildPublicModelCapabilityCatalogFromSources(
+	c *gin.Context,
+	modelFilter string,
+	groups []string,
+	models []model.CapabilityCatalogModel,
+	activeBundle model.ModelCapabilityBundle,
+	capabilityErr error,
+) (publicModelCapabilityResponse, string, error) {
+	token := validatedCapabilityToken(c)
+	var limits map[string]bool
+	if token != nil && token.ModelLimitsEnabled {
+		limits = token.GetModelLimitsMap()
+	}
+	capabilityDataAvailable := capabilityErr == nil
+	capabilityAdvisory := ""
+	activeRevision := model.ModelCapabilityEmptyRevision()
+	contracts := make(map[string]model.ModelCapabilityContract)
+	if capabilityErr != nil {
+		// The enabled ability/channel query above is the authoritative model
+		// list. A stale or unavailable capability bundle must not turn that real
+		// list into a misleading 500 or fabricate automatic candidates.
+		capabilityAdvisory = "capability data is temporarily unavailable; listed models are manual-only until the catalog recovers"
+	} else {
+		activeRevision = activeBundle.Revision
+		contracts = make(map[string]model.ModelCapabilityContract, len(activeBundle.Contracts))
+		for _, contract := range activeBundle.Contracts {
+			contracts[contract.Target.Group+"\x00"+contract.Target.Model] = contract
+		}
+	}
+	entries := make([]publicModelCapabilityEntry, 0, len(models))
+	for _, item := range models {
+		if modelFilter != "" && item.Model != modelFilter {
+			continue
+		}
+		if limits != nil && !limits[item.Model] {
+			continue
+		}
+		entry := publicModelCapabilityEntry{
+			Group:             item.Group,
+			Model:             item.Model,
+			ContractStatus:    "missing",
+			LocalPricing:      billing_setting.ResolveModelPricing(item.Model, item.Group),
+			AutomaticEligible: false,
+		}
+		if !capabilityDataAvailable {
+			entry.ContractStatus = "unavailable"
+		}
+		if contract, ok := contracts[item.Group+"\x00"+item.Model]; ok {
+			entry.ContractStatus = "active"
+			entry.Capabilities = sanitizePublicCapabilityContract(contract)
+			entry.AutomaticEligible = contract.Routing.AutomaticEligible && !contract.Routing.ManualOnly
+		}
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Group != entries[j].Group {
+			return entries[i].Group < entries[j].Group
+		}
+		return entries[i].Model < entries[j].Model
+	})
+	groupCopy := append([]string(nil), groups...)
+	sort.Strings(groupCopy)
+	response := publicModelCapabilityResponse{
+		SchemaVersion:           model.ModelCapabilityCatalogSchema,
+		GeneratedAt:             time.Now().UTC(),
+		Groups:                  groupCopy,
+		Models:                  entries,
+		CapabilityDataAvailable: capabilityDataAvailable,
+		Advisory:                capabilityAdvisory,
+	}
+	hashPayload, err := json.Marshal(struct {
+		BundleRevision          string
+		PricingRevision         string
+		CapabilityDataAvailable bool
+		Advisory                string
+		Groups                  []string
+		Models                  []publicModelCapabilityEntry
+	}{activeRevision, billing_setting.GetGroupModelPricingContract().Revision, capabilityDataAvailable, capabilityAdvisory, groupCopy, entries})
+	if err != nil {
+		return publicModelCapabilityResponse{}, "", err
+	}
+	digest := sha256.Sum256(hashPayload)
+	response.CatalogRevision = "sha256:" + hex.EncodeToString(digest[:])
+	return response, response.CatalogRevision, nil
+}
+
+// GetModelCapabilityCatalog is intentionally read-only and cache-friendly. It
+// lists usable models even when their contract is missing; missing capability
+// data is a status, never an authorization or listing gate.
+func GetModelCapabilityCatalog(c *gin.Context) {
+	response, revision, err := buildPublicModelCapabilityCatalog(c, "")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "capability catalog unavailable", "type": "server_error"}})
+		return
+	}
+	writeCapabilityCatalogResponse(c, response, revision)
+}
+
+func GetModelCapabilityCatalogModel(c *gin.Context) {
+	response, revision, err := buildPublicModelCapabilityCatalog(c, strings.TrimSpace(c.Param("model")))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "capability catalog unavailable", "type": "server_error"}})
+		return
+	}
+	if len(response.Models) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "model is not available for this key", "type": "invalid_request_error"}})
+		return
+	}
+	writeCapabilityCatalogResponse(c, response, revision)
+}
+
+func writeCapabilityCatalogResponse(c *gin.Context, response publicModelCapabilityResponse, revision string) {
+	etag := "\"" + revision + "\""
+	c.Header("ETag", etag)
+	c.Header("Cache-Control", "private, max-age=60, stale-while-revalidate=300")
+	if strings.TrimSpace(c.GetHeader("If-None-Match")) == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}

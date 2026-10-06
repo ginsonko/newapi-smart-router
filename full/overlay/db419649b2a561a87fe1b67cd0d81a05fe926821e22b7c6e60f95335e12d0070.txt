@@ -1,0 +1,138 @@
+package media
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func managedCapabilityFixture() model.ModelCapabilityContract {
+	return model.ModelCapabilityContract{
+		ContractID: "managed-video", RuntimeEnforced: true,
+		Target:   model.CapabilityTarget{Group: "managed-test", Model: "public-video"},
+		Source:   model.CapabilitySource{Model: "provider-video", ChannelIDs: []int{123}},
+		Provider: model.CapabilityProvider{Protocol: "openai-videos-v1", Contract: "declared-video", EndpointTypes: []string{"openai-videos-v1"}},
+		Generation: model.CapabilityGeneration{
+			Duration:    model.CapabilityDuration{Mode: "range", Min: 4, Max: 30},
+			Resolutions: []string{"480p", "720p", "1080p"}, RequireResolution: true,
+			ResolutionAliases: map[string]string{"1280x720": "720p", "720x1280": "720p"},
+			AllowedModes:      []string{"reference"}, ForbiddenModes: []string{"first_last_frame"},
+		},
+		References: model.CapabilityReferences{
+			Images: model.CapabilityReferenceLimit{Max: 30, Roles: []string{"reference"}},
+			Videos: model.CapabilityReferenceLimit{Max: 10, Roles: []string{"reference"}},
+			Audios: model.CapabilityReferenceLimit{Max: 10, Roles: []string{"reference"}}, MaxTotal: 50,
+			ForbiddenRoles:  []string{"first_frame", "last_frame"},
+			PromptReference: &model.CapabilityPromptReference{Required: true, IndexBase: 1, IndexScope: "per_type", Templates: map[string]string{"image": "[fixture-image-{index}]", "video": "[fixture-video-{index}]", "audio": "[fixture-audio-{index}]"}},
+		},
+	}
+}
+
+func TestManagedCapabilityFiftyReferencesAndPromptIdentity(t *testing.T) {
+	capability := CapabilityFromModelContract(managedCapabilityFixture())
+	references := make([]ReferenceDescriptor, 0, 50)
+	var prompt strings.Builder
+	for _, count := range []struct {
+		kind  string
+		count int
+	}{{"image", 30}, {"video", 10}, {"audio", 10}} {
+		for index := 1; index <= count.count; index++ {
+			references = append(references, ReferenceDescriptor{Type: count.kind, Role: "reference"})
+			fmt.Fprintf(&prompt, "[fixture-%s-%d] ", count.kind, index)
+		}
+	}
+	require.NoError(t, capability.Validate(references))
+	require.NoError(t, capability.ValidatePromptReferences(prompt.String(), references))
+	assert.ErrorContains(t, capability.Validate(append(references, ReferenceDescriptor{Type: "audio"})), "at most 10")
+	assert.ErrorContains(t, capability.ValidatePromptReferences(strings.ReplaceAll(prompt.String(), "[fixture-video-2]", ""), references), "fixture-video-2")
+	assert.ErrorContains(t, capability.Validate([]ReferenceDescriptor{{Type: "image", Role: "first_frame"}}), "forbidden")
+	assert.ErrorContains(t, capability.ValidateMode("first_last_frame"), "not supported")
+	capability.MaxImages, capability.MaxVideos, capability.MaxAudios, capability.MaxTotalReferences = 9, 3, 3, 12
+	smaller := append(append([]ReferenceDescriptor{}, references[:9]...), ReferenceDescriptor{Type: "video"}, ReferenceDescriptor{Type: "video"}, ReferenceDescriptor{Type: "audio"}, ReferenceDescriptor{Type: "audio"})
+	assert.ErrorContains(t, capability.Validate(smaller), "12 reference files")
+}
+
+func TestManagedCapabilityUnknownPromptSyntaxAndIndexBoundary(t *testing.T) {
+	capability := CapabilityFromModelContract(managedCapabilityFixture())
+	capability.PromptReference = &model.CapabilityPromptReference{Required: true, IndexBase: 1}
+	references := []ReferenceDescriptor{{Type: "image"}}
+	assert.ErrorContains(t, capability.ValidatePromptReferences("image video audio", references), "not configured")
+	capability.PromptReference.Templates = map[string]string{"image": "@fixture-image{index}"}
+	assert.Error(t, capability.ValidatePromptReferences("@fixture-image10", references))
+	require.NoError(t, capability.ValidatePromptReferences("use @fixture-image1 here", references))
+}
+
+func TestManagedCapabilityResolutionAndGenerationBoundaries(t *testing.T) {
+	capability := CapabilityFromModelContract(managedCapabilityFixture())
+	capability.Duration.Default = 4
+	assert.ErrorContains(t, capability.ValidateGeneration(-1, "", "720p"), "negative")
+	resolution, err := capability.NormalizeResolution("720P", "1280x720")
+	require.NoError(t, err)
+	assert.Equal(t, "720p", resolution)
+	_, err = capability.NormalizeResolution("480p", "1280x720")
+	assert.ErrorContains(t, err, "different")
+	_, err = capability.NormalizeResolution("720p", "2048x1024")
+	assert.ErrorContains(t, err, "no configured")
+	for _, resolution := range []string{"auto", "4k", ""} {
+		_, err := capability.NormalizeResolution(resolution, "")
+		assert.Error(t, err)
+	}
+	for _, maxDuration := range []int{15, 30} {
+		capability.Duration.Max = maxDuration
+		require.NoError(t, capability.ValidateGeneration(4, "", "480p"))
+		require.NoError(t, capability.ValidateGeneration(maxDuration, "", "1080p"))
+		assert.Error(t, capability.ValidateGeneration(3, "", "720p"))
+		assert.Error(t, capability.ValidateGeneration(maxDuration+1, "", "720p"))
+	}
+}
+
+func TestManagedCapabilityTotalReferenceDurationAndFixedContract(t *testing.T) {
+	capability := CapabilityFromModelContract(managedCapabilityFixture())
+	capability.MaxTotalReferenceVideoSecond = 10
+	assert.ErrorContains(t, capability.Validate([]ReferenceDescriptor{
+		{Type: "video", DurationSeconds: 6, MetadataTrusted: true},
+		{Type: "video", DurationSeconds: 6, MetadataTrusted: true},
+	}), "total at most 10")
+	assert.Zero(t, capability.Duration.Step, "an unspecified upstream duration step stays unspecified")
+	capability.Duration = DurationCapability{Mode: "fixed", Fixed: 15}
+	assert.Error(t, capability.ValidateGeneration(1, "", "720p"))
+	capability.ProviderContract = "aizzz-video-v1"
+	require.NoError(t, capability.ValidateGeneration(1, "", "720p"))
+}
+
+func TestManagedCapabilityCatalogDrivesConcreteRoute(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:managed-capability-route?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	require.NoError(t, db.AutoMigrate(&model.ModelCapabilityBundleRecord{}, &model.ModelCapabilityCatalogHead{}, &model.ModelCapabilityChangeSet{}))
+	contract := managedCapabilityFixture()
+	bundle, err := model.NormalizeModelCapabilityBundle(model.ModelCapabilityBundle{Contracts: []model.ModelCapabilityContract{contract}})
+	require.NoError(t, err)
+	_, _, err = model.StageModelCapabilityBundle("managed-route-test", bundle)
+	require.NoError(t, err)
+	activated, err := model.ActivateModelCapabilityBundle("managed-route-test", "", "")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, rollbackErr := model.RollbackModelCapabilityChangeSet(activated.ChangeSet.ID, bundle.Revision)
+		require.NoError(t, rollbackErr)
+		model.DB = previousDB
+	})
+	capability, err := ResolveCapabilityForRequest(123, constant.ChannelTypeOpenAI, "public-video", "provider-video", "managed-test", "openai-videos-v1", "https://provider.example")
+	require.NoError(t, err)
+	assert.True(t, capability.RuntimeEnforced)
+	assert.Equal(t, 50, capability.MaxTotalReferences)
+	assert.Equal(t, bundle.Contracts[0].Revision, capability.ContractRevision)
+	_, err = ResolveCapabilityForRequest(124, constant.ChannelTypeOpenAI, "public-video", "provider-video", "managed-test", "openai-videos-v1", "https://provider.example")
+	assert.ErrorContains(t, err, "outside")
+	otherGroup, err := ResolveCapabilityForRequest(123, constant.ChannelTypeOpenAI, "public-video", "provider-video", "other-group", "openai-videos-v1", "https://provider.example")
+	require.NoError(t, err)
+	assert.False(t, otherGroup.RuntimeEnforced)
+}

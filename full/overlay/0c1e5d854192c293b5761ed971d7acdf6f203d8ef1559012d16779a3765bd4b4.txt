@@ -1,0 +1,228 @@
+package openai
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type responsesStreamResult struct {
+	usageTotal int
+	err        error
+}
+
+func TestOaiResponsesClientGoneDrainsLateCompletedUsage(t *testing.T) {
+	testOaiResponsesClientGoneDrainsLateTerminalUsage(t,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":4,"total_tokens":11}}}`+"\n",
+		"response.completed",
+		11,
+	)
+}
+
+func TestOaiResponsesClientGoneDrainsLateDoneCompletedUsage(t *testing.T) {
+	testOaiResponsesClientGoneDrainsLateTerminalUsage(t,
+		`data: {"type":"response.done","response":{"status":"completed","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13}}}`+"\n",
+		"response.done",
+		13,
+	)
+}
+
+func testOaiResponsesClientGoneDrainsLateTerminalUsage(t *testing.T, terminal, terminalKind string, expectedTotal int) {
+	t.Helper()
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Set(common.RequestIdKey, "r60-4-late-terminal")
+
+	upstreamReader, upstreamWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = upstreamReader.Close()
+		_ = upstreamWriter.Close()
+	})
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       upstreamReader,
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"},
+		IsStream:    true,
+		RelayFormat: types.RelayFormatOpenAI,
+	}
+
+	handlerDone := make(chan responsesStreamResult, 1)
+	go func() {
+		usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+		result := responsesStreamResult{}
+		if usage != nil {
+			result.usageTotal = usage.TotalTokens
+		}
+		if apiErr != nil {
+			result.err = apiErr
+		}
+		handlerDone <- result
+	}()
+
+	initial := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_late","status":"in_progress"}}`,
+		`data: {"type":"response.output_text.delta","delta":"visible answer"}`,
+	}, "\n") + "\n"
+	_, err := io.WriteString(upstreamWriter, initial)
+	require.NoError(t, err)
+
+	// Reproduce the production race: the client closes just before the
+	// provider's authoritative completion/usage event reaches the relay.
+	cancelRequest()
+	time.Sleep(75 * time.Millisecond)
+	_, terminalWriteErr := io.WriteString(upstreamWriter, terminal)
+	_ = upstreamWriter.Close()
+
+	select {
+	case result := <-handlerDone:
+		require.NoError(t, terminalWriteErr, "the bounded Responses drain must keep the upstream body readable")
+		require.NoError(t, result.err)
+		assert.Equal(t, expectedTotal, result.usageTotal, "billing must use the late authoritative provider usage")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Responses handler did not finish within the bounded drain window")
+	}
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.ClientDisconnected())
+	assert.True(t, info.StreamStatus.HasTerminal())
+	assert.Equal(t, terminalKind, info.StreamStatus.TerminalKind())
+	assert.NotContains(t, recorder.Body.String(), terminalKind, "no event may be written after the client is gone")
+}
+
+func TestOaiResponsesClientGoneLateFailedDoesNotCreateBillableUsage(t *testing.T) {
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	c.Set(common.RequestIdKey, "r60-4-late-failed")
+
+	upstreamReader, upstreamWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = upstreamReader.Close()
+		_ = upstreamWriter.Close()
+	})
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       upstreamReader,
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"},
+		IsStream:    true,
+		RelayFormat: types.RelayFormatOpenAI,
+	}
+
+	handlerDone := make(chan responsesStreamResult, 1)
+	go func() {
+		usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+		result := responsesStreamResult{}
+		if usage != nil {
+			result.usageTotal = usage.TotalTokens
+		}
+		if apiErr != nil {
+			result.err = apiErr
+		}
+		handlerDone <- result
+	}()
+
+	_, err := io.WriteString(upstreamWriter, `data: {"type":"response.created","response":{"id":"resp_failed","status":"in_progress"}}`+"\n")
+	require.NoError(t, err)
+	cancelRequest()
+	time.Sleep(50 * time.Millisecond)
+	_, terminalWriteErr := io.WriteString(upstreamWriter, `data: {"type":"response.failed","response":{"status":"failed"},"error":{"message":"provider failed"}}`+"\n")
+	_ = upstreamWriter.Close()
+
+	select {
+	case result := <-handlerDone:
+		require.NoError(t, terminalWriteErr)
+		require.Error(t, result.err)
+		var apiErr *types.NewAPIError
+		require.ErrorAs(t, result.err, &apiErr)
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		assert.Zero(t, result.usageTotal, "a failed provider terminal must never become billable usage")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Responses handler did not finish after the failed terminal")
+	}
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasSemanticTerminal())
+	assert.False(t, info.StreamStatus.HasTerminal())
+	assert.NotContains(t, recorder.Body.String(), "response.failed")
+}
+
+func TestOaiResponsesToChatClientGoneDrainsLateCompletedUsage(t *testing.T) {
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestContext)
+	c.Set(common.RequestIdKey, "r60-4-late-terminal-chat")
+
+	upstreamReader, upstreamWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = upstreamReader.Close()
+		_ = upstreamWriter.Close()
+	})
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       upstreamReader,
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"},
+		IsStream:    true,
+		RelayFormat: types.RelayFormatOpenAI,
+	}
+
+	handlerDone := make(chan responsesStreamResult, 1)
+	go func() {
+		usage, apiErr := OaiResponsesToChatStreamHandler(c, info, resp)
+		result := responsesStreamResult{}
+		if usage != nil {
+			result.usageTotal = usage.TotalTokens
+		}
+		if apiErr != nil {
+			result.err = apiErr
+		}
+		handlerDone <- result
+	}()
+
+	_, err := io.WriteString(upstreamWriter, `data: {"type":"response.output_text.delta","delta":"visible answer"}`+"\n")
+	require.NoError(t, err)
+	cancelRequest()
+	time.Sleep(75 * time.Millisecond)
+	_, terminalWriteErr := io.WriteString(upstreamWriter, `data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":9,"output_tokens":5,"total_tokens":14}}}`+"\n")
+	_ = upstreamWriter.Close()
+
+	select {
+	case result := <-handlerDone:
+		require.NoError(t, terminalWriteErr)
+		require.NoError(t, result.err)
+		assert.Equal(t, 14, result.usageTotal)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Responses-to-Chat handler did not finish within the bounded drain window")
+	}
+	assert.NotContains(t, recorder.Body.String(), "[DONE]", "no synthetic tail may be written after client cancellation")
+}

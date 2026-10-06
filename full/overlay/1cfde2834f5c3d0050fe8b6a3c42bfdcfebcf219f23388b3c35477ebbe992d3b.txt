@@ -1,0 +1,510 @@
+package media_setting
+
+import (
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/common"
+	settingconfig "github.com/QuantumNous/new-api/setting/config"
+)
+
+const ConfigName = "media_setting"
+
+// CapabilityOverride narrows or expands the built-in adapter declaration for
+// one channel/model/endpoint tuple. Nil booleans inherit the adapter default;
+// an explicit false is therefore a durable administrator blacklist for that
+// input capability.
+type CapabilityOverride struct {
+	ChannelID                     int               `json:"channel_id,omitempty"`
+	Model                         string            `json:"model,omitempty"`
+	Endpoint                      string            `json:"endpoint,omitempty"`
+	ReferenceImage                *bool             `json:"reference_image,omitempty"`
+	ReferenceVideo                *bool             `json:"reference_video,omitempty"`
+	ReferenceAudio                *bool             `json:"reference_audio,omitempty"`
+	ImageRoles                    []string          `json:"image_roles,omitempty"`
+	VideoRoles                    []string          `json:"video_roles,omitempty"`
+	AudioRoles                    []string          `json:"audio_roles,omitempty"`
+	MinImages                     *int              `json:"min_images,omitempty"`
+	MaxImages                     int               `json:"max_images,omitempty"`
+	MaxVideos                     int               `json:"max_videos,omitempty"`
+	MaxAudios                     int               `json:"max_audios,omitempty"`
+	MaxTotalReferences            int               `json:"max_total_references,omitempty"`
+	MaxImageBytes                 int64             `json:"max_image_bytes,omitempty"`
+	MaxVideoBytes                 int64             `json:"max_video_bytes,omitempty"`
+	MaxAudioBytes                 int64             `json:"max_audio_bytes,omitempty"`
+	MinReferenceVideoSeconds      int               `json:"min_reference_video_seconds,omitempty"`
+	MaxReferenceVideoSeconds      int               `json:"max_reference_video_seconds,omitempty"`
+	MaxTotalReferenceVideoSeconds int               `json:"max_total_reference_video_seconds,omitempty"`
+	AspectRatios                  []string          `json:"aspect_ratios,omitempty"`
+	SizeAspectRatios              map[string]string `json:"size_aspect_ratios,omitempty"`
+	ResolutionAliases             map[string]string `json:"resolution_aliases,omitempty"`
+	Resolutions                   []string          `json:"resolutions,omitempty"`
+	DurationMode                  string            `json:"duration_mode,omitempty"`
+	DurationMin                   int               `json:"duration_min,omitempty"`
+	DurationMax                   int               `json:"duration_max,omitempty"`
+	DurationStep                  int               `json:"duration_step,omitempty"`
+	DurationDefault               int               `json:"duration_default,omitempty"`
+	FixedDurationSeconds          int               `json:"fixed_duration_seconds,omitempty"`
+	OutputCountMin                int               `json:"output_count_min,omitempty"`
+	OutputCountMax                int               `json:"output_count_max,omitempty"`
+	OutputCountDefault            int               `json:"output_count_default,omitempty"`
+	ProviderContract              string            `json:"provider_contract,omitempty"`
+}
+
+// Setting controls media persistence and lifecycle. It is stored as one JSON
+// document so an administrator update is published atomically to every reader.
+type Setting struct {
+	Enabled                                bool                 `json:"enabled"`
+	StoragePath                            string               `json:"storage_path"`
+	InputTTLHours                          int                  `json:"input_ttl_hours"`
+	AssetTTLHours                          int                  `json:"asset_ttl_hours"`
+	SignedURLTTLSeconds                    int                  `json:"signed_url_ttl_seconds"`
+	ReferenceURLTTLSeconds                 int                  `json:"reference_url_ttl_seconds"`
+	AdminPreviewTTLSeconds                 int                  `json:"admin_preview_ttl_seconds"`
+	MaxFileBytes                           int64                `json:"max_file_bytes"`
+	MaxRequestBytes                        int64                `json:"max_request_bytes"`
+	PerUserMaxBytes                        int64                `json:"per_user_max_bytes"`
+	GlobalMaxBytes                         int64                `json:"global_max_bytes"`
+	HighWatermarkPercent                   int                  `json:"high_watermark_percent"`
+	LowWatermarkPercent                    int                  `json:"low_watermark_percent"`
+	ReservedFreeBytes                      int64                `json:"reserved_free_bytes"`
+	CleanupIntervalMinutes                 int                  `json:"cleanup_interval_minutes"`
+	TemporaryFileTTLHours                  int                  `json:"temporary_file_ttl_hours"`
+	CleanupBatchSize                       int                  `json:"cleanup_batch_size"`
+	UploadReservationMinutes               int                  `json:"upload_reservation_minutes"`
+	MaxUploadConcurrency                   int                  `json:"max_upload_concurrency"`
+	MaxDownloadConcurrency                 int                  `json:"max_download_concurrency"`
+	GenerationActiveGlobal                 int                  `json:"generation_active_global"`
+	GenerationActivePerUser                int                  `json:"generation_active_per_user"`
+	GenerationQueueGlobalMax               int                  `json:"generation_queue_global_max"`
+	GenerationQueuePerUserMax              int                  `json:"generation_queue_per_user_max"`
+	UploadConnectionHardGlobal             int                  `json:"upload_connection_hard_global"`
+	UploadConnectionHardPerUser            int                  `json:"upload_connection_hard_per_user"`
+	DownloadConnectionHardGlobal           int                  `json:"download_connection_hard_global"`
+	DownloadConnectionHardPerUser          int                  `json:"download_connection_hard_per_user"`
+	IngressTotalMbps                       int                  `json:"ingress_total_mbps"`
+	ClientUploadMaxMbps                    int                  `json:"client_upload_max_mbps"`
+	UpstreamArchiveMaxMbps                 int                  `json:"upstream_archive_max_mbps"`
+	EgressTotalMbps                        int                  `json:"egress_total_mbps"`
+	ClientDownloadMaxMbps                  int                  `json:"client_download_max_mbps"`
+	UpstreamForwardMaxMbps                 int                  `json:"upstream_forward_max_mbps"`
+	RateBurstBytes                         int64                `json:"rate_burst_bytes"`
+	MaxEventStreamConnections              int                  `json:"max_event_stream_connections"`
+	MaxEventStreamConnectionsPerUser       int                  `json:"max_event_stream_connections_per_user"`
+	EventStreamPollMilliseconds            int                  `json:"event_stream_poll_milliseconds"`
+	EventStreamHeartbeatSeconds            int                  `json:"event_stream_heartbeat_seconds"`
+	EventStreamMaxLifetimeMinutes          int                  `json:"event_stream_max_lifetime_minutes"`
+	EvidenceRetentionDays                  int                  `json:"evidence_retention_days"`
+	RemoteMaterializeEnabled               bool                 `json:"remote_materialize_enabled"`
+	RemoteMaterializeMaxBytes              int64                `json:"remote_materialize_max_bytes"`
+	RemoteMaterializeWorkers               int                  `json:"remote_materialize_workers"`
+	RemoteMaterializeScanSeconds           int                  `json:"remote_materialize_scan_seconds"`
+	RemoteMaterializeTimeoutSeconds        int                  `json:"remote_materialize_timeout_seconds"`
+	RemoteMaterializeMaxAttempts           int                  `json:"remote_materialize_max_attempts"`
+	RemoteMaterializeInitialBackoffSeconds int                  `json:"remote_materialize_initial_backoff_seconds"`
+	RemoteMaterializeMaxBackoffSeconds     int                  `json:"remote_materialize_max_backoff_seconds"`
+	CapabilityOverrides                    []CapabilityOverride `json:"capability_overrides,omitempty"`
+	SyntheticProbeBudgetPerDay             int                  `json:"synthetic_probe_budget_per_day"`
+}
+
+var defaultSetting = Setting{
+	Enabled:                                true,
+	StoragePath:                            "./data/media",
+	InputTTLHours:                          168,
+	AssetTTLHours:                          720,
+	SignedURLTTLSeconds:                    900,
+	ReferenceURLTTLSeconds:                 7 * 24 * 60 * 60,
+	AdminPreviewTTLSeconds:                 300,
+	MaxFileBytes:                           1024 * 1024 * 1024,
+	MaxRequestBytes:                        2 * 1024 * 1024 * 1024,
+	PerUserMaxBytes:                        2 * 1024 * 1024 * 1024,
+	GlobalMaxBytes:                         10 * 1024 * 1024 * 1024,
+	HighWatermarkPercent:                   85,
+	LowWatermarkPercent:                    70,
+	ReservedFreeBytes:                      2 * 1024 * 1024 * 1024,
+	CleanupIntervalMinutes:                 15,
+	TemporaryFileTTLHours:                  24,
+	CleanupBatchSize:                       100,
+	UploadReservationMinutes:               30,
+	MaxUploadConcurrency:                   2,
+	MaxDownloadConcurrency:                 32,
+	GenerationActiveGlobal:                 8,
+	GenerationActivePerUser:                2,
+	GenerationQueueGlobalMax:               512,
+	GenerationQueuePerUserMax:              64,
+	UploadConnectionHardGlobal:             32,
+	UploadConnectionHardPerUser:            8,
+	DownloadConnectionHardGlobal:           128,
+	DownloadConnectionHardPerUser:          32,
+	IngressTotalMbps:                       50,
+	ClientUploadMaxMbps:                    40,
+	UpstreamArchiveMaxMbps:                 30,
+	EgressTotalMbps:                        50,
+	ClientDownloadMaxMbps:                  50,
+	UpstreamForwardMaxMbps:                 35,
+	RateBurstBytes:                         2 * 1024 * 1024,
+	MaxEventStreamConnections:              64,
+	MaxEventStreamConnectionsPerUser:       3,
+	EventStreamPollMilliseconds:            2000,
+	EventStreamHeartbeatSeconds:            15,
+	EventStreamMaxLifetimeMinutes:          30,
+	EvidenceRetentionDays:                  180,
+	RemoteMaterializeEnabled:               true,
+	RemoteMaterializeMaxBytes:              2 * 1024 * 1024 * 1024,
+	RemoteMaterializeWorkers:               1,
+	RemoteMaterializeScanSeconds:           5,
+	RemoteMaterializeTimeoutSeconds:        300,
+	RemoteMaterializeMaxAttempts:           8,
+	RemoteMaterializeInitialBackoffSeconds: 30,
+	RemoteMaterializeMaxBackoffSeconds:     3600,
+	SyntheticProbeBudgetPerDay:             0,
+}
+
+type atomicSettingValue struct {
+	target *atomic.Pointer[Setting]
+}
+
+type registeredSetting struct {
+	Config atomicSettingValue `json:"config"`
+}
+
+var (
+	currentSetting      atomic.Pointer[Setting]
+	settingRegistration registeredSetting
+)
+
+func init() {
+	initial := Normalize(defaultSetting)
+	currentSetting.Store(&initial)
+	settingRegistration.Config.target = &currentSetting
+	settingconfig.GlobalConfig.Register(ConfigName, &settingRegistration)
+}
+
+func Get() Setting {
+	setting := currentSetting.Load()
+	if setting == nil {
+		return Normalize(defaultSetting)
+	}
+	return *setting
+}
+
+func Replace(next Setting) error {
+	normalized := Normalize(next)
+	if err := normalized.Validate(); err != nil {
+		return err
+	}
+	currentSetting.Store(&normalized)
+	return nil
+}
+
+func Normalize(source Setting) Setting {
+	normalized := source
+	if normalized.StoragePath == "" {
+		normalized.StoragePath = defaultSetting.StoragePath
+	}
+	normalized.StoragePath = filepath.Clean(normalized.StoragePath)
+	if normalized.InputTTLHours <= 0 {
+		normalized.InputTTLHours = defaultSetting.InputTTLHours
+	}
+	if normalized.AssetTTLHours <= 0 {
+		normalized.AssetTTLHours = defaultSetting.AssetTTLHours
+	}
+	if normalized.SignedURLTTLSeconds <= 0 {
+		normalized.SignedURLTTLSeconds = defaultSetting.SignedURLTTLSeconds
+	}
+	if normalized.ReferenceURLTTLSeconds <= 0 {
+		normalized.ReferenceURLTTLSeconds = defaultSetting.ReferenceURLTTLSeconds
+	}
+	if normalized.AdminPreviewTTLSeconds <= 0 {
+		normalized.AdminPreviewTTLSeconds = defaultSetting.AdminPreviewTTLSeconds
+	}
+	if normalized.MaxFileBytes <= 0 {
+		normalized.MaxFileBytes = defaultSetting.MaxFileBytes
+	}
+	if normalized.MaxRequestBytes <= 0 {
+		normalized.MaxRequestBytes = defaultSetting.MaxRequestBytes
+	}
+	if normalized.PerUserMaxBytes <= 0 {
+		normalized.PerUserMaxBytes = defaultSetting.PerUserMaxBytes
+	}
+	if normalized.GlobalMaxBytes <= 0 {
+		normalized.GlobalMaxBytes = defaultSetting.GlobalMaxBytes
+	}
+	if normalized.HighWatermarkPercent <= 0 {
+		normalized.HighWatermarkPercent = defaultSetting.HighWatermarkPercent
+	}
+	if normalized.LowWatermarkPercent <= 0 {
+		normalized.LowWatermarkPercent = defaultSetting.LowWatermarkPercent
+	}
+	if normalized.CleanupIntervalMinutes <= 0 {
+		normalized.CleanupIntervalMinutes = defaultSetting.CleanupIntervalMinutes
+	}
+	if normalized.TemporaryFileTTLHours <= 0 {
+		normalized.TemporaryFileTTLHours = defaultSetting.TemporaryFileTTLHours
+	}
+	if normalized.CleanupBatchSize <= 0 {
+		normalized.CleanupBatchSize = defaultSetting.CleanupBatchSize
+	}
+	if normalized.UploadReservationMinutes <= 0 {
+		normalized.UploadReservationMinutes = defaultSetting.UploadReservationMinutes
+	}
+	if normalized.MaxUploadConcurrency <= 0 {
+		normalized.MaxUploadConcurrency = defaultSetting.MaxUploadConcurrency
+	}
+	if normalized.MaxDownloadConcurrency <= 0 {
+		normalized.MaxDownloadConcurrency = defaultSetting.MaxDownloadConcurrency
+	}
+	if normalized.GenerationActiveGlobal <= 0 {
+		normalized.GenerationActiveGlobal = defaultSetting.GenerationActiveGlobal
+	}
+	if normalized.GenerationActivePerUser <= 0 {
+		normalized.GenerationActivePerUser = defaultSetting.GenerationActivePerUser
+	}
+	if normalized.GenerationQueueGlobalMax <= 0 {
+		normalized.GenerationQueueGlobalMax = defaultSetting.GenerationQueueGlobalMax
+	}
+	if normalized.GenerationQueuePerUserMax <= 0 {
+		normalized.GenerationQueuePerUserMax = defaultSetting.GenerationQueuePerUserMax
+	}
+	if normalized.UploadConnectionHardGlobal <= 0 {
+		normalized.UploadConnectionHardGlobal = defaultSetting.UploadConnectionHardGlobal
+	}
+	if normalized.UploadConnectionHardPerUser <= 0 {
+		normalized.UploadConnectionHardPerUser = defaultSetting.UploadConnectionHardPerUser
+	}
+	if normalized.DownloadConnectionHardGlobal <= 0 {
+		normalized.DownloadConnectionHardGlobal = defaultSetting.DownloadConnectionHardGlobal
+	}
+	if normalized.DownloadConnectionHardPerUser <= 0 {
+		normalized.DownloadConnectionHardPerUser = defaultSetting.DownloadConnectionHardPerUser
+	}
+	if normalized.IngressTotalMbps <= 0 {
+		normalized.IngressTotalMbps = defaultSetting.IngressTotalMbps
+	}
+	if normalized.ClientUploadMaxMbps <= 0 {
+		normalized.ClientUploadMaxMbps = defaultSetting.ClientUploadMaxMbps
+	}
+	if normalized.UpstreamArchiveMaxMbps <= 0 {
+		normalized.UpstreamArchiveMaxMbps = defaultSetting.UpstreamArchiveMaxMbps
+	}
+	if normalized.EgressTotalMbps <= 0 {
+		normalized.EgressTotalMbps = defaultSetting.EgressTotalMbps
+	}
+	if normalized.ClientDownloadMaxMbps <= 0 {
+		normalized.ClientDownloadMaxMbps = defaultSetting.ClientDownloadMaxMbps
+	}
+	if normalized.UpstreamForwardMaxMbps <= 0 {
+		normalized.UpstreamForwardMaxMbps = defaultSetting.UpstreamForwardMaxMbps
+	}
+	if normalized.RateBurstBytes <= 0 {
+		normalized.RateBurstBytes = defaultSetting.RateBurstBytes
+	}
+	if normalized.MaxEventStreamConnections <= 0 {
+		normalized.MaxEventStreamConnections = defaultSetting.MaxEventStreamConnections
+	}
+	if normalized.MaxEventStreamConnectionsPerUser <= 0 {
+		normalized.MaxEventStreamConnectionsPerUser = defaultSetting.MaxEventStreamConnectionsPerUser
+	}
+	if normalized.EventStreamPollMilliseconds <= 0 {
+		normalized.EventStreamPollMilliseconds = defaultSetting.EventStreamPollMilliseconds
+	}
+	if normalized.EventStreamHeartbeatSeconds <= 0 {
+		normalized.EventStreamHeartbeatSeconds = defaultSetting.EventStreamHeartbeatSeconds
+	}
+	if normalized.EventStreamMaxLifetimeMinutes <= 0 {
+		normalized.EventStreamMaxLifetimeMinutes = defaultSetting.EventStreamMaxLifetimeMinutes
+	}
+	if normalized.EvidenceRetentionDays <= 0 {
+		normalized.EvidenceRetentionDays = defaultSetting.EvidenceRetentionDays
+	}
+	if normalized.RemoteMaterializeMaxBytes <= 0 {
+		normalized.RemoteMaterializeMaxBytes = defaultSetting.RemoteMaterializeMaxBytes
+	}
+	if normalized.RemoteMaterializeWorkers <= 0 {
+		normalized.RemoteMaterializeWorkers = defaultSetting.RemoteMaterializeWorkers
+	}
+	if normalized.RemoteMaterializeScanSeconds <= 0 {
+		normalized.RemoteMaterializeScanSeconds = defaultSetting.RemoteMaterializeScanSeconds
+	}
+	if normalized.RemoteMaterializeTimeoutSeconds <= 0 {
+		normalized.RemoteMaterializeTimeoutSeconds = defaultSetting.RemoteMaterializeTimeoutSeconds
+	}
+	if normalized.RemoteMaterializeMaxAttempts <= 0 {
+		normalized.RemoteMaterializeMaxAttempts = defaultSetting.RemoteMaterializeMaxAttempts
+	}
+	if normalized.RemoteMaterializeInitialBackoffSeconds <= 0 {
+		normalized.RemoteMaterializeInitialBackoffSeconds = defaultSetting.RemoteMaterializeInitialBackoffSeconds
+	}
+	if normalized.RemoteMaterializeMaxBackoffSeconds <= 0 {
+		normalized.RemoteMaterializeMaxBackoffSeconds = defaultSetting.RemoteMaterializeMaxBackoffSeconds
+	}
+	for index := range normalized.CapabilityOverrides {
+		override := &normalized.CapabilityOverrides[index]
+		override.Model = strings.TrimSpace(override.Model)
+		override.Endpoint = strings.TrimSpace(override.Endpoint)
+		override.ImageRoles = canonicalStrings(override.ImageRoles)
+		override.VideoRoles = canonicalStrings(override.VideoRoles)
+		override.AudioRoles = canonicalStrings(override.AudioRoles)
+		override.AspectRatios = canonicalStrings(override.AspectRatios)
+		override.Resolutions = canonicalStrings(override.Resolutions)
+		if override.SizeAspectRatios != nil {
+			ratios := make(map[string]string, len(override.SizeAspectRatios))
+			for size, ratio := range override.SizeAspectRatios {
+				ratios[strings.ToLower(strings.TrimSpace(size))] = strings.TrimSpace(ratio)
+			}
+			override.SizeAspectRatios = ratios
+		}
+		if override.ResolutionAliases != nil {
+			aliases := make(map[string]string)
+			for size, resolution := range override.ResolutionAliases {
+				aliases[strings.ToLower(strings.TrimSpace(size))] = strings.ToLower(strings.TrimSpace(resolution))
+			}
+			override.ResolutionAliases = aliases
+		}
+		override.DurationMode = strings.TrimSpace(override.DurationMode)
+		override.ProviderContract = strings.TrimSpace(override.ProviderContract)
+	}
+	sort.SliceStable(normalized.CapabilityOverrides, func(i, j int) bool {
+		left := normalized.CapabilityOverrides[i]
+		right := normalized.CapabilityOverrides[j]
+		return fmt.Sprintf("%010d|%s|%s", left.ChannelID, left.Model, left.Endpoint) <
+			fmt.Sprintf("%010d|%s|%s", right.ChannelID, right.Model, right.Endpoint)
+	})
+	return normalized
+}
+
+func (setting Setting) Validate() error {
+	if setting.LowWatermarkPercent < 1 || setting.LowWatermarkPercent >= setting.HighWatermarkPercent {
+		return fmt.Errorf("media low watermark must be below the high watermark")
+	}
+	if setting.HighWatermarkPercent > 99 {
+		return fmt.Errorf("media high watermark must be at most 99 percent")
+	}
+	if setting.MaxFileBytes > setting.MaxRequestBytes {
+		return fmt.Errorf("media max file bytes cannot exceed max request bytes")
+	}
+	if setting.PerUserMaxBytes > setting.GlobalMaxBytes {
+		return fmt.Errorf("media per-user capacity cannot exceed global capacity")
+	}
+	if setting.ReservedFreeBytes < 0 || setting.SyntheticProbeBudgetPerDay < 0 {
+		return fmt.Errorf("media capacity and probe budget values cannot be negative")
+	}
+	if setting.RemoteMaterializeWorkers > 64 || setting.RemoteMaterializeScanSeconds > 3600 ||
+		setting.RemoteMaterializeTimeoutSeconds > 86400 || setting.RemoteMaterializeMaxAttempts > 100 ||
+		setting.RemoteMaterializeInitialBackoffSeconds > setting.RemoteMaterializeMaxBackoffSeconds ||
+		setting.RemoteMaterializeMaxBackoffSeconds > 604800 {
+		return fmt.Errorf("media remote materialization limits are invalid")
+	}
+	if setting.TemporaryFileTTLHours < 1 || setting.TemporaryFileTTLHours > 168 {
+		return fmt.Errorf("media temporary file lifetime must be between 1 and 168 hours")
+	}
+	if setting.ReferenceURLTTLSeconds < 3600 || setting.ReferenceURLTTLSeconds > 30*24*60*60 {
+		return fmt.Errorf("media reference URL lifetime must be between 1 hour and 30 days")
+	}
+	if setting.MaxEventStreamConnections < 1 || setting.MaxEventStreamConnections > 10000 ||
+		setting.MaxEventStreamConnectionsPerUser < 1 ||
+		setting.MaxEventStreamConnectionsPerUser > setting.MaxEventStreamConnections {
+		return fmt.Errorf("media event stream connection limits are invalid")
+	}
+	if setting.EventStreamPollMilliseconds < 250 || setting.EventStreamPollMilliseconds > 60000 ||
+		setting.EventStreamHeartbeatSeconds < 5 || setting.EventStreamHeartbeatSeconds > 300 ||
+		setting.EventStreamMaxLifetimeMinutes < 1 || setting.EventStreamMaxLifetimeMinutes > 1440 {
+		return fmt.Errorf("media event stream timing limits are invalid")
+	}
+	if setting.GenerationActiveGlobal < 1 || setting.GenerationActiveGlobal > 256 ||
+		setting.GenerationActivePerUser < 1 || setting.GenerationActivePerUser > setting.GenerationActiveGlobal ||
+		setting.GenerationQueueGlobalMax < setting.GenerationActiveGlobal || setting.GenerationQueueGlobalMax > 100000 ||
+		setting.GenerationQueuePerUserMax < setting.GenerationActivePerUser ||
+		setting.GenerationQueuePerUserMax > setting.GenerationQueueGlobalMax {
+		return fmt.Errorf("media generation queue limits are invalid")
+	}
+	if setting.UploadConnectionHardGlobal < 1 || setting.UploadConnectionHardGlobal > 10000 ||
+		setting.UploadConnectionHardPerUser < 1 || setting.UploadConnectionHardPerUser > setting.UploadConnectionHardGlobal ||
+		setting.DownloadConnectionHardGlobal < 1 || setting.DownloadConnectionHardGlobal > 10000 ||
+		setting.DownloadConnectionHardPerUser < 1 || setting.DownloadConnectionHardPerUser > setting.DownloadConnectionHardGlobal {
+		return fmt.Errorf("media transfer connection limits are invalid")
+	}
+	if setting.IngressTotalMbps < 1 || setting.IngressTotalMbps > 10000 ||
+		setting.ClientUploadMaxMbps < 1 || setting.ClientUploadMaxMbps > setting.IngressTotalMbps ||
+		setting.UpstreamArchiveMaxMbps < 1 || setting.UpstreamArchiveMaxMbps > setting.IngressTotalMbps ||
+		setting.EgressTotalMbps < 1 || setting.EgressTotalMbps > 10000 ||
+		setting.ClientDownloadMaxMbps < 1 || setting.ClientDownloadMaxMbps > setting.EgressTotalMbps ||
+		setting.UpstreamForwardMaxMbps < 1 || setting.UpstreamForwardMaxMbps > setting.EgressTotalMbps ||
+		setting.RateBurstBytes < 64*1024 || setting.RateBurstBytes > 64*1024*1024 {
+		return fmt.Errorf("media bandwidth limits are invalid")
+	}
+	for index, override := range setting.CapabilityOverrides {
+		for size, ratio := range override.SizeAspectRatios {
+			if strings.TrimSpace(size) == "" || strings.TrimSpace(ratio) == "" {
+				return fmt.Errorf("media capability override %d has an empty size/aspect ratio", index)
+			}
+		}
+		for alias, resolution := range override.ResolutionAliases {
+			if strings.TrimSpace(alias) == "" || strings.TrimSpace(resolution) == "" {
+				return fmt.Errorf("empty size mapping in override %d", index)
+			}
+			if len(override.Resolutions) > 0 {
+				found := false
+				for _, tier := range override.Resolutions {
+					found = found || strings.EqualFold(tier, resolution)
+				}
+				if !found {
+					return fmt.Errorf("size mapping in override %d selects an unsupported tier", index)
+				}
+			}
+		}
+		if override.ChannelID < 0 || override.MaxImages < 0 || override.MaxVideos < 0 || override.MaxAudios < 0 ||
+			override.MaxTotalReferences < 0 || override.MaxImageBytes < 0 || override.MaxVideoBytes < 0 || override.MaxAudioBytes < 0 ||
+			override.MinReferenceVideoSeconds < 0 || override.MaxReferenceVideoSeconds < 0 || override.MaxTotalReferenceVideoSeconds < 0 ||
+			override.DurationMin < 0 || override.DurationMax < 0 || override.DurationStep < 0 || override.DurationDefault < 0 ||
+			override.FixedDurationSeconds < 0 || override.OutputCountMin < 0 || override.OutputCountMax < 0 || override.OutputCountDefault < 0 {
+			return fmt.Errorf("media capability override %d contains a negative value", index)
+		}
+		if override.MinImages != nil && *override.MinImages < 0 {
+			return fmt.Errorf("media capability override %d contains a negative min_images", index)
+		}
+		if override.DurationMode != "" && override.DurationMode != "range" && override.DurationMode != "fixed" && override.DurationMode != "enum" {
+			return fmt.Errorf("media capability override %d has an invalid duration_mode", index)
+		}
+		if override.ChannelID == 0 && strings.TrimSpace(override.Model) == "" && strings.TrimSpace(override.Endpoint) == "" {
+			return fmt.Errorf("media capability override %d must select a channel, model, or endpoint", index)
+		}
+	}
+	return nil
+}
+
+func canonicalStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (value atomicSettingValue) MarshalJSON() ([]byte, error) {
+	if value.target == nil || value.target.Load() == nil {
+		return common.Marshal(Normalize(defaultSetting))
+	}
+	return common.Marshal(value.target.Load())
+}
+
+func (value *atomicSettingValue) UnmarshalJSON(data []byte) error {
+	var setting Setting
+	if err := common.Unmarshal(data, &setting); err != nil {
+		return err
+	}
+	return Replace(setting)
+}

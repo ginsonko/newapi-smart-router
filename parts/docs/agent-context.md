@@ -1,5 +1,7 @@
 # NewAPI Smart Router Agent Context
 
+当前候选为 `v0.4.0-alpha.1`，协议 `bridge-spi-v1alpha4`；先读 [当前增量](../../docs/v0.4-contract-delta.md) 和 [R98 host hooks](../spec/r98-host-hooks.md)。下文带版本号的小节为历史增量，不覆盖当前合同。
+
 状态：`Development Kit / Not runnable`  
 目标：给 Codex、Claude Code/CC 和其他工程 Agent 一份稳定、低 Token 的集成上下文  
 

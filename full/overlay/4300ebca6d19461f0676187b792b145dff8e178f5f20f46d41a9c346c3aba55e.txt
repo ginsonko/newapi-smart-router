@@ -1,0 +1,139 @@
+package media
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/shirou/gopsutil/disk"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var ErrImageRouteSpoolUnavailable = errors.New("image route spool reservation is unavailable")
+
+const ImageRouteSpoolReservationExpiresAt int64 = model.ImageRouteSpoolReservationExpiresAt
+
+func ReserveImageRouteSpool(bytes int64, expiresAt int64) (string, error) {
+	setting := mediasetting.Get()
+	if bytes < 0 || setting.MaxRequestBytes <= 0 || bytes > setting.MaxRequestBytes {
+		return "", ErrMediaFileTooLarge
+	}
+	if model.DB == nil || expiresAt <= time.Now().Unix() {
+		return "", ErrImageRouteSpoolUnavailable
+	}
+	if err := EnsureStorage(); err != nil {
+		return "", err
+	}
+	if bytes == 0 {
+		bytes = min(requestSpoolReservationStep, setting.MaxRequestBytes)
+	}
+	token, err := reserveStorageWithScope(0, bytes, false)
+	if err != nil {
+		return "", err
+	}
+	result := model.DB.Model(&model.MediaStorageReservation{}).
+		Where("token = ? AND user_id = ? AND state = ? AND expires_at > ?", token, 0, "reserved", time.Now().Unix()).
+		Update("expires_at", expiresAt)
+	if result.Error != nil || result.RowsAffected != 1 {
+		return "", errors.Join(ErrImageRouteSpoolUnavailable, result.Error, ReleaseImageRouteSpool(token))
+	}
+	return token, nil
+}
+
+func GrowImageRouteSpool(token string, bytes int64) error {
+	setting := mediasetting.Get()
+	if bytes < 0 || setting.MaxRequestBytes <= 0 || bytes > setting.MaxRequestBytes {
+		return ErrMediaFileTooLarge
+	}
+	if model.DB == nil || token == "" {
+		return ErrImageRouteSpoolUnavailable
+	}
+	if err := ReconcileStorageStateIfStale(time.Minute); err != nil {
+		return err
+	}
+	root, err := storageRoot()
+	if err != nil {
+		return err
+	}
+	return model.DB.Transaction(func(tx *gorm.DB) error {
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		var reservation model.MediaStorageReservation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("token = ? AND user_id = ? AND state = ? AND expires_at > ?", token, 0, "reserved", time.Now().Unix()).First(&reservation).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrImageRouteSpoolUnavailable
+			}
+			return err
+		}
+		if reservation.Bytes < 0 || reservation.Bytes > setting.MaxRequestBytes {
+			return ErrMediaFileTooLarge
+		}
+		if bytes <= reservation.Bytes {
+			return nil
+		}
+		delta := bytes - reservation.Bytes
+		effectiveUsed := effectiveMediaUsedBytes(*state)
+		if effectiveUsed < 0 || state.ReservedBytes < 0 || state.ReservedBytes > setting.GlobalMaxBytes ||
+			effectiveUsed > setting.GlobalMaxBytes-state.ReservedBytes || delta > setting.GlobalMaxBytes-effectiveUsed-state.ReservedBytes {
+			return ErrMediaCapacity
+		}
+		usage, err := disk.Usage(root)
+		if err != nil {
+			return fmt.Errorf("media disk capacity check failed: %w", err)
+		}
+		reservedNeed := state.ReservedBytes + delta
+		if setting.ReservedFreeBytes > 0 {
+			if reservedNeed > int64(^uint64(0)>>1)-setting.ReservedFreeBytes {
+				return ErrMediaCapacity
+			}
+			reservedNeed += setting.ReservedFreeBytes
+		}
+		if usage.Free < uint64(reservedNeed) {
+			return ErrMediaCapacity
+		}
+		result := tx.Model(&model.MediaStorageReservation{}).
+			Where("id = ? AND user_id = ? AND state = ? AND bytes = ? AND expires_at > ?", reservation.ID, 0, "reserved", reservation.Bytes, time.Now().Unix()).
+			Update("bytes", bytes)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrImageRouteSpoolUnavailable
+		}
+		return tx.Model(state).Update("reserved_bytes", gorm.Expr("reserved_bytes + ?", delta)).Error
+	})
+}
+
+func ReleaseImageRouteSpool(token string) error {
+	if token == "" {
+		return nil
+	}
+	if model.DB == nil {
+		return ErrImageRouteSpoolUnavailable
+	}
+	var reservation model.MediaStorageReservation
+	err := model.DB.Where("token = ?", token).First(&reservation).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if reservation.UserID != 0 {
+		return ErrImageRouteSpoolUnavailable
+	}
+	releaseReservation(token)
+	if err := model.DB.Where("token = ?", token).First(&reservation).Error; err != nil {
+		return err
+	}
+	if reservation.State != "released" && reservation.State != "expired" {
+		return ErrImageRouteSpoolUnavailable
+	}
+	return nil
+}

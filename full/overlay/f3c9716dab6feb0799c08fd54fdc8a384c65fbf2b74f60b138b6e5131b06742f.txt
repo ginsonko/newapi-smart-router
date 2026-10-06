@@ -1,0 +1,167 @@
+package openai
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/relayconvert"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+	}
+
+	var chatResp dto.OpenAITextResponse
+	if err := common.Unmarshal(body, &chatResp); err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+	}
+	if oaiError := chatResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		return nil, MarkSmartResponsesUpstreamError(c, types.WithOpenAIError(*oaiError, resp.StatusCode, types.ErrOptionWithUpstreamResponseReceived()))
+	}
+
+	responseID := helper.GetResponseID(c)
+	responsesResp, usage, err := service.ChatCompletionsResponseToResponsesResponse(&chatResp, responseID)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if usage == nil || usage.TotalTokens == 0 {
+		text := service.ExtractOutputTextFromResponses(responsesResp)
+		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
+		responsesResp.Usage = relayconvert.UsageFromChatUsage(usage)
+	}
+
+	responseBody, err := common.Marshal(responsesResp)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
+	}
+
+	service.IOCopyBytesGracefully(c, resp, responseBody)
+	return usage, nil
+}
+
+func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+
+	responseID := helper.GetResponseID(c)
+	state := relayconvert.NewChatToResponsesStreamState(responseID, info.UpstreamModelName)
+	streamErr := (*types.NewAPIError)(nil)
+	sawFinishReason := false
+
+	markGeneratedEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
+		observeSmartResponsesStreamEvent(c, info, &event.Payload)
+		data, err := common.Marshal(event.Payload)
+		if err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
+			return false
+		}
+		if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data)); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+			return false
+		}
+		if isSmartResponsesRequest(c) {
+			markSmartResponsesSemanticCommitted(c)
+		}
+		return true
+	}
+
+	sendEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
+		return markGeneratedEvent(event)
+	}
+
+	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if streamErr != nil {
+			sr.Stop(streamErr)
+			return
+		}
+
+		var errorResp dto.OpenAITextResponse
+		if err := common.UnmarshalJsonStr(data, &errorResp); err == nil {
+			if oaiError := errorResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+				streamErr = MarkSmartResponsesUpstreamError(c, types.WithOpenAIError(*oaiError, resp.StatusCode, types.ErrOptionWithUpstreamResponseReceived()))
+				sr.Stop(streamErr)
+				return
+			}
+		}
+
+		var chunk dto.ChatCompletionsStreamResponse
+		if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
+			logger.LogError(c, "failed to unmarshal chat stream response: "+err.Error())
+			sr.Error(err)
+			return
+		}
+		MarkFirstSemanticText(info, &chunk)
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != "" {
+				sawFinishReason = true
+				if info.StreamStatus != nil {
+					info.StreamStatus.MarkTerminalKind("chat_finish_reason")
+				}
+			}
+		}
+
+		events, err := relayconvert.ChatCompletionsStreamChunkToResponsesEvents(&chunk, state)
+		if err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
+			return
+		}
+		for _, event := range events {
+			if !sendEvent(event) {
+				sr.Stop(streamErr)
+				return
+			}
+		}
+	})
+
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	if isSmartResponsesRequest(c) {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+		}
+		streamDone := info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone
+		if !sawFinishReason && !streamDone && !SmartResponsesTerminalSeen(c) {
+			incompleteErr := MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+				fmt.Errorf("upstream chat stream ended before a terminal event"),
+				types.ErrorCodeReadResponseBodyFailed,
+				http.StatusBadGateway,
+			))
+			return nil, PreserveSmartResponsesSingleRouteError(c, incompleteErr)
+		}
+	}
+
+	usage := state.Usage
+	if usage == nil || usage.TotalTokens == 0 {
+		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+		state.Usage = relayconvert.UsageFromChatUsage(usage)
+	}
+
+	for _, event := range relayconvert.FinalizeChatCompletionsStreamToResponses(state) {
+		if !sendEvent(event) {
+			return nil, streamErr
+		}
+	}
+
+	return usage, nil
+}

@@ -1,0 +1,232 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { VChart } from '@visactor/react-vchart'
+import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { useChartTheme } from '@/lib/use-chart-theme'
+import { VCHART_OPTION } from '@/lib/vchart'
+
+import {
+  unwrapAnalyticsTooltipDatum,
+  type AnalyticsTooltipDatum,
+} from './analytics-trend-chart-helpers'
+
+export type AnalyticsTrendPoint = {
+  timeMS: number
+  value: number | null
+  requests?: number
+  samples?: number
+}
+
+export type AnalyticsTrendSeries = {
+  key: string
+  label: string
+  color: string
+  points: AnalyticsTrendPoint[]
+}
+
+type AnalyticsTrendChartProps = {
+  title: string
+  subtitle: string
+  series: AnalyticsTrendSeries[]
+  formatValue: (value: number) => string
+  formatAxis?: (value: number) => string
+  area?: boolean
+  zeroBased?: boolean
+}
+
+type ChartDatum = {
+  time: string
+  timestamp: number
+  series: string
+  value: number | null
+  displayValue: string
+  requests: number
+  samples: number
+}
+
+function chartThemeTokens(resolvedTheme: string) {
+  return {
+    textColor:
+      resolvedTheme === 'dark'
+        ? 'rgba(255,255,255,0.68)'
+        : 'rgba(15,23,42,0.62)',
+    gridColor:
+      resolvedTheme === 'dark'
+        ? 'rgba(255,255,255,0.10)'
+        : 'rgba(15,23,42,0.10)',
+  }
+}
+
+function timeLabel(timeMS: number) {
+  return new Date(timeMS).toLocaleString(undefined, {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+export function AnalyticsTrendChart(props: AnalyticsTrendChartProps) {
+  const { t } = useTranslation()
+  const { resolvedTheme, themeReady } = useChartTheme()
+  const { textColor, gridColor } = chartThemeTokens(resolvedTheme)
+  const data = useMemo<ChartDatum[]>(
+    () =>
+      props.series.flatMap((series) =>
+        series.points.map((point) => ({
+          time: timeLabel(point.timeMS),
+          timestamp: point.timeMS,
+          series: series.label,
+          value: point.value,
+          displayValue:
+            point.value === null ? '' : props.formatValue(point.value),
+          requests: point.requests ?? 0,
+          samples: point.samples ?? 0,
+        }))
+      ),
+    [props.formatValue, props.series]
+  )
+  const hasValues = data.some(
+    (point) => typeof point.value === 'number' && Number.isFinite(point.value)
+  )
+  const colors = props.series.map((series) => series.color)
+  const spec = useMemo(() => {
+    if (!hasValues) return null
+    return {
+      type: props.area ? ('area' as const) : ('line' as const),
+      data: [{ id: 'analytics', values: data }],
+      xField: 'time',
+      yField: 'value',
+      seriesField: 'series',
+      color: colors,
+      invalidType: 'break' as const,
+      line: {
+        style: {
+          lineWidth: 2,
+          lineDash: (datum: ChartDatum) =>
+            datum.series === props.series[1]?.label ? [5, 4] : [],
+        },
+      },
+      area: props.area
+        ? {
+            style: { fillOpacity: 0.18 },
+          }
+        : undefined,
+      point: {
+        visible: true,
+        style: {
+          size: 5,
+          lineWidth: 1.5,
+          stroke: resolvedTheme === 'dark' ? '#111827' : '#ffffff',
+        },
+      },
+      legends: {
+        visible: props.series.length > 1,
+        orient: 'top' as const,
+        position: 'start' as const,
+      },
+      tooltip: {
+        mark: {
+          title: {
+            value: (value: AnalyticsTooltipDatum<ChartDatum>) =>
+              unwrapAnalyticsTooltipDatum(value).time,
+          },
+          content: [
+            {
+              key: (value: AnalyticsTooltipDatum<ChartDatum>) =>
+                unwrapAnalyticsTooltipDatum(value).series,
+              value: (value: AnalyticsTooltipDatum<ChartDatum>) => {
+                const datum = unwrapAnalyticsTooltipDatum(value)
+                return datum.value === null ? t('Unknown') : datum.displayValue
+              },
+            },
+            {
+              key: t('Requests'),
+              value: (value: AnalyticsTooltipDatum<ChartDatum>) =>
+                `${unwrapAnalyticsTooltipDatum(value).requests}`,
+            },
+            {
+              key: t('Metric samples'),
+              value: (value: AnalyticsTooltipDatum<ChartDatum>) =>
+                `${unwrapAnalyticsTooltipDatum(value).samples}`,
+            },
+          ],
+        },
+      },
+      axes: [
+        {
+          orient: 'bottom' as const,
+          label: {
+            autoLimit: true,
+            autoRotate: true,
+            style: { fill: textColor, fontSize: 10 },
+          },
+          tick: { visible: false },
+        },
+        {
+          orient: 'left' as const,
+          zero: props.zeroBased === true,
+          label: {
+            formatMethod: (value: number | string) => {
+              const numeric = Number(value)
+              return Number.isFinite(numeric)
+                ? (props.formatAxis ?? props.formatValue)(numeric)
+                : String(value)
+            },
+            style: { fill: textColor, fontSize: 10 },
+          },
+          grid: {
+            visible: true,
+            style: { lineDash: [3, 3], stroke: gridColor },
+          },
+        },
+      ],
+    }
+  }, [colors, data, gridColor, hasValues, props, resolvedTheme, t, textColor])
+
+  return (
+    <section
+      className='min-w-0 rounded-xl border p-3 sm:p-4'
+      data-route-analytics-chart={props.title}
+    >
+      <h3 className='text-sm font-semibold'>{props.title}</h3>
+      <p className='text-muted-foreground mt-1 text-xs'>{props.subtitle}</p>
+      {!hasValues && (
+        <div className='text-muted-foreground flex h-52 items-center justify-center text-sm'>
+          {t('No real samples in this time range')}
+        </div>
+      )}
+      {hasValues && themeReady && spec && (
+        <div className='mt-3 h-60 min-w-0 sm:h-64'>
+          <VChart
+            key={`${props.title}-${resolvedTheme}`}
+            spec={{
+              ...spec,
+              theme: resolvedTheme === 'dark' ? 'dark' : 'light',
+              background: 'transparent',
+            }}
+            option={VCHART_OPTION}
+          />
+        </div>
+      )}
+    </section>
+  )
+}

@@ -1,0 +1,49 @@
+package openai
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/stretchr/testify/require"
+)
+
+func TestEmptyReasoningPreludeFailureCanFailOver(t *testing.T) {
+	for _, message := range []string{"The service is busy. Please retry later.", "context canceled", "Upstream rate limit exceeded, please retry later"} {
+		t.Run(message, func(t *testing.T) {
+			failure, err := json.Marshal(map[string]any{"type": "response.failed", "error": map[string]string{"message": message, "type": "server_error"}})
+			require.NoError(t, err)
+			body := strings.Join([]string{
+				`data: {"type":"response.created","response":{"status":"in_progress"}}`,
+				`data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1","summary":[]}}`,
+				`data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
+				`data: {"type":"response.reasoning_summary_text.delta","delta":""}`,
+				"data: " + string(failure),
+			}, "\n\n") + "\n\n"
+			c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+			defer BeginSmartResponsesSemanticWindow(c, info)()
+			_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			require.NotNil(t, apiErr)
+			require.Empty(t, recorder.Body.String())
+			require.False(t, SmartResponsesSemanticCommitted(c))
+			require.True(t, service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err()).RetryNextRoute)
+		})
+	}
+}
+
+func TestReasoningPreludePreservesMeaningfulOutputBoundary(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"opaque"}}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]}}`,
+		`{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"answer"}]}}`,
+		`{"type":"response.output_item.added","item":{"type":"function_call","name":"write_file"}}`,
+		`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":"reason"}}`,
+		`{"type":"response.reasoning_text.delta","delta":"reason"}`,
+	} {
+		var event dto.ResponsesStreamResponse
+		require.NoError(t, json.Unmarshal([]byte(raw), &event))
+		require.False(t, isSmartResponsesPreludeControl(&event), raw)
+	}
+}

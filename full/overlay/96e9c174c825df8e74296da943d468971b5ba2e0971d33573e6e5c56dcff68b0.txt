@@ -1,0 +1,47 @@
+package service
+
+import (
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+// SmartRouteRequiresPassiveRecovery also handles old durable hints which do
+// not yet carry the catalog's passive_recovery annotation.
+func SmartRouteRequiresPassiveRecovery(canonical string, route smartrouter.CertifiedRoute) bool {
+	const media = smartroutersetting.CapabilityImageGeneration | smartroutersetting.CapabilityVideoGeneration | smartroutersetting.CapabilityAudioSpeech | smartroutersetting.CapabilityAudioTranscription
+	return route.PassiveRecovery || route.Media != nil || route.Capabilities&media != 0 || model.ModelRequiresPassiveRecovery(constant.ChannelTypeOpenAI, canonical, route.UpstreamModel)
+}
+
+// smartRouteSyntheticRecoveryAt returns -1 when there is no ongoing outage.
+// Zero is reserved for the explicit immediate-probe compatibility policy.
+func smartRouteSyntheticRecoveryAt(quality smartrouter.QualityState, setting smartroutersetting.Setting) int64 {
+	delay := setting.TextProbeDelayMS()
+	if delay == 0 {
+		return 0
+	}
+	started := quality.RecoveryStartedMS
+	if started == 0 {
+		started = quality.FirstFailureMS
+	}
+	if started == 0 {
+		started = quality.LastFailureMS
+	}
+	if started <= 0 || quality.LastSuccessMS >= started || quality.LastRealSuccessMS >= started {
+		return -1
+	}
+	return started + delay
+}
+
+func SmartRouteSyntheticProbeAllowed(endpoint, canonical string, routes ...smartrouter.CertifiedRoute) bool {
+	if !supportedSyntheticTextProbeEndpoint(endpoint) || SmartRouteRequiresPassiveRecovery(canonical, smartrouter.CertifiedRoute{}) {
+		return false
+	}
+	for _, route := range routes {
+		if SmartRouteRequiresPassiveRecovery(canonical, route) {
+			return false
+		}
+	}
+	return true
+}

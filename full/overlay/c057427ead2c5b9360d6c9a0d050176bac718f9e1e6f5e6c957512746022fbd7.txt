@@ -1,0 +1,141 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+)
+
+// TopUpCompletion is returned only after the transaction commits. Applied is
+// false for an already completed order; callers must never add quota again.
+type TopUpCompletion struct {
+	TopUp      TopUp
+	QuotaAdded int
+	Applied    bool
+}
+
+func topUpQuota(topUp *TopUp) (int, error) {
+	if math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) || common.QuotaPerUnit <= 0 {
+		return 0, errors.New("invalid quota conversion")
+	}
+	amount := decimal.NewFromInt(topUp.Amount)
+	if topUp.PaymentProvider == PaymentProviderStripe {
+		if math.IsNaN(topUp.Money) || math.IsInf(topUp.Money, 0) {
+			return 0, errors.New("invalid order amount")
+		}
+		amount = decimal.NewFromFloat(topUp.Money)
+	}
+	quota := amount.Mul(decimal.NewFromFloat(common.QuotaPerUnit)).Truncate(0)
+	if quota.LessThanOrEqual(decimal.Zero) || quota.GreaterThan(decimal.NewFromInt(int64(^uint(0)>>1))) {
+		return 0, errors.New("invalid or overflowing topup quota")
+	}
+	return int(quota.IntPart()), nil
+}
+
+func validateEpayMoney(topUp *TopUp, paidMoney string) error {
+	// Purchase sends FormatFloat(..., 'f', 2, 64). Compare with that exact
+	// amount, including its rounding, rather than recomputing today's price.
+	if math.IsNaN(topUp.Money) || math.IsInf(topUp.Money, 0) || topUp.Money <= 0 ||
+		len(paidMoney) == 0 || len(paidMoney) > 64 || strings.ContainsAny(paidMoney, "eE") {
+		return errors.New("invalid payment amount")
+	}
+	paid, err := decimal.NewFromString(paidMoney)
+	if err != nil || !paid.IsPositive() {
+		return errors.New("invalid payment amount")
+	}
+	expected, err := decimal.NewFromString(strconv.FormatFloat(topUp.Money, 'f', 2, 64))
+	if err != nil || !paid.Equal(expected) {
+		return errors.New("payment amount mismatch")
+	}
+	return nil
+}
+
+func completeTopUp(tradeNo, provider, paidMoney, actualMethod string) (*TopUpCompletion, error) {
+	if tradeNo == "" {
+		return nil, errors.New("missing trade number")
+	}
+	result := &TopUpCompletion{}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		order := &result.TopUp
+		if err := lockForUpdate(tx).Where("trade_no = ?", tradeNo).First(order).Error; err != nil {
+			return err
+		}
+		if provider != "" {
+			if order.PaymentProvider != provider {
+				return ErrPaymentMethodMismatch
+			}
+			if err := validateEpayMoney(order, paidMoney); err != nil {
+				return err
+			}
+		}
+		if order.Status == common.TopUpStatusSuccess {
+			return nil
+		}
+		if order.Status != common.TopUpStatusPending {
+			return ErrTopUpStatusInvalid
+		}
+		quota, err := topUpQuota(order)
+		if err != nil {
+			return err
+		}
+		// Scoped lookup rejects missing/deleted users, but permits topping up
+		// a negative balance. A positive credit does not change commissions.
+		var user User
+		if err := lockForUpdate(tx).Where("id = ?", order.UserId).First(&user).Error; err != nil {
+			return err
+		}
+		if user.Quota > int(^uint(0)>>1)-quota {
+			return errors.New("user quota overflow")
+		}
+		credit := tx.Model(&User{}).Where("id = ?", user.Id).UpdateColumn("quota", gorm.Expr("quota + ?", quota))
+		if credit.Error != nil {
+			return credit.Error
+		}
+		if credit.RowsAffected != 1 {
+			return errors.New("topup user update did not affect one row")
+		}
+		method := order.PaymentMethod
+		if actualMethod != "" {
+			method = actualMethod
+		}
+		completedAt := common.GetTimestamp()
+		complete := tx.Model(&TopUp{}).Where("id = ? AND status = ?", order.Id, common.TopUpStatusPending).
+			Updates(map[string]interface{}{"status": common.TopUpStatusSuccess, "complete_time": completedAt, "payment_method": method})
+		if complete.Error != nil {
+			return complete.Error
+		}
+		if complete.RowsAffected != 1 {
+			return errors.New("topup completion did not affect one row")
+		}
+		order.Status, order.CompleteTime, order.PaymentMethod = common.TopUpStatusSuccess, completedAt, method
+		result.QuotaAdded, result.Applied = quota, true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Cache is derived state. Do not change it before commit, and do not turn
+	// a cache failure into a second financial operation on a retry.
+	if err := InvalidateUserCache(result.TopUp.UserId); err != nil {
+		common.SysError(fmt.Sprintf("topup committed but cache invalidation failed user_id=%d: %v", result.TopUp.UserId, err))
+	}
+	return result, nil
+}
+
+func CompleteEpayTopUp(tradeNo, paidMoney, actualMethod, callerIP string) (*TopUpCompletion, error) {
+	result, err := completeTopUp(tradeNo, PaymentProviderEpay, paidMoney, actualMethod)
+	if err != nil {
+		return nil, err
+	}
+	if result.Applied {
+		RecordTopupLog(result.TopUp.UserId, fmt.Sprintf("使用在线充值成功，充值金额: %v，支付金额：%f，订单号：%s", logger.LogQuota(result.QuotaAdded), result.TopUp.Money, result.TopUp.TradeNo), callerIP, result.TopUp.PaymentMethod, "epay")
+	}
+	return result, nil
+}

@@ -1,5 +1,7 @@
 # Choosing a release form
 
+Current Alpha version: [`v0.4.0-alpha.1`](https://github.com/ginsonko/newapi-smart-router/releases/tag/v0.4.0-alpha.1), generic R98 reference, Bridge SPI `bridge-spi-v1alpha4`. See [current capabilities and limits](v0.4-contract-delta.md). Versioned sections below describe historical changes, not current certification. No official Bridge revision is Certified.
+
 ## Full compatibility distribution
 
 Choose Full when replacing the application image is acceptable and the site

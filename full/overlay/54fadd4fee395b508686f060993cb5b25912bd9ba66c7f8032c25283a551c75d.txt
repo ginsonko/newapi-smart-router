@@ -1,0 +1,58 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestFormatUserLogsShowsDeliveryStatusWithoutProviderDiagnostics(t *testing.T) {
+	logs := []*Log{{Other: common.MapToJsonStr(map[string]interface{}{
+		"stream_status": map[string]interface{}{
+			"status": "ok", "provider_status": "completed", "transport_status": "client_gone",
+			"client_disconnected": true, "semantic_terminal": "response.completed", "provider_completed": true,
+			"end_error": "private provider address", "errors": []string{"private diagnostics"},
+		},
+		"admin_info": map[string]interface{}{"secret": "credential"},
+	})}}
+	formatUserLogs(logs, 0)
+	other, err := common.StrToMap(logs[0].Other)
+	require.NoError(t, err)
+	status, ok := other["stream_status"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, true, status["client_disconnected"])
+	assert.Equal(t, true, status["provider_completed"])
+	assert.Equal(t, "completed", status["provider_status"])
+	assert.NotContains(t, status, "end_error")
+	assert.NotContains(t, status, "errors")
+	assert.NotContains(t, other, "admin_info")
+}
+
+// TestFormatUserLogsStripsQuotaSaturation verifies the admin-only quota
+// saturation marker (nested under other.admin_info) is removed for non-admin
+// log views, since formatUserLogs strips the whole admin_info object.
+func TestFormatUserLogsStripsQuotaSaturation(t *testing.T) {
+	other := common.MapToJsonStr(map[string]interface{}{
+		"model_price": 0.004,
+		"admin_info": map[string]interface{}{
+			"quota_saturation": map[string]interface{}{
+				"op":      "QuotaFromDecimal",
+				"kind":    "overflow",
+				"clamped": common.MaxQuota,
+			},
+		},
+	})
+	logs := []*Log{{Other: other}}
+
+	formatUserLogs(logs, 0)
+
+	parsed, err := common.StrToMap(logs[0].Other)
+	require.NoError(t, err)
+	_, hasAdminInfo := parsed["admin_info"]
+	require.False(t, hasAdminInfo, "admin_info (and nested quota_saturation) must be stripped for non-admin views")
+	// Non-admin billing fields remain visible.
+	require.Contains(t, parsed, "model_price")
+}

@@ -1,0 +1,35 @@
+package smart_router_setting
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestImageHealthSettingDefaultsRoundTripAndValidation(t *testing.T) {
+	setting := Normalize(validSetting())
+	assert.Equal(t, 3600, setting.ImageFailureWindowSeconds)
+	assert.Equal(t, 11, setting.ImageFailureThreshold)
+	setting.ImageFailureWindowSeconds = 60
+	setting.ImageFailureThreshold = 5
+	require.NoError(t, setting.Validate())
+	encoded, err := common.Marshal(setting)
+	require.NoError(t, err)
+	var restored Setting
+	require.NoError(t, common.Unmarshal(encoded, &restored))
+	restored = Normalize(restored)
+	assert.Equal(t, 60, restored.ImageFailureWindowSeconds)
+	assert.Equal(t, 5, restored.ImageFailureThreshold)
+	for _, invalid := range []int{-1, 86401} {
+		changed := Clone(setting)
+		changed.ImageFailureWindowSeconds = invalid
+		require.Error(t, changed.Validate())
+	}
+	for _, invalid := range []int{-1, 100001} {
+		changed := Clone(setting)
+		changed.ImageFailureThreshold = invalid
+		require.Error(t, changed.Validate())
+	}
+}

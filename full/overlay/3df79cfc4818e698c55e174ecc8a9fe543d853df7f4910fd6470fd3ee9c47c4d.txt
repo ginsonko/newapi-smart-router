@@ -1,0 +1,685 @@
+package sora
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/relay/channel"
+	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+
+	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+	"github.com/tidwall/sjson"
+)
+
+// ============================
+// Request / Response structures
+// ============================
+
+type ContentItem struct {
+	Type     string    `json:"type"`                // "text" or "image_url"
+	Text     string    `json:"text,omitempty"`      // for text type
+	ImageURL *ImageURL `json:"image_url,omitempty"` // for image_url type
+}
+
+type ImageURL struct {
+	URL string `json:"url"`
+}
+
+type responseTaskMetadata struct {
+	URL string `json:"url,omitempty"`
+}
+
+type responseTask struct {
+	ID                 string               `json:"id"`
+	TaskID             string               `json:"task_id,omitempty"` //兼容旧接口
+	Object             string               `json:"object"`
+	Model              string               `json:"model"`
+	Status             string               `json:"status"`
+	Progress           int                  `json:"progress"`
+	CreatedAt          int64                `json:"created_at"`
+	CompletedAt        int64                `json:"completed_at,omitempty"`
+	ExpiresAt          int64                `json:"expires_at,omitempty"`
+	Seconds            dto.StringValue      `json:"seconds,omitempty"`
+	Size               string               `json:"size,omitempty"`
+	RemixedFromVideoID string               `json:"remixed_from_video_id,omitempty"`
+	URL                string               `json:"url,omitempty"`
+	VideoURL           string               `json:"video_url,omitempty"`
+	Metadata           responseTaskMetadata `json:"metadata,omitempty"`
+	Error              json.RawMessage      `json:"error,omitempty"`
+}
+
+// ============================
+// Adaptor implementation
+// ============================
+
+type TaskAdaptor struct {
+	taskcommon.BaseBilling
+	ChannelType int
+	apiKey      string
+	baseURL     string
+}
+
+func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
+	a.ChannelType = info.ChannelType
+	a.baseURL = info.ChannelBaseUrl
+	a.apiKey = info.ApiKey
+}
+
+func validateRemixRequest(c *gin.Context) *dto.TaskError {
+	var req relaycommon.TaskSubmitReq
+	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		return service.TaskErrorWrapperLocal(fmt.Errorf("field prompt is required"), "invalid_request", http.StatusBadRequest)
+	}
+	// 存储原始请求到 context，与 ValidateMultipartDirect 路径保持一致
+	c.Set("task_request", req)
+	return nil
+}
+
+func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
+	if info.Action == constant.TaskActionRemix {
+		return validateRemixRequest(c)
+	}
+	return relaycommon.ValidateMultipartDirect(c, info)
+}
+
+// EstimateBilling 根据用户请求的 seconds 和 size 计算 OtherRatios。
+func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
+	// remix 路径的 OtherRatios 已在 ResolveOriginTask 中设置
+	if info.Action == constant.TaskActionRemix {
+		return nil
+	}
+
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return nil
+	}
+
+	seconds, _ := strconv.Atoi(req.Seconds)
+	if seconds == 0 {
+		seconds = req.Duration
+	}
+	if seconds <= 0 {
+		seconds = 4
+	}
+
+	size := req.Size
+	if size == "" {
+		size = "720x1280"
+	}
+
+	ratios := map[string]float64{
+		"seconds": float64(seconds),
+		"size":    1,
+	}
+	if size == "1792x1024" || size == "1024x1792" {
+		ratios["size"] = 1.666667
+	}
+	return ratios
+}
+
+func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	if info.Action == constant.TaskActionRemix {
+		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, info.OriginTaskID), nil
+	}
+	return fmt.Sprintf("%s/v1/videos", a.baseURL), nil
+}
+
+const submitIdempotencyContextKey = relaycommon.TaskSubmissionIdempotencyContextKey
+
+// BuildRequestHeader sets required headers.
+func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo) error {
+	req.Header.Set("Authorization", "Bearer "+a.apiKey)
+	req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+	if c.GetBool(submitIdempotencyContextKey) {
+		if info.TaskRelayInfo == nil || strings.TrimSpace(info.PublicTaskID) == "" {
+			return fmt.Errorf("视频提交操作号尚未生成")
+		}
+		// The server task identity survives route retries and persisted async intake.
+		// Client-provided keys cannot merge independently billed local operations.
+		req.Header.Set("Idempotency-Key", info.PublicTaskID)
+		// An uncertain paid send is reconciled explicitly, never replayed by Transport.
+		req.GetBody = nil
+	}
+	if body, ok := req.Body.(*encodedImageBody); ok {
+		req.ContentLength = body.size
+		// A paid create must not be transparently replayed after a redirect.
+		req.GetBody = nil
+	}
+	return nil
+}
+
+func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+	c.Set(submitIdempotencyContextKey, false)
+	if request, requestErr := relaycommon.GetTaskRequest(c); requestErr == nil {
+		capability, capabilityErr := relaycommon.GetTaskMediaCapability(c, info)
+		if capabilityErr != nil {
+			return nil, capabilityErr
+		}
+		c.Set(submitIdempotencyContextKey, capability.RuntimeEnforced && capability.SubmitIdempotency)
+		if capability.RuntimeEnforced && len(capability.ReferenceEncoding) > 0 {
+			return buildInlineImageRequest(c, info, request, capability)
+		}
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, errors.Wrap(err, "get_request_body_failed")
+	}
+	cachedBody, err := storage.Bytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "read_body_bytes_failed")
+	}
+	contentType := c.GetHeader("Content-Type")
+
+	if strings.HasPrefix(contentType, "application/json") {
+		var bodyMap map[string]interface{}
+		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
+			bodyMap["model"] = info.UpstreamModelName
+			if req, requestErr := relaycommon.GetTaskRequest(c); requestErr == nil {
+				capability, capabilityErr := relaycommon.GetTaskMediaCapability(c, info)
+				if capabilityErr != nil {
+					return nil, capabilityErr
+				}
+				if capability.RuntimeEnforced {
+					if err := applyManagedCapabilityPayload(bodyMap, req, capability); err != nil {
+						return nil, err
+					}
+				} else {
+					applyVideoDurationPayload(bodyMap, req, capability)
+					if len(req.References) > 0 {
+						if inputReference := req.ReferenceURL("image", "first_frame", "reference"); inputReference != "" {
+							bodyMap["input_reference"] = inputReference
+						}
+						if capability.ProviderContract == "aizzz-video-v1" {
+							applyAIZZZReferencePayload(bodyMap, req)
+							delete(bodyMap, "references")
+						} else if mediaservice.HasCapabilityOverride(info.ChannelId, info.UpstreamModelName, service.SmartEndpointVideos) {
+							bodyMap["references"] = providerReferencePayload(req.References)
+						} else {
+							// The standard OpenAI video contract accepts exactly one
+							// input_reference. Advanced reference arrays are forwarded only
+							// for a route whose administrator explicitly declared that
+							// extension, preventing private file IDs from leaking upstream.
+							delete(bodyMap, "references")
+						}
+					}
+				}
+				if err := relaycommon.ValidateParameterVideoWire(info.PriceData.ParameterPricing, bodyMap, capability); err != nil {
+					return nil, err
+				}
+			}
+			if newBody, err := common.Marshal(bodyMap); err == nil {
+				return bytes.NewReader(newBody), nil
+			}
+		}
+		if info.PriceData.ParameterPricing != nil {
+			return nil, fmt.Errorf("cannot validate the priced video JSON payload")
+		}
+		return bytes.NewReader(cachedBody), nil
+	}
+
+	if strings.Contains(contentType, "multipart/form-data") {
+		formData, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			if info.PriceData.ParameterPricing != nil {
+				return nil, err
+			}
+			return bytes.NewReader(cachedBody), nil
+		}
+		managedValues := map[string]interface{}(nil)
+		if request, requestErr := relaycommon.GetTaskRequest(c); requestErr == nil {
+			capability, capabilityErr := relaycommon.GetTaskMediaCapability(c, info)
+			if capabilityErr != nil {
+				return nil, capabilityErr
+			}
+			if !capability.RuntimeEnforced && info.PriceData.ParameterPricing != nil {
+				fields := make(map[string]interface{}, len(formData.Value)+1)
+				for key, values := range formData.Value {
+					if len(values) > 0 {
+						fields[key] = values[0]
+					}
+				}
+				fields["model"] = info.UpstreamModelName
+				if err := relaycommon.ValidateParameterVideoWire(info.PriceData.ParameterPricing, fields, capability); err != nil {
+					return nil, err
+				}
+			}
+			if capability.RuntimeEnforced {
+				managedValues = make(map[string]interface{})
+				for key, values := range formData.Value {
+					if len(values) > 0 {
+						managedValues[key] = values[0]
+					}
+				}
+				if len(formData.File) > 0 {
+					return nil, fmt.Errorf("upload reference files first and submit references using file_id for this managed contract")
+				}
+				if len(capability.ReferenceFields) > 0 && len(request.References) > 0 {
+					return nil, fmt.Errorf("provider reference fields require the configured JSON request contract; multipart reference encoding has not been declared")
+				}
+				if err := applyManagedCapabilityPayload(managedValues, request, capability); err != nil {
+					return nil, err
+				}
+				managedValues["model"] = info.UpstreamModelName
+				if err := relaycommon.ValidateParameterVideoWire(info.PriceData.ParameterPricing, managedValues, capability); err != nil {
+					return nil, err
+				}
+			}
+		}
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
+		writer.WriteField("model", info.UpstreamModelName)
+		if managedValues != nil {
+			for key, value := range managedValues {
+				if key == "model" {
+					continue
+				}
+				text, ok := value.(string)
+				if !ok {
+					encoded, encodeErr := common.Marshal(value)
+					if encodeErr != nil {
+						return nil, encodeErr
+					}
+					text = string(encoded)
+				}
+				if err := writer.WriteField(key, text); err != nil {
+					return nil, err
+				}
+			}
+			if err := writer.Close(); err != nil {
+				return nil, err
+			}
+			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			return &buf, nil
+		}
+		for key, values := range formData.Value {
+			if key == "model" {
+				continue
+			}
+			for _, v := range values {
+				writer.WriteField(key, v)
+			}
+		}
+		for fieldName, fileHeaders := range formData.File {
+			for _, fh := range fileHeaders {
+				f, err := fh.Open()
+				if err != nil {
+					continue
+				}
+				ct := fh.Header.Get("Content-Type")
+				if ct == "" || ct == "application/octet-stream" {
+					buf512 := make([]byte, 512)
+					n, _ := io.ReadFull(f, buf512)
+					ct = http.DetectContentType(buf512[:n])
+					// Re-open after sniffing so the full content is copied below
+					f.Close()
+					f, err = fh.Open()
+					if err != nil {
+						continue
+					}
+				}
+				h := make(textproto.MIMEHeader)
+				h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, fh.Filename))
+				h.Set("Content-Type", ct)
+				part, err := writer.CreatePart(h)
+				if err != nil {
+					f.Close()
+					continue
+				}
+				io.Copy(part, f)
+				f.Close()
+			}
+		}
+		writer.Close()
+		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+		return &buf, nil
+	}
+
+	if info.PriceData.ParameterPricing != nil {
+		return nil, fmt.Errorf("unsupported priced video content type")
+	}
+	return common.ReaderOnly(storage), nil
+}
+
+func applyManagedCapabilityPayload(bodyMap map[string]interface{}, req relaycommon.TaskSubmitReq, capability mediaservice.Capability) error {
+	if err := relaycommon.ValidateTaskMediaPayloadFields(capability, bodyMap); err != nil {
+		return err
+	}
+	if metadata, ok := bodyMap["metadata"].(map[string]interface{}); ok {
+		if err := relaycommon.ValidateTaskMediaPayloadFields(capability, metadata); err != nil {
+			return err
+		}
+	}
+	if len(req.References) > 0 {
+		for field, kind := range map[string]string{"image": "image", "images": "image", "input_reference": "image", "video_url": "video", "audio_url": "audio"} {
+			raw, present := bodyMap[field]
+			if !present || raw == nil {
+				continue
+			}
+			values := []string{}
+			switch typed := raw.(type) {
+			case string:
+				if strings.TrimSpace(typed) != "" {
+					values = append(values, typed)
+				}
+			case []string:
+				values = typed
+			case []interface{}:
+				for _, item := range typed {
+					value, ok := item.(string)
+					if !ok {
+						return fmt.Errorf("%s must contain reference URLs", field)
+					}
+					values = append(values, value)
+				}
+			default:
+				return fmt.Errorf("%s must contain reference URLs", field)
+			}
+			for _, value := range values {
+				matched := false
+				for _, referenceURL := range req.ReferenceURLs(kind) {
+					matched = matched || strings.TrimSpace(value) == referenceURL
+				}
+				if !matched {
+					return fmt.Errorf("%s conflicts with references; submit each input through references", field)
+				}
+			}
+		}
+		delete(bodyMap, "video_url")
+		delete(bodyMap, "audio_url")
+	}
+	// Provider arrays are generated only from validated public references.
+	if len(capability.ReferenceFields) > 0 && len(req.References) == 0 && (req.InputReference != "" || req.Image != "" || len(req.Images) > 0) {
+		return fmt.Errorf("this managed provider contract requires image inputs in references")
+	}
+	if len(capability.ReferenceFields) > 0 {
+		for _, field := range []string{"image", "images", "input_reference", "references"} {
+			delete(bodyMap, field)
+		}
+		for _, kind := range []string{"image", "video", "audio"} {
+			urls := req.ReferenceURLs(kind)
+			if len(urls) == 0 {
+				continue
+			}
+			field := capability.ReferenceFields[kind]
+			if field == "" {
+				return fmt.Errorf("provider reference field for %s is not configured", kind)
+			}
+			bodyMap[field] = urls
+		}
+	} else if len(req.References) > 0 {
+		if capability.ReferenceDurationField != "" {
+			bodyMap["references"] = providerReferencePayloadWithDuration(req.References, capability.ReferenceURLField, capability.ReferenceDurationField)
+		} else {
+			bodyMap["references"] = providerReferencePayload(req.References, capability.ReferenceURLField)
+		}
+		delete(bodyMap, "image")
+		delete(bodyMap, "images")
+		delete(bodyMap, "input_reference")
+	}
+	applyVideoDurationPayload(bodyMap, req, capability)
+	delete(bodyMap, "duration")
+	if req.Resolution != "" {
+		bodyMap["resolution"] = req.Resolution
+	}
+	if req.AspectRatio != "" {
+		bodyMap["aspect_ratio"] = req.AspectRatio
+	}
+	for source, destination := range capability.GenerationFields {
+		value, exists := bodyMap[source]
+		if !exists {
+			continue
+		}
+		if source == "seconds" {
+			seconds, err := strconv.Atoi(fmt.Sprint(value))
+			if err != nil {
+				return fmt.Errorf("invalid generation seconds")
+			}
+			value = seconds
+		}
+		if previous, present := bodyMap[destination]; present && fmt.Sprint(previous) != fmt.Sprint(value) {
+			return fmt.Errorf("%s conflicts with %s", destination, source)
+		}
+		bodyMap[destination] = value
+		if destination != source {
+			delete(bodyMap, source)
+		}
+	}
+	return nil
+}
+
+func applyVideoDurationPayload(bodyMap map[string]interface{}, req relaycommon.TaskSubmitReq, capability mediaservice.Capability) {
+	seconds := strings.TrimSpace(req.Seconds)
+	if seconds == "" && req.Duration > 0 {
+		seconds = strconv.Itoa(req.Duration)
+	}
+	if capability.ProviderContract == "aizzz-video-v1" && capability.Duration.Mode == "fixed" && capability.Duration.Fixed > 0 {
+		bodyMap["seconds"] = "1"
+		bodyMap["mySeconds"] = strconv.Itoa(capability.Duration.Fixed)
+		return
+	}
+	if seconds != "" {
+		bodyMap["seconds"] = seconds
+	}
+}
+
+func applyAIZZZReferencePayload(bodyMap map[string]interface{}, req relaycommon.TaskSubmitReq) {
+	images := req.ReferenceURLs("image")
+	videos := req.ReferenceURLs("video")
+	audios := req.ReferenceURLs("audio")
+	if len(images) > 0 {
+		bodyMap["reference_image_urls"] = images
+	}
+	if len(videos) > 0 {
+		bodyMap["reference_videos"] = videos
+	}
+	if len(audios) > 0 {
+		bodyMap["reference_audios"] = audios
+	}
+	if req.AspectRatio != "" {
+		bodyMap["aspect_ratio"] = req.AspectRatio
+	}
+	if req.Resolution != "" {
+		bodyMap["resolution"] = req.Resolution
+	}
+}
+
+func providerReferencePayload(references []relaycommon.MediaReference, configuredURLField ...string) []map[string]string {
+	urlField := "url"
+	if len(configuredURLField) > 0 && configuredURLField[0] != "" {
+		urlField = configuredURLField[0]
+	}
+	result := make([]map[string]string, 0, len(references))
+	for _, reference := range references {
+		source := strings.TrimSpace(reference.SourceURL())
+		if source == "" {
+			continue
+		}
+		item := map[string]string{
+			"type":   strings.ToLower(strings.TrimSpace(reference.Type)),
+			urlField: source,
+		}
+		if role := strings.ToLower(strings.TrimSpace(reference.Role)); role != "" {
+			item["role"] = role
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func providerReferencePayloadWithDuration(references []relaycommon.MediaReference, configuredURLField ...string) []map[string]interface{} {
+	urlField := "url"
+	if len(configuredURLField) > 0 && configuredURLField[0] != "" {
+		urlField = configuredURLField[0]
+	}
+	result := make([]map[string]interface{}, 0, len(references))
+	for _, reference := range references {
+		source := strings.TrimSpace(reference.SourceURL())
+		if source == "" {
+			continue
+		}
+		item := map[string]interface{}{
+			"type":   strings.ToLower(strings.TrimSpace(reference.Type)),
+			urlField: source,
+		}
+		if role := strings.ToLower(strings.TrimSpace(reference.Role)); role != "" {
+			item["role"] = role
+		}
+		if len(configuredURLField) > 1 && configuredURLField[1] != "" && reference.Type != "image" && reference.DurationSeconds > 0 {
+			item[configuredURLField[1]] = reference.DurationSeconds
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+// DoRequest delegates to common helper.
+func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	return channel.DoTaskApiRequest(a, c, info, requestBody)
+}
+
+// DoResponse handles upstream response, returns taskID etc.
+func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
+		return
+	}
+	_ = resp.Body.Close()
+
+	// Parse Sora response
+	var dResp responseTask
+	if err := common.Unmarshal(responseBody, &dResp); err != nil {
+		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		return
+	}
+
+	upstreamID := dResp.ID
+	if upstreamID == "" {
+		upstreamID = dResp.TaskID
+	}
+	if upstreamID == "" {
+		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty"), "invalid_response", http.StatusInternalServerError)
+		return
+	}
+
+	// 使用公开 task_xxxx ID 返回给客户端
+	dResp.ID = info.PublicTaskID
+	dResp.TaskID = info.PublicTaskID
+	c.JSON(http.StatusOK, dResp)
+	return upstreamID, responseBody, nil
+}
+
+// FetchTask fetch task status
+func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
+	taskID, ok := body["task_id"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid task_id")
+	}
+
+	uri := fmt.Sprintf("%s/v1/videos/%s", baseUrl, taskID)
+
+	req, err := http.NewRequest(http.MethodGet, uri, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	client, err := service.GetHttpClientWithProxy(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+	}
+	return client.Do(req)
+}
+
+func (a *TaskAdaptor) GetModelList() []string {
+	return ModelList
+}
+
+func (a *TaskAdaptor) GetChannelName() string {
+	return ChannelName
+}
+
+func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
+	resTask := responseTask{}
+	if err := common.Unmarshal(respBody, &resTask); err != nil {
+		return nil, errors.Wrap(err, "unmarshal task result failed")
+	}
+
+	taskResult := relaycommon.TaskInfo{
+		Code:   0,
+		TaskID: strings.TrimSpace(resTask.ID),
+	}
+	if taskResult.TaskID == "" {
+		taskResult.TaskID = strings.TrimSpace(resTask.TaskID)
+	}
+	status := strings.ToLower(strings.TrimSpace(resTask.Status))
+	// Preserve the existing no-status policy for the original error object.
+	// Newly supported string/numeric error shapes provide diagnostics only
+	// when the provider explicitly reports a failed task status.
+	var originalError struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	}
+	hasExplicitError := common.Unmarshal(resTask.Error, &originalError) == nil &&
+		(strings.TrimSpace(originalError.Message) != "" || strings.TrimSpace(originalError.Code) != "")
+
+	switch status {
+	case "queued", "pending", "created", "accepted", "submitted":
+		taskResult.Status = model.TaskStatusQueued
+	case "processing", "in_progress", "running":
+		taskResult.Status = model.TaskStatusInProgress
+	case "completed", "succeeded", "success":
+		taskResult.Status = model.TaskStatusSuccess
+		taskResult.Url = mediaservice.ExtractPrimaryVideoURL(respBody)
+		// Url intentionally left empty — the caller constructs the proxy URL using the public task ID
+	case "failed", "cancelled", "canceled":
+		taskResult.Status = model.TaskStatusFailure
+		taskResult.Reason = mediaservice.VideoFailureDetails("", respBody).Message
+	default:
+		// Some providers report an accepted job as "unknown" until a worker
+		// claims it. A valid identity without an explicit error is non-terminal.
+		if taskResult.TaskID != "" && !hasExplicitError {
+			taskResult.Status = model.TaskStatusInProgress
+		} else if hasExplicitError {
+			taskResult.Status = model.TaskStatusFailure
+			taskResult.Reason = mediaservice.VideoFailureDetails("", respBody).Message
+		}
+	}
+	if resTask.Progress > 0 && resTask.Progress < 100 {
+		taskResult.Progress = fmt.Sprintf("%d%%", resTask.Progress)
+	}
+
+	return &taskResult, nil
+}
+
+func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
+	data := task.Data
+	var err error
+	if data, err = sjson.SetBytes(data, "id", task.TaskID); err != nil {
+		return nil, errors.Wrap(err, "set id failed")
+	}
+	// Both public aliases must remain in this site's task namespace.
+	if data, err = sjson.SetBytes(data, "task_id", task.TaskID); err != nil {
+		return nil, errors.Wrap(err, "set task_id failed")
+	}
+	return data, nil
+}

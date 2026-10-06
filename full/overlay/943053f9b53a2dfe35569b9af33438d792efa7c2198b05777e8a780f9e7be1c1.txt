@@ -1,0 +1,682 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  DatabaseIcon,
+  RefreshCwIcon,
+  SearchIcon,
+  ShieldCheckIcon,
+  Trash2Icon,
+} from 'lucide-react'
+import { useDeferredValue, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { SectionPageLayout } from '@/components/layout'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { Progress } from '@/components/ui/progress'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
+
+import {
+  deleteAdminMediaAsset,
+  getAdminMediaAssets,
+  getMediaAdminOverview,
+  getMediaCleanupRuns,
+  getMediaConfig,
+  getMediaModerationEvents,
+  moderateMediaAsset,
+  runMediaCleanup,
+  updateMediaConfig,
+} from './api'
+import { AssetDialog } from './components/asset-dialog'
+import { AssetGrid } from './components/asset-grid'
+import { MediaConfigForm } from './components/media-config-form'
+import { ModelCapabilityEditor } from './components/model-capability-editor'
+import { ModerationDialog } from './components/moderation-dialog'
+import { MediaQueryError } from './components/query-error'
+import { formatBytes, formatMediaDate } from './lib'
+import type { MediaAsset, MediaConfig } from './types'
+
+const PAGE_SIZE = 20
+
+export function MediaAdminPage() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const role = useAuthStore((state) => state.auth.user?.role ?? 0)
+  const [page, setPage] = useState(1)
+  const [search, setSearch] = useState('')
+  const [username, setUsername] = useState('')
+  const [type, setType] = useState('')
+  const [moderation, setModeration] = useState('')
+  const [preview, setPreview] = useState<MediaAsset | null>(null)
+  const [review, setReview] = useState<{
+    asset: MediaAsset
+    action: string
+  } | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<MediaAsset | null>(null)
+  const [deleteReason, setDeleteReason] = useState('')
+  const [cleanupMode, setCleanupMode] = useState<'expired' | 'all' | null>(null)
+  const deferredSearch = useDeferredValue(search.trim())
+  const deferredUsername = useDeferredValue(username.trim())
+
+  const assetsQuery = useQuery({
+    queryKey: [
+      'media-admin-assets',
+      page,
+      deferredSearch,
+      deferredUsername,
+      type,
+      moderation,
+    ],
+    queryFn: () =>
+      getAdminMediaAssets({
+        page,
+        pageSize: PAGE_SIZE,
+        search: deferredSearch,
+        username: deferredUsername,
+        type,
+        moderationStatus: moderation,
+      }),
+    // Keep an open governance view current without creating a request storm.
+    // TanStack Query pauses this interval while the browser tab is hidden.
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
+  })
+  const overviewQuery = useQuery({
+    queryKey: ['media-admin-overview'],
+    queryFn: getMediaAdminOverview,
+    refetchInterval: 30_000,
+  })
+  const configQuery = useQuery({
+    queryKey: ['media-admin-config'],
+    queryFn: getMediaConfig,
+  })
+  const cleanupRunsQuery = useQuery({
+    queryKey: ['media-cleanup-runs'],
+    queryFn: () => getMediaCleanupRuns(),
+  })
+  const moderationEventsQuery = useQuery({
+    queryKey: ['media-moderation-events'],
+    queryFn: () => getMediaModerationEvents(),
+  })
+
+  const invalidateMediaAdmin = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['media-admin-assets'] }),
+      queryClient.invalidateQueries({ queryKey: ['media-admin-overview'] }),
+      queryClient.invalidateQueries({ queryKey: ['media-cleanup-runs'] }),
+      queryClient.invalidateQueries({ queryKey: ['media-moderation-events'] }),
+    ])
+  }
+
+  const moderationMutation = useMutation({
+    mutationFn: (value: {
+      assetId: string
+      action: string
+      reason: string
+      adminHold: boolean
+      banUser: boolean
+    }) =>
+      moderateMediaAsset(value.assetId, {
+        action: value.action,
+        reason: value.reason,
+        admin_hold: value.adminHold,
+        ban_user: value.banUser,
+      }),
+    onSuccess: async () => {
+      setReview(null)
+      await invalidateMediaAdmin()
+      toast.success(t('Review saved'))
+    },
+  })
+  const deleteMutation = useMutation({
+    mutationFn: (assetId: string) =>
+      deleteAdminMediaAsset(assetId, deleteReason.trim()),
+    onSuccess: async () => {
+      setPendingDelete(null)
+      setPreview(null)
+      setDeleteReason('')
+      await invalidateMediaAdmin()
+      toast.success(t('Asset deleted'))
+    },
+  })
+  const cleanupMutation = useMutation({
+    mutationFn: (mode: 'expired' | 'all') => runMediaCleanup(mode),
+    onSuccess: async (summary) => {
+      setCleanupMode(null)
+      await invalidateMediaAdmin()
+      toast.success(
+        t('Cleanup completed: {{count}} assets, {{size}} released', {
+          count: summary.deleted_count,
+          size: formatBytes(summary.freed_bytes),
+        })
+      )
+    },
+  })
+  const configMutation = useMutation({
+    mutationFn: (config: MediaConfig) => updateMediaConfig(config),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['media-admin-config'] }),
+        queryClient.invalidateQueries({ queryKey: ['media-admin-overview'] }),
+      ])
+      toast.success(t('Media settings saved'))
+    },
+  })
+
+  const overview = overviewQuery.data
+  const storagePercent = overview
+    ? Math.min(
+        100,
+        ((overview.storage.effective_used_bytes +
+          overview.storage.reserved_bytes) /
+          overview.global_max_bytes) *
+          100
+      )
+    : 0
+  const total = assetsQuery.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  return (
+    <>
+      <SectionPageLayout fixedContent>
+        <SectionPageLayout.Title>
+          {t('Media Governance')}
+        </SectionPageLayout.Title>
+        <SectionPageLayout.Actions>
+          <Button
+            onClick={() => void invalidateMediaAdmin()}
+            size='sm'
+            variant='outline'
+          >
+            <RefreshCwIcon aria-hidden='true' />
+            {t('Refresh')}
+          </Button>
+        </SectionPageLayout.Actions>
+        <SectionPageLayout.Content>
+          <Tabs className='flex h-full min-h-0 flex-col' defaultValue='assets'>
+            <TabsList className='w-fit shrink-0'>
+              <TabsTrigger value='assets'>{t('Assets')}</TabsTrigger>
+              <TabsTrigger value='storage'>{t('Storage')}</TabsTrigger>
+              <TabsTrigger value='audit'>{t('Audit')}</TabsTrigger>
+            </TabsList>
+
+            <TabsContent className='min-h-0 flex-1 pt-4' value='assets'>
+              <div className='flex h-full min-h-0 flex-col gap-4'>
+                <div className='grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(12rem,1fr)_12rem_10rem_11rem]'>
+                  <div className='relative'>
+                    <SearchIcon
+                      aria-hidden='true'
+                      className='text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2'
+                    />
+                    <Input
+                      aria-label={t('Search assets')}
+                      className='pl-8'
+                      onChange={(event) => {
+                        setSearch(event.target.value)
+                        setPage(1)
+                      }}
+                      placeholder={t('File, model, or asset ID')}
+                      value={search}
+                    />
+                  </div>
+                  <Input
+                    aria-label={t('Username')}
+                    onChange={(event) => {
+                      setUsername(event.target.value)
+                      setPage(1)
+                    }}
+                    placeholder={t('Username')}
+                    value={username}
+                  />
+                  <NativeSelect
+                    aria-label={t('Media type')}
+                    className='w-full'
+                    onChange={(event) => {
+                      setType(event.target.value)
+                      setPage(1)
+                    }}
+                    value={type}
+                  >
+                    <NativeSelectOption value=''>
+                      {t('All media')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='image'>
+                      {t('Images')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='video'>
+                      {t('Videos')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='audio'>
+                      {t('Audio')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='file'>
+                      {t('Files')}
+                    </NativeSelectOption>
+                  </NativeSelect>
+                  <NativeSelect
+                    aria-label={t('Moderation status')}
+                    className='w-full'
+                    onChange={(event) => {
+                      setModeration(event.target.value)
+                      setPage(1)
+                    }}
+                    value={moderation}
+                  >
+                    <NativeSelectOption value=''>
+                      {t('All review states')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='unreviewed'>
+                      {t('Unreviewed')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='approved'>
+                      {t('Approved')}
+                    </NativeSelectOption>
+                    <NativeSelectOption value='violation'>
+                      {t('Violation')}
+                    </NativeSelectOption>
+                  </NativeSelect>
+                </div>
+
+                <div className='hover-scrollbar min-h-0 flex-1 overflow-y-auto pb-1'>
+                  <AssetGrid
+                    admin
+                    assets={assetsQuery.data?.items ?? []}
+                    // A transient background refresh failure must not hide the
+                    // last known asset list. Show the error state only when no
+                    // prior response is available to render.
+                    error={assetsQuery.isError && !assetsQuery.data}
+                    loading={assetsQuery.isLoading}
+                    onDelete={setPendingDelete}
+                    onModerate={(asset, action) => setReview({ asset, action })}
+                    onPreview={setPreview}
+                    onRetry={() => void assetsQuery.refetch()}
+                  />
+                </div>
+
+                {totalPages > 1 && (
+                  <div className='flex items-center justify-end gap-2 border-t pt-3'>
+                    <Button
+                      disabled={page <= 1}
+                      onClick={() => setPage((current) => current - 1)}
+                      size='sm'
+                      variant='outline'
+                    >
+                      {t('Previous')}
+                    </Button>
+                    <span className='text-muted-foreground min-w-20 text-center text-xs'>
+                      {t('{{page}} / {{total}}', { page, total: totalPages })}
+                    </span>
+                    <Button
+                      disabled={page >= totalPages}
+                      onClick={() => setPage((current) => current + 1)}
+                      size='sm'
+                      variant='outline'
+                    >
+                      {t('Next')}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </TabsContent>
+
+            <TabsContent
+              className='hover-scrollbar min-h-0 flex-1 overflow-y-auto pt-4'
+              value='storage'
+            >
+              <div className='mx-auto max-w-6xl space-y-6 pb-4'>
+                {overviewQuery.isError && (
+                  <MediaQueryError
+                    onRetry={() => void overviewQuery.refetch()}
+                  />
+                )}
+                {overview && (
+                  <section className='rounded-lg border'>
+                    <div className='flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center'>
+                      <div className='bg-muted flex size-10 items-center justify-center rounded-md'>
+                        <DatabaseIcon aria-hidden='true' className='size-5' />
+                      </div>
+                      <div className='min-w-0 flex-1'>
+                        <div className='flex items-center justify-between gap-3 text-sm'>
+                          <span className='font-medium'>
+                            {t('Storage usage')}
+                          </span>
+                          <span className='text-muted-foreground tabular-nums'>
+                            {formatBytes(
+                              overview.storage.effective_used_bytes +
+                                overview.storage.reserved_bytes
+                            )}{' '}
+                            / {formatBytes(overview.global_max_bytes)}
+                          </span>
+                        </div>
+                        <Progress className='mt-2' value={storagePercent} />
+                      </div>
+                    </div>
+                    <div className='grid grid-cols-1 divide-y border-b sm:grid-cols-2 sm:divide-x sm:divide-y-0 lg:grid-cols-5'>
+                      {[
+                        [
+                          'Current asset ledger',
+                          formatBytes(overview.storage.used_bytes),
+                          undefined,
+                        ],
+                        [
+                          'Physical disk usage',
+                          formatBytes(overview.storage.physical_used_bytes),
+                          `${overview.storage.physical_file_count} ${t('files')}`,
+                        ],
+                        [
+                          'Historical residual files',
+                          formatBytes(overview.storage.untracked_bytes),
+                          `${overview.storage.untracked_file_count} ${t('files')}`,
+                        ],
+                        [
+                          'Temporary files',
+                          formatBytes(overview.storage.temporary_bytes),
+                          `${overview.storage.temporary_file_count} ${t('files')}`,
+                        ],
+                        [
+                          'Active reservation',
+                          formatBytes(overview.storage.reserved_bytes),
+                          undefined,
+                        ],
+                      ].map(([label, value, detail]) => (
+                        <div className='min-w-0 p-3' key={String(label)}>
+                          <p className='text-muted-foreground text-xs'>
+                            {t(String(label))}
+                          </p>
+                          <p className='mt-1 truncate text-sm font-semibold tabular-nums'>
+                            {value}
+                          </p>
+                          {detail && (
+                            <p className='text-muted-foreground mt-0.5 text-xs'>
+                              {detail}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    <div className='text-muted-foreground border-b px-4 py-2 text-xs'>
+                      {overview.storage.last_scan_error
+                        ? t('Storage scan warning: {{message}}', {
+                            message: overview.storage.last_scan_error,
+                          })
+                        : t('Last physical scan: {{time}}', {
+                            time: formatMediaDate(
+                              overview.storage.last_scanned_at
+                            ),
+                          })}
+                    </div>
+                    <div className='grid grid-cols-2 divide-x divide-y sm:grid-cols-3 lg:grid-cols-6 lg:divide-y-0'>
+                      {[
+                        ['Ready', overview.storage.ready_count],
+                        ['Uploading', overview.storage.uploading_count],
+                        ['Failed', overview.storage.failed_count],
+                        ['Unreviewed', overview.storage.unreviewed_count],
+                        ['Violation', overview.storage.violation_count],
+                        ['Protected', overview.storage.protected_count],
+                      ].map(([label, value]) => (
+                        <div className='p-3' key={String(label)}>
+                          <p className='text-muted-foreground text-xs'>
+                            {t(String(label))}
+                          </p>
+                          <p className='mt-1 text-lg font-semibold tabular-nums'>
+                            {value}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section className='rounded-lg border p-4'>
+                  <div className='mb-4 flex flex-wrap items-center gap-2 border-b pb-4'>
+                    <div className='min-w-0 flex-1'>
+                      <h3 className='text-sm font-semibold'>
+                        {t('Manual cleanup')}
+                      </h3>
+                    </div>
+                    <Button
+                      onClick={() => setCleanupMode('expired')}
+                      size='sm'
+                      variant='outline'
+                    >
+                      <Trash2Icon aria-hidden='true' />
+                      {t('Clean expired')}
+                    </Button>
+                    <Button
+                      onClick={() => setCleanupMode('all')}
+                      size='sm'
+                      variant='outline'
+                    >
+                      <DatabaseIcon aria-hidden='true' />
+                      {t('Release to low watermark')}
+                    </Button>
+                  </div>
+                  {role >= ROLE.SUPER_ADMIN && <ModelCapabilityEditor />}
+                  {configQuery.isError ? (
+                    <MediaQueryError
+                      onRetry={() => void configQuery.refetch()}
+                    />
+                  ) : (
+                    <MediaConfigForm
+                      canEdit={role >= ROLE.SUPER_ADMIN}
+                      config={configQuery.data}
+                      onSave={(config) => configMutation.mutate(config)}
+                      saving={configMutation.isPending}
+                    />
+                  )}
+                </section>
+              </div>
+            </TabsContent>
+
+            <TabsContent
+              className='hover-scrollbar min-h-0 flex-1 overflow-y-auto pt-4'
+              value='audit'
+            >
+              <div className='grid gap-6 pb-4 xl:grid-cols-2'>
+                <section className='overflow-hidden rounded-lg border'>
+                  <header className='border-b p-4'>
+                    <h3 className='text-sm font-semibold'>
+                      {t('Review history')}
+                    </h3>
+                  </header>
+                  <div className='divide-y'>
+                    {moderationEventsQuery.isError && (
+                      <MediaQueryError
+                        className='m-3'
+                        compact
+                        onRetry={() => void moderationEventsQuery.refetch()}
+                      />
+                    )}
+                    {!moderationEventsQuery.isError &&
+                      (moderationEventsQuery.data?.items ?? []).map((event) => (
+                        <div className='flex gap-3 p-3 text-sm' key={event.id}>
+                          <ShieldCheckIcon
+                            aria-hidden='true'
+                            className='text-muted-foreground mt-0.5 size-4 shrink-0'
+                          />
+                          <div className='min-w-0 flex-1'>
+                            <div className='flex flex-wrap items-center gap-2'>
+                              <span className='font-medium'>
+                                {event.username}
+                              </span>
+                              <Badge variant='outline'>{t(event.action)}</Badge>
+                            </div>
+                            <p className='text-muted-foreground mt-1 text-xs break-words'>
+                              {event.reason || event.asset_id}
+                            </p>
+                          </div>
+                          <time className='text-muted-foreground shrink-0 text-xs'>
+                            {formatMediaDate(event.created_at)}
+                          </time>
+                        </div>
+                      ))}
+                  </div>
+                </section>
+
+                <section className='overflow-hidden rounded-lg border'>
+                  <header className='border-b p-4'>
+                    <h3 className='text-sm font-semibold'>
+                      {t('Cleanup history')}
+                    </h3>
+                  </header>
+                  <div className='divide-y'>
+                    {cleanupRunsQuery.isError && (
+                      <MediaQueryError
+                        className='m-3'
+                        compact
+                        onRetry={() => void cleanupRunsQuery.refetch()}
+                      />
+                    )}
+                    {!cleanupRunsQuery.isError &&
+                      (cleanupRunsQuery.data?.items ?? []).map((run) => (
+                        <div
+                          className='flex items-center gap-3 p-3 text-sm'
+                          key={run.id}
+                        >
+                          <DatabaseIcon
+                            aria-hidden='true'
+                            className='text-muted-foreground size-4 shrink-0'
+                          />
+                          <div className='min-w-0 flex-1'>
+                            <p className='font-medium'>
+                              {t('{{count}} assets removed', {
+                                count: run.deleted_count,
+                              })}
+                            </p>
+                            <p className='text-muted-foreground mt-1 text-xs'>
+                              {formatBytes(run.freed_bytes)} · {t(run.trigger)}
+                            </p>
+                          </div>
+                          <time className='text-muted-foreground shrink-0 text-xs'>
+                            {formatMediaDate(run.started_at)}
+                          </time>
+                        </div>
+                      ))}
+                  </div>
+                </section>
+              </div>
+            </TabsContent>
+          </Tabs>
+        </SectionPageLayout.Content>
+      </SectionPageLayout>
+
+      <AssetDialog
+        admin
+        asset={preview}
+        onOpenChange={(open) => !open && setPreview(null)}
+        open={Boolean(preview)}
+      />
+      <ModerationDialog
+        action={review?.action ?? 'approve'}
+        asset={review?.asset ?? null}
+        onOpenChange={(open) => !open && setReview(null)}
+        onSubmit={(value) =>
+          review &&
+          moderationMutation.mutate({
+            assetId: review.asset.id,
+            ...value,
+          })
+        }
+        open={Boolean(review)}
+        submitting={moderationMutation.isPending}
+      />
+
+      <AlertDialog
+        open={Boolean(pendingDelete)}
+        onOpenChange={(open) => !open && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('Permanently delete this asset?')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'The file will be removed from storage. Review history remains available.'
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <Input
+            aria-label={t('Deletion reason')}
+            onChange={(event) => setDeleteReason(event.target.value)}
+            placeholder={t('Deletion reason')}
+            value={deleteReason}
+          />
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('Cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleteMutation.isPending || !deleteReason.trim()}
+              onClick={() =>
+                pendingDelete && deleteMutation.mutate(pendingDelete.id)
+              }
+              variant='destructive'
+            >
+              {t('Delete')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={Boolean(cleanupMode)}
+        onOpenChange={(open) => !open && setCleanupMode(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('Run media cleanup now?')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {cleanupMode === 'all'
+                ? t(
+                    'Eligible oldest assets will be removed until storage reaches the low watermark.'
+                  )
+                : t(
+                    'Expired eligible assets will be removed. Protected evidence remains intact.'
+                  )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('Cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={cleanupMutation.isPending}
+              onClick={() => cleanupMode && cleanupMutation.mutate(cleanupMode)}
+            >
+              {t('Run cleanup')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  )
+}

@@ -1,0 +1,223 @@
+package openai
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestResponsesSettlementRejectsUnsuccessfulStreams(tester *testing.T) {
+	for _, smart := range []bool{false, true} {
+		for _, example := range []struct {
+			name   string
+			events []string
+		}{
+			{name: "empty_eof"},
+			{name: "transport_done_only", events: []string{`[DONE]`}},
+			{name: "created_then_eof", events: []string{`{"type":"response.created","response":{"status":"in_progress"}}`}},
+			{name: "failed_without_error", events: []string{`{"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":7,"output_tokens":2}}}`}},
+			{name: "failed_without_type", events: []string{`{"type":"response.failed","response":{"error":{"message":"provider failed"}}}`}},
+			{name: "error", events: []string{`{"type":"error","error":{"message":"provider failed"}}`}},
+			{name: "incomplete", events: []string{`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`}},
+			{name: "done_without_status", events: []string{`{"type":"response.done","response":{"usage":{"input_tokens":3,"output_tokens":2}}}`}},
+			{name: "done_cancelled", events: []string{`{"type":"response.done","response":{"status":"cancelled"}}`}},
+			{name: "malformed_json", events: []string{`{"type":"response.completed"`}},
+			{name: "text_without_terminal", events: []string{`{"type":"response.output_text.delta","delta":"partial answer"}`}},
+			{name: "text_then_failed", events: []string{`{"type":"response.output_text.delta","delta":"partial answer"}`, `{"type":"response.failed","error":{"message":"provider failed"}}`}},
+			{name: "text_then_incomplete", events: []string{`{"type":"response.output_text.delta","delta":"partial answer"}`, `{"type":"response.incomplete","response":{"status":"incomplete"}}`}},
+			{name: "text_then_malformed", events: []string{`{"type":"response.output_text.delta","delta":"partial answer"}`, `{"type":`}},
+			{name: "tool_without_terminal", events: []string{`{"type":"response.output_item.added","item":{"type":"function_call","name":"lookup","arguments":"{}"}}`}},
+		} {
+			tester.Run(fmt.Sprintf("smart=%t/%s", smart, example.name), func(test *testing.T) {
+				body := ""
+				if len(example.events) > 0 {
+					body = "data: " + strings.Join(example.events, "\n\ndata: ") + "\n\n"
+				}
+				requestContext, recorder, response, info := newSmartResponsesTestContext(test, body, true)
+				if !smart {
+					requestContext.Keys = map[string]any{common.RequestIdKey: "fixed-settlement"}
+				}
+				info.SetEstimatePromptTokens(123)
+				usage, apiErr := OaiResponsesStreamHandler(requestContext, info, response)
+				require.NotNil(test, apiErr)
+				assert.Nil(test, usage, "unsuccessful streams must not reach successful settlement")
+				committed := SmartResponsesSemanticCommitted(requestContext)
+				if !smart {
+					committed = recorder.Body.Len() > 0
+				}
+				assert.Equal(test, committed, types.IsSkipRetryError(apiErr))
+			})
+		}
+	}
+}
+
+func TestResponsesSettlementPreservesCompletedOutputAndUsage(tester *testing.T) {
+	for _, smart := range []bool{false, true} {
+		for _, example := range []struct {
+			name     string
+			prefix   string
+			terminal string
+			prompt   int
+			output   int
+			total    int
+		}{
+			{name: "empty_zero", terminal: `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
+			{name: "empty_without_usage", terminal: `{"type":"response.completed","response":{"status":"completed","output":[]}}`},
+			{name: "tool_only", terminal: `{"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{}"}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, prompt: 7, output: 2, total: 9},
+			{name: "done_completed", terminal: `{"type":"response.done","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, prompt: 7, output: 2, total: 9},
+			{name: "top_level_done", terminal: `{"type":"response.done","status":"completed","response":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, prompt: 7, output: 2, total: 9},
+			{name: "text_with_zero_usage", prefix: `{"type":"response.output_text.delta","delta":"real text with reported zero usage"}`, terminal: `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
+			{name: "text_without_usage", prefix: `{"type":"response.output_text.delta","delta":"real text without reported usage"}`, terminal: `{"type":"response.completed","response":{"status":"completed"}}`},
+			{name: "zero_prompt_is_not_estimated", terminal: `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"output_tokens":2,"total_tokens":2}}}`, output: 2, total: 2},
+		} {
+			tester.Run(fmt.Sprintf("smart=%t/%s", smart, example.name), func(test *testing.T) {
+				body := "data: " + example.terminal + "\n\n"
+				if example.prefix != "" {
+					body = "data: " + example.prefix + "\n\n" + body
+				}
+				requestContext, _, response, info := newSmartResponsesTestContext(test, body, true)
+				if !smart {
+					requestContext.Keys = map[string]any{common.RequestIdKey: "fixed-completed"}
+				}
+				info.SetEstimatePromptTokens(123)
+				usage, apiErr := OaiResponsesStreamHandler(requestContext, info, response)
+				require.Nil(test, apiErr)
+				require.NotNil(test, usage)
+				assert.Equal(test, example.prompt, usage.PromptTokens)
+				assert.Equal(test, example.output, usage.CompletionTokens)
+				assert.Equal(test, example.total, usage.TotalTokens)
+				assert.True(test, SmartResponsesCompletedSeen(requestContext))
+			})
+		}
+	}
+}
+
+func TestResponsesSettlementCancelledWithoutTerminalNeverRetries(tester *testing.T) {
+	for _, smart := range []bool{false, true} {
+		tester.Run(fmt.Sprintf("smart=%t", smart), func(test *testing.T) {
+			requestContext, recorder, response, info := newSmartResponsesTestContext(test, "", true)
+			if !smart {
+				requestContext.Keys = map[string]any{common.RequestIdKey: "fixed-cancelled"}
+			}
+			cancelled, cancel := context.WithCancel(requestContext.Request.Context())
+			cancel()
+			requestContext.Request = requestContext.Request.WithContext(cancelled)
+			usage, apiErr := OaiResponsesStreamHandler(requestContext, info, response)
+			require.NotNil(test, apiErr)
+			assert.Nil(test, usage)
+			assert.True(test, types.IsSkipRetryError(apiErr))
+			assert.Empty(test, recorder.Body.String())
+		})
+	}
+}
+
+func TestResponsesSettlementDoesNotReusePriorCompletion(tester *testing.T) {
+	requestContext, _, response, info := newSmartResponsesTestContext(tester, "data: [DONE]\n\n", true)
+	requestContext.Keys = map[string]any{common.RequestIdKey: "fixed-stale-marker"}
+	markSmartResponsesTerminal(requestContext, true)
+	usage, apiErr := OaiResponsesStreamHandler(requestContext, info, response)
+	require.NotNil(tester, apiErr)
+	assert.Nil(tester, usage)
+}
+
+type responsesSettlementBrokenBody struct {
+	io.Reader
+}
+
+func (body responsesSettlementBrokenBody) Read(buffer []byte) (int, error) {
+	count, err := body.Reader.Read(buffer)
+	if err == io.EOF {
+		return count, io.ErrUnexpectedEOF
+	}
+	return count, err
+}
+
+func (body responsesSettlementBrokenBody) Close() error {
+	return nil
+}
+
+func TestResponsesSettlementTransportFailureAfterOutputNeverRetries(tester *testing.T) {
+	body := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial answer\"}\n\n"
+	requestContext, recorder, response, info := newSmartResponsesTestContext(tester, body, true)
+	requestContext.Keys = map[string]any{common.RequestIdKey: "fixed-broken-transport"}
+	response.Body = responsesSettlementBrokenBody{Reader: strings.NewReader(body)}
+	usage, apiErr := OaiResponsesStreamHandler(requestContext, info, response)
+	require.NotNil(tester, apiErr)
+	assert.Nil(tester, usage)
+	assert.True(tester, types.IsSkipRetryError(apiErr))
+	assert.Contains(tester, recorder.Body.String(), "partial answer")
+}
+
+type responsesSettlementBlockedBody struct {
+	readStarted chan struct{}
+	closed      chan struct{}
+	readOnce    sync.Once
+	closeOnce   sync.Once
+}
+
+func (body *responsesSettlementBlockedBody) Read(buffer []byte) (int, error) {
+	body.readOnce.Do(func() { close(body.readStarted) })
+	<-body.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (body *responsesSettlementBlockedBody) Close() error {
+	body.closeOnce.Do(func() { close(body.closed) })
+	return nil
+}
+
+func TestResponsesSettlementClientGoneClosesBodyAfterBoundedDrain(tester *testing.T) {
+	requestContext, recorder, response, info := newSmartResponsesTestContext(tester, "", true)
+	requestContext.Keys = map[string]any{common.RequestIdKey: "fixed-blocked-drain"}
+	info.DisablePing = true
+	clientContext, cancel := context.WithCancel(requestContext.Request.Context())
+	defer cancel()
+	requestContext.Request = requestContext.Request.WithContext(clientContext)
+	body := &responsesSettlementBlockedBody{readStarted: make(chan struct{}), closed: make(chan struct{})}
+	response.Body = body
+	tester.Cleanup(func() { _ = body.Close() })
+	type handlerResult struct {
+		usage  *dto.Usage
+		apiErr *types.NewAPIError
+	}
+	handlerDone := make(chan handlerResult, 1)
+	go func() {
+		usage, apiErr := OaiResponsesStreamHandler(requestContext, info, response)
+		handlerDone <- handlerResult{usage: usage, apiErr: apiErr}
+	}()
+	select {
+	case <-body.readStarted:
+	case <-time.After(3 * time.Second):
+		tester.Fatal("upstream body was not read")
+	}
+	cancelledAt := time.Now()
+	cancel()
+	select {
+	case result := <-handlerDone:
+		require.NotNil(tester, result.apiErr)
+		assert.Nil(tester, result.usage)
+		assert.True(tester, types.IsSkipRetryError(result.apiErr))
+		assert.ErrorIs(tester, result.apiErr, context.Canceled)
+		assert.GreaterOrEqual(tester, time.Since(cancelledAt), responsesClientGoneDrainTimeout-50*time.Millisecond)
+	case <-time.After(responsesClientGoneDrainTimeout + 2*time.Second):
+		tester.Fatal("handler did not close the blocked upstream body within the bounded drain window")
+	}
+	select {
+	case <-body.closed:
+	default:
+		tester.Fatal("upstream body remains open after the handler returned")
+	}
+	assert.True(tester, info.StreamStatus.ClientDisconnected())
+	assert.False(tester, info.StreamStatus.HasTerminal())
+	assert.Empty(tester, recorder.Body.String())
+}

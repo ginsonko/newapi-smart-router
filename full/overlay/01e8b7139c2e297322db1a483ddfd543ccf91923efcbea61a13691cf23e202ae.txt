@@ -1,0 +1,388 @@
+package controller
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+)
+
+type parameterQuoteFile struct {
+	Field string `json:"field"`
+	Name  string `json:"name"`
+	Size  int64  `json:"size"`
+	Type  string `json:"type"`
+}
+type parameterQuoteRequest struct {
+	Mode   string                     `json:"mode"`
+	Group  string                     `json:"group"`
+	Fields map[string]json.RawMessage `json:"fields"`
+	Files  []parameterQuoteFile       `json:"files,omitempty"`
+}
+type parameterQuoteClaims struct {
+	UserID    int    `json:"user_id"`
+	ExpiresAt int64  `json:"expires_at"`
+	Intent    string `json:"intent"`
+	// Only the consumer commitment is signed, so a quote token cannot expose
+	// route IDs, keys or provider procurement prices in its base64 payload.
+	Offer types.ParameterPriceSnapshot `json:"offer"`
+}
+
+func quoteField(fields map[string]json.RawMessage, key string) (string, error) {
+	raw, ok := fields[key]
+	if !ok || string(raw) == "null" {
+		return "", nil
+	}
+	var s string
+	if common.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s), nil
+	}
+	var number json.Number
+	if common.Unmarshal(raw, &number) == nil {
+		return number.String(), nil
+	}
+	return "", fmt.Errorf("%s must be a scalar", key)
+}
+
+func parameterQuoteInput(req parameterQuoteRequest, cap mediaservice.Capability, channelID int) (billing_setting.ParameterPriceInput, error) {
+	in := billing_setting.ParameterPriceInput{Group: req.Group, ChannelID: channelID, Count: 1}
+	var err error
+	read := func(key string) string {
+		if err != nil {
+			return ""
+		}
+		var v string
+		v, err = quoteField(req.Fields, key)
+		return v
+	}
+	in.Model = read("model")
+	resolution, size := read("resolution"), read("size")
+	in.Quality = read("quality")
+	duration, seconds := read("duration"), read("seconds")
+	count := read("n")
+	if err != nil {
+		return in, err
+	}
+	if req.Mode == "videos" {
+		if duration != "" && seconds != "" {
+			a, e1 := decimal.NewFromString(duration)
+			b, e2 := decimal.NewFromString(seconds)
+			if e1 != nil || e2 != nil || !a.Equal(b) {
+				return in, fmt.Errorf("duration and seconds conflict")
+			}
+		}
+		if seconds == "" {
+			seconds = duration
+		}
+		in.DurationSeconds = seconds
+		if cap.RuntimeEnforced {
+			in.Resolution, err = cap.NormalizeResolution(resolution, size)
+		} else {
+			in.Resolution = resolution
+			if in.Resolution == "" {
+				in.Resolution = size
+			}
+		}
+	} else {
+		// Image pricing uses the same explicit capability aliases as runtime
+		// validation. A configured pixel size (for example 1024x576) may map to
+		// a pricing tier (for example 1k), while an unconfigured size is never
+		// guessed into a tier.
+		if cap.RuntimeEnforced || len(cap.ResolutionAliases) > 0 || len(cap.Resolutions) > 0 {
+			in.Resolution, err = cap.NormalizeResolution(resolution, size)
+		} else {
+			if resolution != "" && size != "" && !strings.EqualFold(resolution, size) {
+				return in, fmt.Errorf("resolution and size conflict")
+			}
+			in.Resolution = resolution
+			if in.Resolution == "" {
+				in.Resolution = size
+			}
+		}
+		if count != "" {
+			in.Count, err = strconv.Atoi(count)
+		}
+	}
+	return in, err
+}
+
+func parameterIntentHash(req parameterQuoteRequest) (string, error) {
+	if len(req.Fields) == 0 || len(req.Fields) > 128 || len(req.Files) > 128 {
+		return "", fmt.Errorf("invalid quote request size")
+	}
+	if req.Files == nil {
+		req.Files = []parameterQuoteFile{}
+	}
+	for i := range req.Files {
+		if strings.TrimSpace(req.Files[i].Type) == "" {
+			req.Files[i].Type = "application/octet-stream"
+		}
+	}
+	sort.SliceStable(req.Files, func(i, j int) bool {
+		a, b := req.Files[i], req.Files[j]
+		if a.Field != b.Field {
+			return a.Field < b.Field
+		}
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.Size < b.Size
+	})
+	for _, f := range req.Files {
+		if f.Size < 0 || len(f.Name) > 1024 || len(f.Field) > 256 {
+			return "", fmt.Errorf("invalid reference file descriptor")
+		}
+	}
+	// Canonicalize JSON object order recursively, preserving decimal numbers.
+	fields := make(map[string]any, len(req.Fields))
+	for k, v := range req.Fields {
+		var value any
+		if err := common.DecodeJsonUseNumber(strings.NewReader(string(v)), &value); err != nil {
+			return "", err
+		}
+		fields[k] = value
+	}
+	raw, err := common.Marshal(struct {
+		Mode   string
+		Group  string
+		Fields map[string]any
+		Files  []parameterQuoteFile
+	}{req.Mode, req.Group, fields, req.Files})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func signParameterQuote(claims parameterQuoteClaims) (string, error) {
+	raw, err := common.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	body := base64.RawURLEncoding.EncodeToString(raw)
+	mac := hmac.New(sha256.New, []byte(common.SessionSecret))
+	mac.Write([]byte("parameter-quote.v1:" + body))
+	return body + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+func decodeParameterQuote(token string) (parameterQuoteClaims, error) {
+	var claims parameterQuoteClaims
+	if len(token) > 16384 {
+		return claims, fmt.Errorf("invalid parameter quote")
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return claims, fmt.Errorf("invalid parameter quote")
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return claims, fmt.Errorf("invalid parameter quote")
+	}
+	mac := hmac.New(sha256.New, []byte(common.SessionSecret))
+	mac.Write([]byte("parameter-quote.v1:" + parts[0]))
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return claims, fmt.Errorf("invalid parameter quote signature")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return claims, err
+	}
+	err = common.Unmarshal(raw, &claims)
+	return claims, err
+}
+
+func MediaParameterQuote(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+	var req parameterQuoteRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		mediaError(c, 400, "invalid quote request")
+		return
+	}
+	contract, ok := mediaContractForMode(req.Mode)
+	if !ok || (req.Mode != "videos" && req.Mode != "images" && req.Mode != "image-edits") {
+		mediaError(c, 400, "unsupported quote mode")
+		return
+	}
+	user, err := model.GetUserCache(c.GetInt("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if _, ok := service.GetUserUsableGroups(user.Group)[req.Group]; !ok {
+		mediaError(c, 403, "group is not available to this user")
+		return
+	}
+	name, err := quoteField(req.Fields, "model")
+	if err != nil || name == "" {
+		mediaError(c, 400, "model is required")
+		return
+	}
+	if !billing_setting.HasParameterPricing(name, req.Group) {
+		common.ApiSuccess(c, gin.H{"supported": false})
+		return
+	}
+	abilities, err := model.GetAllEnableAbilityWithChannels()
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	var best *types.ParameterPriceSnapshot
+	var quoteErr error
+	for _, a := range abilities {
+		if a.ChannelStatus != common.ChannelStatusEnabled || a.Model != name || a.Group != req.Group || !channelSupportsMediaContract(a, contract) {
+			continue
+		}
+		channel, e := model.CacheGetChannel(a.ChannelId)
+		if e != nil || channel == nil {
+			continue
+		}
+		upstream := name
+		if channel.ModelMapping != nil && *channel.ModelMapping != "" {
+			var mappings map[string]string
+			if common.Unmarshal([]byte(*channel.ModelMapping), &mappings) != nil {
+				continue
+			}
+			if v := mappings[name]; v != "" {
+				upstream = v
+			}
+		}
+		cap, e := mediaservice.ResolveCapabilityForRequest(a.ChannelId, a.ChannelType, name, upstream, req.Group, contract.Endpoint, channel.GetBaseURL())
+		if e != nil {
+			quoteErr = e
+			continue
+		}
+		pricedRequest := req
+		if cfg := channel.GetOtherSettings().ImageAdapter; cfg != nil && req.Mode != "videos" {
+			size, e1 := quoteField(req.Fields, "size")
+			quality, e2 := quoteField(req.Fields, "quality")
+			if e1 != nil || e2 != nil {
+				quoteErr = fmt.Errorf("图片尺寸或质量参数无效")
+				continue
+			}
+			imageReq, normalizeErr := cfg.Normalize(dto.ImageRequest{Model: name, Size: size, Quality: quality, Extra: req.Fields}, name)
+			if normalizeErr != nil {
+				quoteErr = normalizeErr
+				continue
+			}
+			pricedRequest.Fields = make(map[string]json.RawMessage, len(req.Fields))
+			for key, value := range imageReq.Extra {
+				pricedRequest.Fields[key] = value
+			}
+			pricedRequest.Fields["size"], _ = common.Marshal(imageReq.Size)
+			pricedRequest.Fields["quality"], _ = common.Marshal(imageReq.Quality)
+		}
+		input, e := parameterQuoteInput(pricedRequest, cap, a.ChannelId)
+		if e != nil {
+			quoteErr = e
+			continue
+		}
+		q, e := billing_setting.ResolveParameterPrice(input)
+		if e != nil {
+			quoteErr = e
+			continue
+		}
+		if q != nil && (best == nil || q.Quota < best.Quota) {
+			// Freeze the same post-adapter controls used by relay pricing and
+			// wire validation, while retaining the original request intent hash.
+			if req.Mode != "videos" {
+				rawSize, _ := quoteField(pricedRequest.Fields, "size")
+				rawResolution, _ := quoteField(pricedRequest.Fields, "resolution")
+				if rawSize != "" && !strings.EqualFold(rawSize, q.Parameters["resolution"]) {
+					q.Parameters["size"] = rawSize
+				}
+				if rawResolution != "" && !strings.EqualFold(rawResolution, q.Parameters["resolution"]) {
+					q.Parameters["requested_resolution"] = rawResolution
+				}
+			}
+			best = q
+		}
+	}
+	if best == nil {
+		if quoteErr == nil {
+			quoteErr = fmt.Errorf("no eligible channel has a price for these parameters")
+		}
+		mediaError(c, 400, quoteErr.Error())
+		return
+	}
+	fingerprint, err := parameterIntentHash(req)
+	if err != nil {
+		mediaError(c, 400, err.Error())
+		return
+	}
+	public := types.ParameterPriceSnapshot{SchemaVersion: best.SchemaVersion, Revision: best.Revision, Group: best.Group, Model: best.Model, Unit: best.Unit, Currency: best.Currency, UnitPrice: best.UnitPrice, Quantity: best.Quantity, Amount: best.Amount, Quota: best.Quota, Parameters: best.Parameters}
+	claims := parameterQuoteClaims{UserID: c.GetInt("id"), ExpiresAt: time.Now().Add(5 * time.Minute).Unix(), Intent: fingerprint, Offer: public}
+	token, err := signParameterQuote(claims)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"supported": true, "quote_id": token, "expires_at": claims.ExpiresAt, "offer": best.ConsumerOffer()})
+}
+
+func verifyMediaParameterQuote(c *gin.Context, mode string) error {
+	token := strings.TrimSpace(c.GetHeader(types.ParameterQuoteHeader))
+	if token == "" {
+		return nil
+	}
+	claims, err := decodeParameterQuote(token)
+	if err != nil {
+		return err
+	}
+	if claims.UserID != c.GetInt("id") || claims.ExpiresAt <= time.Now().Unix() {
+		return fmt.Errorf("parameter quote expired or belongs to another user; request a new quote")
+	}
+	if claims.Offer.Revision != billing_setting.GetParameterPricingContract().Revision {
+		return fmt.Errorf("parameter prices changed; request a new quote")
+	}
+	req := parameterQuoteRequest{Mode: mode, Group: c.Query("group"), Fields: map[string]json.RawMessage{}}
+	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
+		form, e := common.ParseMultipartFormReusable(c)
+		if e != nil {
+			return e
+		}
+		for k, v := range form.Value {
+			var raw []byte
+			if len(v) == 1 {
+				raw, _ = common.Marshal(v[0])
+			} else {
+				raw, _ = common.Marshal(v)
+			}
+			req.Fields[k] = raw
+		}
+		for field, files := range form.File {
+			for _, f := range files {
+				req.Files = append(req.Files, parameterQuoteFile{Field: field, Name: f.Filename, Size: f.Size, Type: f.Header.Get("Content-Type")})
+			}
+		}
+	} else {
+		if err := common.UnmarshalBodyReusable(c, &req.Fields); err != nil {
+			return err
+		}
+	}
+	hash, err := parameterIntentHash(req)
+	if err != nil {
+		return err
+	}
+	if hash != claims.Intent {
+		return fmt.Errorf("request parameters or references changed after quote; request a new quote")
+	}
+	c.Set(types.ParameterQuoteContextKey, &claims.Offer)
+	return nil
+}

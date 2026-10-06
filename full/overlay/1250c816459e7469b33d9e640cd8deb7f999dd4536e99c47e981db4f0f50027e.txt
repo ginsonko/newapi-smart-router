@@ -1,0 +1,141 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { api } from '@/lib/api'
+
+import { parameterPriceAtoms } from '../pricing/lib/parameter-price'
+import type { StudioMode } from './types'
+
+export type ParameterQuoteIntent = {
+  mode: StudioMode
+  group: string
+  fields: Record<string, unknown>
+  files?: Array<{ field: string; name: string; size: number; type: string }>
+}
+
+export function parameterQuoteIntent(
+  mode: StudioMode,
+  group: string,
+  payload: Record<string, unknown> | FormData
+): ParameterQuoteIntent {
+  if (!(payload instanceof FormData)) return { mode, group, fields: payload }
+  const fields: Record<string, string | string[]> = {}
+  const files: NonNullable<ParameterQuoteIntent['files']> = []
+  for (const [field, value] of payload.entries()) {
+    if (typeof value !== 'string') {
+      files.push({
+        field,
+        name: value.name,
+        size: value.size,
+        type: value.type || 'application/octet-stream',
+      })
+      continue
+    }
+    const existing = fields[field]
+    if (existing === undefined) fields[field] = value
+    else {
+      fields[field] = Array.isArray(existing)
+        ? [...existing, value]
+        : [existing, value]
+    }
+  }
+  return { mode, group, fields, files }
+}
+
+export class ParameterQuotePreflightError extends Error {
+  constructor(cause: unknown) {
+    super(
+      cause instanceof Error
+        ? cause.message
+        : 'Unable to obtain parameter quote'
+    )
+    this.name = 'ParameterQuotePreflightError'
+  }
+}
+
+type QuoteData = {
+  supported: boolean
+  quote_id?: string
+  expires_at?: number
+  offer?: { amount: string; currency: string }
+}
+
+export function parameterQuoteHeaders(
+  data: QuoteData,
+  now = Date.now(),
+  expected?: { amount: string; currency: string }
+): Record<string, string> {
+  if (data.supported === true && !expected) {
+    throw new Error(
+      'The current parameter price is unavailable. Refresh the model catalog before creating.'
+    )
+  }
+  if (
+    expected &&
+    (!data.supported ||
+      !data.offer ||
+      data.offer.currency !== expected.currency ||
+      parameterPriceAtoms(data.offer.amount) >
+        parameterPriceAtoms(expected.amount))
+  ) {
+    throw new Error(
+      'The price changed or this backup group costs more. Review the current price before creating.'
+    )
+  }
+  if (data.supported === false) return {}
+  if (
+    data.supported !== true ||
+    !data.quote_id ||
+    !Number.isFinite(data.expires_at)
+  ) {
+    throw new Error('Parameter quote is incomplete')
+  }
+  if ((data.expires_at ?? 0) * 1000 <= now) {
+    throw new Error(
+      'Parameter quote has expired; submit again to obtain a new quote'
+    )
+  }
+  return { 'X-Parameter-Quote': data.quote_id }
+}
+
+export async function quoteStudioPayload(
+  mode: StudioMode,
+  group: string,
+  payload: Record<string, unknown> | FormData,
+  expected?: { amount: string; currency: string }
+): Promise<Record<string, string>> {
+  try {
+    const response = await api.post<{
+      success: boolean
+      message?: string
+      data: QuoteData
+    }>(
+      '/api/media/parameter-quote',
+      parameterQuoteIntent(mode, group, payload),
+      { skipErrorHandler: true, skipBusinessError: true }
+    )
+    if (!response.data.success) {
+      throw new Error(
+        response.data.message || 'Unable to obtain parameter quote'
+      )
+    }
+    return parameterQuoteHeaders(response.data.data, Date.now(), expected)
+  } catch (cause) {
+    throw new ParameterQuotePreflightError(cause)
+  }
+}

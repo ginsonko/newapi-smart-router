@@ -1,0 +1,54 @@
+package model
+
+import (
+	"sync"
+	"testing"
+
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestEnsureRouteAnalyticsSchemaAddsNullableGroupAndIsIdempotent(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:route-analytics-schema-additive?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&KeyUsageAnalyticsBucketV1{}))
+	require.NoError(t, db.Migrator().DropIndex(&KeyUsageAnalyticsBucketV1{}, "Group"))
+	require.NoError(t, db.Exec("ALTER TABLE key_usage_analytics_buckets_v1 DROP COLUMN `group`").Error)
+	require.NoError(t, db.Exec(`INSERT INTO key_usage_analytics_buckets_v1 (bucket_key,user_id,token_id,bucket_start_ms,granularity,model,endpoint,logical_requests,successes,failures,positive_quota,refund_quota,input_tokens,output_tokens,cache_read_tokens,ttft_sum_ms,ttft_count,ttft_histogram_json,updated_at_ms) VALUES ('legacy',1,2,3,'5m','model','endpoint',0,0,0,0,0,0,0,0,0,0,'[]',0)`).Error)
+	require.NoError(t, EnsureRouteAnalyticsSchema(db))
+	require.NoError(t, EnsureRouteAnalyticsSchema(db))
+	require.NoError(t, verifyRouteAnalyticsSchema(db))
+	var row KeyUsageAnalyticsBucketV1
+	require.NoError(t, db.Where("bucket_key = ?", "legacy").First(&row).Error)
+	require.Empty(t, row.Group)
+	require.NoError(t, db.Create(&KeyUsageAnalyticsBucketV1{BucketKey: "new", UserID: 1, TokenID: 2, BucketStartMS: 3, Granularity: RouteAnalyticsGranularity5m, Model: "model", Endpoint: "endpoint", Group: "real-group"}).Error)
+	row = KeyUsageAnalyticsBucketV1{}
+	require.NoError(t, db.Where("bucket_key = ?", "new").First(&row).Error)
+	require.Equal(t, "real-group", row.Group)
+}
+
+func TestEnsureRouteAnalyticsSchemaSerializesConcurrentStartup(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:route-analytics-schema-concurrent?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(8)
+	var wait sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := EnsureRouteAnalyticsSchema(db); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.NoError(t, verifyRouteAnalyticsSchema(db))
+}

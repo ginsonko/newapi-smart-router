@@ -1,0 +1,217 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"maps"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/shopspring/decimal"
+)
+
+// Request pricing overlays are private copies. A different user's parameters
+// must never mutate the shared route catalog or cached price snapshot.
+func parameterMediaRoutingSnapshot(request smartrouter.RouteRequest, catalog *smartrouter.CertifiedRouteCatalog, prices *smartrouter.PriceSnapshot) (*smartrouter.CertifiedRouteCatalog, *smartrouter.PriceSnapshot, error) {
+	return parameterMediaRoutingSnapshotWithResolver(request, catalog, prices, resolveParameterMediaRoute)
+}
+
+type parameterMediaRouteResolver func(smartrouter.RouteRequest, smartrouter.CertifiedRoute) (*types.ParameterPriceSnapshot, *smartrouter.MediaCapabilityContract, error)
+
+func parameterMediaRoutingSnapshotWithResolver(request smartrouter.RouteRequest, catalog *smartrouter.CertifiedRouteCatalog, prices *smartrouter.PriceSnapshot, resolve parameterMediaRouteResolver) (*smartrouter.CertifiedRouteCatalog, *smartrouter.PriceSnapshot, error) {
+	if request.Media == nil || catalog == nil || prices == nil {
+		return catalog, prices, nil
+	}
+	entry, exists := catalog.Contracts[request.ContractID]
+	if !exists {
+		return catalog, prices, nil
+	}
+	enabled := false
+	for _, pool := range entry.Pools {
+		for _, route := range pool.Candidates {
+			if billing_setting.HasParameterPricing(request.CanonicalModel, route.Group) {
+				enabled = true
+				break
+			}
+		}
+	}
+	if !enabled {
+		return catalog, prices, nil
+	}
+	nextCatalog := *catalog
+	nextCatalog.Contracts = maps.Clone(catalog.Contracts)
+	nextPrices := *prices
+	nextPrices.RatiosPPM = maps.Clone(prices.RatiosPPM)
+	nextPrices.RoutePrices = maps.Clone(prices.RoutePrices)
+	if nextPrices.RoutePrices == nil {
+		nextPrices.RoutePrices = map[string]smartrouter.RoutePrice{}
+	}
+	entry.Pools = maps.Clone(entry.Pools)
+	revision := billing_setting.GetParameterPricingContract().Revision
+	for id, pool := range entry.Pools {
+		pool.Candidates = append([]smartrouter.CertifiedRoute(nil), pool.Candidates...)
+		for i, route := range pool.Candidates {
+			if !billing_setting.HasParameterPricing(request.CanonicalModel, route.Group) {
+				continue
+			}
+			q, cap, err := resolve(request, route)
+			if err != nil || q == nil {
+				delete(nextPrices.RatiosPPM, route.RouteID)
+				delete(nextPrices.RoutePrices, route.RouteID)
+				continue
+			}
+			if q.Revision != revision {
+				return nil, nil, fmt.Errorf("parameter price changed while selecting a channel")
+			}
+			amount, err := decimal.NewFromString(q.Amount)
+			if err != nil {
+				return nil, nil, err
+			}
+			score := amount.Mul(decimal.NewFromInt(smartrouter.PriceScoreScale)).Round(0)
+			if score.IsNegative() || score.GreaterThan(decimal.NewFromInt(1<<62)) {
+				return nil, nil, fmt.Errorf("parameter route score overflow")
+			}
+			nextPrices.RoutePrices[route.RouteID] = smartrouter.RoutePrice{BillingMode: "parameter_price", BillingUnit: "priced_request", Scope: "parameter", Revision: revision, ComparisonClass: "media_request_cost_v1", ScorePPM: score.IntPart(), StaticComparable: true}
+			if cap != nil {
+				pool.Candidates[i].Media = cap
+				flags := route.Capabilities &^ (SmartCapabilityReferenceImage | SmartCapabilityReferenceVideo | SmartCapabilityReferenceAudio)
+				if cap.ReferenceImage {
+					flags |= SmartCapabilityReferenceImage
+				}
+				if cap.ReferenceVideo {
+					flags |= SmartCapabilityReferenceVideo
+				}
+				if cap.ReferenceAudio {
+					flags |= SmartCapabilityReferenceAudio
+				}
+				pool.Candidates[i].Capabilities = flags
+			}
+		}
+		entry.Pools[id] = pool
+	}
+	nextCatalog.Contracts[request.ContractID] = entry
+	version, err := smartContentHash("parameter-price", struct {
+		Base     string
+		Revision string
+		Request  smartrouter.RouteRequest
+	}{prices.Version, revision, request})
+	if err != nil {
+		return nil, nil, err
+	}
+	nextPrices.Version = version
+	return &nextCatalog, &nextPrices, nil
+}
+
+func resolveParameterMediaRoute(request smartrouter.RouteRequest, route smartrouter.CertifiedRoute) (*types.ParameterPriceSnapshot, *smartrouter.MediaCapabilityContract, error) {
+	shape := request.Media
+	if shape == nil {
+		return nil, nil, fmt.Errorf("parameter media shape is missing")
+	}
+	channel, err := model.CacheGetChannel(route.ChannelID)
+	if err != nil || channel == nil {
+		return nil, nil, fmt.Errorf("parameter route unavailable")
+	}
+	if shape.Kind == smartrouter.MediaKindImage {
+		adapter := channel.GetOtherSettings().ImageAdapter
+		if adapter != nil {
+			count := uint(1)
+			if shape.OutputCountKnown {
+				if shape.OutputCount < 1 || shape.OutputCount > dto.MaxImageN {
+					return nil, nil, fmt.Errorf("n must be between 1 and %d", dto.MaxImageN)
+				}
+				count = uint(shape.OutputCount)
+			}
+			imageRequest := dto.ImageRequest{Size: shape.RawSize, Quality: shape.Quality, N: &count, Extra: map[string]json.RawMessage{}}
+			if imageRequest.Size == "" {
+				imageRequest.Size = shape.Resolution
+			}
+			for field, value := range map[string]string{"resolution": shape.RawResolution, "aspect_ratio": shape.AspectRatio} {
+				if value != "" {
+					encoded, encodeErr := common.Marshal(value)
+					if encodeErr != nil {
+						return nil, nil, encodeErr
+					}
+					imageRequest.Extra[field] = encoded
+				}
+			}
+			normalized, normalizeErr := adapter.Normalize(imageRequest, request.CanonicalModel)
+			if normalizeErr != nil {
+				return nil, nil, normalizeErr
+			}
+			normalizedShape := *shape
+			normalizedShape.RawSize, normalizedShape.Resolution, normalizedShape.Quality = normalized.Size, normalized.Size, normalized.Quality
+			normalizedShape.RawResolution = ""
+			if raw, exists := normalized.Extra["resolution"]; exists {
+				if decodeErr := common.Unmarshal(raw, &normalizedShape.RawResolution); decodeErr != nil {
+					return nil, nil, decodeErr
+				}
+			}
+			shape = &normalizedShape
+		}
+	}
+	cap, err := media.ResolveCapabilityForRequest(route.ChannelID, channel.Type, request.CanonicalModel, route.UpstreamModel, route.Group, request.Endpoint, channel.GetBaseURL())
+	if err != nil {
+		return nil, nil, err
+	}
+	resolution := shape.RawResolution
+	if resolution == "" {
+		resolution = shape.RawSize
+	}
+	if resolution == "" {
+		resolution = shape.Resolution
+	}
+	if !cap.RuntimeEnforced && strings.Contains(request.Endpoint, "images") && len(cap.ResolutionAliases) > 0 {
+		resolution, err = cap.NormalizeResolution(shape.RawResolution, shape.RawSize)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	duration := shape.DurationSeconds
+	if cap.RuntimeEnforced {
+		resolution, err = cap.NormalizeResolution(shape.RawResolution, shape.RawSize)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !shape.DurationKnown {
+			duration = int64(cap.Duration.Default)
+			if cap.Duration.Mode == "fixed" {
+				duration = int64(cap.Duration.Fixed)
+			}
+		}
+		if err := cap.ValidateGeneration(int(duration), shape.AspectRatio, resolution); err != nil {
+			return nil, nil, err
+		}
+		refs := make([]media.ReferenceDescriptor, 0, len(shape.References))
+		for _, r := range shape.References {
+			refs = append(refs, media.ReferenceDescriptor{Type: r.Type, Role: r.Role, SizeBytes: r.SizeBytes, DurationSeconds: r.DurationSeconds, MetadataTrusted: r.MetadataTrusted})
+		}
+		if err := cap.Validate(refs); err != nil {
+			return nil, nil, err
+		}
+	}
+	input := billing_setting.ParameterPriceInput{Group: route.Group, Model: request.CanonicalModel, ChannelID: route.ChannelID, Resolution: resolution, Quality: shape.Quality, Count: 1}
+	if shape.OutputCountKnown {
+		input.Count = int(shape.OutputCount)
+	}
+	if shape.DurationKnown || duration > 0 {
+		input.DurationSeconds = strconv.FormatInt(duration, 10)
+	}
+	q, err := billing_setting.ResolveParameterPrice(input)
+	if err != nil {
+		return nil, nil, err
+	}
+	capability, err := smartMediaCapabilityContract(route.ChannelID, route.UpstreamModel, request.Endpoint, cap)
+	// This copy belongs to the already-validated request. Retain an explicitly
+	// accepted alias for the planner's later literal comparison.
+	if err == nil && (cap.RuntimeEnforced || (strings.Contains(request.Endpoint, "images") && len(cap.ResolutionAliases) > 0)) && request.Media.Resolution != "" && request.Media.Resolution != resolution {
+		capability.Resolutions = append(capability.Resolutions, request.Media.Resolution)
+	}
+	return q, capability, err
+}

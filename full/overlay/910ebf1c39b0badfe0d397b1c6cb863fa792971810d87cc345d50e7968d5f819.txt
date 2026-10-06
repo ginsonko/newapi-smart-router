@@ -1,0 +1,94 @@
+package controller
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestTenantCostPublicProjectionHidesPhysicalPoolAndIdentifiers(t *testing.T) {
+	payload := map[string]interface{}{
+		"binding": map[string]interface{}{
+			"product_pool_id":  "claude_kiro",
+			"key_id":           "sk-secret-example",
+			"route_profile_id": "physical-profile-name",
+			"group":            "internal-group",
+		},
+		"provider_url": "https://internal.example.invalid",
+	}
+	redacted := redactTenantCostValue(payload).(map[string]interface{})
+	binding := redacted["binding"].(map[string]interface{})
+	if got := binding["product_pool_id"]; got != "claude_kiro" {
+		t.Fatalf("public pool = %v, want claude_kiro", got)
+	}
+	if got := binding["key_id"].(string); strings.Contains(got, "sk-") || got == "sk-secret-example" {
+		t.Fatalf("raw key leaked: %q", got)
+	}
+	if got := binding["route_profile_id"].(string); got == "physical-profile-name" || !strings.HasPrefix(got, "profile_") {
+		t.Fatalf("profile was not anonymized: %q", got)
+	}
+	if _, ok := binding["group"]; ok {
+		t.Fatal("physical group leaked")
+	}
+	if _, ok := redacted["provider_url"]; ok {
+		t.Fatal("provider URL leaked")
+	}
+}
+
+func TestTenantCostPublicPoolMappingPreservesProductContracts(t *testing.T) {
+	if got := tenantCostPublicPoolID("claude_kiro"); got != "claude_kiro" {
+		t.Fatalf("Kiro pool mapped to %q", got)
+	}
+	if got := tenantCostPublicPoolID("claude_ccmax"); got != "claude_ccmax" {
+		t.Fatalf("CCMax pool mapped to %q", got)
+	}
+	if got := tenantCostPublicPoolID("unknown_future_pool"); got != "unknown_future_pool" {
+		t.Fatalf("unknown pool was collapsed instead of preserved: %q", got)
+	}
+	for _, invalid := range []string{"", "https://private.example", "sk-secret", "unsafe/value", "control\nvalue"} {
+		if got := tenantCostPublicPoolID(invalid); got != "other_models" {
+			t.Fatalf("invalid pool %q mapped to %q", invalid, got)
+		}
+	}
+}
+
+func TestTenantCostPublicProjectionHidesUpstreamAndRevisionDetails(t *testing.T) {
+	payload := map[string]interface{}{
+		"binding": map[string]interface{}{
+			"profile_revision": "internal-provider-revision",
+		},
+		"model": map[string]interface{}{
+			"upstream":         "private-provider-model",
+			"mapping_revision": "provider-map-revision",
+		},
+		"billing": map[string]interface{}{
+			"site_price_revision": "private-price-revision",
+		},
+		"procurement_cost": map[string]interface{}{
+			"basis_revision": "private-basis-revision",
+			"formula":        "provider_url=https://private.example.invalid",
+		},
+	}
+	redacted := redactTenantCostValue(payload).(map[string]interface{})
+	binding := redacted["binding"].(map[string]interface{})
+	if got := binding["profile_revision"].(string); got == "internal-provider-revision" || !strings.HasPrefix(got, "rev_") {
+		t.Fatalf("profile revision was not anonymized: %q", got)
+	}
+	model := redacted["model"].(map[string]interface{})
+	if _, ok := model["upstream"]; ok {
+		t.Fatal("upstream model leaked")
+	}
+	if got := model["mapping_revision"].(string); got == "provider-map-revision" || !strings.HasPrefix(got, "rev_") {
+		t.Fatalf("mapping revision was not anonymized: %q", got)
+	}
+	billing := redacted["billing"].(map[string]interface{})
+	if got := billing["site_price_revision"].(string); got == "private-price-revision" || !strings.HasPrefix(got, "rev_") {
+		t.Fatalf("site price revision was not anonymized: %q", got)
+	}
+	procurement := redacted["procurement_cost"].(map[string]interface{})
+	if got := procurement["basis_revision"].(string); got == "private-basis-revision" || !strings.HasPrefix(got, "rev_") {
+		t.Fatalf("basis revision was not anonymized: %q", got)
+	}
+	if got := procurement["formula"].(string); got != "[公式已脱敏]" {
+		t.Fatalf("formula was not redacted: %q", got)
+	}
+}

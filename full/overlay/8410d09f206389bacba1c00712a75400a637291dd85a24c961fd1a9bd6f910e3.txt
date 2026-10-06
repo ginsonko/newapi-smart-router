@@ -1,0 +1,40 @@
+package service
+
+import (
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestR55ProbeExecutorFailureIsHealthNeutral(t *testing.T) {
+	outcome := backgroundProbeFailure(errors.New("upstream EOF"), "probe executor returned no outcome")
+	assert.Equal(t, smartrouter.OutcomeInfrastructure, outcome.Outcome)
+	assert.Equal(t, SmartFailureInfrastructure, outcome.FailureScope)
+	assert.False(t, outcome.RouteFailure)
+	assert.False(t, outcome.RetryNextRoute)
+	assert.False(t, outcome.AffectsRouteHealth)
+}
+
+func TestR55SuccessfulProbeIsPositiveHealthEvidence(t *testing.T) {
+	outcome := ClassifySmartRouteOutcome(nil, nil)
+	assert.Equal(t, smartrouter.OutcomeSuccess, outcome.Outcome)
+	assert.Equal(t, SmartFailureNone, outcome.FailureScope)
+	assert.True(t, outcome.AffectsRouteHealth)
+}
+
+func TestR55ReceivedProvider400IgnoresAdapterSkipRetryMarker(t *testing.T) {
+	err := types.WithOpenAIError(types.OpenAIError{
+		Message: "provider rejected this route while preparing the request",
+		Type:    "provider_error",
+		Code:    "provider_route_busy",
+	}, http.StatusBadRequest,
+		types.ErrOptionWithSkipRetry(), types.ErrOptionWithUpstreamResponseReceived())
+
+	outcome := ClassifySmartRouteOutcome(err, nil)
+	assert.True(t, outcome.CanTryNextRoute(), "a received upstream error must advance to another certified route")
+	assert.Equal(t, http.StatusBadRequest, outcome.HTTPStatus)
+}

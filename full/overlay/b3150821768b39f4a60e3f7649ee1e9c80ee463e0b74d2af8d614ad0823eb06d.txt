@@ -1,0 +1,104 @@
+package common
+
+import (
+	"math"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSystemProtectionPressureAndRecovery(t *testing.T) {
+	cfg := PerformanceMonitorConfig{Enabled: true, CPUThreshold: 90, MemoryThreshold: 90, DiskThreshold: 95, ConfirmSeconds: 15, RecoverySeconds: 10, HysteresisPercent: 5, CriticalMemoryThreshold: 97, CriticalDiskThreshold: 99}
+	base := time.Now()
+	for _, tc := range []struct {
+		name    string
+		samples [][4]float64
+		want    []bool
+	}{
+		{"短时尖峰不拒绝", [][4]float64{{0, 100, 50, 50}, {5, 70, 50, 50}, {10, 99, 50, 50}, {15, 60, 50, 50}}, []bool{false, false, false, false}},
+		{"持续满载及恢复滞回", [][4]float64{{0, 95, 50, 50}, {5, 95, 50, 50}, {10, 95, 50, 50}, {15, 95, 50, 50}, {20, 89, 50, 50}, {25, 85, 50, 50}, {30, 85, 50, 50}, {35, 85, 50, 50}}, []bool{false, false, false, true, true, true, true, false}},
+		{"严重内存立即保护", [][4]float64{{0, 20, 97, 50}}, []bool{true}},
+		{"严重磁盘立即保护", [][4]float64{{0, 20, 50, 99}}, []bool{true}},
+		{"资源不能相互累计超限", [][4]float64{{0, 95, 50, 50}, {5, 50, 95, 50}, {10, 95, 50, 50}, {15, 50, 95, 50}}, []bool{false, false, false, false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &systemProtectionMonitor{}
+			for i, v := range tc.samples {
+				now := base.Add(time.Duration(v[0]) * time.Second)
+				m.update(SystemStatus{CPUUsage: v[1], MemoryUsage: v[2], DiskUsage: v[3], CPUValid: true, MemoryValid: true, DiskValid: true, SampledAt: now}, cfg)
+				assert.Equal(t, tc.want[i], m.status(now, cfg).Active, "sample %d", i)
+			}
+		})
+	}
+}
+
+func TestSystemProtectionStaleInvalidAndConfiguration(t *testing.T) {
+	cfg := PerformanceMonitorConfig{Enabled: true, CPUThreshold: 90, MemoryThreshold: 90, DiskThreshold: 95, ConfirmSeconds: 15, CriticalMemoryThreshold: 97, CriticalDiskThreshold: 99}
+	base := time.Now()
+	s := SystemStatus{CPUUsage: 95, MemoryUsage: 98, CPUValid: true, MemoryValid: true, DiskValid: true, SampledAt: base}
+	m := &systemProtectionMonitor{}
+	m.update(s, cfg)
+	require.True(t, m.status(base, cfg).Active)
+	assert.False(t, m.status(base.Add(21*time.Second), cfg).Active, "stale protection must not lock clients out")
+	assert.False(t, m.status(base.Add(-time.Second), cfg).Active)
+	other := cfg
+	other.MemoryThreshold = 99
+	assert.False(t, m.status(base, other).Active, "configuration change must invalidate prior decisions")
+	other = cfg
+	other.Enabled = false
+	assert.False(t, m.status(base, other).Active)
+	other = cfg
+	other.MemoryThreshold = 0
+	m.update(s, other)
+	assert.False(t, m.status(base, other).Active, "zero threshold also disables emergency protection")
+	s.MemoryValid = false
+	s.CPUUsage = math.NaN()
+	s.SampledAt = base.Add(5 * time.Second)
+	m.update(s, cfg)
+	assert.False(t, m.status(s.SampledAt, cfg).Active)
+	s.MemoryUsage = 50
+	s.MemoryValid = true
+	s.CPUUsage = 95
+	s.SampledAt = base.Add(40 * time.Second)
+	m.update(s, cfg)
+	assert.False(t, m.status(s.SampledAt, cfg).Active, "a sampling gap must restart confirmation")
+	for _, seconds := range []int{45, 50, 55} {
+		s.SampledAt = base.Add(time.Duration(seconds) * time.Second)
+		m.update(s, cfg)
+	}
+	require.True(t, m.status(s.SampledAt, cfg).Active)
+	m.reset()
+	assert.False(t, m.status(s.SampledAt, cfg).Active)
+}
+
+func TestSystemProtectionConcurrentSamplesAndReads(t *testing.T) {
+	m := &systemProtectionMonitor{}
+	cfg := PerformanceMonitorConfig{Enabled: true, MemoryThreshold: 90, CriticalMemoryThreshold: 97}
+	now := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		m.update(SystemStatus{MemoryUsage: 98, MemoryValid: true, SampledAt: now}, cfg)
+	}()
+	go func() { defer wg.Done(); _ = m.status(now, cfg) }()
+	wg.Wait()
+	require.True(t, m.status(now, cfg).Active)
+}
+
+func TestCriticalProtectionIndependentOfOrdinaryThreshold(t *testing.T) {
+	cfg := PerformanceMonitorConfig{Enabled: true, MemoryThreshold: 99, DiskThreshold: 100, ConfirmSeconds: 15, CriticalMemoryThreshold: 97, CriticalDiskThreshold: 99}
+	now := time.Now()
+	m := &systemProtectionMonitor{}
+	m.update(SystemStatus{MemoryUsage: 97.5, MemoryValid: true, DiskUsage: 99, DiskValid: true, SampledAt: now}, cfg)
+	status := m.status(now, cfg)
+	require.True(t, status.Resources[1].Blocked)
+	require.True(t, status.Resources[2].Blocked)
+	cfg.MemoryThreshold = 0
+	cfg.DiskThreshold = 0
+	m.update(SystemStatus{MemoryUsage: 100, MemoryValid: true, DiskUsage: 100, DiskValid: true, SampledAt: now.Add(time.Second)}, cfg)
+	require.False(t, m.status(now.Add(time.Second), cfg).Active)
+}

@@ -1,0 +1,123 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestExternalSuccessRestoresOnlyExactPhysicalProtocolAliases(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	state := newTestMemorySmartRouteStateStore(t, clock)
+	chatContractID, chatFingerprint, err := BuildSmartContractIdentity("gpt-5.6-sol", SmartEndpointChat)
+	require.NoError(t, err)
+	responsesContractID, responsesFingerprint, err := BuildSmartContractIdentity("gpt-5.6-sol", SmartEndpointResponses)
+	require.NoError(t, err)
+
+	chatA := smartrouter.CertifiedRoute{
+		RouteID: "chat-economy", ChannelID: 46, ChannelGeneration: "generation-a",
+		Group: "economy", UpstreamModel: "gpt-5.6-sol", CapacityDomain: "capacity-46",
+		FailureDomain: "failure-46", CacheDomain: "cache-46",
+	}
+	chatB := chatA
+	chatB.RouteID = "chat-pro"
+	chatB.Group = "pro"
+	responses := chatA
+	responses.RouteID = "responses-economy"
+	responses.Group = "economy"
+	otherGeneration := chatA
+	otherGeneration.RouteID = "chat-old-generation"
+	otherGeneration.ChannelGeneration = "generation-old"
+
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog-v1",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			chatContractID: {
+				Contract: smartrouter.RouteContract{
+					ContractID: chatContractID, CanonicalModel: "gpt-5.6-sol",
+					Endpoint: SmartEndpointChat, CapabilityFingerprint: chatFingerprint,
+				},
+				Pools: map[string]smartrouter.CertifiedPool{
+					SmartRouteAutoDiscoveredPool: {Candidates: []smartrouter.CertifiedRoute{chatA, chatB, otherGeneration}},
+				},
+			},
+			responsesContractID: {
+				Contract: smartrouter.RouteContract{
+					ContractID: responsesContractID, CanonicalModel: "gpt-5.6-sol",
+					Endpoint: SmartEndpointResponses, CapabilityFingerprint: responsesFingerprint,
+				},
+				Pools: map[string]smartrouter.CertifiedPool{
+					SmartRouteAutoDiscoveredPool: {Candidates: []smartrouter.CertifiedRoute{responses}},
+				},
+			},
+		},
+	}
+	for _, route := range []smartrouter.CertifiedRoute{chatA, chatB, responses, otherGeneration} {
+		for attempt := 0; attempt < smartrouter.DefaultSharedOpenFailureThreshold; attempt++ {
+			require.NoError(t, state.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+				CatalogVersion: catalog.Version,
+				RouteID:        route.RouteID, CapacityDomain: route.CapacityDomain,
+				ObservationID: fmt.Sprintf("%s-failure-%d", route.RouteID, attempt),
+				Outcome:       smartrouter.OutcomeInfrastructure,
+			}))
+		}
+	}
+	require.NoError(t, state.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		CatalogVersion: catalog.Version,
+		RouteID:        chatA.RouteID, CapacityDomain: chatA.CapacityDomain,
+		Outcome: smartrouter.OutcomeCapacityLimited, RetryAfter: 5 * time.Minute,
+	}))
+	require.NoError(t, state.QuarantineRoute(context.Background(), SmartRouteQuarantineRequest{
+		CatalogVersion: catalog.Version, RouteID: chatA.RouteID,
+		FailureScope: SmartFailureRouteContract, TTL: 30 * time.Minute,
+	}))
+
+	engine := &SmartRouterEngine{State: state}
+	restored, err := recordSmartRouteExternalSuccess(context.Background(), engine, catalog, SmartRouteExternalSuccess{
+		ChannelID: 46, ChannelGeneration: "generation-a",
+		CanonicalModel: "gpt-5.6-sol", UpstreamModel: "gpt-5.6-sol",
+		RequestPath: "/v1/chat/completions", TTFT: 120 * time.Millisecond, TTFTObserved: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, restored)
+
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: chatA.RouteID, CapacityDomain: chatA.CapacityDomain},
+		{RouteID: chatB.RouteID, CapacityDomain: chatB.CapacityDomain},
+		{RouteID: responses.RouteID, CapacityDomain: responses.CapacityDomain},
+		{RouteID: otherGeneration.RouteID, CapacityDomain: otherGeneration.CapacityDomain},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes[chatA.RouteID].Phase)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes[chatB.RouteID].Phase)
+	assert.Equal(t, smartrouter.QualityOpen, snapshot.Quality.Routes[responses.RouteID].Phase,
+		"Chat success must not restore the independent Responses contract")
+	assert.Equal(t, smartrouter.QualityOpen, snapshot.Quality.Routes[otherGeneration.RouteID].Phase,
+		"success must not restore an older channel configuration generation")
+	assert.Zero(t, snapshot.Capacity.Domains[chatA.CapacityDomain].BlockedUntilMS)
+
+	exclusions, err := state.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: catalog.Version,
+		Routes:         []SmartRouteStateRoute{{RouteID: chatA.RouteID, CapacityDomain: chatA.CapacityDomain}},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, exclusions.RouteIDs)
+
+	responseRestored, err := recordSmartRouteExternalSuccess(context.Background(), engine, catalog, SmartRouteExternalSuccess{
+		ChannelID: 46, ChannelGeneration: "generation-a",
+		CanonicalModel: "gpt-5.6-sol", UpstreamModel: "gpt-5.6-sol",
+		RequestPath: "/v1/responses",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, responseRestored)
+	snapshot, err = state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: responses.RouteID, CapacityDomain: responses.CapacityDomain},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes[responses.RouteID].Phase)
+}

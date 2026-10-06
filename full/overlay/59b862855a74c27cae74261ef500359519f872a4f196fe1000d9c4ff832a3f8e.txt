@@ -1,0 +1,25 @@
+package model
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestCapabilityMinimumAndIdempotencyContractRoundTrip(t *testing.T) {
+	b := capabilityFixtureBundle()
+	b.Contracts[0].Provider.SubmitIdempotency = true
+	b.Contracts[0].References.MinImages = 1
+	normalized, err := NormalizeModelCapabilityBundle(b)
+	require.NoError(t, err)
+	raw, err := common.Marshal(normalized)
+	require.NoError(t, err)
+	var decoded ModelCapabilityBundle
+	require.NoError(t, common.Unmarshal(raw, &decoded))
+	assert.True(t, decoded.Contracts[0].Provider.SubmitIdempotency)
+	assert.Equal(t, 1, decoded.Contracts[0].References.MinImages)
+	decoded.Contracts[0].References.MinImages = 31
+	_, err = NormalizeModelCapabilityBundle(decoded)
+	require.Error(t, err)
+}

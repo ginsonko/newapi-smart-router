@@ -1,0 +1,133 @@
+package common
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	rootcommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {
+	info := &RelayInfo{
+		RelayFormat:             types.RelayFormatOpenAI,
+		RequestConversionChain:  []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatClaude},
+		FinalRequestRelayFormat: types.RelayFormatOpenAIResponses,
+	}
+
+	require.Equal(t, types.RelayFormat(types.RelayFormatOpenAIResponses), info.GetFinalRequestRelayFormat())
+}
+
+func TestRelayInfoGetFinalRequestRelayFormatFallsBackToConversionChain(t *testing.T) {
+	info := &RelayInfo{
+		RelayFormat:            types.RelayFormatOpenAI,
+		RequestConversionChain: []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatClaude},
+	}
+
+	require.Equal(t, types.RelayFormat(types.RelayFormatClaude), info.GetFinalRequestRelayFormat())
+}
+
+func TestRelayInfoGetFinalRequestRelayFormatFallsBackToRelayFormat(t *testing.T) {
+	info := &RelayInfo{
+		RelayFormat: types.RelayFormatGemini,
+	}
+
+	require.Equal(t, types.RelayFormat(types.RelayFormatGemini), info.GetFinalRequestRelayFormat())
+}
+
+func TestRelayInfoGetFinalRequestRelayFormatNilReceiver(t *testing.T) {
+	var info *RelayInfo
+	require.Equal(t, types.RelayFormat(""), info.GetFinalRequestRelayFormat())
+}
+
+func TestRelayInfoFirstTokenLatencyPrefersSemanticText(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	info := &RelayInfo{
+		StartTime:         start,
+		FirstResponseTime: start.Add(100 * time.Millisecond),
+		FirstTextTime:     start.Add(400 * time.Millisecond),
+	}
+
+	first, ok := info.FirstTokenTime()
+	require.True(t, ok)
+	assert.Equal(t, start.Add(400*time.Millisecond), first)
+	latency, ok := info.FirstTokenLatency()
+	require.True(t, ok)
+	assert.Equal(t, 400*time.Millisecond, latency)
+}
+
+func TestRelayInfoFirstTokenLatencyFallsBackToFirstResponse(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	info := &RelayInfo{
+		StartTime:         start,
+		FirstResponseTime: start.Add(120 * time.Millisecond),
+		FirstTextTime:     start.Add(-time.Second),
+	}
+
+	latency, ok := info.FirstTokenLatency()
+	require.True(t, ok)
+	assert.Equal(t, 120*time.Millisecond, latency)
+}
+
+func TestRelayInfoFirstTokenLatencyDoesNotUseCompletionTime(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	info := &RelayInfo{
+		StartTime:         start,
+		FirstResponseTime: start.Add(-time.Second),
+		FirstTextTime:     start.Add(-time.Second),
+	}
+
+	_, ok := info.FirstTokenLatency()
+	assert.False(t, ok)
+}
+
+func TestRelayInfoFirstTokenMethodsAreNilSafe(t *testing.T) {
+	var info *RelayInfo
+	_, ok := info.FirstTokenTime()
+	assert.False(t, ok)
+	_, ok = info.FirstTokenLatency()
+	assert.False(t, ok)
+	assert.False(t, info.HasSemanticText())
+}
+
+func TestGenBaseRelayInfoMarksTemporaryPlaygroundRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name        string
+		path        string
+		marker      bool
+		expectedURL string
+	}{
+		{name: "legacy playground route", path: "/pg/chat/completions", expectedURL: "/v1/chat/completions"},
+		{name: "media studio marker", path: "/v1/images/generations", marker: true, expectedURL: "/v1/images/generations"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.path, nil)
+			context, _ := gin.CreateTestContext(httptest.NewRecorder())
+			context.Request = request
+			rootcommon.SetContextKey(context, constant.ContextKeyUserId, 42)
+			rootcommon.SetContextKey(context, constant.ContextKeyUsingGroup, "default")
+			rootcommon.SetContextKey(context, constant.ContextKeyTokenId, 0)
+			rootcommon.SetContextKey(context, constant.ContextKeyTokenKey, "")
+			if test.marker {
+				context.Set("is_playground", true)
+			}
+
+			info := genBaseRelayInfo(context, nil)
+
+			require.NotNil(t, info)
+			assert.True(t, info.IsPlayground, "temporary dashboard tokens must use playground billing semantics")
+			assert.Zero(t, info.TokenId)
+			assert.Empty(t, info.TokenKey)
+			assert.Equal(t, test.expectedURL, info.RequestURLPath)
+		})
+	}
+}

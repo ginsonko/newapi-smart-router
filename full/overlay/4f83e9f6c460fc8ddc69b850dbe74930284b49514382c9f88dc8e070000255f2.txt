@@ -1,0 +1,34 @@
+package media
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestResolveVideoTaskContentURL(t *testing.T) {
+	tests := []struct{ name, base, source, id, want string }{
+		{"relative content", "https://provider.test", "/v1/videos/upstream/content", "upstream", "https://provider.test/v1/videos/upstream/content"},
+		{"relative download and query", "https://provider.test/v1", "/v1/videos/upstream/download?token=signed", "upstream", "https://provider.test/v1/videos/upstream/download?token=signed"},
+		{"path prefix", "https://provider.test/gateway/v1/", "/gateway/v1/videos/upstream/download", "upstream", "https://provider.test/gateway/v1/videos/upstream/download"},
+		{"absolute", "https://provider.test", "https://provider.test/v1/videos/upstream/content", "upstream", "https://provider.test/v1/videos/upstream/content"},
+		{"wrong host", "https://provider.test", "https://evil.test/v1/videos/upstream/content", "upstream", ""},
+		{"wrong task", "https://provider.test", "/v1/videos/local/content", "upstream", ""},
+		{"scheme relative", "https://provider.test", "//evil.test/v1/videos/upstream/content", "upstream", ""},
+		{"downgrade", "https://provider.test", "http://provider.test/v1/videos/upstream/content", "upstream", ""},
+		{"userinfo", "https://provider.test", "https://secret@provider.test/v1/videos/upstream/content", "upstream", ""},
+		{"traversal", "https://provider.test", "/v1/videos/local/../upstream/content", "upstream", ""},
+		{"encoded slash", "https://provider.test", "/v1/videos/upstream%2fcontent", "upstream", ""},
+		{"encoded task traversal", "https://provider.test", "/v1/videos/upstream/content", "../upstream", ""},
+		{"missing provider identity", "https://provider.test", "/v1/videos/local/content", "", ""},
+		{"fragment", "https://provider.test", "/v1/videos/upstream/content#x", "upstream", ""},
+		{"arbitrary same host", "https://provider.test", "/private/files/other-user", "upstream", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ResolveVideoTaskContentURL(tc.source, tc.base, tc.id)
+			assert.Equal(t, tc.want != "", ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}

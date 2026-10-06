@@ -1,0 +1,343 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate } from '@tanstack/react-router'
+import {
+  CheckSquare2Icon,
+  DownloadIcon,
+  Grid2X2Icon,
+  PlusIcon,
+  SearchIcon,
+  Trash2Icon,
+} from 'lucide-react'
+import { useDeferredValue, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { SectionPageLayout } from '@/components/layout'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+
+import { deleteMediaAssets, getMediaAssets } from './api'
+import { downloadMediaAssets } from './asset-delivery'
+import { AssetDialog } from './components/asset-dialog'
+import { AssetGrid } from './components/asset-grid'
+import type { MediaAsset } from './types'
+
+const PAGE_SIZE = 24
+
+export function MediaAssetsPage() {
+  const { t } = useTranslation()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [page, setPage] = useState(1)
+  const [type, setType] = useState('')
+  const [search, setSearch] = useState('')
+  const [selected, setSelected] = useState<MediaAsset | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [pendingDeleteIds, setPendingDeleteIds] = useState<string[]>([])
+  const deferredSearch = useDeferredValue(search.trim())
+
+  const clearSelection = () => setSelectedIds(new Set())
+
+  const assetsQuery = useQuery({
+    queryKey: ['media-assets', page, type, deferredSearch],
+    queryFn: () =>
+      getMediaAssets({
+        page,
+        pageSize: PAGE_SIZE,
+        type,
+        search: deferredSearch,
+      }),
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (assetIds: string[]) => deleteMediaAssets(assetIds),
+    onSuccess: async (results) => {
+      setPendingDeleteIds([])
+      setSelectedIds(new Set())
+      setSelected(null)
+      await queryClient.invalidateQueries({ queryKey: ['media-assets'] })
+      const failed = results.filter((result) => !result.ok).length
+      if (failed > 0) {
+        toast.warning(
+          t('{{success}} deleted, {{failed}} failed', {
+            success: results.length - failed,
+            failed,
+          })
+        )
+      } else {
+        toast.success(t('{{count}} assets deleted', { count: results.length }))
+      }
+    },
+  })
+
+  const total = assetsQuery.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const visibleAssets = assetsQuery.data?.items ?? []
+  const visibleSelected = visibleAssets.filter((asset) =>
+    selectedIds.has(asset.id)
+  )
+  const allVisibleSelected =
+    visibleAssets.length > 0 && visibleSelected.length === visibleAssets.length
+
+  const toggleVisibleSelection = (checked: boolean) => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      visibleAssets.forEach((asset) => {
+        if (checked) next.add(asset.id)
+        else next.delete(asset.id)
+      })
+      return next
+    })
+  }
+
+  const downloadSelected = async () => {
+    const assets = visibleAssets.filter((asset) => selectedIds.has(asset.id))
+    if (assets.length === 0) return
+    const result = await downloadMediaAssets(assets)
+    if (result.failed > 0) {
+      toast.warning(
+        t('{{success}} assets packaged, {{failed}} unavailable', {
+          success: result.success,
+          failed: result.failed,
+        })
+      )
+    } else {
+      toast.success(
+        t('{{count}} assets packaged into one ZIP', { count: result.success })
+      )
+    }
+  }
+
+  return (
+    <>
+      <SectionPageLayout fixedContent>
+        <SectionPageLayout.Title>{t('My Assets')}</SectionPageLayout.Title>
+        <SectionPageLayout.Actions>
+          <Button
+            onClick={() => void navigate({ to: '/media/studio' })}
+            size='sm'
+          >
+            <PlusIcon aria-hidden='true' />
+            {t('Create')}
+          </Button>
+        </SectionPageLayout.Actions>
+        <SectionPageLayout.Content>
+          <div className='flex h-full min-h-0 flex-col gap-4'>
+            <div className='flex flex-col gap-2 sm:flex-row sm:items-center'>
+              <div className='relative min-w-0 flex-1 sm:max-w-sm'>
+                <SearchIcon
+                  aria-hidden='true'
+                  className='text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2'
+                />
+                <Input
+                  aria-label={t('Search assets')}
+                  className='pl-8'
+                  onChange={(event) => {
+                    setSearch(event.target.value)
+                    setPage(1)
+                    clearSelection()
+                  }}
+                  placeholder={t('Search by file name or model')}
+                  value={search}
+                />
+              </div>
+              <NativeSelect
+                aria-label={t('Media type')}
+                className='w-full sm:w-40'
+                onChange={(event) => {
+                  setType(event.target.value)
+                  setPage(1)
+                  clearSelection()
+                }}
+                value={type}
+              >
+                <NativeSelectOption value=''>
+                  {t('All media')}
+                </NativeSelectOption>
+                <NativeSelectOption value='image'>
+                  {t('Images')}
+                </NativeSelectOption>
+                <NativeSelectOption value='video'>
+                  {t('Videos')}
+                </NativeSelectOption>
+                <NativeSelectOption value='audio'>
+                  {t('Audio')}
+                </NativeSelectOption>
+                <NativeSelectOption value='file'>
+                  {t('Files')}
+                </NativeSelectOption>
+              </NativeSelect>
+              <div className='text-muted-foreground flex items-center gap-1.5 text-xs sm:ml-auto'>
+                <Grid2X2Icon aria-hidden='true' className='size-3.5' />
+                {t('{{count}} assets', { count: total })}
+              </div>
+            </div>
+
+            <div className='bg-muted/20 flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2'>
+              <Checkbox
+                aria-label={t('Select all visible assets')}
+                checked={allVisibleSelected}
+                onCheckedChange={(checked) =>
+                  toggleVisibleSelection(checked === true)
+                }
+              />
+              <span className='text-muted-foreground text-xs'>
+                {t('{{count}} selected', { count: selectedIds.size })}
+              </span>
+              <Button
+                disabled={selectedIds.size === 0}
+                onClick={() => void downloadSelected()}
+                size='sm'
+                variant='outline'
+              >
+                <DownloadIcon aria-hidden='true' />
+                {t('Download selected')}
+              </Button>
+              <Button
+                disabled={selectedIds.size === 0}
+                onClick={() => setPendingDeleteIds([...selectedIds])}
+                size='sm'
+                variant='destructive'
+              >
+                <Trash2Icon aria-hidden='true' />
+                {t('Delete selected')}
+              </Button>
+              <Button
+                className='ml-auto'
+                onClick={() => toggleVisibleSelection(!allVisibleSelected)}
+                size='sm'
+                variant='ghost'
+              >
+                <CheckSquare2Icon aria-hidden='true' />
+                {allVisibleSelected ? t('Clear page') : t('Select page')}
+              </Button>
+            </div>
+
+            <div className='hover-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain pb-1'>
+              <AssetGrid
+                assets={visibleAssets}
+                error={assetsQuery.isError}
+                loading={assetsQuery.isLoading}
+                onDelete={(asset) => setPendingDeleteIds([asset.id])}
+                onPreview={setSelected}
+                onRetry={() => void assetsQuery.refetch()}
+                onSelectionChange={(asset, selected) =>
+                  setSelectedIds((current) => {
+                    const next = new Set(current)
+                    if (selected) next.add(asset.id)
+                    else next.delete(asset.id)
+                    return next
+                  })
+                }
+                selectedIds={selectedIds}
+                onReuse={(asset) =>
+                  void navigate({
+                    to: '/media/studio',
+                    search: {
+                      reference: asset.id,
+                      type: asset.type,
+                    },
+                  })
+                }
+              />
+            </div>
+
+            {totalPages > 1 && (
+              <div className='flex items-center justify-end gap-2 border-t pt-3'>
+                <Button
+                  disabled={page <= 1}
+                  onClick={() => {
+                    setPage((current) => current - 1)
+                    clearSelection()
+                  }}
+                  size='sm'
+                  variant='outline'
+                >
+                  {t('Previous')}
+                </Button>
+                <span className='text-muted-foreground min-w-20 text-center text-xs'>
+                  {t('{{page}} / {{total}}', { page, total: totalPages })}
+                </span>
+                <Button
+                  disabled={page >= totalPages}
+                  onClick={() => {
+                    setPage((current) => current + 1)
+                    clearSelection()
+                  }}
+                  size='sm'
+                  variant='outline'
+                >
+                  {t('Next')}
+                </Button>
+              </div>
+            )}
+          </div>
+        </SectionPageLayout.Content>
+      </SectionPageLayout>
+
+      <AssetDialog
+        asset={selected}
+        onOpenChange={(open) => !open && setSelected(null)}
+        open={Boolean(selected)}
+      />
+
+      <AlertDialog
+        open={pendingDeleteIds.length > 0}
+        onOpenChange={(open) => !open && setPendingDeleteIds([])}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('Delete {{count}} assets?', {
+                count: pendingDeleteIds.length,
+              })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('The stored file and its download link will be removed.')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('Cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleteMutation.isPending}
+              onClick={() => deleteMutation.mutate(pendingDeleteIds)}
+              variant='destructive'
+            >
+              {t('Delete')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  )
+}

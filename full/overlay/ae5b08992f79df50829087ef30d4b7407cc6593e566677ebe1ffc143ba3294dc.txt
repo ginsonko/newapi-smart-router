@@ -1,0 +1,112 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import i18n, {
+  type BackendModule,
+  type ReadCallback,
+  type ResourceKey,
+} from 'i18next'
+import LanguageDetector from 'i18next-browser-languagedetector'
+import { initReactI18next } from 'react-i18next'
+
+import {
+  convertDetectedLanguage,
+  normalizeInterfaceLanguage,
+  type InterfaceLanguageCode,
+} from './languages'
+
+type LocaleBundle = {
+  translation: ResourceKey
+}
+
+const localeLoaders: Record<
+  InterfaceLanguageCode,
+  () => Promise<LocaleBundle>
+> = {
+  en: async () => (await import('./locales/en.json')).default,
+  zhCN: async () => (await import('./locales/zh.json')).default,
+  fr: async () => (await import('./locales/fr.json')).default,
+  ru: async () => (await import('./locales/ru.json')).default,
+  ja: async () => (await import('./locales/ja.json')).default,
+  vi: async () => (await import('./locales/vi.json')).default,
+  zhTW: async () => (await import('./locales/zh-TW.json')).default,
+}
+
+async function readLocale(
+  language: string,
+  callback: ReadCallback
+): Promise<void> {
+  const normalizedLanguage = normalizeInterfaceLanguage(
+    language
+  ) as InterfaceLanguageCode
+
+  try {
+    const bundle = await localeLoaders[normalizedLanguage]()
+    callback(null, bundle.translation)
+  } catch (error: unknown) {
+    const cause =
+      error instanceof Error
+        ? error
+        : new Error('Unable to load the selected interface language')
+    callback(cause, null)
+  }
+}
+
+const dynamicLocaleBackend: BackendModule = {
+  type: 'backend',
+  init: () => undefined,
+  read: (language, _namespace, callback) => {
+    void readLocale(language, callback)
+  },
+}
+
+i18n.use(dynamicLocaleBackend).use(LanguageDetector).use(initReactI18next)
+
+let initializationPromise: Promise<void> | undefined
+
+export function initializeI18n(): Promise<void> {
+  if (initializationPromise) return initializationPromise
+
+  initializationPromise = i18n
+    .init({
+      // Translation keys are English, so a missing localized entry can fall
+      // back to its key without downloading a second locale bundle.
+      fallbackLng: false,
+      supportedLngs: ['en', 'zhCN', 'fr', 'ru', 'ja', 'vi', 'zhTW'],
+      load: 'currentOnly',
+      nsSeparator: false, // Allow literal colons in keys (e.g., URLs, labels)
+      debug: import.meta.env.DEV,
+      interpolation: {
+        escapeValue: false, // not needed for react as it escapes by default
+      },
+      detection: {
+        order: ['localStorage', 'navigator'],
+        caches: ['localStorage'],
+        // Browsers report `zh-CN`/`zh-TW`/`zh`; map them onto our `zhCN`/`zhTW`
+        // codes (non-Chinese codes pass through for normal supportedLngs matching).
+        convertDetectedLanguage,
+      },
+    })
+    .then(() => undefined)
+
+  return initializationPromise
+}
+
+export const i18nReady = initializeI18n()
+
+export default i18n

@@ -1,0 +1,617 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type { TFunction } from 'i18next'
+import { z } from 'zod'
+
+import {
+  MAX_SMART_ROUTER_EFFECTIVE_RATIO,
+  MAX_SMART_ROUTER_TTFT_MS,
+  MAX_SMART_ROUTER_TTFT_SAMPLES,
+  SMART_ROUTER_RATIO_SCALE,
+  parseSmartRouterPolicy,
+  type SmartRouterPolicy,
+} from '@/features/smart-routing'
+import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
+
+import { DEFAULT_GROUP } from '../constants'
+import type { ApiKey, ApiKeyFormData } from '../types'
+
+export type ApiKeyRoutingMode = 'fixed' | 'smart'
+
+export function buildRememberedSmartRouterPolicy(
+  data: ApiKeyFormValues,
+  availableGroups: string[],
+  schema: ReturnType<typeof getApiKeyFormSchema>
+): string | undefined {
+  if (!schema.safeParse({ ...data, routing_mode: 'smart' }).success) {
+    return undefined
+  }
+  return JSON.stringify(buildSmartRouterPolicyFromForm(data, availableGroups))
+}
+
+export function getApiKeyFormInitializationKey(apiKey?: Pick<ApiKey, 'id'>) {
+  return apiKey ? `update:${apiKey.id}` : 'create'
+}
+
+const fallbackSmartRouterPolicy: SmartRouterPolicy = {
+  version: 4,
+  enabled: true,
+  strategy: 'price',
+  excluded_groups: [],
+  allow_future_groups: true,
+  manual_group_order: [],
+  max_attempts: 3,
+  failure_threshold: 3,
+  max_effective_ratio_ppm: 1_000_000,
+  health_guard: true,
+  actual_input_cost_ranking: true,
+  recovery_profile: 'balanced',
+  affinity_enabled: true,
+  affinity_mode: 'economic_break_even',
+  affinity_max_premium_percent: 0,
+  affinity_ttl_seconds: 1800,
+  compression_thresholds: [],
+  ttft_policy: {
+    enabled: false,
+    metric: 'p95',
+    target_ms: 1500,
+    hard_max_ms: 8000,
+    min_samples: 20,
+  },
+  queue_policy: {
+    mode: 'no_queue',
+    max_wait_ms: 0,
+    min_saving_percent: 20,
+  },
+  balanced_weights: {
+    stability: 45,
+    price: 40,
+    ttft: 15,
+  },
+  custom_weights: {
+    cache: 25,
+    cost: 25,
+    ttft: 25,
+    stability: 25,
+  },
+}
+
+function buildSmartPolicyFormDefaults(
+  policy: SmartRouterPolicy,
+  availableGroups: string[]
+): ApiKeyFormValues['smart_policy'] {
+  const excluded = new Set(policy.excluded_groups)
+  const knownAllowed = new Set(policy.manual_group_order)
+  const selectedGroups = availableGroups.filter(
+    (group) =>
+      !excluded.has(group) &&
+      (policy.allow_future_groups || knownAllowed.has(group))
+  )
+  const selectedSet = new Set(selectedGroups)
+  const manualGroupOrder = policy.manual_group_order.filter((group) =>
+    selectedSet.has(group)
+  )
+  for (const group of selectedGroups) {
+    if (!manualGroupOrder.includes(group)) manualGroupOrder.push(group)
+  }
+
+  return {
+    selected_groups: selectedGroups,
+    allow_future_groups: policy.allow_future_groups === true,
+    strategy: policy.strategy,
+    manual_group_order: manualGroupOrder,
+    max_effective_ratio:
+      policy.max_effective_ratio_ppm / SMART_ROUTER_RATIO_SCALE,
+    recovery_profile: policy.recovery_profile ?? 'balanced',
+    failure_threshold: policy.failure_threshold,
+    max_attempts: policy.max_attempts,
+    health_guard: true,
+    actual_input_cost_ranking: policy.actual_input_cost_ranking !== false,
+    affinity_enabled: policy.affinity_enabled,
+    affinity_mode: policy.affinity_mode,
+    affinity_max_premium_percent: policy.affinity_max_premium_percent,
+    affinity_ttl_seconds: policy.affinity_ttl_seconds,
+    compression_thresholds: policy.compression_thresholds.map((threshold) => ({
+      ...threshold,
+    })),
+    queue_mode: policy.queue_policy.mode,
+    queue_max_wait_ms: policy.queue_policy.max_wait_ms,
+    queue_min_saving_percent: policy.queue_policy.min_saving_percent,
+    ttft_enabled: policy.ttft_policy.enabled,
+    ttft_target_ms: policy.ttft_policy.target_ms,
+    ttft_hard_max_ms: policy.ttft_policy.hard_max_ms,
+    ttft_min_samples: policy.ttft_policy.min_samples,
+    balanced_stability_weight: policy.balanced_weights.stability,
+    balanced_price_weight: policy.balanced_weights.price,
+    balanced_ttft_weight: policy.balanced_weights.ttft,
+    custom_cache_weight: policy.custom_weights.cache,
+    custom_cost_weight: policy.custom_weights.cost,
+    custom_ttft_weight: policy.custom_weights.ttft,
+    custom_stability_weight: policy.custom_weights.stability,
+  }
+}
+
+// ============================================================================
+// Form Schema
+// ============================================================================
+
+export type ApiKeyFormSchemaOptions = {
+  maxAttempts?: number
+  maxFailureThreshold?: number
+  absoluteMaxRatioPPM?: number
+  maxQueueWaitMs?: number
+}
+
+export function getApiKeyFormSchema(
+  t: TFunction,
+  options: ApiKeyFormSchemaOptions = {}
+) {
+  // Mirror the server's current safety ceilings in the client so a user gets
+  // an actionable field error instead of a rejected save after filling the
+  // form. Undefined ceilings keep the protocol defaults used by older hosts.
+  const maxAttempts = Math.min(8, Math.max(1, options.maxAttempts ?? 8))
+  const maxFailureThreshold = Math.min(
+    100,
+    Math.max(1, options.maxFailureThreshold ?? 100)
+  )
+  const maxEffectiveRatio = Math.min(
+    MAX_SMART_ROUTER_EFFECTIVE_RATIO,
+    options.absoluteMaxRatioPPM && options.absoluteMaxRatioPPM > 0
+      ? options.absoluteMaxRatioPPM / SMART_ROUTER_RATIO_SCALE
+      : MAX_SMART_ROUTER_EFFECTIVE_RATIO
+  )
+  const maxQueueWait = Math.min(
+    60_000,
+    Math.max(0, options.maxQueueWaitMs ?? 60_000)
+  )
+
+  return z
+    .object({
+      name: z.string().min(1, t('Please enter a name')),
+      remain_quota_dollars: z.number().optional(),
+      expired_time: z.date().optional(),
+      unlimited_quota: z.boolean(),
+      model_limits: z.array(z.string()),
+      allow_ips: z.string().optional(),
+      group: z.string().optional(),
+      routing_mode: z.enum(['fixed', 'smart']),
+      smart_policy_base: z.custom<SmartRouterPolicy>(),
+      smart_policy: z.object({
+        selected_groups: z.array(z.string()),
+        allow_future_groups: z.boolean(),
+        strategy: z.enum([
+          'price',
+          'stability',
+          'latency',
+          'balanced',
+          'custom_weighted',
+          'manual',
+        ]),
+        manual_group_order: z.array(z.string()),
+        max_effective_ratio: z
+          .number()
+          .finite()
+          .min(0, t('Group ratio ceiling cannot be negative'))
+          .max(
+            maxEffectiveRatio,
+            t('Group ratio ceiling exceeds the supported limit')
+          ),
+        recovery_profile: z.enum(['fast', 'balanced', 'stable']),
+        failure_threshold: z.number().int().min(1).max(maxFailureThreshold),
+        max_attempts: z.number().int().min(1).max(maxAttempts),
+        health_guard: z.boolean(),
+        actual_input_cost_ranking: z.boolean(),
+        affinity_enabled: z.boolean(),
+        affinity_mode: z.enum(['fixed_premium', 'economic_break_even']),
+        affinity_max_premium_percent: z.number().int().min(0).max(100),
+        affinity_ttl_seconds: z.number().int().min(0).max(604800),
+        compression_thresholds: z.array(
+          z.object({
+            model: z.string().trim().min(1, t('Enter a model name')),
+            tokens: z.number().int().min(1).max(100_000_000),
+          })
+        ),
+        queue_mode: z.enum(['no_queue', 'short_wait']),
+        queue_max_wait_ms: z.number().int().min(0).max(maxQueueWait),
+        queue_min_saving_percent: z.number().int().min(0).max(100),
+        ttft_enabled: z.boolean(),
+        ttft_target_ms: z
+          .number()
+          .finite()
+          .int()
+          .min(0)
+          .max(
+            MAX_SMART_ROUTER_TTFT_MS,
+            t('TTFT timing exceeds the supported limit')
+          ),
+        ttft_hard_max_ms: z
+          .number()
+          .finite()
+          .int()
+          .min(0)
+          .max(
+            MAX_SMART_ROUTER_TTFT_MS,
+            t('TTFT timing exceeds the supported limit')
+          ),
+        ttft_min_samples: z
+          .number()
+          .finite()
+          .int()
+          .min(0)
+          .max(
+            MAX_SMART_ROUTER_TTFT_SAMPLES,
+            t('TTFT sample count exceeds the supported limit')
+          ),
+        balanced_stability_weight: z.number().int().min(0).max(100),
+        balanced_price_weight: z.number().int().min(0).max(100),
+        balanced_ttft_weight: z.number().int().min(0).max(100),
+        custom_cache_weight: z.number().int().min(0).max(100),
+        custom_cost_weight: z.number().int().min(0).max(100),
+        custom_ttft_weight: z.number().int().min(0).max(100),
+        custom_stability_weight: z.number().int().min(0).max(100),
+      }),
+      cross_group_retry: z.boolean().optional(),
+      tokenCount: z.number().min(1).optional(),
+    })
+    .superRefine((data, ctx) => {
+      if (
+        !data.unlimited_quota &&
+        (data.remain_quota_dollars === undefined ||
+          data.remain_quota_dollars < 0)
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['remain_quota_dollars'],
+          message: t('Quota must be zero or greater'),
+        })
+      }
+
+      if (data.routing_mode !== 'smart') return
+      if (data.smart_policy.selected_groups.length === 0) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['smart_policy', 'selected_groups'],
+          message: t('Select at least one available group'),
+        })
+      }
+
+      if (data.smart_policy.strategy === 'manual') {
+        const selected = new Set(data.smart_policy.selected_groups)
+        const order = data.smart_policy.manual_group_order
+        const complete =
+          order.length === selected.size &&
+          order.every((group) => selected.has(group))
+        if (!complete) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['smart_policy', 'manual_group_order'],
+            message: t('Manual order must include every selected group once'),
+          })
+        }
+      }
+
+      if (
+        data.smart_policy.strategy === 'balanced' &&
+        data.smart_policy.balanced_stability_weight +
+          data.smart_policy.balanced_price_weight +
+          data.smart_policy.balanced_ttft_weight !==
+          100
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['smart_policy', 'balanced_stability_weight'],
+          message: t('Balanced strategy weights must add up to 100'),
+        })
+      }
+
+      if (
+        data.smart_policy.strategy === 'custom_weighted' &&
+        data.smart_policy.custom_cache_weight +
+          data.smart_policy.custom_cost_weight +
+          data.smart_policy.custom_ttft_weight +
+          data.smart_policy.custom_stability_weight !==
+          100
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['smart_policy', 'custom_cache_weight'],
+          message: t('Custom ranking weights must add up to 100'),
+        })
+      }
+
+      if (
+        data.smart_policy.ttft_enabled &&
+        (data.smart_policy.ttft_target_ms <= 0 ||
+          data.smart_policy.ttft_hard_max_ms <= 0 ||
+          data.smart_policy.ttft_target_ms >
+            data.smart_policy.ttft_hard_max_ms ||
+          data.smart_policy.ttft_min_samples <= 0)
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['smart_policy', 'ttft_enabled'],
+          message: t(
+            'TTFT target and hard maximum must be positive, target cannot exceed the hard maximum, and samples must be positive'
+          ),
+        })
+      }
+
+      if (
+        data.smart_policy.queue_mode === 'short_wait' &&
+        data.smart_policy.queue_max_wait_ms <= 0
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['smart_policy', 'queue_max_wait_ms'],
+          message: t('Short queue wait must be positive'),
+        })
+      }
+
+      const compressionModels = new Set<string>()
+      for (const [
+        index,
+        threshold,
+      ] of data.smart_policy.compression_thresholds.entries()) {
+        const model = threshold.model.trim()
+        if (!model || !compressionModels.has(model)) {
+          compressionModels.add(model)
+          continue
+        }
+        ctx.addIssue({
+          code: 'custom',
+          path: ['smart_policy', 'compression_thresholds', index, 'model'],
+          message: t('Each model can only have one context threshold'),
+        })
+      }
+    })
+}
+
+export type ApiKeyFormValues = z.infer<ReturnType<typeof getApiKeyFormSchema>>
+
+// ============================================================================
+// Form Defaults
+// ============================================================================
+
+export const API_KEY_FORM_DEFAULT_VALUES: ApiKeyFormValues = {
+  name: '',
+  remain_quota_dollars: 10,
+  expired_time: undefined,
+  unlimited_quota: true,
+  model_limits: [],
+  allow_ips: '',
+  group: DEFAULT_GROUP,
+  routing_mode: 'fixed',
+  smart_policy_base: fallbackSmartRouterPolicy,
+  smart_policy: buildSmartPolicyFormDefaults(fallbackSmartRouterPolicy, []),
+  cross_group_retry: true,
+  tokenCount: 1,
+}
+
+type ApiKeyFormDefaultsOptions = {
+  useSmartRouting?: boolean
+  preserveSmartPolicyAffinityMode?: boolean
+  useLegacyAutoGroup?: boolean
+  fixedGroup?: string
+  smartPolicy?: SmartRouterPolicy
+  smartGroups?: string[]
+}
+
+export function getApiKeyFormDefaultValues(
+  options: ApiKeyFormDefaultsOptions = {}
+): ApiKeyFormValues {
+  const useSmartRouting = options.useSmartRouting === true
+  const useLegacyAutoGroup = options.useLegacyAutoGroup === true
+  const smartPolicy = options.smartPolicy ?? fallbackSmartRouterPolicy
+  const smartGroups = options.smartGroups ?? []
+  const smartPolicyDefaults = buildSmartPolicyFormDefaults(
+    smartPolicy,
+    smartGroups
+  )
+  if (useSmartRouting && options.preserveSmartPolicyAffinityMode !== true) {
+    smartPolicyDefaults.affinity_mode = 'economic_break_even'
+  }
+
+  return {
+    ...API_KEY_FORM_DEFAULT_VALUES,
+    smart_policy_base: structuredClone(smartPolicy),
+    smart_policy: smartPolicyDefaults,
+    group:
+      useSmartRouting || useLegacyAutoGroup
+        ? 'auto'
+        : (options.fixedGroup ?? DEFAULT_GROUP),
+    routing_mode: useSmartRouting ? 'smart' : 'fixed',
+    cross_group_retry: !useSmartRouting && useLegacyAutoGroup,
+  }
+}
+
+// ============================================================================
+// Form Data Transformation
+// ============================================================================
+
+/**
+ * Transform form data to API payload
+ */
+export function transformFormDataToPayload(
+  data: ApiKeyFormValues,
+  smartRoutingPolicy = '',
+  smartRoutingMemory?: string
+): ApiKeyFormData {
+  const useSmartRouting = data.routing_mode === 'smart'
+
+  return {
+    name: data.name,
+    remain_quota: data.unlimited_quota
+      ? 0
+      : parseQuotaFromDollars(data.remain_quota_dollars || 0),
+    expired_time: data.expired_time
+      ? Math.floor(data.expired_time.getTime() / 1000)
+      : -1,
+    unlimited_quota: data.unlimited_quota,
+    model_limits_enabled: data.model_limits.length > 0,
+    model_limits: data.model_limits.join(','),
+    allow_ips: data.allow_ips || '',
+    group: useSmartRouting ? 'auto' : data.group || '',
+    cross_group_retry:
+      !useSmartRouting && data.group === 'auto'
+        ? !!data.cross_group_retry
+        : false,
+    routing_policy: useSmartRouting ? smartRoutingPolicy : '',
+    ...(smartRoutingMemory !== undefined && {
+      routing_policy_memory: smartRoutingMemory,
+    }),
+  }
+}
+
+/**
+ * Transform API key data to form defaults
+ */
+export function transformApiKeyToFormDefaults(
+  apiKey: ApiKey,
+  smartPolicy?: SmartRouterPolicy,
+  smartGroups: string[] = []
+): ApiKeyFormValues {
+  const routingMode =
+    apiKey.group === 'auto' && apiKey.routing_policy?.trim() ? 'smart' : 'fixed'
+  const rememberedPolicy =
+    parseSmartRouterPolicy(apiKey.routing_policy) ??
+    parseSmartRouterPolicy(apiKey.routing_policy_memory) ??
+    smartPolicy
+  const defaults = getApiKeyFormDefaultValues({
+    useSmartRouting: routingMode === 'smart',
+    preserveSmartPolicyAffinityMode: true,
+    smartPolicy: rememberedPolicy,
+    smartGroups,
+  })
+
+  return {
+    ...defaults,
+    name: apiKey.name,
+    remain_quota_dollars: apiKey.unlimited_quota
+      ? 0
+      : quotaUnitsToDollars(apiKey.remain_quota),
+    expired_time:
+      apiKey.expired_time > 0
+        ? new Date(apiKey.expired_time * 1000)
+        : undefined,
+    unlimited_quota: apiKey.unlimited_quota,
+    model_limits: apiKey.model_limits
+      ? apiKey.model_limits.split(',').filter(Boolean)
+      : [],
+    allow_ips: apiKey.allow_ips || '',
+    group: apiKey.group || DEFAULT_GROUP,
+    routing_mode: routingMode,
+    cross_group_retry: !!apiKey.cross_group_retry,
+    tokenCount: 1,
+  }
+}
+
+export function buildSmartRouterPolicyFromForm(
+  data: ApiKeyFormValues,
+  availableGroups: string[]
+): SmartRouterPolicy {
+  // React Hook Form may return proxied values in production builds. Convert
+  // through the versioned JSON parser so saving a key never depends on the
+  // browser's structuredClone support for proxies.
+  const base =
+    parseSmartRouterPolicy(JSON.stringify(data.smart_policy_base)) ??
+    structuredClone(fallbackSmartRouterPolicy)
+  const available = new Set(availableGroups)
+  const selected = new Set(data.smart_policy.selected_groups)
+  // Preserve the user's explicit future-group choice. Inferring it from the
+  // currently visible catalog can silently widen a fixed key when a group is
+  // temporarily hidden by permissions, health, or a catalog refresh.
+  const allowFutureGroups = data.smart_policy.allow_future_groups
+  const unavailableExclusions = base.excluded_groups.filter(
+    (group) => !available.has(group)
+  )
+  const unavailableAllowedGroups = base.manual_group_order.filter(
+    (group) => !available.has(group) && !base.excluded_groups.includes(group)
+  )
+  const excludedGroups = [
+    ...unavailableExclusions,
+    ...availableGroups.filter((group) => !selected.has(group)),
+  ]
+  const manualGroupOrder = data.smart_policy.manual_group_order.filter(
+    (group) => selected.has(group)
+  )
+  for (const group of data.smart_policy.selected_groups) {
+    if (!manualGroupOrder.includes(group)) manualGroupOrder.push(group)
+  }
+  for (const group of unavailableAllowedGroups) {
+    if (!manualGroupOrder.includes(group)) manualGroupOrder.push(group)
+  }
+
+  return {
+    ...base,
+    version: 4,
+    enabled: true,
+    strategy: data.smart_policy.strategy,
+    order_mode:
+      data.smart_policy.strategy === 'manual' ? 'manual' : 'auto_price',
+    manual_group_order: manualGroupOrder,
+    max_effective_ratio_ppm: Math.round(
+      data.smart_policy.max_effective_ratio * SMART_ROUTER_RATIO_SCALE
+    ),
+    recovery_profile: data.smart_policy.recovery_profile,
+    excluded_groups: [...new Set(excludedGroups)].sort(),
+    allow_future_groups: allowFutureGroups,
+    health_guard: true,
+    actual_input_cost_ranking: data.smart_policy.actual_input_cost_ranking,
+    failure_threshold: data.smart_policy.failure_threshold,
+    max_attempts: data.smart_policy.max_attempts,
+    affinity_enabled: data.smart_policy.affinity_enabled,
+    affinity_mode: data.smart_policy.affinity_mode,
+    affinity_max_premium_percent:
+      data.smart_policy.affinity_max_premium_percent,
+    affinity_ttl_seconds: data.smart_policy.affinity_ttl_seconds,
+    compression_thresholds:
+      data.smart_policy.affinity_mode === 'economic_break_even'
+        ? data.smart_policy.compression_thresholds.map((threshold) => ({
+            model: threshold.model.trim(),
+            tokens: threshold.tokens,
+          }))
+        : base.compression_thresholds,
+    ttft_policy: {
+      ...base.ttft_policy,
+      enabled: data.smart_policy.ttft_enabled,
+      metric: 'p95',
+      target_ms: data.smart_policy.ttft_target_ms,
+      hard_max_ms: data.smart_policy.ttft_hard_max_ms,
+      min_samples: data.smart_policy.ttft_min_samples,
+    },
+    queue_policy: {
+      ...base.queue_policy,
+      mode: data.smart_policy.queue_mode,
+      max_wait_ms: data.smart_policy.queue_max_wait_ms,
+      min_saving_percent: data.smart_policy.queue_min_saving_percent,
+    },
+    balanced_weights: {
+      stability: data.smart_policy.balanced_stability_weight,
+      price: data.smart_policy.balanced_price_weight,
+      ttft: data.smart_policy.balanced_ttft_weight,
+    },
+    custom_weights: {
+      cache: data.smart_policy.custom_cache_weight,
+      cost: data.smart_policy.custom_cost_weight,
+      ttft: data.smart_policy.custom_ttft_weight,
+      stability: data.smart_policy.custom_stability_weight,
+    },
+    allow_future_certified_routes: allowFutureGroups,
+  }
+}

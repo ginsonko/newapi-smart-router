@@ -1,0 +1,25 @@
+package service
+
+import (
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAutomaticRecoveryDoesNotProbeUnknownRoutes(t *testing.T) {
+	dueAt, scheduled := smartRouteRecoveryDueAtMS(
+		smartrouter.QualityState{Phase: smartrouter.QualityUnknown, Epoch: 1},
+		100_000,
+	)
+	assert.False(t, scheduled, "unknown routes are foreground-usable and must not consume background probes")
+	assert.Zero(t, dueAt)
+}
+
+func TestConfiguredProbeScheduleIsCappedAtFiveMinutes(t *testing.T) {
+	backoffs := smartRouteBackoffSchedule(time.Minute, time.Hour)
+	if assert.NotEmpty(t, backoffs) {
+		assert.LessOrEqual(t, backoffs[len(backoffs)-1], int64((5 * time.Minute).Milliseconds()))
+	}
+}

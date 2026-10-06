@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-memory.schema.json",
+  "title": "Per-Key routing policy memory mutation",
+  "type": "object",
+  "properties": {
+    "group": {"type": "string"},
+    "routing_policy": {"type": ["string", "null"]},
+    "routing_policy_memory": {"type": ["string", "null"], "maxLength": 65536}
+  },
+  "description": "Persistence uses a separate nullable TEXT column. Omitted or null memory preserves prior memory when active policy is empty. Empty string explicitly clears it. Nonempty active policy is the authoritative remembered policy. Runtime dispatch consumes only active policy for auto group."
+}

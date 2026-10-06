@@ -1,0 +1,91 @@
+package controller
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTokenRoutingMemoryRoundTripAndIsolation(t *testing.T) {
+	database := setupTokenControllerTestDB(t)
+	require.NoError(t, database.Exec("CREATE TABLE users (id integer PRIMARY KEY, `group` text, deleted_at datetime)").Error)
+	require.NoError(t, database.Exec("INSERT INTO users(id, `group`) VALUES (1, 'default'), (2, 'default')").Error)
+	policy, err := model.NormalizeTokenRoutingPolicy("auto", controllerTestRoutingPolicy(t))
+	require.NoError(t, err)
+	token := model.Token{UserId: 1, Key: "memory-isolation-first", Name: "first", Group: "auto", RoutingPolicy: policy, UnlimitedQuota: true, ExpiredTime: -1}
+	other := model.Token{UserId: 1, Key: "memory-isolation-second", Name: "second", Group: "default", UnlimitedQuota: true, ExpiredTime: -1}
+	require.NoError(t, database.Create(&token).Error)
+	require.NoError(t, database.Create(&other).Error)
+	body := tokenMutationBody(&token, "default", false)
+	body["routing_policy"] = ""
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	var stored model.Token
+	require.NoError(t, database.First(&stored, token.Id).Error)
+	require.Empty(t, stored.RoutingPolicy)
+	require.Equal(t, policy, stored.RoutingPolicyMemory)
+	require.False(t, stored.IsSmartRouting())
+	active, err := stored.GetSmartRoutingPolicy()
+	require.NoError(t, err)
+	require.Nil(t, active)
+	require.NoError(t, database.First(&other, other.Id).Error)
+	require.Empty(t, other.RoutingPolicyMemory)
+	body = tokenMutationBody(&stored, "auto", true)
+	body["routing_policy"] = ""
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	require.NoError(t, database.First(&stored, token.Id).Error)
+	require.Empty(t, stored.RoutingPolicy)
+	require.Equal(t, policy, stored.RoutingPolicyMemory)
+	require.False(t, stored.IsSmartRouting())
+	require.True(t, stored.CrossGroupRetry)
+	body["routing_policy"] = stored.RoutingPolicyMemory
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	require.NoError(t, database.First(&stored, token.Id).Error)
+	require.True(t, stored.IsSmartRouting())
+	require.Equal(t, policy, stored.RoutingPolicy)
+	require.Equal(t, policy, stored.RoutingPolicyMemory)
+	require.False(t, stored.CrossGroupRetry)
+	for _, userID := range []int{0, 2} {
+		body["routing_policy_memory"] = ""
+		body["routing_policy"] = ""
+		ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, userID)
+		UpdateToken(ctx)
+		require.False(t, decodeAPIResponse(t, recorder).Success)
+	}
+	body["routing_policy_memory"] = "not-json"
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+	UpdateToken(ctx)
+	require.False(t, decodeAPIResponse(t, recorder).Success)
+	require.NoError(t, database.First(&stored, token.Id).Error)
+	require.Equal(t, policy, stored.RoutingPolicyMemory)
+	require.Equal(t, policy, stored.RoutingPolicy)
+	body = map[string]any{"id": token.Id, "status": common.TokenStatusDisabled, "routing_policy_memory": "not-json"}
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=1", body, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	require.NoError(t, database.First(&stored, token.Id).Error)
+	require.Equal(t, policy, stored.RoutingPolicyMemory)
+}
+
+func TestTokenRoutingMemoryPreservesUnknownFieldsWithoutActivating(t *testing.T) {
+	policy := controllerTestRoutingPolicy(t)
+	policy = policy[:len(policy)-1] + `,"future_extension":{"value":42}}`
+	memory, err := model.ResolveTokenRoutingPolicyMemory("", "", "", &policy)
+	require.NoError(t, err)
+	require.Equal(t, policy, memory)
+	for _, group := range []string{"default", "auto"} {
+		token := model.Token{Group: group, RoutingPolicyMemory: memory}
+		require.False(t, token.IsSmartRouting())
+		active, activeErr := token.GetSmartRoutingPolicy()
+		require.NoError(t, activeErr)
+		require.Nil(t, active)
+	}
+}

@@ -1,0 +1,369 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { ChevronRight, Copy } from 'lucide-react'
+import { memo } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { GroupBadge } from '@/components/group-badge'
+import { StatusBadge } from '@/components/status-badge'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { sortGroupNames } from '@/lib/group-visuals'
+import { getLobeIcon } from '@/lib/lobe-icon'
+import { cn } from '@/lib/utils'
+import { useSystemConfigStore } from '@/stores/system-config-store'
+
+import { DEFAULT_TOKEN_UNIT } from '../constants'
+import { getDynamicPricingSummary } from '../lib/dynamic-price'
+import { parseTags } from '../lib/filters'
+import { isTokenBasedModel } from '../lib/model-helpers'
+import { hasModelParameterPricing } from '../lib/parameter-price'
+import {
+  formatPrice,
+  formatRequestPrice,
+  resolveModelDisplayPricing,
+} from '../lib/price'
+import type { PricingModel, TokenUnit } from '../types'
+import { ActualInputCost } from './actual-input-cost'
+import { ModelGroupPrices } from './model-group-prices'
+import { ModelPerfBadge, type ModelPerfBadgeData } from './model-perf-badge'
+
+export interface ModelCardProps {
+  model: PricingModel
+  onClick: () => void
+  priceRate?: number
+  usdExchangeRate?: number
+  tokenUnit?: TokenUnit
+  showRechargePrice?: boolean
+  selectedGroup?: string
+  perf?: ModelPerfBadgeData
+}
+
+export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
+  const { t } = useTranslation()
+  const { copyToClipboard } = useCopyToClipboard()
+  const groupColors = useSystemConfigStore(
+    (state) => state.config.groupColors ?? {}
+  )
+  const tokenUnit = props.tokenUnit ?? DEFAULT_TOKEN_UNIT
+  const priceRate = props.priceRate ?? 1
+  const usdExchangeRate = props.usdExchangeRate ?? 1
+  const showRechargePrice = props.showRechargePrice ?? false
+  const selectedGroup = props.selectedGroup ?? 'all'
+  const display = resolveModelDisplayPricing(
+    props.model,
+    selectedGroup,
+    props.model.group_ratio
+  )
+  const displayModel = display.pricing.model
+  const isTokenBased = isTokenBasedModel(displayModel)
+  const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
+  const tags = parseTags(props.model.tags)
+  const groups = sortGroupNames(
+    props.model.enable_groups || [],
+    groupColors,
+    (group) => props.model.group_ratio?.[group]
+  )
+  const endpoints = props.model.supported_endpoint_types || []
+  const modelIconKey = props.model.icon || props.model.vendor_icon
+  const modelIcon = modelIconKey ? getLobeIcon(modelIconKey, 28) : null
+  const initial = props.model.model_name?.charAt(0).toUpperCase() || '?'
+  const isDynamicPricing =
+    displayModel.billing_mode === 'tiered_expr' &&
+    Boolean(displayModel.billing_expr)
+  const hasCachedPrice =
+    !hasModelParameterPricing(props.model, selectedGroup) &&
+    isTokenBased &&
+    displayModel.cache_ratio != null
+  const dynamicSummary =
+    isDynamicPricing && !display.variesByGroup
+      ? getDynamicPricingSummary(displayModel, {
+          tokenUnit,
+          showRechargePrice,
+          priceRate,
+          usdExchangeRate,
+          groupRatioMultiplier: display.pricing.groupRatio,
+        })
+      : null
+
+  const primaryGroup =
+    selectedGroup !== 'all' ? selectedGroup : display.pricing.group || groups[0]
+  const billingUnitLabel = (() => {
+    if (hasModelParameterPricing(props.model, selectedGroup)) {
+      return t('Parameter Pricing')
+    }
+    switch (display.pricing.billingUnit) {
+      case 'per_second':
+        return t('Per second')
+      case 'per_image':
+        return t('Per image')
+      case 'fixed_duration':
+        return t('Fixed {{seconds}} seconds', {
+          seconds: display.pricing.fixedDurationSeconds,
+        })
+      case 'per_million_tokens':
+        return t('Token-based')
+      default:
+        return t('Per Request')
+    }
+  })()
+  const bottomTags = [...endpoints.slice(0, 2), ...tags.slice(0, 2)]
+  const hiddenCount =
+    Math.max(groups.length - 1, 0) +
+    Math.max(endpoints.length - 2, 0) +
+    Math.max(tags.length - 2, 0)
+
+  const priceSummary = (() => {
+    if (hasModelParameterPricing(props.model, selectedGroup)) {
+      return (
+        <ModelGroupPrices
+          model={props.model}
+          selectedGroup={selectedGroup}
+          tokenUnit={tokenUnit}
+          showRechargePrice={showRechargePrice}
+          priceRate={priceRate}
+          usdExchangeRate={usdExchangeRate}
+        />
+      )
+    }
+    if (display.variesByGroup) {
+      return (
+        <span className='text-muted-foreground text-xs'>
+          {t('Prices vary by group')}
+        </span>
+      )
+    }
+    if (dynamicSummary) {
+      if (dynamicSummary.isSpecialExpression) {
+        return (
+          <span className='min-w-0'>
+            <span className='text-amber-700 dark:text-amber-300'>
+              {t('Special billing expression')}
+            </span>
+            <code className='text-muted-foreground/70 mt-0.5 line-clamp-1 block font-mono text-[11px] break-all'>
+              {dynamicSummary.rawExpression}
+            </code>
+          </span>
+        )
+      }
+      if (dynamicSummary.primaryEntries.length === 0) {
+        return (
+          <span className='text-muted-foreground text-xs'>
+            {t('Dynamic Pricing')}
+          </span>
+        )
+      }
+      return (
+        <>
+          {dynamicSummary.primaryEntries.map((entry) => (
+            <span
+              key={entry.key}
+              className='text-muted-foreground whitespace-nowrap'
+            >
+              {t(entry.shortLabel)}{' '}
+              <span className='text-foreground font-mono font-semibold'>
+                {entry.formatted}
+              </span>
+              /{tokenUnitLabel}
+            </span>
+          ))}
+        </>
+      )
+    }
+    if (isTokenBased) {
+      return (
+        <>
+          <span className='text-muted-foreground whitespace-nowrap'>
+            {t('Input')}{' '}
+            <span className='text-foreground font-mono font-semibold'>
+              {formatPrice(
+                props.model,
+                'input',
+                tokenUnit,
+                showRechargePrice,
+                priceRate,
+                usdExchangeRate,
+                selectedGroup
+              )}
+            </span>
+            /{tokenUnitLabel}
+          </span>
+          <span className='text-muted-foreground whitespace-nowrap'>
+            {t('Output')}{' '}
+            <span className='text-foreground font-mono font-semibold'>
+              {formatPrice(
+                props.model,
+                'output',
+                tokenUnit,
+                showRechargePrice,
+                priceRate,
+                usdExchangeRate,
+                selectedGroup
+              )}
+            </span>
+            /{tokenUnitLabel}
+          </span>
+          {hasCachedPrice && (
+            <span className='text-muted-foreground/60 whitespace-nowrap'>
+              {t('Cached')}{' '}
+              <span className='font-mono'>
+                {formatPrice(
+                  props.model,
+                  'cache',
+                  tokenUnit,
+                  showRechargePrice,
+                  priceRate,
+                  usdExchangeRate,
+                  selectedGroup
+                )}
+              </span>
+            </span>
+          )}
+        </>
+      )
+    }
+    return (
+      <span className='text-muted-foreground whitespace-nowrap'>
+        <span className='text-foreground font-mono font-semibold'>
+          {formatRequestPrice(
+            props.model,
+            showRechargePrice,
+            priceRate,
+            usdExchangeRate,
+            selectedGroup
+          )}
+        </span>{' '}
+        / {billingUnitLabel}
+      </span>
+    )
+  })()
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    copyToClipboard(props.model.model_name || '')
+  }
+
+  return (
+    <div
+      className={cn(
+        'group relative flex flex-col rounded-xl border p-3 transition-colors sm:p-5',
+        'hover:bg-muted/20'
+      )}
+    >
+      {/* Header: icon + name + price + actions */}
+      <div className='flex items-start justify-between gap-2.5 sm:gap-3'>
+        <div className='flex min-w-0 items-start gap-2.5 sm:gap-3'>
+          <div className='bg-muted/40 flex size-9 shrink-0 items-center justify-center rounded-lg sm:size-10 sm:rounded-xl'>
+            {modelIcon || (
+              <span className='text-muted-foreground text-sm font-bold'>
+                {initial}
+              </span>
+            )}
+          </div>
+          <div className='min-w-0'>
+            <h3 className='text-foreground truncate font-mono text-[15px] leading-tight font-bold'>
+              {props.model.model_name}
+            </h3>
+            <div className='mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs sm:mt-1 sm:gap-x-3'>
+              {priceSummary}
+            </div>
+            <ActualInputCost
+              model={props.model}
+              group={selectedGroup}
+              tokenUnit={tokenUnit}
+              showRechargePrice={showRechargePrice}
+              priceRate={priceRate}
+              usdExchangeRate={usdExchangeRate}
+              compact
+              className='mt-1.5'
+            />
+          </div>
+        </div>
+
+        <div className='flex shrink-0 items-center gap-1.5'>
+          <button
+            type='button'
+            onClick={props.onClick}
+            className='text-muted-foreground hover:text-foreground hover:bg-muted inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition-colors sm:px-2.5 sm:py-1.5'
+          >
+            {t('Details')}
+            <ChevronRight className='size-3.5' />
+          </button>
+          <button
+            type='button'
+            onClick={handleCopy}
+            className='text-muted-foreground hover:text-foreground hover:bg-muted rounded-md border p-1.5 transition-colors'
+            title={t('Copy')}
+          >
+            <Copy className='size-3.5' />
+          </button>
+        </div>
+      </div>
+
+      {/* Description */}
+      <p className='text-muted-foreground mt-2 line-clamp-1 flex-1 text-[13px] leading-relaxed sm:mt-4 sm:line-clamp-2 sm:min-h-[2.5rem]'>
+        {props.model.description || t('No description available.')}
+      </p>
+
+      {/* Footer: left metadata and right performance summary share row alignment */}
+      <div className='mt-2 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-2 gap-y-1 sm:mt-4'>
+        <div className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
+          {primaryGroup && (
+            <GroupBadge
+              group={primaryGroup}
+              ratio={props.model.group_ratio?.[primaryGroup]}
+              size='sm'
+              copyable={false}
+            />
+          )}
+          <span className='text-muted-foreground text-xs font-medium'>
+            {display.variesByGroup ? t('Varies by group') : billingUnitLabel}
+          </span>
+          {isDynamicPricing && (
+            <StatusBadge
+              label={t('Dynamic Pricing')}
+              variant='warning'
+              copyable={false}
+              size='sm'
+            />
+          )}
+        </div>
+        <ModelPerfBadge perf={props.perf} className='row-span-2 self-start' />
+
+        <div className='flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-0.5 sm:gap-x-3 sm:gap-y-1'>
+          {bottomTags.map((item) => (
+            <span key={item} className='text-muted-foreground/70 text-xs'>
+              {item}
+            </span>
+          ))}
+          {isTokenBased &&
+            !hasModelParameterPricing(props.model, selectedGroup) && (
+              <span className='text-muted-foreground/50 text-xs'>
+                {tokenUnitLabel}
+              </span>
+            )}
+          {hiddenCount > 0 && (
+            <span className='text-muted-foreground/40 text-xs'>
+              +{hiddenCount}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+})

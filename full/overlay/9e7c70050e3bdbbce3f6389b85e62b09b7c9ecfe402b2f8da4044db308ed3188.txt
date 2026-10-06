@@ -1,0 +1,47 @@
+package common
+
+import "sync/atomic"
+
+// PerformanceMonitorConfig 性能监控配置
+type PerformanceMonitorConfig struct {
+	Enabled                 bool
+	CPUThreshold            int
+	MemoryThreshold         int
+	DiskThreshold           int
+	ConfirmSeconds          int
+	RecoverySeconds         int
+	HysteresisPercent       int
+	CriticalMemoryThreshold int
+	CriticalDiskThreshold   int
+}
+
+var performanceMonitorConfig atomic.Value
+
+func init() {
+	// 初始化默认配置
+	performanceMonitorConfig.Store(PerformanceMonitorConfig{
+		Enabled:                 true,
+		CPUThreshold:            90,
+		MemoryThreshold:         90,
+		DiskThreshold:           95,
+		ConfirmSeconds:          15,
+		RecoverySeconds:         10,
+		HysteresisPercent:       5,
+		CriticalMemoryThreshold: 97,
+		CriticalDiskThreshold:   99,
+	})
+}
+
+// GetPerformanceMonitorConfig 获取性能监控配置
+func GetPerformanceMonitorConfig() PerformanceMonitorConfig {
+	return performanceMonitorConfig.Load().(PerformanceMonitorConfig)
+}
+
+// SetPerformanceMonitorConfig 设置性能监控配置
+func SetPerformanceMonitorConfig(config PerformanceMonitorConfig) {
+	// 热更新后，旧阈值积累的超限时间不能用于新配置。
+	if GetPerformanceMonitorConfig() != config {
+		performanceMonitorConfig.Store(config)
+		systemProtection.reset()
+	}
+}

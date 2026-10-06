@@ -1,0 +1,18 @@
+package service
+
+import "strings"
+
+func SmartRouteImageObservationID(billingRequestID string) string {
+	billingRequestID = strings.TrimSpace(billingRequestID)
+	if strings.HasPrefix(billingRequestID, smartRouteObservationIdentityVersion+":") {
+		return billingRequestID
+	}
+	return smartRouteCanonicalObservationID("request", billingRequestID)
+}
+
+func smartRouteAttemptAtMS(record SmartRouteAttemptRecord, nowMS int64) int64 {
+	if record.ImageAttempt && record.AtMS > 0 && record.AtMS <= nowMS {
+		return record.AtMS
+	}
+	return nowMS
+}

@@ -1,0 +1,1000 @@
+package smart_router_setting
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/setting/config"
+)
+
+const (
+	ConfigName = "smart_router_setting"
+
+	KillSwitchNormal       = "normal"
+	KillSwitchFallbackOnly = "fallback_only"
+)
+
+const (
+	CapabilityText uint64 = 1 << iota
+	CapabilityStreaming
+	CapabilityTools
+	CapabilityVision
+	CapabilityStructuredOutput
+	CapabilityReasoning
+	CapabilityPromptCache
+	CapabilityImageGeneration
+	CapabilityVideoGeneration
+	CapabilityAsyncTask
+	CapabilityReferenceImage
+	CapabilityReferenceVideo
+	CapabilityReferenceAudio
+	CapabilityAudioSpeech
+	CapabilityAudioTranscription
+)
+
+const KnownCapabilityMask = CapabilityText |
+	CapabilityStreaming |
+	CapabilityTools |
+	CapabilityVision |
+	CapabilityStructuredOutput |
+	CapabilityReasoning |
+	CapabilityPromptCache |
+	CapabilityImageGeneration |
+	CapabilityVideoGeneration |
+	CapabilityAsyncTask |
+	CapabilityReferenceImage |
+	CapabilityReferenceVideo |
+	CapabilityReferenceAudio |
+	CapabilityAudioSpeech |
+	CapabilityAudioTranscription
+
+const (
+	DefaultCatalogRefreshSeconds                  = 30
+	DefaultMaxAttempts                            = 8
+	DefaultMaxFailureThreshold                    = 10
+	DefaultSharedHealthOpenFailureThreshold       = 3
+	DefaultHardFailureWindowSeconds               = 600
+	DefaultProbeInitialBackoffSeconds             = 60
+	DefaultProbeMaxBackoffSeconds                 = 60
+	DefaultMaxProbeFailures                       = 8
+	DefaultMaxOutageSeconds                       = 86400
+	DefaultProbeBudgetPerMinute                   = 30
+	DefaultProbeMaxConcurrency                    = 3
+	DefaultProbeTimeoutSeconds                    = 45
+	DefaultProbeCompletionGraceSeconds            = 15
+	DefaultProbeScanIntervalMS                    = 5_000
+	DefaultProbeQueueCapacity                     = 2_048
+	DefaultProbeLeaseTTLSeconds                   = 75
+	MaximumRecoveryProbeBackoffSeconds            = 300
+	MinimumRecoveryProbeBudgetPerMinute           = 12
+	MinimumRecoveryProbeConcurrency               = 3
+	MaximumRecoveryProbeTimeoutSeconds            = 60
+	DefaultRecoveryFastIntervalSeconds            = 60
+	DefaultRecoveryFastWindowSeconds              = 3600
+	DefaultRecoverySweepIntervalSeconds           = 30
+	DefaultRecoveryCanaryInitialTrafficPPM        = 250_000
+	DefaultRecoveryCanaryHealthySamples           = 3
+	DefaultRecoveryCanaryFastHistorySamples       = 5
+	DefaultRecoveryCanaryFastReliabilityPPM       = 800_000
+	DefaultRecoveryCoverageTarget                 = 1
+	DefaultRecoveryBackupEvidenceTTLSeconds       = 3600
+	DefaultColdStartWaveBatchSize                 = 2
+	DefaultColdStartWaveMaxConcurrency            = 2
+	DefaultColdStartProbeBudgetPerMinute          = 60
+	DefaultColdStartWaitMS                        = 60_000
+	DefaultColdStartPollIntervalMS                = 100
+	AbsoluteMaxProbeTimeoutSeconds                = 86_400
+	DefaultMaxQueueWaitMS                         = 1000
+	DefaultMaxEffectiveRatioPPM             int64 = 1_000_000
+	AbsoluteMaxEffectiveRatioPPM            int64 = 10_000_000
+)
+
+// DiscoverySetting controls only the conservative automatic-discovery
+// boundary. It is a protocol allow-list, not a model/channel publishing
+// allow-list: every enabled route inside the boundary is discovered unless a
+// durable smart_route_blocks row excludes it. AllowedTextEndpoints retains its
+// historical JSON name for rolling-upgrade compatibility and now covers all
+// supported smart-routing endpoint families, including image and video.
+type DiscoverySetting struct {
+	AllowedTextEndpoints []constant.EndpointType `json:"allowed_text_endpoints"`
+	ExcludeVirtualGroups []string                `json:"exclude_virtual_groups"`
+}
+
+// CertifiedGroupSetting is an administrator assertion that an existing New API
+// group may participate in one or more named smart-routing pools. Empty allow
+// lists mean "all routes already certified by the remaining constraints";
+// deny lists always take precedence.
+type CertifiedGroupSetting struct {
+	Pools          []string `json:"pools"`
+	StableFallback bool     `json:"stable_fallback"`
+	ModelAllow     []string `json:"model_allow,omitempty"`
+	ModelDeny      []string `json:"model_deny,omitempty"`
+	ChannelAllow   []int    `json:"channel_allow,omitempty"`
+	AdminOrder     int      `json:"admin_order,omitempty"`
+}
+
+// TextContractSetting describes one capability contract that may be published.
+// Only replay-safe text endpoint families are accepted in phase one.
+// Model and channel filters allow different context/capability contracts to be
+// certified without inventing capabilities from a channel type.
+type TextContractSetting struct {
+	Endpoint     constant.EndpointType `json:"endpoint"`
+	Capabilities uint64                `json:"capabilities"`
+	MaxContext   int                   `json:"max_context"`
+	ModelAllow   []string              `json:"model_allow,omitempty"`
+	ModelDeny    []string              `json:"model_deny,omitempty"`
+	ChannelAllow []int                 `json:"channel_allow,omitempty"`
+}
+
+// ChannelProfileSetting supplies optional administrator-certified endpoint and
+// failure-domain metadata. The map key in Setting.ChannelProfiles is the base-10
+// ChannelID. When a domain is omitted the catalog uses the conservative,
+// channel-local domain "channel:<id>".
+type ChannelProfileSetting struct {
+	EndpointAllow  []constant.EndpointType `json:"endpoint_allow,omitempty"`
+	Capabilities   uint64                  `json:"capabilities,omitempty"`
+	MaxContext     int                     `json:"max_context,omitempty"`
+	CacheDomain    string                  `json:"cache_domain,omitempty"`
+	CapacityDomain string                  `json:"capacity_domain,omitempty"`
+	FailureDomain  string                  `json:"failure_domain,omitempty"`
+	MaxInflight    int                     `json:"max_inflight,omitempty"`
+}
+
+// Setting is persisted through setting/config under ConfigName. It intentionally
+// starts disabled and contains no site-specific group, pool, model, or price.
+type Setting struct {
+	ImageFailureWindowSeconds int              `json:"image_failure_window_seconds"`
+	ImageFailureThreshold     int              `json:"image_failure_threshold"`
+	Enabled                   bool             `json:"enabled"`
+	DefaultForNewKeys         bool             `json:"default_for_new_keys"`
+	Discovery                 DiscoverySetting `json:"discovery"`
+	// CertifiedGroups and TextContracts are accepted only so persisted v3 JSON
+	// can be read during a rolling upgrade. v4 automatic discovery does not use
+	// them as publishing gates.
+	CertifiedGroups                  map[string]CertifiedGroupSetting `json:"certified_groups,omitempty"`
+	TextContracts                    []TextContractSetting            `json:"text_contracts,omitempty"`
+	ChannelProfiles                  map[string]ChannelProfileSetting `json:"channel_profiles"`
+	DefaultPolicy                    smartrouter.Policy               `json:"default_policy"`
+	DefaultMaxEffectiveRatioPPM      int64                            `json:"default_max_effective_ratio_ppm"`
+	AbsoluteMaxEffectiveRatioPPM     int64                            `json:"absolute_max_effective_ratio_ppm"`
+	AttemptLimitEnabled              bool                             `json:"attempt_limit_enabled"`
+	MaxAttempts                      int                              `json:"max_attempts"`
+	MaxFailureThreshold              int                              `json:"max_failure_threshold"`
+	SharedHealthOpenFailureThreshold int                              `json:"shared_health_open_failure_threshold"`
+	HardFailureWindowSeconds         int                              `json:"hard_failure_window_seconds"`
+	CatalogRefreshSeconds            int                              `json:"catalog_refresh_seconds"`
+	ProbeInitialBackoffSeconds       int                              `json:"probe_initial_backoff_seconds"`
+	ProbeMaxBackoffSeconds           int                              `json:"probe_max_backoff_seconds"`
+	MaxProbeFailures                 int                              `json:"max_probe_failures"`
+	MaxOutageSeconds                 int                              `json:"max_outage_seconds"`
+	ProbeBudgetPerMinute             int                              `json:"probe_budget_per_minute"`
+	ProbeMaxConcurrency              int                              `json:"probe_max_concurrency"`
+	ProbeTimeoutSeconds              int                              `json:"probe_timeout_seconds"`
+	ProbeCompletionGraceSeconds      int                              `json:"probe_completion_grace_seconds"`
+	ProbeScanIntervalMS              int                              `json:"probe_scan_interval_ms"`
+	ProbeQueueCapacity               int                              `json:"probe_queue_capacity"`
+	ProbeLeaseTTLSeconds             int                              `json:"probe_lease_ttl_seconds"`
+	RecoveryFastIntervalSeconds      int                              `json:"recovery_fast_interval_seconds"`
+	RecoveryFastWindowSeconds        int                              `json:"recovery_fast_window_seconds"`
+	RecoverySweepIntervalSeconds     int                              `json:"recovery_sweep_interval_seconds"`
+	RecoveryCanaryInitialTrafficPPM  int                              `json:"recovery_canary_initial_traffic_ppm"`
+	RecoveryCanaryHealthySamples     int                              `json:"recovery_canary_healthy_samples"`
+	RecoveryCanaryFastHistorySamples int                              `json:"recovery_canary_fast_history_samples"`
+	RecoveryCanaryFastReliabilityPPM int64                            `json:"recovery_canary_fast_reliability_ppm"`
+	RecoverySlowBackoffSeconds       []int                            `json:"recovery_slow_backoff_seconds"`
+	RecoveryProbeCadenceSeconds      []int                            `json:"recovery_probe_cadence_seconds"`
+	// RecoveryCoverageTarget is retained for rolling-upgrade JSON compatibility.
+	// V4.4 discovery completes after the first confirmed usable route.
+	RecoveryCoverageTarget           int `json:"recovery_coverage_target"`
+	RecoveryBackupEvidenceTTLSeconds int `json:"recovery_backup_evidence_ttl_seconds"`
+	ColdStartWaveBatchSize           int `json:"cold_start_wave_batch_size"`
+	ColdStartWaveMaxConcurrency      int `json:"cold_start_wave_max_concurrency"`
+	ColdStartProbeBudgetPerMinute    int `json:"cold_start_probe_budget_per_minute"`
+	ColdStartWaitMS                  int `json:"cold_start_wait_ms"`
+	ColdStartPollIntervalMS          int `json:"cold_start_poll_interval_ms"`
+	// Nil uses five minutes of demand recovery; explicit zero preserves the
+	// administrator-selected immediate-probe compatibility policy.
+	TextRecoveryProbeAfterSeconds      *int   `json:"text_recovery_probe_after_seconds"`
+	RecoveryFallbackEnabled            *bool  `json:"recovery_fallback_enabled"`
+	TextRecoveryInitialBackoffSeconds  int    `json:"text_recovery_initial_backoff_seconds"`
+	TextRecoveryMaxBackoffSeconds      int    `json:"text_recovery_max_backoff_seconds"`
+	MediaRecoveryInitialBackoffSeconds int    `json:"media_recovery_initial_backoff_seconds"`
+	MediaRecoveryMaxBackoffSeconds     int    `json:"media_recovery_max_backoff_seconds"`
+	BackgroundProbeEnabled             bool   `json:"background_probe_enabled"`
+	MaxQueueWaitMS                     int    `json:"max_queue_wait_ms"`
+	KillSwitchMode                     string `json:"kill_switch_mode"`
+}
+
+var defaultSmartRouterSetting = Setting{
+	Enabled:           false,
+	DefaultForNewKeys: false,
+	Discovery: DiscoverySetting{
+		AllowedTextEndpoints: []constant.EndpointType{
+			constant.EndpointTypeOpenAI,
+			constant.EndpointTypeOpenAIResponse,
+			constant.EndpointTypeAnthropic,
+			constant.EndpointTypeImageGeneration,
+			constant.EndpointTypeOpenAIVideo,
+			constant.EndpointTypeAudioSpeech,
+			constant.EndpointTypeAudioTranscription,
+			constant.EndpointTypeAudioTranslation,
+		},
+		ExcludeVirtualGroups: []string{"auto"},
+	},
+	CertifiedGroups:                  map[string]CertifiedGroupSetting{},
+	TextContracts:                    []TextContractSetting{},
+	ChannelProfiles:                  map[string]ChannelProfileSetting{},
+	DefaultPolicy:                    defaultV4Policy(),
+	DefaultMaxEffectiveRatioPPM:      DefaultMaxEffectiveRatioPPM,
+	AbsoluteMaxEffectiveRatioPPM:     AbsoluteMaxEffectiveRatioPPM,
+	AttemptLimitEnabled:              false,
+	MaxAttempts:                      DefaultMaxAttempts,
+	MaxFailureThreshold:              DefaultMaxFailureThreshold,
+	SharedHealthOpenFailureThreshold: DefaultSharedHealthOpenFailureThreshold,
+	HardFailureWindowSeconds:         DefaultHardFailureWindowSeconds,
+	CatalogRefreshSeconds:            DefaultCatalogRefreshSeconds,
+	ProbeInitialBackoffSeconds:       DefaultProbeInitialBackoffSeconds,
+	ProbeMaxBackoffSeconds:           DefaultProbeMaxBackoffSeconds,
+	MaxProbeFailures:                 DefaultMaxProbeFailures,
+	MaxOutageSeconds:                 DefaultMaxOutageSeconds,
+	ProbeBudgetPerMinute:             DefaultProbeBudgetPerMinute,
+	ProbeMaxConcurrency:              DefaultProbeMaxConcurrency,
+	ProbeTimeoutSeconds:              DefaultProbeTimeoutSeconds,
+	ProbeCompletionGraceSeconds:      DefaultProbeCompletionGraceSeconds,
+	ProbeScanIntervalMS:              DefaultProbeScanIntervalMS,
+	ProbeQueueCapacity:               DefaultProbeQueueCapacity,
+	ProbeLeaseTTLSeconds:             DefaultProbeLeaseTTLSeconds,
+	RecoveryFastIntervalSeconds:      DefaultRecoveryFastIntervalSeconds,
+	ImageFailureWindowSeconds:        int(smartrouter.DefaultImageFailureWindowMS / 1000),
+	ImageFailureThreshold:            smartrouter.DefaultImageFailureThreshold,
+	RecoveryFastWindowSeconds:        DefaultRecoveryFastWindowSeconds,
+	RecoverySweepIntervalSeconds:     DefaultRecoverySweepIntervalSeconds,
+	RecoveryCanaryInitialTrafficPPM:  DefaultRecoveryCanaryInitialTrafficPPM,
+	RecoveryCanaryHealthySamples:     DefaultRecoveryCanaryHealthySamples,
+	RecoveryCanaryFastHistorySamples: DefaultRecoveryCanaryFastHistorySamples,
+	RecoveryCanaryFastReliabilityPPM: DefaultRecoveryCanaryFastReliabilityPPM,
+	// Kept as a compatibility field, but every recovery opportunity must stay
+	// within the five-minute probe contract. Legacy 15/60-minute tiers are
+	// normalized away and must not be emitted as the new default.
+	RecoverySlowBackoffSeconds:       []int{MaximumRecoveryProbeBackoffSeconds},
+	RecoveryProbeCadenceSeconds:      []int{10, 20, 40, 60, 120, 240, MaximumRecoveryProbeBackoffSeconds},
+	RecoveryCoverageTarget:           DefaultRecoveryCoverageTarget,
+	RecoveryBackupEvidenceTTLSeconds: DefaultRecoveryBackupEvidenceTTLSeconds,
+	ColdStartWaveBatchSize:           DefaultColdStartWaveBatchSize,
+	ColdStartWaveMaxConcurrency:      DefaultColdStartWaveMaxConcurrency,
+	ColdStartProbeBudgetPerMinute:    DefaultColdStartProbeBudgetPerMinute,
+	ColdStartWaitMS:                  DefaultColdStartWaitMS,
+	ColdStartPollIntervalMS:          DefaultColdStartPollIntervalMS,
+	BackgroundProbeEnabled:           true,
+	MaxQueueWaitMS:                   DefaultMaxQueueWaitMS,
+	KillSwitchMode:                   KillSwitchNormal,
+}
+
+func defaultV4Policy() smartrouter.Policy {
+	return smartrouter.NormalizePolicy(smartrouter.Policy{
+		Version:                    smartrouter.PolicyVersion,
+		Enabled:                    true,
+		Strategy:                   smartrouter.StrategyPrice,
+		MaxAttempts:                smartrouter.DefaultPolicyMaxAttempts,
+		FailureThreshold:           smartrouter.DefaultPolicyFailureThreshold,
+		MaxEffectiveRatioPPM:       0,
+		ExcludedGroups:             []string{},
+		ExcludedRoutes:             []string{},
+		ContractOverrides:          map[string]smartrouter.ContractOverride{},
+		HealthGuard:                true,
+		RecoveryProfile:            smartrouter.RecoveryBalanced,
+		AffinityEnabled:            true,
+		AffinityMaxPremiumPercent:  0,
+		AffinityTTLSeconds:         1800,
+		AllowFutureGroups:          true,
+		AllowFutureCertifiedRoutes: true,
+		QueuePolicy:                smartrouter.QueuePolicy{Mode: smartrouter.QueueModeNoQueue},
+		BalancedWeights:            smartrouter.DefaultBalancedWeights(),
+	})
+}
+
+type atomicSettingValue struct {
+	target *atomic.Pointer[Setting]
+}
+
+type registeredSetting struct {
+	Config atomicSettingValue `json:"config"`
+}
+
+var (
+	currentSetting      atomic.Pointer[Setting]
+	settingRegistration registeredSetting
+	listenerSequence    atomic.Uint64
+	listenersMu         sync.RWMutex
+	listeners           = make(map[uint64]func())
+)
+
+func init() {
+	initial := Normalize(defaultSmartRouterSetting)
+	currentSetting.Store(&initial)
+	settingRegistration.Config.target = &currentSetting
+	config.GlobalConfig.Register(ConfigName, &settingRegistration)
+}
+
+// GetSmartRouterSetting returns an independent snapshot. Mutating the returned
+// value does not alter runtime configuration; use ReplaceSmartRouterSetting.
+func GetSmartRouterSetting() *Setting {
+	snapshot := GetSmartRouterSettingSnapshot()
+	return &snapshot
+}
+
+func GetSmartRouterSettingSnapshot() Setting {
+	setting := currentSetting.Load()
+	if setting == nil {
+		return Clone(defaultSmartRouterSetting)
+	}
+	return Clone(*setting)
+}
+
+// EffectiveProbeLeaseTTLSeconds keeps the distributed lease alive for the
+// complete first-text deadline and response-drain grace period. The persisted
+// lease value remains a backwards-compatible optional floor; administrators
+// normally only need to tune probe_timeout_seconds.
+func (setting Setting) EffectiveProbeLeaseTTLSeconds() int {
+	setting = Normalize(setting)
+	derived64 := int64(setting.ProbeTimeoutSeconds) + int64(setting.ProbeCompletionGraceSeconds) + 15
+	maxInt := int64(^uint(0) >> 1)
+	if derived64 < 1 || derived64 > maxInt {
+		derived64 = maxInt
+	}
+	derived := int(derived64)
+	if setting.ProbeLeaseTTLSeconds > derived {
+		return setting.ProbeLeaseTTLSeconds
+	}
+	return derived
+}
+
+// ReplaceSmartRouterSetting validates and atomically publishes a complete
+// immutable snapshot, then notifies catalog/price managers to invalidate their
+// derived state. Invalid updates leave the last valid configuration untouched.
+func ReplaceSmartRouterSetting(next Setting) error {
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	normalized := Normalize(next)
+	published := normalized
+	currentSetting.Store(&published)
+	notifySettingListeners()
+	return nil
+}
+
+func SubscribeSmartRouterSettingChanges(listener func()) func() {
+	if listener == nil {
+		return func() {}
+	}
+	id := listenerSequence.Add(1)
+	listenersMu.Lock()
+	listeners[id] = listener
+	listenersMu.Unlock()
+	return func() {
+		listenersMu.Lock()
+		delete(listeners, id)
+		listenersMu.Unlock()
+	}
+}
+
+func notifySettingListeners() {
+	listenersMu.RLock()
+	snapshot := make([]func(), 0, len(listeners))
+	for _, listener := range listeners {
+		snapshot = append(snapshot, listener)
+	}
+	listenersMu.RUnlock()
+	for _, listener := range snapshot {
+		listener()
+	}
+}
+
+func (value atomicSettingValue) MarshalJSON() ([]byte, error) {
+	if value.target == nil {
+		return common.Marshal(Normalize(defaultSmartRouterSetting))
+	}
+	setting := value.target.Load()
+	if setting == nil {
+		return common.Marshal(Normalize(defaultSmartRouterSetting))
+	}
+	return common.Marshal(setting)
+}
+
+func (value *atomicSettingValue) UnmarshalJSON(data []byte) error {
+	var setting Setting
+	if err := common.Unmarshal(data, &setting); err != nil {
+		return err
+	}
+	// V4.0 persisted this field as false because the background worker did not
+	// exist yet. A missing V4.1 timeout distinguishes that legacy value from an
+	// administrator's explicit opt-out in a current configuration.
+	var presence struct {
+		ProbeTimeoutSeconds *int `json:"probe_timeout_seconds"`
+	}
+	if err := common.Unmarshal(data, &presence); err != nil {
+		return err
+	}
+	if presence.ProbeTimeoutSeconds == nil {
+		setting.BackgroundProbeEnabled = true
+	}
+	return ReplaceSmartRouterSetting(setting)
+}
+
+func Clone(source Setting) Setting {
+	clone := source
+	if source.RecoveryFallbackEnabled != nil {
+		value := *source.RecoveryFallbackEnabled
+		clone.RecoveryFallbackEnabled = &value
+	}
+	if source.TextRecoveryProbeAfterSeconds != nil {
+		value := *source.TextRecoveryProbeAfterSeconds
+		clone.TextRecoveryProbeAfterSeconds = &value
+	}
+	clone.Discovery.AllowedTextEndpoints = append([]constant.EndpointType(nil), source.Discovery.AllowedTextEndpoints...)
+	clone.Discovery.ExcludeVirtualGroups = append([]string(nil), source.Discovery.ExcludeVirtualGroups...)
+	clone.CertifiedGroups = make(map[string]CertifiedGroupSetting, len(source.CertifiedGroups))
+	for group, rule := range source.CertifiedGroups {
+		rule.Pools = append([]string(nil), rule.Pools...)
+		rule.ModelAllow = append([]string(nil), rule.ModelAllow...)
+		rule.ModelDeny = append([]string(nil), rule.ModelDeny...)
+		rule.ChannelAllow = append([]int(nil), rule.ChannelAllow...)
+		clone.CertifiedGroups[group] = rule
+	}
+	clone.TextContracts = make([]TextContractSetting, len(source.TextContracts))
+	clone.RecoverySlowBackoffSeconds = append([]int(nil), source.RecoverySlowBackoffSeconds...)
+	for index, contract := range source.TextContracts {
+		contract.ModelAllow = append([]string(nil), contract.ModelAllow...)
+		contract.ModelDeny = append([]string(nil), contract.ModelDeny...)
+		contract.ChannelAllow = append([]int(nil), contract.ChannelAllow...)
+		clone.TextContracts[index] = contract
+	}
+	clone.ChannelProfiles = make(map[string]ChannelProfileSetting, len(source.ChannelProfiles))
+	for channelID, profile := range source.ChannelProfiles {
+		profile.EndpointAllow = append([]constant.EndpointType(nil), profile.EndpointAllow...)
+		clone.ChannelProfiles[channelID] = profile
+	}
+	clone.DefaultPolicy = smartrouter.NormalizePolicy(source.DefaultPolicy)
+	return clone
+}
+
+func (setting Setting) TextProbeDelayMS() int64 {
+	if setting.TextRecoveryProbeAfterSeconds == nil {
+		return 300_000
+	}
+	return int64(*setting.TextRecoveryProbeAfterSeconds) * 1000
+}
+
+func (setting Setting) RecoveryFallbackAllowed() bool {
+	return setting.RecoveryFallbackEnabled == nil || *setting.RecoveryFallbackEnabled
+}
+
+func Normalize(source Setting) Setting {
+	normalized := Clone(source)
+	if normalized.ImageFailureWindowSeconds == 0 {
+		normalized.ImageFailureWindowSeconds = int(smartrouter.DefaultImageFailureWindowMS / 1000)
+	}
+	if normalized.ImageFailureThreshold == 0 {
+		normalized.ImageFailureThreshold = smartrouter.DefaultImageFailureThreshold
+	}
+	if normalized.RecoveryFallbackEnabled == nil {
+		value := true
+		normalized.RecoveryFallbackEnabled = &value
+	}
+	if normalized.TextRecoveryProbeAfterSeconds == nil {
+		value := 300
+		normalized.TextRecoveryProbeAfterSeconds = &value
+	}
+	if *normalized.TextRecoveryProbeAfterSeconds < 0 || *normalized.TextRecoveryProbeAfterSeconds > 300 {
+		*normalized.TextRecoveryProbeAfterSeconds = 300
+	}
+	if normalized.TextRecoveryInitialBackoffSeconds <= 0 || normalized.TextRecoveryInitialBackoffSeconds > 300 {
+		normalized.TextRecoveryInitialBackoffSeconds = 2
+	}
+	if normalized.TextRecoveryMaxBackoffSeconds < 300 || normalized.TextRecoveryMaxBackoffSeconds > 600 {
+		normalized.TextRecoveryMaxBackoffSeconds = 600
+	}
+	if normalized.MediaRecoveryInitialBackoffSeconds <= 0 {
+		normalized.MediaRecoveryInitialBackoffSeconds = 60
+	}
+	if normalized.MediaRecoveryInitialBackoffSeconds > 3600 {
+		normalized.MediaRecoveryInitialBackoffSeconds = 3600
+	}
+	if normalized.MediaRecoveryMaxBackoffSeconds <= 0 || normalized.MediaRecoveryMaxBackoffSeconds > 3600 {
+		normalized.MediaRecoveryMaxBackoffSeconds = 3600
+	}
+	if normalized.MediaRecoveryMaxBackoffSeconds < normalized.MediaRecoveryInitialBackoffSeconds {
+		normalized.MediaRecoveryInitialBackoffSeconds = normalized.MediaRecoveryMaxBackoffSeconds
+	}
+	if source.ProbeTimeoutSeconds == 0 && source.ProbeCompletionGraceSeconds == 0 {
+		// Direct callers, including an older admin client, do not pass through
+		// atomicSettingValue.UnmarshalJSON. Give the same legacy document the
+		// safe V4.1 default instead of reviving request-driven probes.
+		normalized.BackgroundProbeEnabled = true
+	}
+	if normalized.DefaultPolicy.Version == 0 {
+		normalized.DefaultPolicy = defaultV4Policy()
+	}
+	if len(normalized.Discovery.AllowedTextEndpoints) == 0 {
+		normalized.Discovery.AllowedTextEndpoints = append(
+			[]constant.EndpointType(nil), defaultSmartRouterSetting.Discovery.AllowedTextEndpoints...,
+		)
+	}
+	if len(normalized.Discovery.ExcludeVirtualGroups) == 0 {
+		normalized.Discovery.ExcludeVirtualGroups = append(
+			[]string(nil), defaultSmartRouterSetting.Discovery.ExcludeVirtualGroups...,
+		)
+	}
+	// This historical field remains in persisted JSON for compatibility. Keep
+	// explicit text protocol assertions, but always migrate the two V4.1 media
+	// families into discovery; explicit smart-route blocks are their opt-out
+	// mechanism. This upgrades the production V4 text-only document without
+	// inventing additional text contracts for deliberately narrow channels.
+	endpointSet := make(map[constant.EndpointType]struct{}, len(normalized.Discovery.AllowedTextEndpoints)+5)
+	for _, endpoint := range normalized.Discovery.AllowedTextEndpoints {
+		endpointSet[endpoint] = struct{}{}
+	}
+	endpointSet[constant.EndpointTypeImageGeneration] = struct{}{}
+	endpointSet[constant.EndpointTypeOpenAIVideo] = struct{}{}
+	endpointSet[constant.EndpointTypeAudioSpeech] = struct{}{}
+	endpointSet[constant.EndpointTypeAudioTranscription] = struct{}{}
+	endpointSet[constant.EndpointTypeAudioTranslation] = struct{}{}
+	mergedEndpoints := make([]constant.EndpointType, 0, len(endpointSet))
+	for endpoint := range endpointSet {
+		mergedEndpoints = append(mergedEndpoints, endpoint)
+	}
+	normalized.Discovery.AllowedTextEndpoints = canonicalEndpoints(mergedEndpoints)
+	normalized.Discovery.ExcludeVirtualGroups = canonicalStrings(normalized.Discovery.ExcludeVirtualGroups)
+	if normalized.DefaultMaxEffectiveRatioPPM == 0 {
+		normalized.DefaultMaxEffectiveRatioPPM = DefaultMaxEffectiveRatioPPM
+	}
+	if normalized.AbsoluteMaxEffectiveRatioPPM == 0 {
+		normalized.AbsoluteMaxEffectiveRatioPPM = AbsoluteMaxEffectiveRatioPPM
+	}
+	if normalized.MaxAttempts == 0 {
+		normalized.MaxAttempts = DefaultMaxAttempts
+	}
+	if normalized.MaxFailureThreshold == 0 {
+		normalized.MaxFailureThreshold = DefaultMaxFailureThreshold
+	}
+	if normalized.SharedHealthOpenFailureThreshold == 0 {
+		normalized.SharedHealthOpenFailureThreshold = DefaultSharedHealthOpenFailureThreshold
+	}
+	if normalized.HardFailureWindowSeconds == 0 {
+		normalized.HardFailureWindowSeconds = DefaultHardFailureWindowSeconds
+	}
+	if normalized.CatalogRefreshSeconds == 0 {
+		normalized.CatalogRefreshSeconds = DefaultCatalogRefreshSeconds
+	}
+	if normalized.ProbeInitialBackoffSeconds == 0 {
+		normalized.ProbeInitialBackoffSeconds = DefaultProbeInitialBackoffSeconds
+	}
+	if normalized.ProbeMaxBackoffSeconds == 0 {
+		normalized.ProbeMaxBackoffSeconds = DefaultProbeMaxBackoffSeconds
+	}
+	if normalized.ProbeInitialBackoffSeconds > MaximumRecoveryProbeBackoffSeconds {
+		normalized.ProbeInitialBackoffSeconds = MaximumRecoveryProbeBackoffSeconds
+	}
+	if normalized.ProbeMaxBackoffSeconds > MaximumRecoveryProbeBackoffSeconds {
+		normalized.ProbeMaxBackoffSeconds = MaximumRecoveryProbeBackoffSeconds
+	}
+	if normalized.ProbeMaxBackoffSeconds < normalized.ProbeInitialBackoffSeconds {
+		normalized.ProbeMaxBackoffSeconds = normalized.ProbeInitialBackoffSeconds
+	}
+	if normalized.MaxProbeFailures == 0 {
+		normalized.MaxProbeFailures = DefaultMaxProbeFailures
+	}
+	if normalized.MaxOutageSeconds == 0 {
+		normalized.MaxOutageSeconds = DefaultMaxOutageSeconds
+	}
+	if normalized.ProbeBudgetPerMinute == 0 {
+		normalized.ProbeBudgetPerMinute = DefaultProbeBudgetPerMinute
+	}
+	if normalized.ProbeBudgetPerMinute < MinimumRecoveryProbeBudgetPerMinute {
+		normalized.ProbeBudgetPerMinute = MinimumRecoveryProbeBudgetPerMinute
+	}
+	if normalized.ProbeMaxConcurrency == 0 {
+		normalized.ProbeMaxConcurrency = DefaultProbeMaxConcurrency
+	}
+	if normalized.ProbeMaxConcurrency < MinimumRecoveryProbeConcurrency {
+		normalized.ProbeMaxConcurrency = MinimumRecoveryProbeConcurrency
+	}
+	if normalized.ProbeTimeoutSeconds == 0 {
+		normalized.ProbeTimeoutSeconds = DefaultProbeTimeoutSeconds
+	}
+	if normalized.ProbeTimeoutSeconds > MaximumRecoveryProbeTimeoutSeconds {
+		normalized.ProbeTimeoutSeconds = MaximumRecoveryProbeTimeoutSeconds
+	}
+	if normalized.ProbeCompletionGraceSeconds == 0 {
+		normalized.ProbeCompletionGraceSeconds = DefaultProbeCompletionGraceSeconds
+	}
+	if normalized.ProbeScanIntervalMS == 0 {
+		normalized.ProbeScanIntervalMS = DefaultProbeScanIntervalMS
+	}
+	if normalized.ProbeQueueCapacity == 0 {
+		normalized.ProbeQueueCapacity = DefaultProbeQueueCapacity
+	}
+	if normalized.ProbeLeaseTTLSeconds == 0 {
+		normalized.ProbeLeaseTTLSeconds = DefaultProbeLeaseTTLSeconds
+	}
+	if normalized.RecoveryFastIntervalSeconds == 0 {
+		normalized.RecoveryFastIntervalSeconds = DefaultRecoveryFastIntervalSeconds
+	}
+	if normalized.RecoveryFastIntervalSeconds > MaximumRecoveryProbeBackoffSeconds {
+		normalized.RecoveryFastIntervalSeconds = MaximumRecoveryProbeBackoffSeconds
+	}
+	if normalized.RecoveryFastWindowSeconds == 0 {
+		normalized.RecoveryFastWindowSeconds = DefaultRecoveryFastWindowSeconds
+	}
+	if normalized.RecoveryFastWindowSeconds < normalized.RecoveryFastIntervalSeconds {
+		normalized.RecoveryFastWindowSeconds = normalized.RecoveryFastIntervalSeconds
+	}
+	if normalized.RecoverySweepIntervalSeconds == 0 {
+		normalized.RecoverySweepIntervalSeconds = DefaultRecoverySweepIntervalSeconds
+	}
+	if normalized.RecoveryCanaryInitialTrafficPPM == 0 {
+		normalized.RecoveryCanaryInitialTrafficPPM = DefaultRecoveryCanaryInitialTrafficPPM
+	}
+	if normalized.RecoveryCanaryHealthySamples == 0 {
+		normalized.RecoveryCanaryHealthySamples = DefaultRecoveryCanaryHealthySamples
+	}
+	if normalized.RecoveryCanaryFastHistorySamples == 0 {
+		normalized.RecoveryCanaryFastHistorySamples = DefaultRecoveryCanaryFastHistorySamples
+	}
+	if normalized.RecoveryCanaryFastReliabilityPPM == 0 {
+		normalized.RecoveryCanaryFastReliabilityPPM = DefaultRecoveryCanaryFastReliabilityPPM
+	}
+	// Retain the JSON field for rolling compatibility, but remove the old
+	// 15/60-minute slow-recovery tiers from runtime behavior.
+	normalized.RecoverySlowBackoffSeconds = []int{MaximumRecoveryProbeBackoffSeconds}
+	if len(normalized.RecoveryProbeCadenceSeconds) == 0 {
+		normalized.RecoveryProbeCadenceSeconds = []int{10, 20, 40, 60, 120, 240, MaximumRecoveryProbeBackoffSeconds}
+	} else {
+		normalized.RecoveryProbeCadenceSeconds = append([]int(nil), normalized.RecoveryProbeCadenceSeconds...)
+	}
+	normalized.RecoveryCoverageTarget = DefaultRecoveryCoverageTarget
+	if normalized.RecoveryBackupEvidenceTTLSeconds == 0 {
+		normalized.RecoveryBackupEvidenceTTLSeconds = DefaultRecoveryBackupEvidenceTTLSeconds
+	}
+	if normalized.ColdStartWaveBatchSize == 0 {
+		normalized.ColdStartWaveBatchSize = DefaultColdStartWaveBatchSize
+	}
+	if normalized.ColdStartWaveMaxConcurrency == 0 {
+		normalized.ColdStartWaveMaxConcurrency = DefaultColdStartWaveMaxConcurrency
+	}
+	if normalized.ColdStartProbeBudgetPerMinute == 0 {
+		normalized.ColdStartProbeBudgetPerMinute = DefaultColdStartProbeBudgetPerMinute
+	}
+	if normalized.ColdStartWaitMS == 0 {
+		normalized.ColdStartWaitMS = DefaultColdStartWaitMS
+	}
+	if normalized.ColdStartPollIntervalMS == 0 {
+		normalized.ColdStartPollIntervalMS = DefaultColdStartPollIntervalMS
+	}
+	if normalized.MaxQueueWaitMS == 0 {
+		normalized.MaxQueueWaitMS = DefaultMaxQueueWaitMS
+	}
+	if strings.TrimSpace(normalized.KillSwitchMode) == "" {
+		normalized.KillSwitchMode = KillSwitchNormal
+	}
+	normalized.KillSwitchMode = strings.TrimSpace(normalized.KillSwitchMode)
+	normalized.DefaultPolicy = smartrouter.NormalizePolicy(normalized.DefaultPolicy)
+
+	groups := make(map[string]CertifiedGroupSetting, len(normalized.CertifiedGroups))
+	for group, rule := range normalized.CertifiedGroups {
+		group = strings.TrimSpace(group)
+		rule.Pools = canonicalStrings(rule.Pools)
+		rule.ModelAllow = canonicalStrings(rule.ModelAllow)
+		rule.ModelDeny = canonicalStrings(rule.ModelDeny)
+		rule.ChannelAllow = canonicalPositiveInts(rule.ChannelAllow)
+		groups[group] = rule
+	}
+	normalized.CertifiedGroups = groups
+
+	for index := range normalized.TextContracts {
+		contract := &normalized.TextContracts[index]
+		contract.Endpoint = constant.EndpointType(strings.TrimSpace(string(contract.Endpoint)))
+		contract.ModelAllow = canonicalStrings(contract.ModelAllow)
+		contract.ModelDeny = canonicalStrings(contract.ModelDeny)
+		contract.ChannelAllow = canonicalPositiveInts(contract.ChannelAllow)
+	}
+	sort.Slice(normalized.TextContracts, func(i, j int) bool {
+		return textContractIdentity(normalized.TextContracts[i]) < textContractIdentity(normalized.TextContracts[j])
+	})
+
+	profiles := make(map[string]ChannelProfileSetting, len(normalized.ChannelProfiles))
+	for channelID, profile := range normalized.ChannelProfiles {
+		channelID = strings.TrimSpace(channelID)
+		profile.CacheDomain = strings.TrimSpace(profile.CacheDomain)
+		profile.CapacityDomain = strings.TrimSpace(profile.CapacityDomain)
+		profile.FailureDomain = strings.TrimSpace(profile.FailureDomain)
+		profile.EndpointAllow = canonicalEndpoints(profile.EndpointAllow)
+		profiles[channelID] = profile
+	}
+	normalized.ChannelProfiles = profiles
+	return normalized
+}
+
+func (setting Setting) Validate() error {
+	if err := validateUnnormalizedMapKeys(setting); err != nil {
+		return err
+	}
+	setting = Normalize(setting)
+	if setting.ImageFailureWindowSeconds < 1 || setting.ImageFailureWindowSeconds > 86400 ||
+		setting.ImageFailureThreshold < 1 || setting.ImageFailureThreshold > 100000 {
+		return fmt.Errorf("smart router: invalid image failure window or threshold")
+	}
+	if setting.KillSwitchMode != "" && setting.KillSwitchMode != KillSwitchNormal && setting.KillSwitchMode != KillSwitchFallbackOnly {
+		return fmt.Errorf("smart router: unsupported kill_switch_mode %q", setting.KillSwitchMode)
+	}
+
+	for index, endpoint := range setting.Discovery.AllowedTextEndpoints {
+		if !IsSupportedEndpoint(endpoint) {
+			return fmt.Errorf("smart router: discovery.allowed_text_endpoints[%d] has unsupported endpoint %q", index, endpoint)
+		}
+	}
+	if len(setting.Discovery.AllowedTextEndpoints) == 0 {
+		return fmt.Errorf("smart router: discovery.allowed_text_endpoints must not be empty")
+	}
+	for _, group := range setting.Discovery.ExcludeVirtualGroups {
+		if strings.TrimSpace(group) == "" {
+			return fmt.Errorf("smart router: discovery.exclude_virtual_groups cannot contain an empty group")
+		}
+	}
+
+	// CertifiedGroups and TextContracts are v3 decode-only fields. v4 builds
+	// its catalog from enabled channels and abilities, so stale or malformed
+	// values in those fields must never block automatic discovery.
+
+	for channelID, profile := range setting.ChannelProfiles {
+		parsedID, err := strconv.Atoi(channelID)
+		if err != nil || parsedID <= 0 {
+			return fmt.Errorf("smart router: channel profile key %q must be a positive ChannelID", channelID)
+		}
+		for _, endpoint := range profile.EndpointAllow {
+			if !IsSupportedEndpoint(endpoint) {
+				return fmt.Errorf("smart router: channel profile %q has unsupported endpoint %q", channelID, endpoint)
+			}
+		}
+		if profile.MaxInflight < 0 {
+			return fmt.Errorf("smart router: channel profile %q max_inflight cannot be negative", channelID)
+		}
+		if profile.MaxContext < 0 {
+			return fmt.Errorf("smart router: channel profile %q max_context cannot be negative", channelID)
+		}
+		if profile.Capabilities&^KnownCapabilityMask != 0 {
+			return fmt.Errorf("smart router: channel profile %q capabilities contain unsupported bits", channelID)
+		}
+	}
+
+	if !setting.Enabled {
+		if setting.DefaultForNewKeys {
+			return fmt.Errorf("smart router: default_for_new_keys requires enabled=true")
+		}
+		return nil
+	}
+	if common.BatchUpdateEnabled {
+		return fmt.Errorf("smart router: strict billing requires BATCH_UPDATE_ENABLED=false")
+	}
+	if setting.MaxAttempts < 1 || setting.MaxAttempts > 8 {
+		return fmt.Errorf("smart router: max_attempts must be between 1 and 8")
+	}
+	if setting.CatalogRefreshSeconds < 10 || setting.CatalogRefreshSeconds > 3600 {
+		return fmt.Errorf("smart router: catalog_refresh_seconds must be between 10 and 3600")
+	}
+	if setting.KillSwitchMode == "" {
+		return fmt.Errorf("smart router: kill_switch_mode is required")
+	}
+	if !setting.DefaultPolicy.Enabled {
+		return fmt.Errorf("smart router: default_policy must be enabled")
+	}
+	if err := setting.DefaultPolicy.Validate(); err != nil {
+		return fmt.Errorf("smart router: invalid default_policy: %w", err)
+	}
+	if setting.DefaultMaxEffectiveRatioPPM <= 0 || setting.AbsoluteMaxEffectiveRatioPPM <= 0 ||
+		setting.DefaultMaxEffectiveRatioPPM > setting.AbsoluteMaxEffectiveRatioPPM {
+		return fmt.Errorf("smart router: effective ratio limits must be positive and default must not exceed absolute")
+	}
+	if setting.MaxFailureThreshold < 1 || setting.MaxFailureThreshold > 100 {
+		return fmt.Errorf("smart router: max_failure_threshold must be between 1 and 100")
+	}
+	if setting.SharedHealthOpenFailureThreshold < 2 || setting.SharedHealthOpenFailureThreshold > 10 {
+		return fmt.Errorf("smart router: shared_health_open_failure_threshold must be between 2 and 10")
+	}
+	if setting.HardFailureWindowSeconds < 10 || setting.HardFailureWindowSeconds > 86400 {
+		return fmt.Errorf("smart router: hard_failure_window_seconds must be between 10 and 86400")
+	}
+	if setting.ProbeInitialBackoffSeconds < 1 || setting.ProbeMaxBackoffSeconds < setting.ProbeInitialBackoffSeconds ||
+		setting.ProbeMaxBackoffSeconds > MaximumRecoveryProbeBackoffSeconds {
+		return fmt.Errorf("smart router: probe backoff limits are invalid")
+	}
+	if setting.MaxProbeFailures < 1 || setting.MaxProbeFailures > 100 {
+		return fmt.Errorf("smart router: max_probe_failures must be between 1 and 100")
+	}
+	if setting.MaxOutageSeconds < setting.ProbeInitialBackoffSeconds || setting.MaxOutageSeconds > 604800 {
+		return fmt.Errorf("smart router: max_outage_seconds is invalid")
+	}
+	if setting.ProbeTimeoutSeconds < 1 || setting.ProbeTimeoutSeconds > AbsoluteMaxProbeTimeoutSeconds {
+		return fmt.Errorf("smart router: probe_timeout_seconds must be between 1 and %d (30-60 is recommended)", AbsoluteMaxProbeTimeoutSeconds)
+	}
+	if setting.ProbeCompletionGraceSeconds < 1 || setting.ProbeCompletionGraceSeconds > AbsoluteMaxProbeTimeoutSeconds {
+		return fmt.Errorf("smart router: probe_completion_grace_seconds must be between 1 and %d", AbsoluteMaxProbeTimeoutSeconds)
+	}
+	if setting.ProbeBudgetPerMinute < 1 || setting.ProbeBudgetPerMinute > 10000 ||
+		setting.ProbeMaxConcurrency < 1 || setting.ProbeMaxConcurrency > 100 ||
+		setting.ProbeScanIntervalMS < 100 || setting.ProbeScanIntervalMS > 60000 ||
+		setting.ProbeQueueCapacity < 1 || setting.ProbeQueueCapacity > 100000 ||
+		setting.ProbeLeaseTTLSeconds < 1 || setting.ProbeLeaseTTLSeconds > 172815 {
+		return fmt.Errorf("smart router: probe budget or lease limits are invalid")
+	}
+	if setting.RecoveryFastIntervalSeconds < 1 || setting.RecoveryFastIntervalSeconds > MaximumRecoveryProbeBackoffSeconds ||
+		setting.RecoveryFastWindowSeconds < setting.RecoveryFastIntervalSeconds ||
+		setting.RecoveryFastWindowSeconds > 86400 ||
+		setting.RecoverySweepIntervalSeconds < 5 || setting.RecoverySweepIntervalSeconds > 3600 ||
+		setting.RecoveryCoverageTarget < 1 || setting.RecoveryCoverageTarget > 8 ||
+		setting.RecoveryBackupEvidenceTTLSeconds < 60 || setting.RecoveryBackupEvidenceTTLSeconds > 604800 {
+		return fmt.Errorf("smart router: recovery schedule or coverage limits are invalid")
+	}
+	if setting.RecoveryCanaryInitialTrafficPPM < 1 || setting.RecoveryCanaryInitialTrafficPPM > 1_000_000 ||
+		setting.RecoveryCanaryHealthySamples < 1 || setting.RecoveryCanaryHealthySamples > 100 ||
+		setting.RecoveryCanaryFastHistorySamples < 1 || setting.RecoveryCanaryFastHistorySamples > 100000 ||
+		setting.RecoveryCanaryFastReliabilityPPM < 0 || setting.RecoveryCanaryFastReliabilityPPM > 1_000_000 {
+		return fmt.Errorf("smart router: recovery canary settings are invalid")
+	}
+	previousRecoveryDelay := 0
+	for _, delay := range setting.RecoverySlowBackoffSeconds {
+		if delay < 1 || delay < previousRecoveryDelay || delay > MaximumRecoveryProbeBackoffSeconds {
+			return fmt.Errorf("smart router: recovery_slow_backoff_seconds must be positive, non-decreasing and at most 300")
+		}
+		previousRecoveryDelay = delay
+	}
+	if len(setting.RecoveryProbeCadenceSeconds) == 0 || len(setting.RecoveryProbeCadenceSeconds) > 16 {
+		return fmt.Errorf("smart router: recovery_probe_cadence_seconds must contain 1 to 16 entries")
+	}
+	previousRecoveryDelay = 0
+	for _, delay := range setting.RecoveryProbeCadenceSeconds {
+		if delay < 1 || delay < previousRecoveryDelay || delay > MaximumRecoveryProbeBackoffSeconds {
+			return fmt.Errorf("smart router: recovery_probe_cadence_seconds must be positive, non-decreasing and at most 300")
+		}
+		previousRecoveryDelay = delay
+	}
+	if setting.ColdStartWaveBatchSize < 1 || setting.ColdStartWaveBatchSize > 100 ||
+		setting.ColdStartWaveMaxConcurrency < 1 || setting.ColdStartWaveMaxConcurrency > 100 ||
+		setting.ColdStartWaveMaxConcurrency > setting.ColdStartWaveBatchSize ||
+		setting.ColdStartProbeBudgetPerMinute < 1 || setting.ColdStartProbeBudgetPerMinute > 10000 {
+		return fmt.Errorf("smart router: cold-start wave limits are invalid")
+	}
+	if setting.ColdStartWaitMS < 1 || setting.ColdStartWaitMS > 300000 ||
+		setting.ColdStartPollIntervalMS < 10 || setting.ColdStartPollIntervalMS > 5000 ||
+		setting.ColdStartPollIntervalMS > setting.ColdStartWaitMS {
+		return fmt.Errorf("smart router: cold-start wait limits are invalid")
+	}
+	if setting.MaxQueueWaitMS < 0 || setting.MaxQueueWaitMS > 60000 {
+		return fmt.Errorf("smart router: max_queue_wait_ms must be between 0 and 60000")
+	}
+	if setting.DefaultPolicy.QueuePolicy.Mode == smartrouter.QueueModeShortWait &&
+		setting.DefaultPolicy.QueuePolicy.MaxWaitMS > int64(setting.MaxQueueWaitMS) {
+		return fmt.Errorf("smart router: default policy short_wait exceeds max_queue_wait_ms")
+	}
+	return nil
+}
+
+func validateUnnormalizedMapKeys(setting Setting) error {
+	profiles := make(map[string]string, len(setting.ChannelProfiles))
+	for original := range setting.ChannelProfiles {
+		normalized := strings.TrimSpace(original)
+		if prior, exists := profiles[normalized]; exists && prior != original {
+			return fmt.Errorf("smart router: channel profile keys %q and %q normalize to the same ChannelID", prior, original)
+		}
+		profiles[normalized] = original
+	}
+	return nil
+}
+
+func textContractIdentity(contract TextContractSetting) string {
+	return fmt.Sprintf("%s|%d|%d|%s|%s|%v", contract.Endpoint, contract.Capabilities, contract.MaxContext, strings.Join(contract.ModelAllow, "\x00"), strings.Join(contract.ModelDeny, "\x00"), contract.ChannelAllow)
+}
+
+func IsSupportedTextEndpoint(endpoint constant.EndpointType) bool {
+	switch endpoint {
+	case constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse, constant.EndpointTypeAnthropic:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsSupportedEndpoint(endpoint constant.EndpointType) bool {
+	if IsSupportedTextEndpoint(endpoint) {
+		return true
+	}
+	switch endpoint {
+	case constant.EndpointTypeImageGeneration,
+		constant.EndpointTypeOpenAIVideo,
+		constant.EndpointTypeAudioSpeech,
+		constant.EndpointTypeAudioTranscription,
+		constant.EndpointTypeAudioTranslation:
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func canonicalPositiveInts(values []int) []int {
+	seen := make(map[int]struct{}, len(values))
+	result := make([]int, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			result = append(result, value)
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Ints(result)
+	return result
+}
+
+func canonicalEndpoints(values []constant.EndpointType) []constant.EndpointType {
+	seen := make(map[constant.EndpointType]struct{}, len(values))
+	result := make([]constant.EndpointType, 0, len(values))
+	for _, value := range values {
+		value = constant.EndpointType(strings.TrimSpace(string(value)))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+func validatePatterns(label string, patterns []string) error {
+	for _, pattern := range patterns {
+		if strings.TrimSpace(pattern) == "" {
+			return fmt.Errorf("smart router: %s cannot contain an empty pattern", label)
+		}
+	}
+	return nil
+}
+
+func validateChannelIDs(label string, channelIDs []int) error {
+	for _, channelID := range channelIDs {
+		if channelID <= 0 {
+			return fmt.Errorf("smart router: %s contains invalid ChannelID %d", label, channelID)
+		}
+	}
+	return nil
+}

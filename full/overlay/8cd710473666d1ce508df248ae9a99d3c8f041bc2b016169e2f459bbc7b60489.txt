@@ -1,0 +1,109 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  clampStudioDuration,
+  isStudioDurationAllowed,
+  managedCapabilityIssues,
+  studioDurationHintCopy,
+  studioDurationOptions,
+} from './parameter-capability.ts'
+import type { MediaCapabilityContract, StudioFormValue } from './types.ts'
+
+const value: StudioFormValue = {
+  mode: 'videos',
+  group: 'group-a',
+  model: 'generic-video',
+  prompt: 'A landscape',
+  size: '1024x1024',
+  aspectRatio: '16:9',
+  resolution: '720p',
+  duration: 5,
+  count: 1,
+  quality: 'standard',
+  voice: '',
+  responseFormat: 'url',
+  references: [],
+}
+
+const capability: MediaCapabilityContract = {
+  runtime_enforced: true,
+  reference_image: true,
+  reference_video: false,
+  reference_audio: false,
+  resolutions: ['720p'],
+}
+
+describe('generic studio duration contracts', () => {
+  test('step contracts expose discrete seconds and reject in-between values', () => {
+    const stepped = { mode: 'range', min: 5, max: 15, step: 5, default: 5 }
+    assert.deepEqual(studioDurationOptions(stepped), [5, 10, 15])
+    assert.equal(isStudioDurationAllowed(stepped, 5), true)
+    assert.equal(isStudioDurationAllowed(stepped, 10), true)
+    assert.equal(isStudioDurationAllowed(stepped, 8), false)
+    assert.equal(clampStudioDuration(stepped, 8), 5)
+    assert.equal(studioDurationHintCopy(stepped)?.values.seconds, '5 / 10 / 15')
+  })
+
+  test('fixed contracts lock to one duration', () => {
+    const fixed = { mode: 'fixed', fixed: 30 }
+    assert.deepEqual(studioDurationOptions(fixed), [30])
+    assert.equal(isStudioDurationAllowed(fixed, 30), true)
+    assert.equal(isStudioDurationAllowed(fixed, 5), false)
+    assert.equal(clampStudioDuration(fixed, 5), 30)
+    assert.equal(studioDurationHintCopy(fixed)?.values.seconds, 30)
+  })
+
+  test('integer range without a step greater than 1 stays a free range', () => {
+    const sTier = { mode: 'range', min: 4, max: 15 }
+    assert.deepEqual(studioDurationOptions(sTier), [])
+    assert.equal(isStudioDurationAllowed(sTier, 7), true)
+    assert.equal(isStudioDurationAllowed(sTier, 3), false)
+    assert.equal(clampStudioDuration(sTier, 7), 7)
+    assert.equal(clampStudioDuration(sTier, 40), 15)
+    assert.deepEqual(studioDurationHintCopy(sTier)?.values, {
+      min: 4,
+      max: 15,
+    })
+  })
+
+  test('managed issues follow the contract instead of a model name', () => {
+    assert.equal(
+      managedCapabilityIssues(
+        {
+          ...capability,
+          duration: { mode: 'range', min: 5, max: 15, step: 5 },
+        },
+        { ...value, duration: 8 },
+        []
+      ).includes('The selected duration is not supported by this model'),
+      true
+    )
+    assert.equal(
+      managedCapabilityIssues(
+        { ...capability, duration: { mode: 'range', min: 4, max: 15 } },
+        { ...value, duration: 7 },
+        []
+      ).length,
+      0
+    )
+  })
+})

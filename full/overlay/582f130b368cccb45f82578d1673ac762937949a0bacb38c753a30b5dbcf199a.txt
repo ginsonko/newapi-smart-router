@@ -1,0 +1,64 @@
+package service
+
+import (
+	"context"
+	"testing"
+
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGlobalLeaderboardUsesAuthorizedAccountGroupsAndPrices(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"public":    smartRouteTestRatio(0.05),
+		"removed":   smartRouteTestRatio(0.08),
+		"exclusive": smartRouteTestRatio(0.37),
+	})
+	special := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	originalSpecial := special.ReadAll()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	t.Cleanup(func() {
+		special.Replace(originalSpecial)
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+	})
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"public":"公共","removed":"公共可用"}`))
+	special.Replace(map[string]map[string]string{
+		"test-vip": {"+:exclusive": "专属", "-:removed": "不可用"},
+	})
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{"test-vip":{"exclusive":0.31}}`))
+
+	for _, tc := range []struct {
+		name, userGroup string
+		groups          []string
+	}{
+		{"public internal caller", "", []string{"public", "removed"}},
+		{"ordinary user", "default", []string{"public", "removed"}},
+		{"VIP additions and removals", "test-vip", []string{"public", "exclusive"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			index, err := fixture.engine.GlobalLeaderboardModelIndex(context.Background(), SmartRouteGlobalLeaderboardModelIndexRequest{
+				UserGroup: tc.userGroup, Page: 1, PageSize: 100,
+			})
+			require.NoError(t, err)
+			require.Len(t, index.Items, 1)
+			assert.Zero(t, index.TokenID)
+			assert.ElementsMatch(t, tc.groups, index.Items[0].Groups)
+			report, err := fixture.engine.GlobalLeaderboardStatusReport(context.Background(), SmartRouteGlobalLeaderboardStatusRequest{
+				UserGroup: tc.userGroup, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+				IncludeExcluded: true, Page: 1, PageSize: 100,
+			})
+			require.NoError(t, err)
+			assert.Zero(t, report.TokenID)
+			groups := make([]string, 0, len(report.Items))
+			for _, item := range report.Items {
+				groups = append(groups, item.Group)
+				if item.Group == "exclusive" {
+					assert.Equal(t, int64(310_000), item.EffectiveRatioPPM)
+				}
+			}
+			assert.ElementsMatch(t, tc.groups, groups)
+		})
+	}
+}

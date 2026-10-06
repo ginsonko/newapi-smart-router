@@ -1,0 +1,232 @@
+package controller
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func controllerTestRoutingPolicy(t *testing.T) string {
+	t.Helper()
+	policy := smartrouter.Policy{
+		Version:              smartrouter.PolicyVersion,
+		PolicyID:             "lowest-stable-v1",
+		Enabled:              true,
+		PoolPolicy:           "all-certified",
+		OrderMode:            smartrouter.OrderAutoPrice,
+		MaxEffectiveRatioPPM: 2_000_000,
+		ExcludedGroups:       []string{"pro", "discount", "pro"},
+		HealthGuard:          true,
+		AllowFutureGroups:    true,
+		RecoveryProfile:      smartrouter.RecoveryBalanced,
+	}
+	data, err := common.Marshal(policy)
+	require.NoError(t, err)
+	return string(data)
+}
+
+func tokenMutationBody(token *model.Token, group string, crossGroupRetry bool) map[string]any {
+	body := map[string]any{
+		"name":                 token.Name,
+		"expired_time":         token.ExpiredTime,
+		"remain_quota":         token.RemainQuota,
+		"unlimited_quota":      token.UnlimitedQuota,
+		"model_limits_enabled": token.ModelLimitsEnabled,
+		"model_limits":         token.ModelLimits,
+		"group":                group,
+		"cross_group_retry":    crossGroupRetry,
+	}
+	if token.Id != 0 {
+		body["id"] = token.Id
+	}
+	return body
+}
+
+func TestAddTokenPersistsSmartPolicyAndDisablesLegacyRetry(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	rawPolicy := controllerTestRoutingPolicy(t)
+	body := tokenMutationBody(&model.Token{Name: "smart", ExpiredTime: -1, UnlimitedQuota: true}, "auto", true)
+	body["routing_policy"] = rawPolicy
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+
+	var stored model.Token
+	require.NoError(t, db.First(&stored, "name = ?", "smart").Error)
+	assert.True(t, stored.IsSmartRouting())
+	assert.False(t, stored.CrossGroupRetry)
+	assert.NotEqual(t, rawPolicy, "")
+	assert.Contains(t, stored.RoutingPolicy, `"queue_policy":{"mode":"no_queue"`)
+}
+
+func TestAddTokenKeepsLegacyAutoSemanticsWithoutPolicy(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	body := tokenMutationBody(&model.Token{Name: "legacy-auto", ExpiredTime: -1, UnlimitedQuota: true}, "auto", true)
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+
+	var stored model.Token
+	require.NoError(t, db.First(&stored, "name = ?", "legacy-auto").Error)
+	assert.Empty(t, stored.RoutingPolicy)
+	assert.True(t, stored.CrossGroupRetry)
+}
+
+func TestUpdateTokenPreservesMissingRoutingPolicy(t *testing.T) {
+	t.Run("legacy auto is not upgraded", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "legacy-auto", "legacy-auto-key")
+		require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "cross_group_retry": true}).Error)
+
+		body := tokenMutationBody(token, "auto", true)
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Empty(t, stored.RoutingPolicy)
+		assert.True(t, stored.CrossGroupRetry)
+	})
+
+	t.Run("smart policy is not cleared by an old client", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "smart", "smart-key")
+		normalized, err := model.NormalizeTokenRoutingPolicy("auto", controllerTestRoutingPolicy(t))
+		require.NoError(t, err)
+		require.NoError(t, db.Model(token).Updates(map[string]any{
+			"group": "auto", "routing_policy": normalized, "cross_group_retry": true,
+		}).Error)
+
+		body := tokenMutationBody(token, "auto", true)
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Equal(t, normalized, stored.RoutingPolicy)
+		assert.False(t, stored.CrossGroupRetry)
+	})
+}
+
+func TestUpdateTokenExplicitSmartRoutingTransitions(t *testing.T) {
+	t.Run("upgrade legacy auto", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "legacy-auto", "upgrade-key")
+		require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "cross_group_retry": true}).Error)
+
+		body := tokenMutationBody(token, "auto", true)
+		body["routing_policy"] = controllerTestRoutingPolicy(t)
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.True(t, stored.IsSmartRouting())
+		assert.False(t, stored.CrossGroupRetry)
+	})
+
+	t.Run("moving to a fixed group clears policy", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		require.NoError(t, db.AutoMigrate(&model.User{}))
+		require.NoError(t, db.Create(&model.User{Id: 1, Username: "fixture-user", Group: "default"}).Error)
+		token := seedToken(t, db, 1, "smart", "fixed-key")
+		normalized, err := model.NormalizeTokenRoutingPolicy("auto", controllerTestRoutingPolicy(t))
+		require.NoError(t, err)
+		require.NoError(t, db.Model(token).Updates(map[string]any{
+			"group": "auto", "routing_policy": normalized, "cross_group_retry": false,
+		}).Error)
+
+		body := tokenMutationBody(token, "default", true)
+		body["routing_policy"] = normalized
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Empty(t, stored.RoutingPolicy)
+		assert.True(t, stored.CrossGroupRetry)
+	})
+
+	t.Run("explicit empty policy restores legacy auto behavior", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "smart", "legacy-downgrade-key")
+		normalized, err := model.NormalizeTokenRoutingPolicy("auto", controllerTestRoutingPolicy(t))
+		require.NoError(t, err)
+		require.NoError(t, db.Model(token).Updates(map[string]any{
+			"group": "auto", "routing_policy": normalized, "cross_group_retry": false,
+		}).Error)
+
+		body := tokenMutationBody(token, "auto", true)
+		body["routing_policy"] = ""
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Empty(t, stored.RoutingPolicy)
+		assert.True(t, stored.CrossGroupRetry)
+	})
+}
+
+func TestUpdateTokenStatusOnlyIgnoresRoutingPolicyPayload(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 1, "smart", "status-only-key")
+	normalized, err := model.NormalizeTokenRoutingPolicy("auto", controllerTestRoutingPolicy(t))
+	require.NoError(t, err)
+	require.NoError(t, db.Model(token).Updates(map[string]any{
+		"group": "auto", "routing_policy": normalized, "cross_group_retry": false,
+	}).Error)
+
+	body := map[string]any{
+		"id":             token.Id,
+		"status":         common.TokenStatusDisabled,
+		"routing_policy": "malformed-but-ignored-for-status-only",
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=1", body, 1)
+	UpdateToken(ctx)
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+
+	var stored model.Token
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	assert.Equal(t, common.TokenStatusDisabled, stored.Status)
+	assert.Equal(t, normalized, stored.RoutingPolicy)
+	assert.False(t, stored.CrossGroupRetry)
+}
+
+func TestTokenAutoMigrateAddsEmptyRoutingPolicyToLegacyRows(t *testing.T) {
+	db := openTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&legacyToken{}))
+	require.NoError(t, db.Create(&legacyToken{
+		UserId: 1, Key: "legacy-migration-key", Status: common.TokenStatusEnabled,
+		Name: "legacy", ExpiredTime: -1, UnlimitedQuota: true, Group: "auto", CrossGroupRetry: true,
+	}).Error)
+
+	migrateTokenControllerTestDB(t, db)
+	assert.True(t, db.Migrator().HasColumn(&model.Token{}, "routing_policy"))
+
+	var stored model.Token
+	require.NoError(t, db.First(&stored, "name = ?", "legacy").Error)
+	assert.Empty(t, stored.RoutingPolicy)
+	assert.Equal(t, "auto", stored.Group)
+	assert.True(t, stored.CrossGroupRetry)
+}

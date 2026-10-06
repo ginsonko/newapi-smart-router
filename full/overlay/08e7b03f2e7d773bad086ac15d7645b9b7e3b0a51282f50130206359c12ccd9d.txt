@@ -1,0 +1,29 @@
+package dto
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestStandaloneSearchRequestPreservesUnknownFieldsAndMapsModel(t *testing.T) {
+	raw := []byte(`{"id":"search-1","model":"gpt-5","settings":{"external_web_access":"live"},"future":{"opaque":[1,true,"x"]}}`)
+	var request StandaloneSearchRequest
+	require.NoError(t, json.Unmarshal(raw, &request))
+	request.SetModelName("gpt-5-upstream")
+	encoded, err := json.Marshal(request)
+	require.NoError(t, err)
+	var got map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded, &got))
+	require.JSONEq(t, `{"opaque":[1,true,"x"]}`, string(got["future"]))
+	require.JSONEq(t, `{"external_web_access":"live"}`, string(got["settings"]))
+	require.JSONEq(t, `"gpt-5-upstream"`, string(got["model"]))
+}
+
+func TestStandaloneSearchRequestRejectsNonStringKnownFields(t *testing.T) {
+	for _, raw := range []string{`{"id":1,"model":"gpt"}`, `{"id":"x","model":false}`} {
+		var request StandaloneSearchRequest
+		require.Error(t, json.Unmarshal([]byte(raw), &request))
+	}
+}

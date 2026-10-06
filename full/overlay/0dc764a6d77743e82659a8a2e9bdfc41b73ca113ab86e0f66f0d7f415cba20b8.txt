@@ -1,0 +1,127 @@
+package types
+
+import (
+	"sync"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+type RWMap[K comparable, V any] struct {
+	data  map[K]V
+	mutex sync.RWMutex
+}
+
+func (m *RWMap[K, V]) UnmarshalJSON(b []byte) error {
+	var next map[K]V
+	if err := common.Unmarshal(b, &next); err != nil {
+		return err
+	}
+	if next == nil {
+		next = make(map[K]V)
+	}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.data = next
+	return nil
+}
+
+func (m *RWMap[K, V]) MarshalJSON() ([]byte, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return common.Marshal(m.data)
+}
+
+func NewRWMap[K comparable, V any]() *RWMap[K, V] {
+	return &RWMap[K, V]{
+		data: make(map[K]V),
+	}
+}
+
+func (m *RWMap[K, V]) Get(key K) (V, bool) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	value, exists := m.data[key]
+	return value, exists
+}
+
+func (m *RWMap[K, V]) Set(key K, value V) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.data[key] = value
+}
+
+func (m *RWMap[K, V]) AddAll(other map[K]V) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	for k, v := range other {
+		m.data[k] = v
+	}
+}
+
+func (m *RWMap[K, V]) Clear() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.data = make(map[K]V)
+}
+
+// Replace atomically swaps the complete map after the caller has parsed and
+// validated it. The input is copied so later caller mutations cannot alter the
+// live configuration behind the lock.
+func (m *RWMap[K, V]) Replace(next map[K]V) {
+	copied := make(map[K]V, len(next))
+	for key, value := range next {
+		copied[key] = value
+	}
+	m.mutex.Lock()
+	m.data = copied
+	m.mutex.Unlock()
+}
+
+// ReadAll returns a copy of the entire map.
+func (m *RWMap[K, V]) ReadAll() map[K]V {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	copiedMap := make(map[K]V)
+	for k, v := range m.data {
+		copiedMap[k] = v
+	}
+	return copiedMap
+}
+
+func (m *RWMap[K, V]) Len() int {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return len(m.data)
+}
+
+func LoadFromJsonString[K comparable, V any](m *RWMap[K, V], jsonStr string) error {
+	var next map[K]V
+	if err := common.Unmarshal([]byte(jsonStr), &next); err != nil {
+		return err
+	}
+	if next == nil {
+		next = make(map[K]V)
+	}
+	m.Replace(next)
+	return nil
+}
+
+// LoadFromJsonStringWithCallback loads a JSON string into the RWMap and calls the callback on success.
+func LoadFromJsonStringWithCallback[K comparable, V any](m *RWMap[K, V], jsonStr string, onSuccess func()) error {
+	if err := LoadFromJsonString(m, jsonStr); err != nil {
+		return err
+	}
+	if onSuccess != nil {
+		onSuccess()
+	}
+	return nil
+}
+
+// MarshalJSONString returns the JSON string representation of the RWMap.
+func (m *RWMap[K, V]) MarshalJSONString() string {
+	bytes, err := m.MarshalJSON()
+	if err != nil {
+		return "{}"
+	}
+	return string(bytes)
+}

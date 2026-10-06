@@ -1,0 +1,106 @@
+package gemini
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGeminiChatStreamHandlerClaudeEntryProducesLegalToolLifecycle(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Set(common.RequestIdKey, "gemini-claude-entry-test")
+	info := &relaycommon.RelayInfo{
+		RelayMode:         relayconstant.RelayModeChatCompletions,
+		RelayFormat:       types.RelayFormatClaude,
+		IsStream:          true,
+		DisablePing:       true,
+		ChannelMeta:       &relaycommon.ChannelMeta{UpstreamModelName: "gemini-tool-compatible"},
+		ClaudeConvertInfo: relaycommon.NewClaudeConvertInfo(),
+	}
+
+	first := dto.GeminiChatResponse{
+		Candidates: []dto.GeminiChatCandidate{{
+			Index: 0,
+			Content: dto.GeminiChatContent{
+				Role: "model",
+				Parts: []dto.GeminiPart{{FunctionCall: &dto.FunctionCall{
+					FunctionName: "lookup",
+					Arguments:    map[string]any{"q": "x"},
+				}}},
+			},
+		}},
+		UsageMetadata: dto.GeminiUsageMetadata{
+			PromptTokenCount:     2,
+			CandidatesTokenCount: 3,
+			TotalTokenCount:      5,
+		},
+	}
+	stopReason := "STOP"
+	last := dto.GeminiChatResponse{
+		Candidates: []dto.GeminiChatCandidate{{
+			Index:        0,
+			FinishReason: &stopReason,
+			Content:      dto.GeminiChatContent{Role: "model", Parts: []dto.GeminiPart{{}}},
+		}},
+		UsageMetadata: first.UsageMetadata,
+	}
+	firstData, err := common.Marshal(first)
+	require.NoError(t, err)
+	lastData, err := common.Marshal(last)
+	require.NoError(t, err)
+	body := strings.Join([]string{
+		"data: " + string(firstData),
+		"data: " + string(lastData),
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	usage, apiErr := GeminiChatStreamHandler(c, info, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	})
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	require.Equal(t, 5, usage.TotalTokens)
+	output := recorder.Body.String()
+	require.Equal(t, 1, strings.Count(output, "event: content_block_start\n"))
+	require.Equal(t, 1, strings.Count(output, "event: content_block_stop\n"))
+	require.Equal(t, 1, strings.Count(output, "event: message_stop\n"))
+	require.Contains(t, output, `"type":"tool_use"`)
+	require.Contains(t, output, `"type":"input_json_delta"`)
+	requireOrderedGeminiClaudeEvents(t, output,
+		"event: message_start",
+		"event: content_block_start",
+		"event: content_block_delta",
+		"event: content_block_stop",
+		"event: message_stop",
+	)
+}
+
+func requireOrderedGeminiClaudeEvents(t *testing.T, output string, events ...string) {
+	t.Helper()
+	offset := 0
+	for _, event := range events {
+		idx := strings.Index(output[offset:], event)
+		require.NotEqualf(t, -1, idx, "missing %q after offset %d", event, offset)
+		offset += idx + len(event)
+	}
+}

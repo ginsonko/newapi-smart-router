@@ -1,0 +1,86 @@
+package media_setting
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTemporaryFileLifetimeIsDefaultedAndBounded(t *testing.T) {
+	setting := Get()
+	setting.TemporaryFileTTLHours = 0
+	normalized := Normalize(setting)
+	assert.Equal(t, 24, normalized.TemporaryFileTTLHours)
+	require.NoError(t, normalized.Validate())
+
+	normalized.TemporaryFileTTLHours = 169
+	assert.Error(t, normalized.Validate())
+}
+
+func TestEventStreamLimitsAreDefaultedAndValidatedTogether(t *testing.T) {
+	setting := Get()
+	setting.MaxEventStreamConnections = 0
+	setting.MaxEventStreamConnectionsPerUser = 0
+	setting.EventStreamPollMilliseconds = 0
+	setting.EventStreamHeartbeatSeconds = 0
+	setting.EventStreamMaxLifetimeMinutes = 0
+	normalized := Normalize(setting)
+
+	assert.Equal(t, 64, normalized.MaxEventStreamConnections)
+	assert.Equal(t, 3, normalized.MaxEventStreamConnectionsPerUser)
+	assert.Equal(t, 2000, normalized.EventStreamPollMilliseconds)
+	assert.Equal(t, 15, normalized.EventStreamHeartbeatSeconds)
+	assert.Equal(t, 30, normalized.EventStreamMaxLifetimeMinutes)
+	require.NoError(t, normalized.Validate())
+
+	normalized.MaxEventStreamConnectionsPerUser = normalized.MaxEventStreamConnections + 1
+	assert.Error(t, normalized.Validate())
+}
+
+func TestDefaultCapacityMatchesProductionTwoGiBDiskReserve(t *testing.T) {
+	normalized := Get()
+
+	assert.EqualValues(t, 2*1024*1024*1024, normalized.PerUserMaxBytes)
+	assert.EqualValues(t, 10*1024*1024*1024, normalized.GlobalMaxBytes)
+	assert.EqualValues(t, 2*1024*1024*1024, normalized.ReservedFreeBytes)
+	assert.Less(t, normalized.ReservedFreeBytes, normalized.GlobalMaxBytes)
+	require.NoError(t, normalized.Validate())
+}
+
+func TestMediaResourceGuardDefaultsAndBounds(t *testing.T) {
+	setting := Get()
+	setting.GenerationActiveGlobal = 0
+	setting.GenerationActivePerUser = 0
+	setting.GenerationQueueGlobalMax = 0
+	setting.GenerationQueuePerUserMax = 0
+	setting.UploadConnectionHardGlobal = 0
+	setting.UploadConnectionHardPerUser = 0
+	setting.DownloadConnectionHardGlobal = 0
+	setting.DownloadConnectionHardPerUser = 0
+	setting.IngressTotalMbps = 0
+	setting.ClientUploadMaxMbps = 0
+	setting.UpstreamArchiveMaxMbps = 0
+	setting.EgressTotalMbps = 0
+	setting.ClientDownloadMaxMbps = 0
+	setting.UpstreamForwardMaxMbps = 0
+	setting.RateBurstBytes = 0
+	normalized := Normalize(setting)
+
+	assert.Equal(t, 8, normalized.GenerationActiveGlobal)
+	assert.Equal(t, 2, normalized.GenerationActivePerUser)
+	assert.Equal(t, 512, normalized.GenerationQueueGlobalMax)
+	assert.Equal(t, 64, normalized.GenerationQueuePerUserMax)
+	assert.Equal(t, 32, normalized.UploadConnectionHardGlobal)
+	assert.Equal(t, 128, normalized.DownloadConnectionHardGlobal)
+	assert.Equal(t, 50, normalized.IngressTotalMbps)
+	assert.Equal(t, 40, normalized.ClientUploadMaxMbps)
+	assert.Equal(t, 30, normalized.UpstreamArchiveMaxMbps)
+	assert.Equal(t, 50, normalized.EgressTotalMbps)
+	assert.Equal(t, 50, normalized.ClientDownloadMaxMbps)
+	assert.Equal(t, 35, normalized.UpstreamForwardMaxMbps)
+	require.NoError(t, normalized.Validate())
+
+	normalized.ClientUploadMaxMbps = normalized.IngressTotalMbps + 1
+	assert.Error(t, normalized.Validate())
+}

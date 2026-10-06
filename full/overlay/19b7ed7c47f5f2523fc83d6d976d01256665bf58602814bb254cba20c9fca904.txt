@@ -1,0 +1,1283 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+type SmartRouteHealthItem struct {
+	RouteID                 string                   `json:"route_id"`
+	Model                   string                   `json:"model,omitempty"`
+	Group                   string                   `json:"group,omitempty"`
+	ChannelID               int                      `json:"channel_id,omitempty"`
+	ContractID              string                   `json:"contract_id,omitempty"`
+	Endpoint                string                   `json:"endpoint,omitempty"`
+	Status                  string                   `json:"status"`
+	Phase                   smartrouter.QualityPhase `json:"phase"`
+	Epoch                   uint64                   `json:"epoch"`
+	ConsecutiveHardFailures int                      `json:"consecutive_hard_failures"`
+	Successes               uint64                   `json:"successes"`
+	Failures                uint64                   `json:"failures"`
+	SuccessRate             *float64                 `json:"success_rate"`
+	EvidenceSamples         uint64                   `json:"evidence_samples"`
+	EvidenceFreshness       string                   `json:"evidence_freshness"`
+	EvidenceConfidence      string                   `json:"evidence_confidence"`
+	PrimaryState            string                   `json:"primary_state"`
+	ConstraintLabels        []string                 `json:"constraint_labels"`
+	ProbeState              string                   `json:"probe_state"`
+	ProbeCapability         string                   `json:"probe_capability"`
+	// EffectiveRatioPPM remains the Key's admission ceiling evidence. It is
+	// not the resolved price of this model when group-model pricing is active.
+	EffectiveRatioPPM   int64                      `json:"effective_ratio_ppm,omitempty"`
+	PriceKnown          bool                       `json:"price_known"`
+	ModelPriceKnown     bool                       `json:"model_price_known"`
+	Price               *smartrouter.RoutePrice    `json:"price,omitempty"`
+	LastOutcome         smartrouter.QualityOutcome `json:"last_outcome,omitempty"`
+	LastHTTPStatus      int                        `json:"last_http_status,omitempty"`
+	LastError           string                     `json:"last_error,omitempty"`
+	LastProbeAtMS       int64                      `json:"last_probe_at_ms,omitempty"`
+	LastProbeOutcome    smartrouter.QualityOutcome `json:"last_probe_outcome,omitempty"`
+	LastProbeHTTPStatus int                        `json:"last_probe_http_status,omitempty"`
+	LastProbeError      string                     `json:"last_probe_error,omitempty"`
+	ProbeSuccesses      uint64                     `json:"probe_successes"`
+	FirstFailureAtMS    int64                      `json:"first_failure_at_ms,omitempty"`
+	LastFailureAtMS     int64                      `json:"last_failure_at_ms,omitempty"`
+	LastSuccessAtMS     int64                      `json:"last_success_at_ms,omitempty"`
+	LastUpdatedMS       int64                      `json:"last_updated_ms,omitempty"`
+	ProbeFailures       int                        `json:"probe_failures"`
+	NextProbeAtMS       int64                      `json:"next_probe_at_ms,omitempty"`
+	SampleDueAtMS       int64                      `json:"sample_due_at_ms,omitempty"`
+	StableSinceMS       int64                      `json:"stable_since_ms,omitempty"`
+	CapacityUntilMS     int64                      `json:"capacity_until_ms,omitempty"`
+	TTFTP95MS           int64                      `json:"ttft_p95_ms,omitempty"`
+	TTFTSamples         int                        `json:"ttft_samples,omitempty"`
+	Quarantined         bool                       `json:"quarantined"`
+	QuarantinedAtMS     int64                      `json:"quarantined_at_ms,omitempty"`
+	RequiresAdminReview bool                       `json:"requires_admin_review"`
+	RecentCacheRatePPM  *int64                     `json:"recent_cache_rate_ppm,omitempty"`
+	EstimatedInputPPM   *int64                     `json:"estimated_input_cost_ppm,omitempty"`
+	EstimatedInputUSD   *float64                   `json:"estimated_input_usd_per_million,omitempty"`
+	ActualCostSource    string                     `json:"actual_input_cost_source,omitempty"`
+	ActualCostSamples   int64                      `json:"actual_input_cost_samples,omitempty"`
+	ActualCostObserved  int64                      `json:"actual_input_cost_last_observed_at_ms,omitempty"`
+}
+
+type SmartRouteHealthSummary struct {
+	Total                int `json:"total"`
+	Healthy              int `json:"healthy"`
+	DegradedUsable       int `json:"degraded_usable"`
+	Recovering           int `json:"recovering"`
+	Probing              int `json:"probing"`
+	Unavailable          int `json:"unavailable"`
+	NeedsReview          int `json:"needs_review"`
+	PendingSample        int `json:"pending_sample"`
+	TelemetryUnavailable int `json:"telemetry_unavailable"`
+	ProbeDue             int `json:"probe_due"`
+	ProbeOverdue         int `json:"probe_overdue"`
+	NaturalTrafficOnly   int `json:"natural_traffic_only"`
+	CapacityLimited      int `json:"capacity_limited"`
+	CredentialBlocked    int `json:"credential_blocked"`
+	RequiresAdminReview  int `json:"requires_admin_review"`
+}
+
+type SmartRouteHealthPagination struct {
+	Page       int `json:"page"`
+	PageSize   int `json:"page_size"`
+	Total      int `json:"total"`
+	TotalPages int `json:"total_pages"`
+}
+
+type SmartRouteHealthSnapshot struct {
+	ID             string `json:"id"`
+	GeneratedAtMS  int64  `json:"generated_at_ms"`
+	AgeMS          int64  `json:"age_ms"`
+	Stale          bool   `json:"stale"`
+	StaleAfterMS   int64  `json:"stale_after_ms"`
+	CatalogVersion string `json:"catalog_version,omitempty"`
+	PriceVersion   string `json:"price_version,omitempty"`
+	StateVersion   string `json:"state_version,omitempty"`
+}
+
+type SmartRouteHealthReport struct {
+	Items                    []SmartRouteHealthItem           `json:"items"`
+	Total                    int                              `json:"total"`
+	Summary                  SmartRouteHealthSummary          `json:"summary"`
+	Pagination               *SmartRouteHealthPagination      `json:"pagination,omitempty"`
+	Snapshot                 SmartRouteHealthSnapshot         `json:"snapshot"`
+	SharedStateBackend       string                           `json:"shared_state_backend"`
+	BackgroundProbeAvailable bool                             `json:"background_probe_available"`
+	BackgroundProbeEnabled   bool                             `json:"background_probe_enabled"`
+	ProbeWorker              *SmartRouteProbeWorkerStats      `json:"probe_worker,omitempty"`
+	ActualInputCostStatus    *SmartRouteActualInputCostStatus `json:"actual_input_cost_status,omitempty"`
+}
+
+type SmartRouteHealthQuery struct {
+	Page                int
+	PageSize            int
+	Search              string
+	Model               string
+	Endpoint            string
+	Group               string
+	ChannelID           int
+	PrimaryStates       []string
+	ProbeStates         []string
+	RequiresAdminReview *bool
+	Sort                string
+	Order               string
+}
+
+type smartRouteHealthMetadata struct {
+	route           smartrouter.CertifiedRoute
+	model           string
+	contractID      string
+	endpoint        string
+	blockedAuto     bool
+	blockEpoch      uint64
+	blockReason     string
+	quarantinedAtMS int64
+}
+
+const (
+	smartRoutePrimaryNeedsReview          = "needs_review"
+	smartRoutePrimaryUnavailable          = "unavailable"
+	smartRoutePrimaryProbing              = "probing"
+	smartRoutePrimaryRecovering           = "recovering"
+	smartRoutePrimaryDegradedUsable       = "degraded_usable"
+	smartRoutePrimaryHealthy              = "healthy"
+	smartRoutePrimaryPendingSample        = "pending_sample"
+	smartRoutePrimaryTelemetryUnavailable = "telemetry_unavailable"
+
+	smartRouteProbeCapabilitySyntheticText = "synthetic_text"
+	smartRouteProbeCapabilityNaturalOnly   = "natural_traffic_only"
+
+	smartRouteHealthSnapshotFreshness   = 5 * time.Second
+	smartRouteManualProbeCooldownWindow = time.Minute
+)
+
+type smartRouteHealthCacheEntry struct {
+	mu          sync.Mutex
+	report      SmartRouteHealthReport
+	generatedAt time.Time
+}
+
+var smartRouteHealthReportCache sync.Map
+
+func (engine *SmartRouterEngine) HealthReport(ctx context.Context) (SmartRouteHealthReport, error) {
+	if engine == nil || engine.Catalogs == nil || engine.State == nil {
+		return SmartRouteHealthReport{}, errors.New("smart router engine is unavailable")
+	}
+	catalog, catalogErr := engine.Catalogs.RefreshIfDue(ctx)
+	metadata := make(map[string]smartRouteHealthMetadata)
+	if catalog != nil {
+		for contractID, contract := range catalog.Contracts {
+			for _, pool := range contract.Pools {
+				for _, route := range pool.Candidates {
+					metadata[route.RouteID] = smartRouteHealthMetadata{
+						route: route, model: contract.Contract.CanonicalModel,
+						contractID: contractID, endpoint: contract.Contract.Endpoint,
+					}
+				}
+			}
+		}
+	}
+	// Auto-health blocks are absent from the dispatch catalog, but the catalog
+	// build report retains their internal metadata for privileged diagnostics.
+	// Include them in the same state snapshot so administrators see the real
+	// last probe, next probe, success rate and TTFT evidence instead of a mostly
+	// empty synthetic row. Manual/model-404 blocks retain the DB-only fallback
+	// below and are never reintroduced as routable metadata.
+	if buildReport, ok := engine.Catalogs.LastReport(); ok {
+		for _, blocked := range buildReport.BlockedRoutes {
+			if blocked.Source != SmartRouteBlockSourceAutoHealth || blocked.Route.RouteID == "" {
+				continue
+			}
+			metadata[blocked.Route.RouteID] = smartRouteHealthMetadata{
+				route: blocked.Route, model: blocked.Contract.CanonicalModel,
+				contractID: blocked.Contract.ContractID, endpoint: blocked.Contract.Endpoint,
+				blockedAuto: true, blockEpoch: blocked.BlockEpoch, blockReason: blocked.Reason,
+				quarantinedAtMS: blocked.CreatedAt * 1_000,
+			}
+		}
+	}
+	routes := make([]smartrouter.CertifiedRoute, 0, len(metadata))
+	for _, item := range metadata {
+		routes = append(routes, item.route)
+	}
+	runtime, err := engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: smartRouteStateRoutes(routes)})
+	if err != nil {
+		return SmartRouteHealthReport{}, err
+	}
+	var prices *smartrouter.PriceSnapshot
+	if engine.Prices != nil && catalog != nil {
+		prices, _ = engine.Prices.GetOrRefresh(ctx, "")
+	}
+	actualInputCostSnapshot := engine.actualInputCostSnapshot()
+	nowMS := time.Now().UnixMilli()
+	items := make([]SmartRouteHealthItem, 0, len(metadata))
+	seen := make(map[string]bool, len(metadata))
+	for routeID, item := range metadata {
+		quality := runtime.Quality.Routes[routeID]
+		ttft := runtime.TTFT.Routes[routeID]
+		capacity := runtime.Capacity.Domains[item.route.CapacityDomain]
+		credential := runtime.Credentials.Domains[smartrouter.RouteCredentialDomain(item.route)]
+		ratio, priceKnown := int64(0), false
+		var routePrice smartrouter.RoutePrice
+		modelPriceKnown := false
+		if prices != nil {
+			ratio, priceKnown = prices.RatiosPPM[routeID]
+			if price, exists := prices.RoutePrices[routeID]; exists {
+				routePrice, modelPriceKnown = price, true
+			} else if priceKnown {
+				routePrice, modelPriceKnown = smartrouter.LegacyRoutePrice(ratio), true
+			}
+		}
+		if !priceKnown && item.blockedAuto {
+			ratio, priceKnown = (NewAPIRouteRatioSource{}).RouteRatioPPM("", item.route.Group)
+		}
+		if priceKnown && !modelPriceKnown {
+			price, priceErr := (NewAPIRouteRatioSource{}).RoutePriceDescriptor(item.model, item.route.Group, ratio)
+			if priceErr == nil {
+				routePrice, modelPriceKnown = price, true
+			}
+		}
+		healthItem := buildSmartRouteHealthItem(
+			item, quality, ttft, capacity, credential,
+			ratio, priceKnown, routePrice, modelPriceKnown, nowMS,
+		)
+		if modelPriceKnown {
+			estimate, estimatedUSD, available := smartRouteActualInputCostEstimateAt(
+				item.route, item.model, item.endpoint, routePrice, actualInputCostSnapshot, nowMS,
+			)
+			healthItem.ActualCostSource = estimate.Source
+			healthItem.ActualCostSamples = estimate.Samples
+			healthItem.ActualCostObserved = estimate.LastObservedAtMS
+			if estimate.HasRealEvidence && estimate.ObservedCacheReadRatePPM != nil {
+				cacheRate := estimate.CacheReadRatePPM
+				healthItem.RecentCacheRatePPM = &cacheRate
+			}
+			if available {
+				effectivePPM := estimate.EffectivePPM
+				healthItem.EstimatedInputPPM = &effectivePPM
+				healthItem.EstimatedInputUSD = &estimatedUSD
+			}
+		}
+		items = append(items, healthItem)
+		seen[routeID] = true
+	}
+
+	var blocks []model.SmartRouteBlock
+	var blockErr error
+	if model.DB != nil && model.DB.Migrator().HasTable(&model.SmartRouteBlock{}) {
+		blocks, _, blockErr = ListSmartRouteBlocks(ctx, SmartRouteBlockListFilter{Scope: SmartRouteBlockScopeRoute, Limit: 10_000})
+	}
+	if blockErr == nil {
+		for _, block := range blocks {
+			// Legacy auto_health/model_404 rows remain available for rollback and
+			// audit, but V4.4 never presents them as live exclusions. Only an
+			// administrator-created manual blacklist requires review.
+			if block.Source != SmartRouteBlockSourceManual || seen[block.RouteId] {
+				continue
+			}
+			items = append(items, SmartRouteHealthItem{
+				RouteID: block.RouteId, Model: block.ModelPattern, Group: block.Group, ChannelID: block.ChannelId,
+				ContractID: block.ContractId, Endpoint: block.Endpoint,
+				Status: "quarantined", Phase: smartrouter.QualityQuarantined,
+				PrimaryState: smartRoutePrimaryNeedsReview, ProbeState: "stopped",
+				ProbeCapability:   smartRouteProbeCapability(block.Endpoint),
+				EvidenceFreshness: "none", EvidenceConfidence: "none",
+				ConstraintLabels: []string{"manual_or_durable_exclusion"},
+				Epoch:            block.Epoch, LastError: block.Reason, Quarantined: true,
+				QuarantinedAtMS: block.CreatedAt * 1_000, RequiresAdminReview: true,
+			})
+		}
+	}
+	if len(items) == 0 && catalogErr != nil {
+		return SmartRouteHealthReport{}, catalogErr
+	}
+	sort.Slice(items, func(left, right int) bool {
+		if items[left].Quarantined != items[right].Quarantined {
+			return items[left].Quarantined
+		}
+		if items[left].Model != items[right].Model {
+			return items[left].Model < items[right].Model
+		}
+		if items[left].Group != items[right].Group {
+			return items[left].Group < items[right].Group
+		}
+		return items[left].RouteID < items[right].RouteID
+	})
+	backend := "memory"
+	if _, ok := engine.State.(*RedisSmartRouteStateStore); ok {
+		backend = "redis"
+	}
+	setting := smartroutersetting.Setting{}
+	if engine.Settings != nil {
+		setting = smartroutersetting.Normalize(engine.Settings())
+	}
+	var workerStats *SmartRouteProbeWorkerStats
+	engine.recoveryHintsMu.RLock()
+	if worker, ok := engine.recoveryHints.(*SmartRouteProbeWorker); ok {
+		stats := worker.Stats()
+		heartbeatAge := time.Since(time.UnixMilli(stats.HeartbeatAtMS))
+		if stats.HeartbeatAtMS > 0 && heartbeatAge >= 0 && heartbeatAge <= smartRouteWorkerHeartbeatFreshness {
+			workerStats = &stats
+		}
+	}
+	engine.recoveryHintsMu.RUnlock()
+	if workerStats == nil {
+		if stats, available := readSmartRouteWorkerStats(ctx); available {
+			workerStats = &stats
+		}
+	}
+	backgroundAvailable := setting.Enabled && setting.BackgroundProbeEnabled && workerStats != nil
+	catalogVersion := ""
+	if catalog != nil {
+		catalogVersion = catalog.Version
+	}
+	priceVersion := ""
+	if prices != nil {
+		priceVersion = prices.Version
+	}
+	report := SmartRouteHealthReport{
+		Items: items, Total: len(items), SharedStateBackend: backend,
+		BackgroundProbeAvailable: backgroundAvailable,
+		BackgroundProbeEnabled:   setting.BackgroundProbeEnabled,
+		ProbeWorker:              workerStats,
+		Snapshot: SmartRouteHealthSnapshot{
+			ID:            fmt.Sprintf("%s:%s:%d", catalogVersion, runtime.Quality.Version, nowMS),
+			GeneratedAtMS: nowMS, StaleAfterMS: smartRouteHealthSnapshotFreshness.Milliseconds(),
+			CatalogVersion: catalogVersion, PriceVersion: priceVersion, StateVersion: runtime.Quality.Version,
+		},
+	}
+	if engine.ActualInputCosts != nil {
+		status := engine.ActualInputCosts.Status()
+		report.ActualInputCostStatus = &status
+	}
+	report.Summary = summarizeSmartRouteHealth(report.Items, nowMS)
+	return report, nil
+}
+
+func buildSmartRouteHealthItem(
+	metadata smartRouteHealthMetadata,
+	quality smartrouter.QualityState,
+	ttft smartrouter.TTFTState,
+	capacity smartrouter.CapacityState,
+	credential smartrouter.CredentialState,
+	ratioPPM int64,
+	priceKnown bool,
+	price smartrouter.RoutePrice,
+	modelPriceKnown bool,
+	nowMS int64,
+) SmartRouteHealthItem {
+	total := quality.TotalSuccesses + quality.TotalHardFailures
+	var successRate *float64
+	if total > 0 {
+		value := float64(quality.TotalSuccesses) / float64(total)
+		successRate = &value
+	}
+	status := string(quality.Phase)
+	quarantined := quality.Phase == smartrouter.QualityQuarantined
+	if quarantined {
+		status = "quarantined"
+	} else if credential.BlockedUntilMS > nowMS {
+		status = "credential_blocked"
+	} else if capacity.BlockedUntilMS > nowMS {
+		status = "capacity_limited"
+	}
+	item := SmartRouteHealthItem{
+		RouteID: metadata.route.RouteID, Model: metadata.model, Group: metadata.route.Group,
+		ChannelID: metadata.route.ChannelID, ContractID: metadata.contractID, Endpoint: metadata.endpoint,
+		Status: status, Phase: quality.Phase, Epoch: quality.Epoch,
+		ConsecutiveHardFailures: quality.ConsecutiveHardFailures,
+		Successes:               quality.TotalSuccesses, Failures: quality.TotalHardFailures, SuccessRate: successRate,
+		EvidenceSamples:    total,
+		EvidenceFreshness:  smartRouteEvidenceFreshness(quality, nowMS),
+		EvidenceConfidence: smartRouteEvidenceConfidence(total),
+		EffectiveRatioPPM:  ratioPPM, PriceKnown: priceKnown, ModelPriceKnown: modelPriceKnown,
+		LastOutcome: quality.LastOutcome, LastHTTPStatus: quality.LastHTTPStatus,
+		LastError: quality.LastErrorSummary, FirstFailureAtMS: quality.FirstFailureMS,
+		LastFailureAtMS: quality.LastFailureMS, LastSuccessAtMS: quality.LastSuccessMS,
+		LastProbeAtMS: quality.LastProbeAtMS, LastProbeOutcome: quality.LastProbeOutcome,
+		LastProbeHTTPStatus: quality.LastProbeHTTPStatus, LastProbeError: quality.LastProbeErrorSummary,
+		ProbeSuccesses: quality.ProbeSuccesses,
+		LastUpdatedMS:  quality.LastUpdatedMS, ProbeFailures: quality.ProbeFailures,
+		NextProbeAtMS: quality.NextProbeAtMS, SampleDueAtMS: quality.SampleDueAtMS,
+		StableSinceMS: quality.StableSinceMS, CapacityUntilMS: capacity.BlockedUntilMS,
+		TTFTP95MS: ttft.P95MS, TTFTSamples: ttft.Samples, Quarantined: quarantined,
+	}
+	if modelPriceKnown {
+		priceCopy := price
+		item.Price = &priceCopy
+	}
+	if metadata.blockedAuto {
+		item.Status = "quarantined"
+		item.Phase = smartrouter.QualityQuarantined
+		item.Quarantined = true
+		if metadata.blockEpoch > item.Epoch {
+			item.Epoch = metadata.blockEpoch
+		}
+		if item.LastError == "" {
+			item.LastError = metadata.blockReason
+		}
+		item.QuarantinedAtMS = metadata.quarantinedAtMS
+		item.RequiresAdminReview = true
+	}
+	item.ProbeCapability = smartRouteProbeCapability(metadata.endpoint)
+	if !SmartRouteSyntheticProbeAllowed(metadata.endpoint, item.Model, metadata.route) {
+		item.ProbeCapability = smartRouteProbeCapabilityNaturalOnly
+	}
+	item.ProbeState = smartRouteProbeState(item, nowMS)
+	if item.ProbeState == "natural_traffic" {
+		item.NextProbeAtMS = 0
+		item.SampleDueAtMS = 0
+	}
+	item.ConstraintLabels = smartRouteConstraintLabels(item, credential, nowMS)
+	item.PrimaryState = smartRoutePrimaryState(item)
+	if item.PrimaryState == smartRoutePrimaryNeedsReview {
+		item.RequiresAdminReview = true
+	}
+	return item
+}
+
+func smartRouteEvidenceFreshness(quality smartrouter.QualityState, nowMS int64) string {
+	observedAtMS := maxSmartRouteInt64(quality.LastUpdatedMS, maxSmartRouteInt64(quality.LastSuccessMS, quality.LastFailureMS))
+	if observedAtMS <= 0 {
+		return "none"
+	}
+	ageMS := nowMS - observedAtMS
+	if ageMS <= 5*time.Minute.Milliseconds() {
+		return "fresh"
+	}
+	if ageMS <= 30*time.Minute.Milliseconds() {
+		return "recent"
+	}
+	return "stale"
+}
+
+func smartRouteEvidenceConfidence(samples uint64) string {
+	switch {
+	case samples == 0:
+		return "none"
+	case samples < 5:
+		return "low"
+	case samples < 20:
+		return "medium"
+	default:
+		return "high"
+	}
+}
+
+func smartRouteProbeCapability(endpoint string) string {
+	if supportedSyntheticTextProbeEndpoint(endpoint) {
+		return smartRouteProbeCapabilitySyntheticText
+	}
+	return smartRouteProbeCapabilityNaturalOnly
+}
+
+func smartRouteProbeState(item SmartRouteHealthItem, nowMS int64) string {
+	if item.ProbeCapability == smartRouteProbeCapabilityNaturalOnly {
+		return "natural_traffic_only"
+	}
+	if item.Quarantined || item.Phase == smartrouter.QualityQuarantined {
+		return "stopped"
+	}
+	if item.Phase == smartrouter.QualityHalfOpen {
+		return "running"
+	}
+	if item.Phase == smartrouter.QualityWarming ||
+		(item.Phase == smartrouter.QualityDegraded && smartRouteHealthHasRecoverySuccess(item)) {
+		return "natural_traffic"
+	}
+	nextAtMS := item.NextProbeAtMS
+	if item.Phase == smartrouter.QualityDegraded {
+		nextAtMS = item.SampleDueAtMS
+	}
+	if nextAtMS > 0 {
+		if nextAtMS <= nowMS {
+			return "due"
+		}
+		return "scheduled"
+	}
+	if item.Phase == smartrouter.QualityOpen || item.Phase == smartrouter.QualityUnknown ||
+		item.Phase == smartrouter.QualityDegraded {
+		return "stopped"
+	}
+	return "idle"
+}
+
+func smartRouteHealthHasRecoverySuccess(item SmartRouteHealthItem) bool {
+	if item.LastSuccessAtMS > item.LastFailureAtMS {
+		return true
+	}
+	return item.LastSuccessAtMS > 0 && item.LastSuccessAtMS == item.LastFailureAtMS &&
+		item.LastOutcome == smartrouter.OutcomeSuccess
+}
+
+func smartRouteConstraintLabels(
+	item SmartRouteHealthItem,
+	credential smartrouter.CredentialState,
+	nowMS int64,
+) []string {
+	labels := make([]string, 0, 4)
+	if item.CapacityUntilMS > nowMS {
+		labels = append(labels, "capacity_busy")
+	}
+	if credential.BlockedUntilMS > nowMS {
+		labels = append(labels, "credential_blocked")
+	}
+	if !item.PriceKnown {
+		labels = append(labels, "price_unknown")
+	}
+	if !item.ModelPriceKnown {
+		labels = append(labels, "model_price_unknown")
+	} else if item.Price != nil && !item.Price.StaticComparable {
+		labels = append(labels, "model_price_incomparable")
+	}
+	if item.ProbeCapability == smartRouteProbeCapabilityNaturalOnly {
+		labels = append(labels, "media_natural_traffic_recovery")
+	}
+	return labels
+}
+
+func smartRoutePrimaryState(item SmartRouteHealthItem) string {
+	if item.RequiresAdminReview || item.Quarantined {
+		return smartRoutePrimaryNeedsReview
+	}
+	if item.Status == "credential_blocked" || item.Phase == smartrouter.QualityOpen {
+		return smartRoutePrimaryUnavailable
+	}
+	if item.ProbeState == "running" || item.ProbeState == "queued" {
+		return smartRoutePrimaryProbing
+	}
+	switch item.Phase {
+	case smartrouter.QualityWarming:
+		return smartRoutePrimaryRecovering
+	case smartrouter.QualityDegraded:
+		return smartRoutePrimaryDegradedUsable
+	case smartrouter.QualityHealthy:
+		return smartRoutePrimaryHealthy
+	case smartrouter.QualityUnknown, smartrouter.QualityBootstrap:
+		return smartRoutePrimaryPendingSample
+	case smartrouter.QualityHalfOpen:
+		return smartRoutePrimaryProbing
+	case smartrouter.QualityQuarantined:
+		return smartRoutePrimaryNeedsReview
+	default:
+		return smartRoutePrimaryTelemetryUnavailable
+	}
+}
+
+func summarizeSmartRouteHealth(items []SmartRouteHealthItem, nowMS int64) SmartRouteHealthSummary {
+	summary := SmartRouteHealthSummary{Total: len(items)}
+	for _, item := range items {
+		switch item.PrimaryState {
+		case smartRoutePrimaryHealthy:
+			summary.Healthy++
+		case smartRoutePrimaryDegradedUsable:
+			summary.DegradedUsable++
+		case smartRoutePrimaryRecovering:
+			summary.Recovering++
+		case smartRoutePrimaryProbing:
+			summary.Probing++
+		case smartRoutePrimaryUnavailable:
+			summary.Unavailable++
+		case smartRoutePrimaryNeedsReview:
+			summary.NeedsReview++
+		case smartRoutePrimaryPendingSample:
+			summary.PendingSample++
+		default:
+			summary.TelemetryUnavailable++
+		}
+		if item.ProbeState == "due" {
+			summary.ProbeDue++
+			nextAtMS := item.NextProbeAtMS
+			if item.Phase == smartrouter.QualityDegraded {
+				nextAtMS = item.SampleDueAtMS
+			}
+			if nextAtMS > 0 && nextAtMS < nowMS-time.Second.Milliseconds() {
+				summary.ProbeOverdue++
+			}
+		}
+		if item.ProbeCapability == smartRouteProbeCapabilityNaturalOnly {
+			summary.NaturalTrafficOnly++
+		}
+		if item.CapacityUntilMS > nowMS {
+			summary.CapacityLimited++
+		}
+		if item.Status == "credential_blocked" {
+			summary.CredentialBlocked++
+		}
+		if item.RequiresAdminReview {
+			summary.RequiresAdminReview++
+		}
+	}
+	return summary
+}
+
+func (engine *SmartRouterEngine) cachedHealthReport(ctx context.Context) (SmartRouteHealthReport, error) {
+	entryValue, _ := smartRouteHealthReportCache.LoadOrStore(engine, &smartRouteHealthCacheEntry{})
+	entry := entryValue.(*smartRouteHealthCacheEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	now := time.Now()
+	if !entry.generatedAt.IsZero() && now.Sub(entry.generatedAt) < smartRouteHealthSnapshotFreshness {
+		result := cloneSmartRouteHealthReport(entry.report)
+		result.Snapshot.AgeMS = now.Sub(entry.generatedAt).Milliseconds()
+		return result, nil
+	}
+	report, err := engine.HealthReport(ctx)
+	if err != nil {
+		if !entry.generatedAt.IsZero() {
+			result := cloneSmartRouteHealthReport(entry.report)
+			result.Snapshot.AgeMS = now.Sub(entry.generatedAt).Milliseconds()
+			result.Snapshot.Stale = true
+			return result, nil
+		}
+		return SmartRouteHealthReport{}, err
+	}
+	entry.report = cloneSmartRouteHealthReport(report)
+	entry.generatedAt = now
+	return report, nil
+}
+
+func cloneSmartRouteHealthReport(report SmartRouteHealthReport) SmartRouteHealthReport {
+	report.Items = append([]SmartRouteHealthItem(nil), report.Items...)
+	return report
+}
+
+func invalidateSmartRouteHealthReport(engine *SmartRouterEngine) {
+	if engine != nil {
+		smartRouteHealthReportCache.Delete(engine)
+	}
+}
+
+func (engine *SmartRouterEngine) HealthReportPage(
+	ctx context.Context,
+	query SmartRouteHealthQuery,
+) (SmartRouteHealthReport, error) {
+	report, err := engine.cachedHealthReport(ctx)
+	if err != nil {
+		return SmartRouteHealthReport{}, err
+	}
+	query = normalizeSmartRouteHealthQuery(query)
+	items := make([]SmartRouteHealthItem, 0, len(report.Items))
+	for _, item := range report.Items {
+		if smartRouteHealthMatches(item, query) {
+			items = append(items, item)
+		}
+	}
+	sort.SliceStable(items, func(left, right int) bool {
+		if query.Sort == "price" && items[left].PriceKnown != items[right].PriceKnown {
+			return items[left].PriceKnown
+		}
+		if query.Sort == "success_rate" && (items[left].SuccessRate == nil) != (items[right].SuccessRate == nil) {
+			return items[left].SuccessRate != nil
+		}
+		if query.Sort == "next_probe" {
+			leftNext := smartRouteHealthNextProbeAt(items[left])
+			rightNext := smartRouteHealthNextProbeAt(items[right])
+			if (leftNext == 0) != (rightNext == 0) {
+				return leftNext != 0
+			}
+		}
+		if query.Order == "desc" {
+			return smartRouteHealthLess(items[right], items[left], query.Sort)
+		}
+		return smartRouteHealthLess(items[left], items[right], query.Sort)
+	})
+	nowMS := time.Now().UnixMilli()
+	report.Summary = summarizeSmartRouteHealth(items, nowMS)
+	report.Total = len(items)
+	totalPages := 0
+	if len(items) > 0 {
+		totalPages = (len(items) + query.PageSize - 1) / query.PageSize
+	}
+	if totalPages > 0 && query.Page > totalPages {
+		query.Page = totalPages
+	}
+	start := (query.Page - 1) * query.PageSize
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + query.PageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	report.Items = append([]SmartRouteHealthItem(nil), items[start:end]...)
+	report.Pagination = &SmartRouteHealthPagination{
+		Page: query.Page, PageSize: query.PageSize, Total: len(items), TotalPages: totalPages,
+	}
+	report.Snapshot.AgeMS = maxSmartRouteInt64(0, nowMS-report.Snapshot.GeneratedAtMS)
+	report.Snapshot.Stale = report.Snapshot.Stale || report.Snapshot.AgeMS > report.Snapshot.StaleAfterMS
+	return report, nil
+}
+
+func normalizeSmartRouteHealthQuery(query SmartRouteHealthQuery) SmartRouteHealthQuery {
+	if query.Page < 1 {
+		query.Page = 1
+	}
+	if query.PageSize < 1 {
+		query.PageSize = 50
+	}
+	if query.PageSize > 100 {
+		query.PageSize = 100
+	}
+	query.Search = strings.ToLower(strings.TrimSpace(query.Search))
+	query.Model = strings.TrimSpace(query.Model)
+	query.Endpoint = strings.TrimSpace(query.Endpoint)
+	query.Group = strings.TrimSpace(query.Group)
+	query.Sort = strings.ToLower(strings.TrimSpace(query.Sort))
+	query.Order = strings.ToLower(strings.TrimSpace(query.Order))
+	if query.Order != "desc" {
+		query.Order = "asc"
+	}
+	switch query.Sort {
+	case "model", "price", "last_failure", "next_probe", "success_rate":
+	default:
+		query.Sort = "priority"
+	}
+	return query
+}
+
+func smartRouteHealthMatches(item SmartRouteHealthItem, query SmartRouteHealthQuery) bool {
+	if query.Search != "" {
+		haystack := strings.ToLower(strings.Join([]string{
+			item.RouteID, item.Model, item.Group, item.Endpoint, item.LastError,
+			strconv.Itoa(item.ChannelID),
+		}, "\x00"))
+		if !strings.Contains(haystack, query.Search) {
+			return false
+		}
+	}
+	if query.Model != "" && item.Model != query.Model {
+		return false
+	}
+	if query.Endpoint != "" && item.Endpoint != query.Endpoint {
+		return false
+	}
+	if query.Group != "" && item.Group != query.Group {
+		return false
+	}
+	if query.ChannelID > 0 && item.ChannelID != query.ChannelID {
+		return false
+	}
+	if len(query.PrimaryStates) > 0 && !smartRouteStringContains(query.PrimaryStates, item.PrimaryState) {
+		return false
+	}
+	if len(query.ProbeStates) > 0 && !smartRouteStringContains(query.ProbeStates, item.ProbeState) {
+		return false
+	}
+	return query.RequiresAdminReview == nil || item.RequiresAdminReview == *query.RequiresAdminReview
+}
+
+func smartRouteStringContains(values []string, expected string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func smartRouteHealthPriority(state string) int {
+	switch state {
+	case smartRoutePrimaryNeedsReview:
+		return 0
+	case smartRoutePrimaryUnavailable:
+		return 1
+	case smartRoutePrimaryProbing:
+		return 2
+	case smartRoutePrimaryRecovering:
+		return 3
+	case smartRoutePrimaryDegradedUsable:
+		return 4
+	case smartRoutePrimaryHealthy:
+		return 5
+	case smartRoutePrimaryPendingSample:
+		return 6
+	default:
+		return 7
+	}
+}
+
+func smartRouteHealthLess(left, right SmartRouteHealthItem, sortBy string) bool {
+	switch sortBy {
+	case "model":
+		if left.Model != right.Model {
+			return left.Model < right.Model
+		}
+	case "price":
+		// The health endpoint's price sort is intentionally limited to the
+		// resolved static descriptor. Actual-input ranking is performed by the
+		// planner and requires the unique observed two-price formula; this
+		// diagnostic sort must not be mistaken for that prediction.
+		if left.PriceKnown != right.PriceKnown {
+			return left.PriceKnown
+		}
+		if left.ModelPriceKnown != right.ModelPriceKnown {
+			return left.ModelPriceKnown
+		}
+		if left.Price != nil && right.Price != nil && left.Price.ComparableWith(*right.Price) &&
+			left.Price.ScorePPM != right.Price.ScorePPM {
+			return left.Price.ScorePPM < right.Price.ScorePPM
+		}
+		// Old snapshots have no model descriptor. Preserve their ratio ordering,
+		// but never compare incompatible new price classes by Key ceiling.
+		if !left.ModelPriceKnown && left.EffectiveRatioPPM != right.EffectiveRatioPPM {
+			return left.EffectiveRatioPPM < right.EffectiveRatioPPM
+		}
+	case "last_failure":
+		if left.LastFailureAtMS != right.LastFailureAtMS {
+			return left.LastFailureAtMS < right.LastFailureAtMS
+		}
+	case "next_probe":
+		leftNext := smartRouteHealthNextProbeAt(left)
+		rightNext := smartRouteHealthNextProbeAt(right)
+		if leftNext != rightNext {
+			return leftNext < rightNext
+		}
+	case "success_rate":
+		if left.SuccessRate == nil || right.SuccessRate == nil {
+			return left.SuccessRate != nil
+		}
+		if *left.SuccessRate != *right.SuccessRate {
+			return *left.SuccessRate < *right.SuccessRate
+		}
+	default:
+		leftPriority := smartRouteHealthPriority(left.PrimaryState)
+		rightPriority := smartRouteHealthPriority(right.PrimaryState)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+	}
+	if left.Model != right.Model {
+		return left.Model < right.Model
+	}
+	if left.Endpoint != right.Endpoint {
+		return left.Endpoint < right.Endpoint
+	}
+	if left.Group != right.Group {
+		return left.Group < right.Group
+	}
+	return left.RouteID < right.RouteID
+}
+
+func smartRouteHealthNextProbeAt(item SmartRouteHealthItem) int64 {
+	if item.Phase == smartrouter.QualityWarming ||
+		(item.Phase == smartrouter.QualityDegraded && smartRouteHealthHasRecoverySuccess(item)) {
+		return 0
+	}
+	if item.Phase == smartrouter.QualityDegraded {
+		return item.SampleDueAtMS
+	}
+	return item.NextProbeAtMS
+}
+
+type SmartRouteProbeScheduleResult struct {
+	State           smartrouter.QualityState `json:"state"`
+	Mode            string                   `json:"mode"`
+	Disposition     string                   `json:"disposition"`
+	ProbeCapability string                   `json:"probe_capability"`
+	WorkerAvailable bool                     `json:"worker_available"`
+	RetryAfterMS    int64                    `json:"retry_after_ms,omitempty"`
+}
+
+const (
+	smartRouteManualProbeQueued             = "queued"
+	smartRouteManualProbeDuplicate          = "duplicate"
+	smartRouteManualProbeAlreadyHealthy     = "already_healthy"
+	smartRouteManualProbeAlreadyRunning     = "already_running"
+	smartRouteManualProbeCoolingDown        = "cooldown"
+	smartRouteManualProbeWaitingForBudget   = "waiting_for_budget"
+	smartRouteManualProbeNaturalTrafficOnly = "natural_traffic_only"
+	smartRouteManualProbeRequiresReset      = "requires_reset"
+	smartRouteManualProbeQueueFull          = "queue_full"
+	smartRouteManualProbeWorkerUnavailable  = "worker_unavailable"
+	smartRouteManualProbeNotFound           = "not_found"
+	smartRouteManualProbeUnsupported        = "unsupported"
+)
+
+var smartRouteManualProbeCooldowns = struct {
+	sync.Mutex
+	deadlines map[string]time.Time
+	budget    map[string]time.Time
+}{deadlines: make(map[string]time.Time), budget: make(map[string]time.Time)}
+
+func (engine *SmartRouterEngine) ScheduleRouteProbe(ctx context.Context, routeID string) (smartrouter.QualityState, error) {
+	result, err := engine.ScheduleRouteProbeDetailed(ctx, routeID)
+	if err == nil {
+		switch result.Disposition {
+		case smartRouteManualProbeNotFound:
+			err = errors.New("smart router route was not found")
+		case smartRouteManualProbeRequiresReset:
+			err = errors.New("smart router route is quarantined; reset it before scheduling a probe")
+		case smartRouteManualProbeWorkerUnavailable:
+			err = errors.New("smart router recovery worker is unavailable")
+		case smartRouteManualProbeQueueFull:
+			err = errors.New("smart router recovery probe queue is full")
+		}
+	}
+	return result.State, err
+}
+
+func (engine *SmartRouterEngine) ScheduleRouteProbeDetailed(
+	ctx context.Context,
+	routeID string,
+) (SmartRouteProbeScheduleResult, error) {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return SmartRouteProbeScheduleResult{Disposition: smartRouteManualProbeNotFound}, nil
+	}
+	if retryAfter, coolingDown := smartRouteManualProbeCooldownRemaining(ctx, routeID); coolingDown {
+		return SmartRouteProbeScheduleResult{
+			Disposition:  smartRouteManualProbeCoolingDown,
+			RetryAfterMS: retryAfter.Milliseconds(),
+		}, nil
+	}
+	report, err := engine.HealthReport(ctx)
+	if err != nil {
+		return SmartRouteProbeScheduleResult{}, err
+	}
+	health, known := smartRouteHealthItemByID(report, routeID)
+	if !known {
+		return SmartRouteProbeScheduleResult{Disposition: smartRouteManualProbeNotFound}, nil
+	}
+	result := SmartRouteProbeScheduleResult{
+		State: smartRouteQualityFromHealthItem(health), ProbeCapability: health.ProbeCapability,
+	}
+	if health.Phase == smartrouter.QualityHealthy || health.Phase == smartrouter.QualityBootstrap {
+		result.Disposition = smartRouteManualProbeAlreadyHealthy
+		return result, nil
+	}
+	if health.Phase == smartrouter.QualityHalfOpen {
+		result.Disposition = smartRouteManualProbeAlreadyRunning
+		result.WorkerAvailable = true
+		return result, nil
+	}
+	catalog, catalogErr := engine.Catalogs.RefreshIfDue(ctx)
+	if catalogErr != nil || catalog == nil {
+		if catalogErr != nil {
+			return SmartRouteProbeScheduleResult{}, catalogErr
+		}
+		result.Disposition = smartRouteManualProbeNotFound
+		return result, nil
+	}
+	contract, route, found := findSmartRouteContractRoute(*catalog, routeID)
+	if !found {
+		result.Disposition = smartRouteManualProbeNotFound
+		return result, nil
+	}
+	result.ProbeCapability = smartRouteProbeCapability(contract.Endpoint)
+	if !SmartRouteSyntheticProbeAllowed(contract.Endpoint, contract.CanonicalModel, route) {
+		result.ProbeCapability = smartRouteProbeCapabilityNaturalOnly
+	}
+	var sink SmartRouteManualProbeSink
+	if result.ProbeCapability == smartRouteProbeCapabilitySyntheticText {
+		var available bool
+		sink, available = smartRouteManualProbeSink(ctx, engine)
+		result.WorkerAvailable = available
+		if !available {
+			result.Mode = "waiting_for_worker"
+			result.Disposition = smartRouteManualProbeWorkerUnavailable
+			return result, nil
+		}
+	}
+	setting := smartroutersetting.Normalize(engine.Settings())
+	acquired, denial, retryAfter, releaseCooldown, cooldownErr := acquireSmartRouteManualProbeCooldown(
+		ctx,
+		routeID,
+		smartRouteManualProbeBudget(setting.ProbeBudgetPerMinute),
+	)
+	if cooldownErr != nil {
+		return SmartRouteProbeScheduleResult{}, cooldownErr
+	}
+	if !acquired {
+		result.Disposition = denial
+		result.RetryAfterMS = retryAfter.Milliseconds()
+		return result, nil
+	}
+	if result.ProbeCapability == smartRouteProbeCapabilityNaturalOnly {
+		scheduler, ok := engine.State.(SmartRouteStateProbeScheduler)
+		if !ok {
+			releaseCooldown()
+			return SmartRouteProbeScheduleResult{}, errors.New("smart router state backend cannot schedule natural-traffic recovery")
+		}
+		state, scheduleErr := scheduler.ScheduleProbe(ctx, routeID)
+		if scheduleErr != nil {
+			releaseCooldown()
+			return SmartRouteProbeScheduleResult{}, scheduleErr
+		}
+		result.State = state
+		invalidateSmartRouteHealthReport(engine)
+		result.Mode = "natural_traffic"
+		result.Disposition = smartRouteManualProbeNaturalTrafficOnly
+		return result, nil
+	}
+	switch sink.ScheduleRoute(catalog.Version, contract, route) {
+	case SmartRouteProbeEnqueued:
+		result.Mode = "queued"
+		result.Disposition = smartRouteManualProbeQueued
+	case SmartRouteProbeAlreadyQueued:
+		result.Mode = "queued"
+		result.Disposition = smartRouteManualProbeDuplicate
+	case SmartRouteProbeQueueFull:
+		releaseCooldown()
+		result.Mode = "queue_full"
+		result.Disposition = smartRouteManualProbeQueueFull
+	case SmartRouteProbeWorkerUnavailable:
+		releaseCooldown()
+		result.Mode = "waiting_for_worker"
+		result.Disposition = smartRouteManualProbeWorkerUnavailable
+	default:
+		releaseCooldown()
+		result.Mode = "unsupported"
+		result.Disposition = smartRouteManualProbeUnsupported
+	}
+	return result, nil
+}
+
+func smartRouteHealthItemByID(report SmartRouteHealthReport, routeID string) (SmartRouteHealthItem, bool) {
+	for _, item := range report.Items {
+		if item.RouteID == routeID {
+			return item, true
+		}
+	}
+	return SmartRouteHealthItem{}, false
+}
+
+func smartRouteQualityFromHealthItem(item SmartRouteHealthItem) smartrouter.QualityState {
+	return smartrouter.QualityState{
+		Phase: item.Phase, Epoch: item.Epoch,
+		ConsecutiveHardFailures: item.ConsecutiveHardFailures,
+		TotalSuccesses:          item.Successes, TotalHardFailures: item.Failures,
+		ProbeFailures: item.ProbeFailures, NextProbeAtMS: item.NextProbeAtMS,
+		SampleDueAtMS: item.SampleDueAtMS, LastProbeAtMS: item.LastProbeAtMS,
+		LastProbeOutcome: item.LastProbeOutcome,
+	}
+}
+
+func smartRouteManualProbeSink(ctx context.Context, engine *SmartRouterEngine) (SmartRouteManualProbeSink, bool) {
+	if engine == nil {
+		return nil, false
+	}
+	engine.recoveryHintsMu.RLock()
+	sink, ok := engine.recoveryHints.(SmartRouteManualProbeSink)
+	engine.recoveryHintsMu.RUnlock()
+	if !ok || sink == nil {
+		return nil, false
+	}
+	switch current := sink.(type) {
+	case *SmartRouteProbeWorker:
+		current.mu.Lock()
+		available := !current.closed && current.ctx != nil
+		current.mu.Unlock()
+		return sink, available
+	case *RedisSmartRouteRecoveryHintPublisher:
+		statsCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+		_, available := readSmartRouteWorkerStats(statsCtx)
+		return sink, available
+	default:
+		return sink, true
+	}
+}
+
+func acquireSmartRouteManualProbeCooldown(
+	ctx context.Context,
+	routeID string,
+	manualBudget int,
+) (bool, string, time.Duration, func(), error) {
+	// Manual checks are durable, physically deduplicated recovery requests.
+	// Their actual execution still consumes the worker's shared probe budget,
+	// so rejecting the HTTP action with a second per-minute budget only makes
+	// the button appear unreliable without reducing probe cost. Keep only the
+	// per-route click cooldown here; the worker remains the single budget owner.
+	_ = manualBudget
+	if common.RedisEnabled && common.RDB != nil {
+		cooldownKey := smartRouteRedisKey("manual-probe-cooldown:" + smartRouteRedisComponent(routeID))
+		owner := common.NewRequestId()
+		const acquireScript = `
+if redis.call('EXISTS', KEYS[1]) == 1 then return -1 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return 1
+`
+		code, err := common.RDB.Eval(
+			ctx,
+			acquireScript,
+			[]string{cooldownKey},
+			owner,
+			smartRouteManualProbeCooldownWindow.Milliseconds(),
+		).Int64()
+		if err != nil {
+			return false, "", 0, func() {}, err
+		}
+		if code == -1 {
+			retryAfter, ttlErr := common.RDB.PTTL(ctx, cooldownKey).Result()
+			if ttlErr != nil || retryAfter < 0 {
+				retryAfter = smartRouteManualProbeCooldownWindow
+			}
+			return false, smartRouteManualProbeCoolingDown, retryAfter, func() {}, nil
+		}
+		if code != 1 {
+			return false, "", 0, func() {}, errors.New("smart router manual probe limiter returned an invalid result")
+		}
+		release := func() {
+			const releaseScript = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+return 1
+`
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			_ = common.RDB.Eval(releaseCtx, releaseScript, []string{cooldownKey}, owner).Err()
+		}
+		return true, "", 0, release, nil
+	}
+	now := time.Now()
+	smartRouteManualProbeCooldowns.Lock()
+	deadline := smartRouteManualProbeCooldowns.deadlines[routeID]
+	if deadline.After(now) {
+		smartRouteManualProbeCooldowns.Unlock()
+		return false, smartRouteManualProbeCoolingDown, time.Until(deadline), func() {}, nil
+	}
+	smartRouteManualProbeCooldowns.deadlines[routeID] = now.Add(smartRouteManualProbeCooldownWindow)
+	smartRouteManualProbeCooldowns.Unlock()
+	release := func() {
+		smartRouteManualProbeCooldowns.Lock()
+		delete(smartRouteManualProbeCooldowns.deadlines, routeID)
+		smartRouteManualProbeCooldowns.Unlock()
+	}
+	return true, "", 0, release, nil
+}
+
+func smartRouteManualProbeCooldownRemaining(ctx context.Context, routeID string) (time.Duration, bool) {
+	if common.RedisEnabled && common.RDB != nil {
+		key := smartRouteRedisKey("manual-probe-cooldown:" + smartRouteRedisComponent(routeID))
+		retryAfter, err := common.RDB.PTTL(ctx, key).Result()
+		if err == nil && retryAfter > 0 {
+			return retryAfter, true
+		}
+		return 0, false
+	}
+	smartRouteManualProbeCooldowns.Lock()
+	deadline := smartRouteManualProbeCooldowns.deadlines[routeID]
+	smartRouteManualProbeCooldowns.Unlock()
+	if deadline.After(time.Now()) {
+		return time.Until(deadline), true
+	}
+	return 0, false
+}
+
+func smartRouteManualProbeBudget(globalBudget int) int {
+	budget := globalBudget / 3
+	if budget < 1 {
+		budget = 1
+	}
+	if budget > 10 {
+		budget = 10
+	}
+	return budget
+}
+
+func findSmartRouteContractRoute(
+	catalog smartrouter.CertifiedRouteCatalog,
+	routeID string,
+) (smartrouter.RouteContract, smartrouter.CertifiedRoute, bool) {
+	for _, entry := range catalog.Contracts {
+		for _, pool := range entry.Pools {
+			for _, route := range pool.Candidates {
+				if route.RouteID == routeID {
+					return entry.Contract, route, true
+				}
+			}
+		}
+	}
+	return smartrouter.RouteContract{}, smartrouter.CertifiedRoute{}, false
+}
+
+func (engine *SmartRouterEngine) ResetRouteHealth(ctx context.Context, routeID string) (smartrouter.QualityState, error) {
+	report, err := engine.HealthReport(ctx)
+	if err != nil {
+		return smartrouter.QualityState{}, err
+	}
+	known, _ := smartRouteHealthContains(report, routeID)
+	if !known {
+		return smartrouter.QualityState{}, errors.New("smart router route was not found")
+	}
+	resetter, ok := engine.State.(SmartRouteStateResetter)
+	if !ok {
+		return smartrouter.QualityState{}, errors.New("smart router state backend cannot reset routes")
+	}
+	state, err := resetter.ResetRoute(ctx, SmartRouteResetRequest{RouteID: routeID, ForceProbe: true})
+	if err == nil {
+		engine.Catalogs.Invalidate()
+		engine.Prices.InvalidateAll()
+		invalidateSmartRouteHealthReport(engine)
+	}
+	return state, err
+}
+
+// ResetAllAutomaticHealth clears only the automatically learned health state
+// for routes currently present in the certified catalog. Manual blocks,
+// model/contract exclusions, prices, authorization and channel configuration
+// are separate stores and are intentionally untouched.
+func (engine *SmartRouterEngine) ResetAllAutomaticHealth(ctx context.Context) (int, int, error) {
+	if engine == nil || engine.Catalogs == nil || engine.State == nil {
+		return 0, 0, errors.New("smart router health dependencies are incomplete")
+	}
+	resetter, ok := engine.State.(SmartRouteStateResetter)
+	if !ok {
+		return 0, 0, errors.New("smart router state backend cannot reset routes")
+	}
+	catalog, err := engine.Catalogs.RefreshIfDue(ctx)
+	if err != nil && !errors.Is(err, ErrNoCertifiedSmartRoutes) {
+		return 0, 0, err
+	}
+	if catalog == nil {
+		return 0, 0, ErrNoCurrentSmartCatalog
+	}
+	routeIDs := make(map[string]struct{})
+	for _, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				if route.RouteID != "" {
+					routeIDs[route.RouteID] = struct{}{}
+				}
+			}
+		}
+	}
+	reset, failed := 0, 0
+	for routeID := range routeIDs {
+		if _, resetErr := resetter.ResetRoute(ctx, SmartRouteResetRequest{RouteID: routeID, ForceProbe: true}); resetErr != nil {
+			failed++
+			continue
+		}
+		reset++
+	}
+	engine.Catalogs.Invalidate()
+	engine.Prices.InvalidateAll()
+	invalidateSmartRouteHealthReport(engine)
+	if err := ctx.Err(); err != nil {
+		return reset, failed, err
+	}
+	return reset, failed, nil
+}
+
+func smartRouteHealthContains(report SmartRouteHealthReport, routeID string) (bool, bool) {
+	for _, item := range report.Items {
+		if item.RouteID == routeID {
+			return true, item.Quarantined
+		}
+	}
+	return false, false
+}

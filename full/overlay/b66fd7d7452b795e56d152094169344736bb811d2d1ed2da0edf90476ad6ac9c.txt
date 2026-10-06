@@ -1,0 +1,17 @@
+package smart_router_setting
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestRecoveryFallbackDefaultAndExplicitDisableSurviveClone(t *testing.T) {
+	require.True(t, Setting{}.RecoveryFallbackAllowed())
+	disabled := false
+	source := Setting{RecoveryFallbackEnabled: &disabled}
+	clone := Normalize(source)
+	require.False(t, clone.RecoveryFallbackAllowed())
+	*clone.RecoveryFallbackEnabled = true
+	require.False(t, source.RecoveryFallbackAllowed())
+}

@@ -15,7 +15,7 @@ from pathlib import Path
 TEXT_SUFFIXES = {
     ".go", ".py", ".ps1", ".sh", ".cmd", ".bat", ".ts", ".tsx", ".js",
     ".mjs", ".json", ".yaml", ".yml", ".toml", ".md", ".txt", ".sql",
-    ".html", ".css", ".scss", ".mod", ".sum", ".xml", ".env",
+    ".html", ".css", ".scss", ".mod", ".sum", ".xml", ".env", ".lock", ".svg",
 }
 SKIP_COMPONENTS = {".git", "node_modules", ".cache", ".tmp", "vendor"}
 MAX_TEXT_BYTES = 16 * 1024 * 1024
@@ -62,7 +62,7 @@ def scan_text(label: str, text: str, rules: tuple) -> list[dict]:
             start = max(0, match.start() - 100)
             end = min(len(text), match.end() + 100)
             context = text[start:end].replace("\r", " ").replace("\n", " ")
-            if ALLOW_CONTEXT.search(context):
+            if not rule_id.startswith(("private_term_", "local_user_path")) and ALLOW_CONTEXT.search(context):
                 continue
             line = text.count("\n", 0, match.start()) + 1
             findings.append({

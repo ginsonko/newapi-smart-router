@@ -1,0 +1,204 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/service"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+const smartRouteProbeRelayDrainTimeout = 5 * time.Second
+
+type smartRouteRelayProbeExecutor struct{}
+
+func NewSmartRouteRelayProbeExecutor() service.SmartRouteProbeExecutor {
+	return smartRouteRelayProbeExecutor{}
+}
+
+func (smartRouteRelayProbeExecutor) ExecuteSmartRouteProbe(
+	parent context.Context,
+	request service.SmartRouteProbeExecutionRequest,
+) service.SmartRouteProbeExecutionResult {
+	if !service.SmartRouteSyntheticProbeAllowed(request.Endpoint, request.CanonicalModel, request.Route) {
+		return service.SmartRouteProbeExecutionResult{Outcome: service.SmartRouteOutcome{Outcome: smartrouter.OutcomeUserRejected, ErrorSummary: "media recovery requires real traffic"}}
+	}
+	path, format, payload, ok := smartRouteProbeContract(request.Endpoint, request.CanonicalModel)
+	if !ok {
+		return service.SmartRouteProbeExecutionResult{Outcome: smartRouteProbeInfrastructureFailure(
+			http.StatusBadRequest, "unsupported synthetic probe contract",
+		)}
+	}
+	body, err := common.Marshal(payload)
+	if err != nil {
+		return service.SmartRouteProbeExecutionResult{Outcome: smartRouteProbeInfrastructureFailure(
+			http.StatusInternalServerError, err.Error(),
+		)}
+	}
+	totalTimeout := request.FirstTextTimeout + request.CompletionGrace + 15*time.Second
+	if totalTimeout <= 0 {
+		totalTimeout = 75 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, totalTimeout)
+	defer cancel()
+	// Relay adaptors join ChannelBaseUrl and RequestURLPath themselves.  The
+	// synthetic request must therefore carry only the internal relative path;
+	// using an absolute placeholder host here gets concatenated into malformed
+	// upstream URLs (for example, "https://upstreamhttp//smart-route...").
+	httpRequest, err := newSmartRouteProbeHTTPRequest(ctx, path, bytes.NewReader(body))
+	if err != nil {
+		return service.SmartRouteProbeExecutionResult{Outcome: smartRouteProbeInfrastructureFailure(
+			http.StatusInternalServerError, err.Error(),
+		)}
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httpRequest
+	defer common.CleanupBodyStorage(c)
+	common.SetContextKey(c, common.RequestIdKey, "smart-route-background-probe")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, request.CanonicalModel)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, request.Route.Group)
+	common.SetContextKey(c, constant.ContextKeyAutoGroup, request.Route.Group)
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+
+	channel, channelErr := loadCurrentSmartRouteChannel(request.Route, request.CanonicalModel)
+	if channelErr != nil {
+		return service.SmartRouteProbeExecutionResult{Outcome: service.ClassifySmartRouteOutcome(channelErr, nil)}
+	}
+	setting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	if !setting.Enabled || !setting.BackgroundProbeEnabled || model.ModelRequiresPassiveRecovery(channel.Type, request.CanonicalModel, request.Route.UpstreamModel) {
+		return service.SmartRouteProbeExecutionResult{Outcome: service.SmartRouteOutcome{Outcome: smartrouter.OutcomeUserRejected, ErrorSummary: "synthetic probe disabled or media route"}}
+	}
+	if setupErr := middleware.SetupContextForSelectedChannel(c, channel, request.CanonicalModel); setupErr != nil {
+		return service.SmartRouteProbeExecutionResult{Outcome: service.ClassifySmartRouteOutcome(setupErr, nil)}
+	}
+	info, infoErr := rebuildSmartRelayInfo(c, format, 1)
+	if infoErr != nil {
+		return service.SmartRouteProbeExecutionResult{Outcome: service.ClassifySmartRouteOutcome(infoErr, nil)}
+	}
+	info.IsSmartRouteProbe = true
+	startedAt := time.Now()
+	done := make(chan *types.NewAPIError, 1)
+	go func() { done <- dispatchSmartRelay(c, format, info) }()
+	dispatchFinished := false
+
+	firstTextTimer := time.NewTimer(request.FirstTextTimeout)
+	defer firstTextTimer.Stop()
+	result := service.SmartRouteProbeExecutionResult{}
+	select {
+	case relayErr := <-done:
+		dispatchFinished = true
+		result.Outcome = service.ClassifySmartRouteOutcome(relayErr, ctx.Err())
+		result.Completed = relayErr == nil
+	case <-info.FirstTextReady():
+		result.TTFTObserved = true
+		result.TTFT = time.Since(startedAt)
+		completionTimer := time.NewTimer(request.CompletionGrace)
+		select {
+		case relayErr := <-done:
+			dispatchFinished = true
+			result.Outcome = service.ClassifySmartRouteOutcome(relayErr, ctx.Err())
+			result.Completed = relayErr == nil
+		case <-completionTimer.C:
+			cancel()
+			result.Outcome = smartRouteProbeInfrastructureFailure(http.StatusGatewayTimeout, "probe completion grace exceeded")
+		case <-ctx.Done():
+			result.Outcome = smartRouteProbeInfrastructureFailure(http.StatusGatewayTimeout, ctx.Err().Error())
+		}
+		if !completionTimer.Stop() {
+			select {
+			case <-completionTimer.C:
+			default:
+			}
+		}
+	case <-firstTextTimer.C:
+		cancel()
+		result.Outcome = smartRouteProbeInfrastructureFailure(http.StatusGatewayTimeout, "probe semantic first-text deadline exceeded")
+	case <-ctx.Done():
+		result.Outcome = smartRouteProbeInfrastructureFailure(http.StatusGatewayTimeout, ctx.Err().Error())
+	}
+	if !dispatchFinished {
+		// Cancellation must be joined before the worker releases the capacity and
+		// probe leases. Most relay paths stop immediately when ctx is canceled;
+		// retain a bounded drain for a provider transport that needs a few seconds
+		// to close its response body.
+		cancel()
+		drainTimer := time.NewTimer(smartRouteProbeRelayDrainTimeout)
+		select {
+		case relayErr := <-done:
+			dispatchFinished = true
+			if result.Outcome.Outcome == "" {
+				result.Outcome = service.ClassifySmartRouteOutcome(relayErr, ctx.Err())
+			}
+		case <-drainTimer.C:
+			result.Outcome = smartRouteProbeInfrastructureFailure(http.StatusGatewayTimeout, "probe relay did not stop after cancellation")
+		}
+		if !drainTimer.Stop() {
+			select {
+			case <-drainTimer.C:
+			default:
+			}
+		}
+	}
+	if firstToken, ok := info.FirstTokenTime(); ok && firstToken.After(startedAt) {
+		result.TTFEObserved = true
+		result.TTFE = firstToken.Sub(startedAt)
+	}
+	return result
+}
+
+// newSmartRouteProbeHTTPRequest builds the request shape expected by the
+// normal relay pipeline: a path-only URL that is resolved against the selected
+// channel's base URL by its adaptor.
+func newSmartRouteProbeHTTPRequest(ctx context.Context, path string, body io.Reader) (*http.Request, error) {
+	return http.NewRequestWithContext(ctx, http.MethodPost, path, body)
+}
+
+func smartRouteProbeContract(endpoint, model string) (string, types.RelayFormat, map[string]any, bool) {
+	if !service.SmartRouteSyntheticProbeAllowed(endpoint, model) {
+		return "", "", nil, false
+	}
+	const prompt = "Reply with exactly OK."
+	switch endpoint {
+	case service.SmartEndpointChat:
+		return "/v1/chat/completions", types.RelayFormatOpenAI, map[string]any{
+			"model": model, "messages": []map[string]string{{"role": "user", "content": prompt}},
+			"stream": true, "max_tokens": 1,
+		}, true
+	case service.SmartEndpointCompletions:
+		return "/v1/completions", types.RelayFormatOpenAI, map[string]any{
+			"model": model, "prompt": prompt, "stream": true, "max_tokens": 1,
+		}, true
+	case service.SmartEndpointResponses:
+		return "/v1/responses", types.RelayFormatOpenAIResponses, map[string]any{
+			"model": model, "input": prompt, "stream": true, "max_output_tokens": 1,
+		}, true
+	case service.SmartEndpointMessages:
+		return "/v1/messages", types.RelayFormatClaude, map[string]any{
+			"model": model, "messages": []map[string]string{{"role": "user", "content": prompt}},
+			"stream": true, "max_tokens": 1,
+		}, true
+	default:
+		return "", "", nil, false
+	}
+}
+
+func smartRouteProbeInfrastructureFailure(status int, summary string) service.SmartRouteOutcome {
+	return service.SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, FailureScope: service.SmartFailureInfrastructure,
+		RouteFailure: true, RetryNextRoute: true, AffectsRouteHealth: true,
+		HTTPStatus: status, ErrorSummary: summary,
+	}
+}

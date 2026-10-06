@@ -1,0 +1,13 @@
+package controller
+
+import (
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+)
+
+const taskBillingContextVersion = service.TaskBillingContextVersion
+
+func snapshotTaskBillingContext(info *relaycommon.RelayInfo) *model.TaskBillingContext {
+	return service.SnapshotTaskBillingContext(info)
+}

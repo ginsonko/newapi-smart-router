@@ -1,0 +1,95 @@
+package common
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/shopspring/decimal"
+)
+
+// ValidateParameterVideoWire runs after provider conversion. A conversion may
+// change field names, but cannot change the generation purchased by the user.
+func ValidateParameterVideoWire(q *types.ParameterPriceSnapshot, fields map[string]interface{}, capability media.Capability) error {
+	if q == nil {
+		return nil
+	}
+	read := func(key string) string {
+		v, ok := fields[key]
+		if !ok || v == nil {
+			return ""
+		}
+		if s, ok := v.(string); ok {
+			return s
+		}
+		raw, err := common.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	}
+	if read("model") != q.UpstreamModel {
+		return fmt.Errorf("outbound model differs from the priced supply")
+	}
+	count := read("n")
+	if count == "" {
+		count = "1"
+	}
+	n, err := strconv.ParseUint(count, 10, 32)
+	if err != nil || strconv.FormatUint(n, 10) != q.Parameters["count"] {
+		return fmt.Errorf("outbound video count differs from the quote")
+	}
+	duration := read("seconds")
+	if q.Unit == "fixed_duration" && capability.ProviderContract == "aizzz-video-v1" && duration == "1" {
+		duration = read("mySeconds")
+	}
+	if duration == "" {
+		duration = read("duration")
+	}
+	want := q.Parameters["duration_seconds"]
+	if want != "" {
+		actual, e := decimal.NewFromString(duration)
+		expected, e2 := decimal.NewFromString(want)
+		if e != nil || e2 != nil || !actual.Equal(expected) {
+			return fmt.Errorf("outbound video duration differs from the quote")
+		}
+		for _, field := range []string{"duration", "mySeconds"} {
+			if v := read(field); v != "" {
+				value, e := decimal.NewFromString(v)
+				if e != nil || !value.Equal(expected) {
+					return fmt.Errorf("outbound %s conflicts with the quoted duration", field)
+				}
+			}
+		}
+	}
+	resolution, size := read("resolution"), read("size")
+	if capability.RuntimeEnforced {
+		resolution, err = capability.NormalizeResolution(resolution, size)
+		if err != nil {
+			return err
+		}
+	} else {
+		if resolution != "" && size != "" && !strings.EqualFold(resolution, size) {
+			return fmt.Errorf("outbound resolution and size conflict")
+		}
+		if resolution == "" {
+			resolution = size
+		}
+	}
+	if want := q.Parameters["resolution"]; want != "" && !strings.EqualFold(strings.TrimSpace(resolution), want) {
+		return fmt.Errorf("outbound video resolution differs from the quote")
+	}
+	quality := read("quality")
+	if quality == "" {
+		if metadata, ok := fields["metadata"].(map[string]interface{}); ok {
+			quality, _ = metadata["quality"].(string)
+		}
+	}
+	if want := q.Parameters["quality"]; want != "" && !strings.EqualFold(strings.TrimSpace(quality), want) {
+		return fmt.Errorf("outbound quality differs from the quote")
+	}
+	return nil
+}

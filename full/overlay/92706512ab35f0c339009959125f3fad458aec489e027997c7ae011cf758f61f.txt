@@ -1,0 +1,191 @@
+package media
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupImageRouteSpoolTest(t *testing.T) *gorm.DB {
+	t.Helper()
+	_, database := preparePhysicalStorageTest(t)
+	connection, err := database.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
+	setting := mediasetting.Get()
+	setting.GlobalMaxBytes, setting.PerUserMaxBytes = 100, 10
+	setting.MaxFileBytes, setting.MaxRequestBytes = 80, 80
+	require.NoError(t, mediasetting.Replace(setting))
+	return database
+}
+
+func TestImageRouteSpoolSurvivesConnectionReplacementAndReleaseReplay(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	token, err := ReserveImageRouteSpool(20, 253402300799)
+	require.NoError(t, err)
+	require.NotEmpty(t, token)
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	assert.EqualValues(t, 253402300799, reservation.ExpiresAt)
+	assert.Zero(t, reservation.UserID)
+	serialized, err := common.Marshal(reservation)
+	require.NoError(t, err)
+	assert.NotContains(t, string(serialized), token)
+	other, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := other.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
+	model.DB = other
+	require.NoError(t, GrowImageRouteSpool(token, 40))
+	require.NoError(t, GrowImageRouteSpool(token, 40))
+	require.NoError(t, GrowImageRouteSpool(token, 30))
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.EqualValues(t, 40, state.ReservedBytes)
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	assert.EqualValues(t, 40, reservation.Bytes)
+	assert.EqualValues(t, 253402300799, reservation.ExpiresAt)
+	require.NoError(t, ReleaseImageRouteSpool(token))
+	require.NoError(t, ReleaseImageRouteSpool(token))
+	require.NoError(t, ReleaseImageRouteSpool(""))
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.Zero(t, state.ReservedBytes)
+	require.ErrorIs(t, GrowImageRouteSpool(token, 50), ErrImageRouteSpoolUnavailable)
+}
+
+func TestImageRouteSpoolSharesGlobalCapacityWithoutUserAssetAllowance(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	first, err := ReserveImageRouteSpool(60, 253402300799)
+	require.NoError(t, err)
+	second, err := ReserveImageRouteSpool(30, 253402300799)
+	require.NoError(t, err)
+	_, err = ReserveImageRouteSpool(11, 253402300799)
+	require.ErrorIs(t, err, ErrMediaCapacity)
+	require.ErrorIs(t, GrowImageRouteSpool(first, 80), ErrMediaCapacity)
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.EqualValues(t, 90, state.ReservedBytes)
+	require.NoError(t, ReleaseImageRouteSpool(second))
+	require.NoError(t, GrowImageRouteSpool(first, 80))
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.EqualValues(t, 80, state.ReservedBytes)
+}
+
+func TestImageRouteSpoolRejectsInvalidSizeAndExpiryWithoutReservation(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	for _, bytes := range []int64{-1, 81, int64(^uint64(0) >> 1)} {
+		token, err := ReserveImageRouteSpool(bytes, 253402300799)
+		require.ErrorIs(t, err, ErrMediaFileTooLarge)
+		assert.Empty(t, token)
+	}
+	for _, expiry := range []int64{-1, 0, 1} {
+		token, err := ReserveImageRouteSpool(1, expiry)
+		require.ErrorIs(t, err, ErrImageRouteSpoolUnavailable)
+		assert.Empty(t, token)
+	}
+	var count int64
+	require.NoError(t, database.Model(&model.MediaStorageReservation{}).Count(&count).Error)
+	assert.Zero(t, count)
+	token, err := ReserveImageRouteSpool(0, 253402300799)
+	require.NoError(t, err)
+	for _, bytes := range []int64{-1, 81, int64(^uint64(0) >> 1)} {
+		require.ErrorIs(t, GrowImageRouteSpool(token, bytes), ErrMediaFileTooLarge)
+	}
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	assert.EqualValues(t, 80, reservation.Bytes)
+}
+
+func TestImageRouteSpoolExpiryAndForeignReservationsFailClosed(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	token, err := ReserveImageRouteSpool(20, 253402300799)
+	require.NoError(t, err)
+	require.NoError(t, database.Model(&model.MediaStorageReservation{}).Where("token = ?", token).Update("expires_at", 1).Error)
+	require.ErrorIs(t, GrowImageRouteSpool(token, 20), ErrImageRouteSpoolUnavailable)
+	require.ErrorIs(t, GrowImageRouteSpool(token, 30), ErrImageRouteSpoolUnavailable)
+	require.NoError(t, ReconcileStorageState())
+	require.NoError(t, ReleaseImageRouteSpool(token))
+	foreign, err := reserveStorage(9, 5)
+	require.NoError(t, err)
+	require.ErrorIs(t, GrowImageRouteSpool(foreign, 10), ErrImageRouteSpoolUnavailable)
+	require.ErrorIs(t, ReleaseImageRouteSpool(foreign), ErrImageRouteSpoolUnavailable)
+	require.ErrorIs(t, GrowImageRouteSpool("missing", 1), ErrImageRouteSpoolUnavailable)
+	require.NoError(t, ReleaseImageRouteSpool("missing"))
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.EqualValues(t, 5, state.ReservedBytes)
+}
+
+func TestImageRouteSpoolExpiryWriteFailureReleasesCapacity(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	sentinel := errors.New("expiry persistence failed")
+	require.NoError(t, database.Callback().Update().Before("gorm:update").Register("image_spool_expiry_failure", func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]interface{})
+		if ok && updates["expires_at"] != nil {
+			tx.AddError(sentinel)
+		}
+	}))
+	token, err := ReserveImageRouteSpool(20, 253402300799)
+	require.ErrorIs(t, err, sentinel)
+	assert.Empty(t, token)
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.Zero(t, state.ReservedBytes)
+}
+
+func TestImageRouteSpoolGrowthRollsBackWhenLedgerWriteFails(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	token, err := ReserveImageRouteSpool(20, 253402300799)
+	require.NoError(t, err)
+	sentinel := errors.New("capacity ledger persistence failed")
+	require.NoError(t, database.Callback().Update().Before("gorm:update").Register("image_spool_ledger_failure", func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "media_storage_states" {
+			tx.AddError(sentinel)
+		}
+	}))
+	require.ErrorIs(t, GrowImageRouteSpool(token, 40), sentinel)
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	assert.EqualValues(t, 20, reservation.Bytes)
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.EqualValues(t, 20, state.ReservedBytes)
+	require.ErrorIs(t, ReleaseImageRouteSpool(token), ErrImageRouteSpoolUnavailable)
+	require.NoError(t, database.Callback().Update().Remove("image_spool_ledger_failure"))
+	require.NoError(t, ReleaseImageRouteSpool(token))
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.Zero(t, state.ReservedBytes)
+}
+
+func TestImageRouteSpoolGrowthRejectsConcurrentReservationChange(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	token, err := ReserveImageRouteSpool(20, 253402300799)
+	require.NoError(t, err)
+	injected := false
+	require.NoError(t, database.Callback().Query().After("gorm:query").Register("image_spool_competing_growth", func(tx *gorm.DB) {
+		if injected || tx.Statement.Schema == nil || tx.Statement.Schema.Table != "media_storage_reservations" {
+			return
+		}
+		injected = true
+		err := tx.Session(&gorm.Session{NewDB: true}).Model(&model.MediaStorageReservation{}).
+			Where("token = ?", token).Update("bytes", 30).Error
+		tx.AddError(err)
+	}))
+	require.ErrorIs(t, GrowImageRouteSpool(token, 40), ErrImageRouteSpoolUnavailable)
+	assert.True(t, injected)
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	assert.EqualValues(t, 20, state.ReservedBytes)
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	assert.EqualValues(t, 20, reservation.Bytes)
+}

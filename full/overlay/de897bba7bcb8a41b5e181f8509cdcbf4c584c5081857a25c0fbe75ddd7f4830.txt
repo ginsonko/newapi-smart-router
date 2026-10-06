@@ -1,0 +1,130 @@
+package middleware
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	EmailVerificationRateLimitMark = "EV"
+	EmailVerificationMaxRequests   = 2
+	EmailVerificationDuration      = 30
+)
+
+const emailReservationScript = `
+local wait = 0
+for index, key in ipairs(KEYS) do
+    local count = tonumber(redis.call('GET', key) or '0')
+    if count >= tonumber(ARGV[index + 1]) then
+        local ttl = redis.call('PTTL', key)
+        if ttl < 0 then
+            redis.call('PEXPIRE', key, ARGV[1])
+            ttl = tonumber(ARGV[1])
+        end
+        wait = math.max(wait, ttl, 1)
+    end
+end
+if wait > 0 then return wait end
+for index, key in ipairs(KEYS) do
+    local count = redis.call('INCR', key)
+    if count == 1 or redis.call('PTTL', key) < 0 then
+        redis.call('PEXPIRE', key, ARGV[1])
+    end
+end
+return 0
+`
+
+type emailRateWindow struct {
+	count   int
+	expires time.Time
+}
+
+var emailRateMemory = struct {
+	sync.Mutex
+	windows map[string]emailRateWindow
+}{windows: make(map[string]emailRateWindow)}
+
+func reserveEmailMemory(keys []string, limits []int, duration time.Duration) time.Duration {
+	emailRateMemory.Lock()
+	defer emailRateMemory.Unlock()
+	now := time.Now()
+	for key, window := range emailRateMemory.windows {
+		if !now.Before(window.expires) {
+			delete(emailRateMemory.windows, key)
+		}
+	}
+	var wait time.Duration
+	for index, key := range keys {
+		window := emailRateMemory.windows[key]
+		if window.count >= limits[index] && window.expires.Sub(now) > wait {
+			wait = window.expires.Sub(now)
+		}
+	}
+	if wait > 0 {
+		return wait
+	}
+	for _, key := range keys {
+		window := emailRateMemory.windows[key]
+		if window.count == 0 {
+			window.expires = now.Add(duration)
+		}
+		window.count++
+		emailRateMemory.windows[key] = window
+	}
+	return 0
+}
+
+func EmailVerificationRateLimit() gin.HandlerFunc {
+	seconds := common.GetEnvOrDefault("EMAIL_VERIFICATION_COOLDOWN_SECONDS", EmailVerificationDuration)
+	maxIP := common.GetEnvOrDefault("EMAIL_VERIFICATION_IP_MAX_REQUESTS", EmailVerificationMaxRequests)
+	if seconds < 1 {
+		seconds = EmailVerificationDuration
+	}
+	if maxIP < 1 {
+		maxIP = EmailVerificationMaxRequests
+	}
+	duration := time.Duration(seconds) * time.Second
+	return func(c *gin.Context) {
+		email := model.NormalizeEmail(c.Query("email"))
+		if err := common.Validate.Var(email, "required,email"); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"success": false, "message": "无效的邮箱地址"})
+			return
+		}
+		keys := []string{
+			fmt.Sprintf("email-send:{verification}:ip:%x", sha256.Sum256([]byte(c.ClientIP()))),
+			fmt.Sprintf("email-send:{verification}:mail:%x", sha256.Sum256([]byte(email))),
+		}
+		var wait time.Duration
+		if common.RedisEnabled {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+			defer cancel()
+			milliseconds, err := common.RDB.Eval(ctx, emailReservationScript, keys, duration.Milliseconds(), maxIP, 1).Int64()
+			if err != nil {
+				c.Header("Retry-After", "5")
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "邮件服务暂时繁忙，请稍后重试", "retry_after": 5})
+				return
+			}
+			wait = time.Duration(milliseconds) * time.Millisecond
+		} else {
+			wait = reserveEmailMemory(keys, []int{maxIP, 1}, duration)
+		}
+		c.Header("Cache-Control", "no-store")
+		if wait > 0 {
+			remaining := int64((wait + time.Second - 1) / time.Second)
+			c.Header("Retry-After", strconv.FormatInt(remaining, 10))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"success": false, "message": fmt.Sprintf("发送过于频繁，请等待 %d 秒后再试", remaining), "retry_after": remaining})
+			return
+		}
+		c.Header("X-Email-Cooldown-Seconds", strconv.Itoa(seconds))
+		c.Next()
+	}
+}

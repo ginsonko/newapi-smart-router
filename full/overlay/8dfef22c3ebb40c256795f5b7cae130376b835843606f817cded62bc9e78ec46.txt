@@ -1,0 +1,3729 @@
+package service
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/go-redis/redis/v8"
+)
+
+var (
+	ErrSmartRouteStateConflict = errors.New("smart router state changed too frequently")
+	ErrSmartRouteInvalidLease  = errors.New("smart router lease configuration is invalid")
+	ErrSmartRouteLeaseNotOwned = errors.New("smart router lease is expired or no longer owned")
+)
+
+const (
+	defaultSmartRouteTTFTWindow            = 100
+	defaultSmartRouteTTFTFreshness         = 15 * time.Minute
+	smartRouteLeaderboardWindowHorizon     = time.Hour
+	smartRouteLeaderboardWindowHalfLife    = 30 * time.Minute
+	smartRouteLeaderboardWindowSize        = 100
+	smartRouteLeaderboardHistoryHorizon    = 24 * time.Hour
+	smartRouteLeaderboardHistoryHalfLife   = 500.0
+	smartRouteLeaderboardHistoryBatchSize  = 20
+	smartRouteLeaderboardHistoryBatchAge   = 5 * time.Minute
+	smartRouteLeaderboardHistoryAlphaMax   = 0.08
+	smartRouteLeaderboardHistoryDriftAlpha = 0.12
+	defaultSmartRouteLeaseTTL              = 2 * time.Minute
+	defaultSmartRouteProbeTTL              = 45 * time.Second
+	defaultSmartRouteCapacityBackoff       = 15 * time.Second
+	defaultSmartRouteProbeBudgetLimit      = 5
+	defaultSmartRouteProbeMaxConcurrency   = 3
+	defaultSmartRouteProbeBudgetWindow     = time.Minute
+	defaultSmartRouteProbeSubjectCooldown  = time.Minute
+	defaultSmartRouteMaxProbeFailures      = 8
+	defaultSmartRouteMaxOutage             = 24 * time.Hour
+	maxSmartRouteStateCASAttempts          = 128
+	smartRouteRedisLeaseCleanupGrace       = 60 * time.Second
+	smartRouteFailClosedVersionPrefix      = "fail-closed"
+)
+
+type SmartRouteStateConfig struct {
+	Clock                func() time.Time
+	Quality              smartrouter.QualityConfig
+	TTFTWindowSize       int
+	TTFTFreshness        time.Duration
+	DefaultLeaseTTL      time.Duration
+	DefaultProbeTTL      time.Duration
+	CapacityBackoff      time.Duration
+	ProbeBudgetLimit     int
+	ProbeMaxConcurrency  int
+	ProbeBudgetWindow    time.Duration
+	ProbeSubjectCooldown time.Duration
+	MaxProbeFailures     int
+	MaxOutage            time.Duration
+	DurableQuarantine    SmartRouteDurableQuarantineStore
+	RedisKeyPrefix       string
+}
+
+func DefaultSmartRouteStateConfig() SmartRouteStateConfig {
+	return SmartRouteStateConfig{
+		Clock:                time.Now,
+		Quality:              smartrouter.DefaultQualityConfig(),
+		TTFTWindowSize:       defaultSmartRouteTTFTWindow,
+		TTFTFreshness:        defaultSmartRouteTTFTFreshness,
+		DefaultLeaseTTL:      defaultSmartRouteLeaseTTL,
+		DefaultProbeTTL:      defaultSmartRouteProbeTTL,
+		CapacityBackoff:      defaultSmartRouteCapacityBackoff,
+		ProbeBudgetLimit:     defaultSmartRouteProbeBudgetLimit,
+		ProbeMaxConcurrency:  defaultSmartRouteProbeMaxConcurrency,
+		ProbeBudgetWindow:    defaultSmartRouteProbeBudgetWindow,
+		ProbeSubjectCooldown: defaultSmartRouteProbeSubjectCooldown,
+		MaxProbeFailures:     defaultSmartRouteMaxProbeFailures,
+		MaxOutage:            defaultSmartRouteMaxOutage,
+		RedisKeyPrefix:       smartRouteRedisPrefix(),
+	}
+}
+
+func normalizeSmartRouteStateConfig(config SmartRouteStateConfig) (SmartRouteStateConfig, error) {
+	defaults := DefaultSmartRouteStateConfig()
+	if config.Clock == nil {
+		config.Clock = defaults.Clock
+	}
+	if emptySmartRouteQualityConfig(config.Quality) {
+		config.Quality = defaults.Quality
+	}
+	if config.TTFTWindowSize == 0 {
+		config.TTFTWindowSize = defaults.TTFTWindowSize
+	}
+	if config.TTFTFreshness == 0 {
+		config.TTFTFreshness = defaults.TTFTFreshness
+	}
+	if config.DefaultLeaseTTL == 0 {
+		config.DefaultLeaseTTL = defaults.DefaultLeaseTTL
+	}
+	if config.DefaultProbeTTL == 0 {
+		config.DefaultProbeTTL = defaults.DefaultProbeTTL
+	}
+	if config.CapacityBackoff == 0 {
+		config.CapacityBackoff = defaults.CapacityBackoff
+	}
+	if config.ProbeBudgetLimit == 0 {
+		config.ProbeBudgetLimit = defaults.ProbeBudgetLimit
+	}
+	if config.ProbeBudgetWindow == 0 {
+		config.ProbeBudgetWindow = defaults.ProbeBudgetWindow
+	}
+	if config.ProbeMaxConcurrency == 0 {
+		config.ProbeMaxConcurrency = defaults.ProbeMaxConcurrency
+	}
+	if config.MaxProbeFailures == 0 {
+		config.MaxProbeFailures = defaults.MaxProbeFailures
+	}
+	if config.MaxOutage == 0 {
+		config.MaxOutage = defaults.MaxOutage
+	}
+	if config.ProbeSubjectCooldown == 0 {
+		config.ProbeSubjectCooldown = defaults.ProbeSubjectCooldown
+	}
+	config.RedisKeyPrefix = strings.TrimSpace(config.RedisKeyPrefix)
+	if config.RedisKeyPrefix == "" {
+		config.RedisKeyPrefix = defaults.RedisKeyPrefix
+	}
+	if err := config.Quality.Validate(); err != nil {
+		return SmartRouteStateConfig{}, fmt.Errorf("validate smart router quality config: %w", err)
+	}
+	if config.TTFTWindowSize < 1 || config.TTFTFreshness < time.Millisecond ||
+		config.DefaultLeaseTTL < time.Millisecond || config.DefaultProbeTTL < time.Millisecond ||
+		config.CapacityBackoff < time.Millisecond || config.ProbeBudgetLimit < 1 || config.ProbeMaxConcurrency < 1 ||
+		config.MaxProbeFailures < 1 || config.MaxOutage < time.Millisecond ||
+		config.ProbeBudgetWindow < time.Millisecond || config.ProbeSubjectCooldown < time.Millisecond {
+		return SmartRouteStateConfig{}, errors.New("smart router state durations and window size must be positive")
+	}
+	return config, nil
+}
+
+type SmartRouteStateRoute struct {
+	RouteID          string
+	CapacityDomain   string
+	CredentialDomain string
+	StableFallback   bool
+	MaxInflight      int
+}
+
+type SmartRouteStateSnapshotRequest struct {
+	Routes []SmartRouteStateRoute
+}
+
+type SmartRouteRuntimeSnapshot struct {
+	Quality     smartrouter.QualitySnapshot
+	TTFT        smartrouter.TTFTSnapshot
+	Recent      SmartRouteRecentSnapshot
+	Capacity    smartrouter.CapacitySnapshot
+	Credentials smartrouter.CredentialSnapshot
+	FailClosed  bool
+	StoreError  error
+}
+
+type SmartRouteProbeRequest struct {
+	RouteID string
+	// LeaseKey identifies the physical upstream probe target. Health evidence
+	// remains route-local, while probes for route aliases sharing this key are
+	// single-flight. Empty values preserve the legacy RouteID-based behavior.
+	LeaseKey        string
+	StableFallback  bool
+	SubjectKey      string
+	ExpectedEpoch   uint64
+	Force           bool
+	VirginBootstrap bool
+	TTL             time.Duration
+	BudgetLimit     int
+	MaxConcurrency  int
+	BudgetWindow    time.Duration
+	SubjectCooldown time.Duration
+	BudgetNamespace string
+}
+
+const (
+	SmartRouteProbeBudgetRecovery  = "recovery"
+	SmartRouteProbeBudgetColdStart = "cold-start"
+)
+
+type SmartRouteCapacityRequest struct {
+	RecoveryFallback bool
+	CapacityDomain   string
+	MaxInflight      int
+	StableFallback   bool
+	QueueMode        smartrouter.QueueMode
+	TTL              time.Duration
+	// IdleOnly atomically admits the lease only when the capacity domain has
+	// no foreground or background holder. Recovery probes use this lane so
+	// they never consume a slot while user traffic is active.
+	IdleOnly bool
+}
+
+type SmartRouteCapacityDisposition string
+
+const (
+	SmartRouteCapacityGranted SmartRouteCapacityDisposition = "granted"
+	SmartRouteCapacitySpill   SmartRouteCapacityDisposition = "spill"
+)
+
+type SmartRouteCapacityAcquisition struct {
+	Disposition SmartRouteCapacityDisposition
+	Lease       *SmartRouteLease
+	State       smartrouter.CapacityState
+	FailClosed  bool
+	StoreError  error
+}
+
+func (acquisition SmartRouteCapacityAcquisition) Granted() bool {
+	return acquisition.Disposition == SmartRouteCapacityGranted && acquisition.Lease != nil
+}
+
+type SmartRouteAttemptRecord struct {
+	ImageAttempt     bool
+	AtMS             int64
+	CatalogVersion   string
+	RouteID          string
+	Group            string
+	Model            string
+	ChannelID        int
+	ContractID       string
+	Endpoint         string
+	CapacityDomain   string
+	CredentialDomain string
+	StableFallback   bool
+	Outcome          smartrouter.QualityOutcome
+	// SkipHealthUpdate keeps route-local contract/model tombstones from
+	// poisoning the shared health state while still allowing the caller to
+	// exclude the attempted route for this request.
+	SkipHealthUpdate bool
+	// SkipDomainUpdate prevents an alias health write from double-counting the
+	// same physical capacity or credential-domain event.
+	SkipDomainUpdate bool
+	RetryAfter       time.Duration
+	TTFTObserved     bool
+	TTFT             time.Duration
+	Admission        smartrouter.AdmissionKind
+	RouteEpoch       uint64
+	ProbeLeaseID     string
+	DemandRecovery   bool
+	PassiveRecovery  bool
+	SyntheticProbe   bool
+	// ObservationID is normalized to a one-way digest before persistence. It
+	// makes request-level facts idempotent across retries, route aliases and
+	// reconciliation replay without retaining a raw request identifier.
+	ObservationID string
+	StartedAtMS   int64
+	HTTPStatus    int
+	ErrorSummary  string
+	// Warmup marks a route/cache namespace that has just been entered. Warmup
+	// observations remain visible and counted, but carry reduced influence in
+	// recent/history metric estimates until steady-state traffic confirms them.
+	Warmup bool
+}
+
+type SmartRouteDurableQuarantineRecord struct {
+	RouteID             string
+	Group               string
+	Model               string
+	ChannelID           int
+	ContractID          string
+	Endpoint            string
+	Epoch               uint64
+	Reason              string
+	FirstFailureMS      int64
+	LastFailureMS       int64
+	ProbeFailures       int
+	ConsecutiveFailures int
+}
+
+// SmartRouteDurableQuarantineStore is implemented by the database-backed
+// block service. Redis and memory remain hot evidence stores; long-lived
+// quarantine authority is durable and survives process or Redis restarts.
+type SmartRouteDurableQuarantineStore interface {
+	UpsertAutoHealth(context.Context, SmartRouteDurableQuarantineRecord) error
+	ClearAutoHealth(context.Context, string, uint64) error
+}
+
+type SmartRouteResetRequest struct {
+	RouteID    string
+	ForceProbe bool
+}
+
+type SmartRouteQuarantineRequest struct {
+	CatalogVersion string
+	RouteID        string
+	FailureScope   SmartRouteFailureScope
+	TTL            time.Duration
+}
+
+type SmartRouteExclusionRequest struct {
+	CatalogVersion string
+	Routes         []SmartRouteStateRoute
+	FailureScopes  []SmartRouteFailureScope
+}
+
+type SmartRouteExclusion struct {
+	RouteID      string
+	FailureScope SmartRouteFailureScope
+	ExpiresAtMS  int64
+}
+
+type SmartRouteExclusionSnapshot struct {
+	Version    string
+	RouteIDs   []string
+	Entries    []SmartRouteExclusion
+	FailClosed bool
+	StoreError error
+}
+
+// SmartRouteStateStore is the runtime boundary consumed by the smart planner.
+// QueueModeShortWait is represented in the request for forward compatibility,
+// but the first production implementation deliberately returns spill instead
+// of maintaining a process-local fairness queue.
+type SmartRouteStateStore interface {
+	Snapshot(context.Context, SmartRouteStateSnapshotRequest) (SmartRouteRuntimeSnapshot, error)
+	TryAcquireProbe(context.Context, SmartRouteProbeRequest) (*SmartRouteLease, bool, error)
+	TryAcquireCapacity(context.Context, SmartRouteCapacityRequest) (SmartRouteCapacityAcquisition, error)
+	RecordAttempt(context.Context, SmartRouteAttemptRecord) error
+	QuarantineRoute(context.Context, SmartRouteQuarantineRequest) error
+	RouteExclusions(context.Context, SmartRouteExclusionRequest) (SmartRouteExclusionSnapshot, error)
+}
+
+type SmartRouteStateResetter interface {
+	ResetRoute(context.Context, SmartRouteResetRequest) (smartrouter.QualityState, error)
+}
+
+type SmartRouteStateProbeScheduler interface {
+	ScheduleProbe(context.Context, string) (smartrouter.QualityState, error)
+}
+
+type SmartRouteStateConfigUpdater interface {
+	UpdateConfig(SmartRouteStateConfig) error
+}
+
+// SmartRouteHistoricalEvidence is a privacy-safe, request-level leaderboard
+// fact reconstructed from an existing usage/error log. Importers must update
+// only recent TTFT/outcome evidence; health, capacity and credential state are
+// explicitly outside this contract.
+type SmartRouteHistoricalEvidence struct {
+	RouteID              string
+	StableFallback       bool
+	ObservationID        string
+	LegacyObservationIDs []string
+	// LegacyIdentity marks old Smart Router logs that predate the shared live
+	// observation field. If a route already has live evidence, replay skips the
+	// ambiguous legacy row instead of risking a one-time duplicate at upgrade.
+	LegacyIdentity  bool
+	EventMS         int64
+	OutcomeObserved bool
+	Success         bool
+	TTFTObserved    bool
+	TTFTMS          int64
+}
+
+type SmartRouteRecentEvidenceImporter interface {
+	ImportRecentEvidence(context.Context, []SmartRouteHistoricalEvidence) (int, error)
+}
+
+type SmartRouteLease struct {
+	ID    string
+	Epoch uint64
+
+	mu          sync.Mutex
+	released    bool
+	expiresAtMS int64
+	renewTTL    time.Duration
+	release     func(context.Context) error
+	renew       func(context.Context, time.Duration) (int64, error)
+}
+
+func (lease *SmartRouteLease) ExpiresAtMS() int64 {
+	if lease == nil {
+		return 0
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	return lease.expiresAtMS
+}
+
+// Renew is the heartbeat used by long-running streaming requests. It extends
+// only the same random lease ID and can never resurrect an expired lease.
+func (lease *SmartRouteLease) Renew(ctx context.Context) error {
+	if lease == nil {
+		return ErrSmartRouteInvalidLease
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.released {
+		return ErrSmartRouteLeaseNotOwned
+	}
+	if lease.renew == nil || lease.renewTTL < time.Millisecond {
+		return ErrSmartRouteInvalidLease
+	}
+	expiresAtMS, err := lease.renew(ctx, lease.renewTTL)
+	if err != nil {
+		return err
+	}
+	lease.expiresAtMS = expiresAtMS
+	return nil
+}
+
+func (lease *SmartRouteLease) Release(ctx context.Context) error {
+	if lease == nil {
+		return nil
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.released {
+		return nil
+	}
+	if lease.release == nil {
+		return ErrSmartRouteInvalidLease
+	}
+	if err := lease.release(ctx); err != nil {
+		return err
+	}
+	lease.released = true
+	return nil
+}
+
+type smartRouteTTFTSample struct {
+	AtMS          int64  `json:"at_ms"`
+	MS            int64  `json:"ms"`
+	Synthetic     bool   `json:"synthetic,omitempty"`
+	ObservationID string `json:"observation_id,omitempty"`
+	Warmup        bool   `json:"warmup,omitempty"`
+}
+
+type smartRouteOutcomeSample struct {
+	AtMS          int64  `json:"at_ms"`
+	Success       bool   `json:"success"`
+	ObservationID string `json:"observation_id,omitempty"`
+	Warmup        bool   `json:"warmup,omitempty"`
+}
+
+// SmartRouteRecentMetrics is request-level, privacy-safe evidence for the
+// leaderboard. It deliberately excludes probes, client cancellations and
+// request/content rejections so those events cannot distort provider quality.
+type SmartRouteRecentMetrics struct {
+	TTFTAverageMS              int64   `json:"ttft_average_ms,omitempty"`
+	TTFTRecentAverageMS        int64   `json:"ttft_recent_average_ms,omitempty"`
+	TTFTHistoricalAverageMS    int64   `json:"ttft_historical_average_ms,omitempty"`
+	TTFTHistoricalP50MS        int64   `json:"ttft_historical_p50_ms,omitempty"`
+	TTFTHistoricalP95MS        int64   `json:"ttft_historical_p95_ms,omitempty"`
+	TTFTHistoricalSamples      int64   `json:"ttft_historical_samples,omitempty"`
+	TTFTSource                 string  `json:"ttft_source,omitempty"`
+	TTFTConfidencePPM          int64   `json:"ttft_confidence_ppm,omitempty"`
+	TTFTSamples                int     `json:"ttft_samples,omitempty"`
+	RecentUsageCount           int     `json:"recent_usage_count,omitempty"`
+	StabilityRate              float64 `json:"stability_rate"`
+	StabilityRecentRate        float64 `json:"stability_recent_rate"`
+	StabilityHistoricalRate    float64 `json:"stability_historical_rate"`
+	StabilityHistoricalSamples int64   `json:"stability_historical_samples,omitempty"`
+	StabilitySource            string  `json:"stability_source,omitempty"`
+	StabilityConfidencePPM     int64   `json:"stability_confidence_ppm,omitempty"`
+	StabilitySamples           int     `json:"stability_samples,omitempty"`
+	StabilitySuccesses         int     `json:"stability_successes,omitempty"`
+	StabilityFailures          int     `json:"stability_failures,omitempty"`
+	LastObservedAtMS           int64   `json:"last_observed_at_ms,omitempty"`
+}
+
+type smartRouteMetricHistory struct {
+	Version                 string                          `json:"version,omitempty"`
+	Value                   float64                         `json:"value,omitempty"`
+	P50                     float64                         `json:"p50,omitempty"`
+	P95                     float64                         `json:"p95,omitempty"`
+	MAD                     float64                         `json:"mad,omitempty"`
+	EffectiveSamples        float64                         `json:"effective_samples,omitempty"`
+	TotalSamples            int64                           `json:"total_samples,omitempty"`
+	LastEventMS             int64                           `json:"last_event_ms,omitempty"`
+	DriftDirection          int                             `json:"drift_direction,omitempty"`
+	ConsecutiveDriftBatches int                             `json:"consecutive_drift_batches,omitempty"`
+	PendingStartedMS        int64                           `json:"pending_started_ms,omitempty"`
+	Pending                 []smartRouteMetricHistorySample `json:"pending,omitempty"`
+}
+
+type smartRouteMetricHistorySample struct {
+	Value   float64 `json:"value"`
+	EventMS int64   `json:"event_ms"`
+	Weight  float64 `json:"weight,omitempty"`
+}
+
+func smartRouteWarmupMetricWeight(warmup bool) float64 {
+	if warmup {
+		return 0.10
+	}
+	return 1
+}
+
+type smartRouteRecentHistory struct {
+	TTFT      smartRouteMetricHistory `json:"ttft,omitempty"`
+	Stability smartRouteMetricHistory `json:"stability,omitempty"`
+}
+
+type SmartRouteRecentSnapshot struct {
+	Version string                             `json:"version"`
+	Routes  map[string]SmartRouteRecentMetrics `json:"routes"`
+}
+
+type memorySmartRouteCapacity struct {
+	blockedUntilMS int64
+	leases         map[string]int64
+}
+
+type memorySmartRouteProbe struct {
+	id              string
+	routeID         string
+	epoch           uint64
+	expiresAtMS     int64
+	sample          bool
+	budgetNamespace string
+}
+
+type smartRouteQuarantineKey struct {
+	catalogVersion string
+	routeID        string
+	failureScope   SmartRouteFailureScope
+}
+
+type MemorySmartRouteStateStore struct {
+	config        SmartRouteStateConfig
+	runtimeConfig atomic.Pointer[SmartRouteStateConfig]
+
+	mu            sync.Mutex
+	revision      uint64
+	quality       map[string]smartrouter.QualityState
+	credentials   map[string]smartrouter.CredentialState
+	ttft          map[string][]smartRouteTTFTSample
+	outcomes      map[string][]smartRouteOutcomeSample
+	history       map[string]smartRouteRecentHistory
+	capacity      map[string]*memorySmartRouteCapacity
+	probeOwner    map[string]memorySmartRouteProbe
+	probeStarts   map[string][]int64
+	probeSubjects map[string]int64
+	quarantine    map[smartRouteQuarantineKey]int64
+}
+
+func NewMemorySmartRouteStateStore(config SmartRouteStateConfig) (*MemorySmartRouteStateStore, error) {
+	normalized, err := normalizeSmartRouteStateConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	store := &MemorySmartRouteStateStore{
+		config:        normalized,
+		quality:       make(map[string]smartrouter.QualityState),
+		credentials:   make(map[string]smartrouter.CredentialState),
+		ttft:          make(map[string][]smartRouteTTFTSample),
+		outcomes:      make(map[string][]smartRouteOutcomeSample),
+		history:       make(map[string]smartRouteRecentHistory),
+		capacity:      make(map[string]*memorySmartRouteCapacity),
+		probeOwner:    make(map[string]memorySmartRouteProbe),
+		probeStarts:   make(map[string][]int64),
+		probeSubjects: make(map[string]int64),
+		quarantine:    make(map[smartRouteQuarantineKey]int64),
+	}
+	store.runtimeConfig.Store(&normalized)
+	return store, nil
+}
+
+func (store *MemorySmartRouteStateStore) UpdateConfig(config SmartRouteStateConfig) error {
+	if store == nil {
+		return errors.New("smart router memory state store is unavailable")
+	}
+	normalized, err := normalizeSmartRouteStateConfig(config)
+	if err != nil {
+		return err
+	}
+	store.runtimeConfig.Store(&normalized)
+	return nil
+}
+
+func (store *MemorySmartRouteStateStore) runtimeConfigSnapshot() SmartRouteStateConfig {
+	if store != nil {
+		if current := store.runtimeConfig.Load(); current != nil {
+			return *current
+		}
+	}
+	return store.config
+}
+
+func NewSmartRouteStateStore(config SmartRouteStateConfig) (SmartRouteStateStore, error) {
+	if config.DurableQuarantine == nil {
+		config.DurableQuarantine = NewDatabaseSmartRouteDurableQuarantineStore()
+	}
+	if common.RedisEnabled && common.RDB != nil {
+		return NewRedisSmartRouteStateStore(common.RDB, config)
+	}
+	return NewMemorySmartRouteStateStore(config)
+}
+
+func (store *MemorySmartRouteStateStore) Snapshot(
+	ctx context.Context,
+	request SmartRouteStateSnapshotRequest,
+) (SmartRouteRuntimeSnapshot, error) {
+	routes, domains, err := normalizeSmartRouteSnapshotRequest(request)
+	if err != nil {
+		return SmartRouteRuntimeSnapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SmartRouteRuntimeSnapshot{}, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.recoverExpiredProbeOwnersLocked(nowMS)
+	store.pruneExpiredQuarantinesLocked(nowMS)
+
+	quality := make(map[string]smartrouter.QualityState, len(routes))
+	ttft := make(map[string]smartrouter.TTFTState, len(routes))
+	recent := make(map[string]SmartRouteRecentMetrics, len(routes))
+	credentials := make(map[string]smartrouter.CredentialState)
+	for _, route := range routes {
+		state, exists := store.quality[route.RouteID]
+		if !exists {
+			state = smartrouter.InitialQuality(route.StableFallback)
+			store.quality[route.RouteID] = state
+			store.revision++
+		} else if migrated, changed := smartrouter.NormalizeAutomaticRecoveryStateWithConfig(state, nowMS, store.runtimeConfigSnapshot().Quality); changed {
+			state = migrated
+			store.quality[route.RouteID] = state
+			store.revision++
+		}
+		quality[route.RouteID] = state
+		if current := calculateSmartRouteTTFT(store.ttft[route.RouteID], nowMS, store.config.TTFTFreshness); current.Samples > 0 {
+			ttft[route.RouteID] = current
+		}
+		recent[route.RouteID] = calculateSmartRouteRecentMetrics(
+			store.ttft[route.RouteID], store.outcomes[route.RouteID], store.history[route.RouteID], nowMS,
+		)
+		if route.CredentialDomain != "" {
+			credentials[route.CredentialDomain] = store.credentials[route.CredentialDomain]
+		}
+	}
+	capacity := make(map[string]smartrouter.CapacityState, len(domains))
+	for domain, input := range domains {
+		state := store.memoryCapacityStateLocked(domain, input.maxInflight, nowMS)
+		capacity[domain] = state
+	}
+	version := "memory:" + strconv.FormatUint(store.revision, 10)
+	return SmartRouteRuntimeSnapshot{
+		Quality:     smartrouter.QualitySnapshot{Version: version, Routes: quality},
+		TTFT:        smartrouter.TTFTSnapshot{Version: version, Routes: ttft},
+		Recent:      SmartRouteRecentSnapshot{Version: version, Routes: recent},
+		Capacity:    smartrouter.CapacitySnapshot{Version: version, Domains: capacity},
+		Credentials: smartrouter.CredentialSnapshot{Version: version, Domains: credentials},
+	}, nil
+}
+
+func (store *MemorySmartRouteStateStore) TryAcquireProbe(
+	ctx context.Context,
+	request SmartRouteProbeRequest,
+) (*SmartRouteLease, bool, error) {
+	config := store.runtimeConfigSnapshot()
+	request.RouteID = strings.TrimSpace(request.RouteID)
+	request.LeaseKey = normalizeSmartRouteProbeLeaseKey(request.RouteID, request.LeaseKey)
+	request.SubjectKey = strings.TrimSpace(request.SubjectKey)
+	request.BudgetNamespace = normalizeSmartRouteProbeBudgetNamespace(request.BudgetNamespace)
+	if request.RouteID == "" {
+		return nil, false, errors.New("smart router probe route is required")
+	}
+	ttl, err := smartRouteLeaseTTL(request.TTL, config.DefaultProbeTTL)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	id, err := newSmartRouteLeaseID()
+	if err != nil {
+		return nil, false, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	budgetLimit := request.BudgetLimit
+	if budgetLimit <= 0 {
+		budgetLimit = config.ProbeBudgetLimit
+	}
+	maxConcurrency := request.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = config.ProbeMaxConcurrency
+	}
+	budgetWindow := request.BudgetWindow
+	if budgetWindow <= 0 {
+		budgetWindow = config.ProbeBudgetWindow
+	}
+	subjectCooldown := request.SubjectCooldown
+	if subjectCooldown <= 0 {
+		subjectCooldown = config.ProbeSubjectCooldown
+	}
+	expiresAtMS := addDurationMS(nowMS, ttl)
+	store.mu.Lock()
+	store.recoverExpiredProbeOwnersLocked(nowMS)
+	if _, exists := store.probeOwner[request.LeaseKey]; exists {
+		store.mu.Unlock()
+		return nil, false, nil
+	}
+	for _, owner := range store.probeOwner {
+		if owner.routeID == request.RouteID {
+			store.mu.Unlock()
+			return nil, false, nil
+		}
+	}
+	state, exists := store.quality[request.RouteID]
+	if !exists {
+		state = smartrouter.InitialQuality(request.StableFallback)
+	}
+	if request.ExpectedEpoch > 0 && state.Epoch != request.ExpectedEpoch {
+		store.quality[request.RouteID] = state
+		store.mu.Unlock()
+		return nil, false, nil
+	}
+	if request.VirginBootstrap && !smartrouter.IsVirginUnknown(state) {
+		store.quality[request.RouteID] = state
+		store.mu.Unlock()
+		return nil, false, nil
+	}
+	nextState := state
+	sample := state.Phase == smartrouter.QualityWarming || state.Phase == smartrouter.QualityDegraded
+	if sample && !request.Force {
+		if state.SampleDueAtMS > nowMS {
+			store.quality[request.RouteID] = state
+			store.mu.Unlock()
+			return nil, false, nil
+		}
+	} else {
+		var acquired bool
+		nextState, acquired = smartrouter.BeginProbe(state, nowMS)
+		if !acquired && !request.Force {
+			store.quality[request.RouteID] = state
+			store.mu.Unlock()
+			return nil, false, nil
+		}
+		if request.Force && !acquired {
+			nextState = state
+			nextState.Phase = smartrouter.QualityHalfOpen
+			nextState.Revision++
+			nextState.LastUpdatedMS = nowMS
+		}
+	}
+	activeInNamespace := 0
+	for _, owner := range store.probeOwner {
+		if owner.budgetNamespace == request.BudgetNamespace {
+			activeInNamespace++
+		}
+	}
+	if activeInNamespace >= maxConcurrency {
+		store.quality[request.RouteID] = state
+		store.mu.Unlock()
+		return nil, false, nil
+	}
+	// Scope the per-subject cooldown to the route health epoch. An explicit
+	// administrator reset must be able to schedule a fresh recovery sample;
+	// the global budget and concurrency limits still apply.
+	probeSubjectKey := smartRouteProbeSubjectKey(request.SubjectKey, state.Epoch)
+	if !store.consumeProbeBudgetLocked(
+		nowMS, request.BudgetNamespace, probeSubjectKey, budgetLimit, budgetWindow, subjectCooldown,
+	) {
+		store.quality[request.RouteID] = state
+		store.mu.Unlock()
+		return nil, false, nil
+	}
+	state = nextState
+	store.quality[request.RouteID] = state
+	store.probeOwner[request.LeaseKey] = memorySmartRouteProbe{
+		id: id, routeID: request.RouteID, epoch: state.Epoch, expiresAtMS: expiresAtMS, sample: sample,
+		budgetNamespace: request.BudgetNamespace,
+	}
+	store.revision++
+	store.mu.Unlock()
+
+	lease := &SmartRouteLease{ID: id, Epoch: state.Epoch, expiresAtMS: expiresAtMS, renewTTL: ttl}
+	lease.release = func(releaseCtx context.Context) error {
+		if err := releaseCtx.Err(); err != nil {
+			return err
+		}
+		now := store.config.Clock().UnixMilli()
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		owner, exists := store.probeOwner[request.LeaseKey]
+		if !exists || owner.id != id {
+			return nil
+		}
+		delete(store.probeOwner, request.LeaseKey)
+		if !owner.sample {
+			store.reopenAbandonedProbeLocked(owner.routeID, now)
+		}
+		store.revision++
+		return nil
+	}
+	lease.renew = func(renewCtx context.Context, renewTTL time.Duration) (int64, error) {
+		if err := renewCtx.Err(); err != nil {
+			return 0, err
+		}
+		now := store.config.Clock().UnixMilli()
+		nextExpiry := addDurationMS(now, renewTTL)
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		owner, exists := store.probeOwner[request.LeaseKey]
+		if !exists || owner.id != id || owner.expiresAtMS <= now {
+			if exists && owner.id == id {
+				store.expireProbeOwnerLocked(request.LeaseKey, owner, now)
+			}
+			return 0, ErrSmartRouteLeaseNotOwned
+		}
+		owner.expiresAtMS = nextExpiry
+		store.probeOwner[request.LeaseKey] = owner
+		store.revision++
+		return nextExpiry, nil
+	}
+	return lease, true, nil
+}
+
+func (store *MemorySmartRouteStateStore) TryAcquireCapacity(
+	ctx context.Context,
+	request SmartRouteCapacityRequest,
+) (SmartRouteCapacityAcquisition, error) {
+	request.CapacityDomain = strings.TrimSpace(request.CapacityDomain)
+	if err := validateSmartRouteCapacityRequest(request); err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	ttl, err := smartRouteLeaseTTL(request.TTL, store.config.DefaultLeaseTTL)
+	if err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	id, err := newSmartRouteLeaseID()
+	if err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	expiresAtMS := addDurationMS(nowMS, ttl)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	state := store.memoryCapacityStateLocked(request.CapacityDomain, request.MaxInflight, nowMS)
+	if (!request.RecoveryFallback && state.BlockedUntilMS > nowMS) || (request.IdleOnly && state.Inflight > 0) ||
+		(request.MaxInflight > 0 && state.Inflight >= request.MaxInflight) {
+		return SmartRouteCapacityAcquisition{Disposition: SmartRouteCapacitySpill, State: state}, nil
+	}
+	domain := store.capacity[request.CapacityDomain]
+	if domain == nil {
+		domain = &memorySmartRouteCapacity{leases: make(map[string]int64)}
+		store.capacity[request.CapacityDomain] = domain
+	}
+	domain.leases[id] = expiresAtMS
+	store.revision++
+	state.Inflight++
+
+	lease := &SmartRouteLease{ID: id, expiresAtMS: expiresAtMS, renewTTL: ttl}
+	lease.release = func(releaseCtx context.Context) error {
+		if err := releaseCtx.Err(); err != nil {
+			return err
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		current := store.capacity[request.CapacityDomain]
+		if current == nil {
+			return nil
+		}
+		if _, exists := current.leases[id]; !exists {
+			return nil
+		}
+		delete(current.leases, id)
+		store.revision++
+		return nil
+	}
+	lease.renew = func(renewCtx context.Context, renewTTL time.Duration) (int64, error) {
+		if err := renewCtx.Err(); err != nil {
+			return 0, err
+		}
+		now := store.config.Clock().UnixMilli()
+		nextExpiry := addDurationMS(now, renewTTL)
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		current := store.capacity[request.CapacityDomain]
+		if current == nil {
+			return 0, ErrSmartRouteLeaseNotOwned
+		}
+		currentExpiry, exists := current.leases[id]
+		if !exists || currentExpiry <= now {
+			if exists {
+				delete(current.leases, id)
+				store.revision++
+			}
+			return 0, ErrSmartRouteLeaseNotOwned
+		}
+		current.leases[id] = nextExpiry
+		store.revision++
+		return nextExpiry, nil
+	}
+	return SmartRouteCapacityAcquisition{
+		Disposition: SmartRouteCapacityGranted,
+		Lease:       lease,
+		State:       state,
+	}, nil
+}
+
+func (store *MemorySmartRouteStateStore) RecordAttempt(ctx context.Context, record SmartRouteAttemptRecord) error {
+	config := store.runtimeConfigSnapshot()
+	record.ImageAttempt = record.ImageAttempt || record.Endpoint == SmartEndpointImages || record.Endpoint == SmartEndpointImageEdits
+	if record.ImageAttempt {
+		record.ObservationID = SmartRouteImageObservationID(record.ObservationID)
+	}
+	record.RouteID = strings.TrimSpace(record.RouteID)
+	record.CapacityDomain = strings.TrimSpace(record.CapacityDomain)
+	record.CredentialDomain = strings.TrimSpace(record.CredentialDomain)
+	record.ObservationID = smartRouteObservationDigest(record.ObservationID)
+	record.ErrorSummary = sanitizeSmartRouteErrorSummary(record.ErrorSummary)
+	if err := validateSmartRouteAttempt(record); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	store.mu.Lock()
+	state, exists := store.quality[record.RouteID]
+	if !exists {
+		state = smartrouter.InitialQuality(record.StableFallback)
+	}
+	if smartRouteAttemptUsesProbeFence(record) && record.RouteEpoch > 0 && state.Epoch != record.RouteEpoch {
+		store.mu.Unlock()
+		return nil
+	}
+	if record.ProbeLeaseID != "" {
+		owner, owned := store.memoryProbeOwnerByLeaseIDLocked(record.ProbeLeaseID)
+		if !owned || owner.routeID != record.RouteID || (record.RouteEpoch > 0 && owner.epoch != record.RouteEpoch) {
+			store.mu.Unlock()
+			return nil
+		}
+	}
+
+	factAccepted := !smartRouteObservationSeen(store.outcomes[record.RouteID], record.ObservationID)
+	if record.ImageAttempt {
+		factAccepted = smartrouter.ImageQualityEventAccepted(state, smartrouter.QualityEvent{
+			ObservationID: record.ObservationID, Outcome: record.Outcome, SyntheticProbe: record.SyntheticProbe, AtMS: smartRouteAttemptAtMS(record, nowMS),
+		})
+	}
+	if !record.SkipHealthUpdate {
+		next := state
+		if factAccepted || isSmartRouteRecoveryAdmission(record.Admission) {
+			next = smartrouter.ReduceQuality(state, smartrouter.QualityEvent{
+				ImageAttempt:    record.ImageAttempt,
+				AtMS:            smartRouteAttemptAtMS(record, nowMS),
+				StartedAtMS:     record.StartedAtMS,
+				ObservationID:   record.ObservationID,
+				Outcome:         record.Outcome,
+				RetryAfterMS:    durationMilliseconds(record.RetryAfter),
+				Probe:           isSmartRouteRecoveryAdmission(record.Admission),
+				DemandRecovery:  record.DemandRecovery,
+				PassiveRecovery: record.PassiveRecovery,
+				SyntheticProbe:  record.SyntheticProbe,
+				VirginBootstrap: record.Admission == smartrouter.AdmissionVirginBootstrap,
+				HTTPStatus:      record.HTTPStatus,
+				ErrorSummary:    record.ErrorSummary,
+			}, config.Quality)
+		}
+		next = jitterSmartRouteProbeDeadline(next, record.RouteID, nowMS)
+		next = deferNeutralSmartRouteSample(state, next, record, nowMS, config.Quality.WarmingSampleIntervalMS)
+		if next != state {
+			store.quality[record.RouteID] = next
+			state = next
+			store.revision++
+		}
+	}
+	if !record.SkipDomainUpdate && factAccepted {
+		if record.Outcome == smartrouter.OutcomeCapacityLimited {
+			store.recordMemoryCapacityBlockLocked(record, nowMS)
+		} else if record.Outcome == smartrouter.OutcomeSuccess {
+			store.clearMemoryCapacityBlockLocked(record.CapacityDomain)
+		}
+		store.recordMemoryCredentialLocked(record, nowMS)
+	}
+	if record.Outcome == smartrouter.OutcomeSuccess && factAccepted {
+		store.clearMemoryRouteQuarantinesLocked(record.CatalogVersion, record.RouteID)
+	}
+
+	if record.Outcome == smartrouter.OutcomeSuccess && record.TTFTObserved && !record.SkipHealthUpdate && factAccepted {
+		sample := smartRouteTTFTSample{
+			AtMS: nowMS, MS: durationMilliseconds(record.TTFT),
+			Synthetic:     record.SyntheticProbe || (isSmartRouteRecoveryAdmission(record.Admission) && !record.PassiveRecovery && !record.DemandRecovery),
+			ObservationID: record.ObservationID,
+			Warmup:        record.Warmup,
+		}
+		store.ttft[record.RouteID] = appendBoundedSmartRouteTTFT(
+			store.ttft[record.RouteID],
+			sample,
+			store.config.TTFTWindowSize,
+		)
+		if !sample.Synthetic {
+			history := store.history[record.RouteID]
+			history.TTFT = updateSmartRouteMetricHistoryWeighted(history.TTFT, float64(sample.MS), nowMS, false, smartRouteWarmupMetricWeight(record.Warmup))
+			store.history[record.RouteID] = history
+		}
+		store.revision++
+	}
+	if success, count := smartRouteLeaderboardOutcome(record); count && factAccepted {
+		store.outcomes[record.RouteID] = appendBoundedSmartRouteOutcome(
+			store.outcomes[record.RouteID],
+			smartRouteOutcomeSample{AtMS: nowMS, Success: success, ObservationID: record.ObservationID, Warmup: record.Warmup},
+			smartRouteLeaderboardWindowSize,
+		)
+		store.revision++
+		history := store.history[record.RouteID]
+		value := 0.0
+		if success {
+			value = 1
+		}
+		history.Stability = updateSmartRouteMetricHistoryWeighted(history.Stability, value, nowMS, true, smartRouteWarmupMetricWeight(record.Warmup))
+		store.history[record.RouteID] = history
+	}
+	store.mu.Unlock()
+	return nil
+}
+
+func (store *MemorySmartRouteStateStore) ImportRecentEvidence(
+	ctx context.Context,
+	evidence []SmartRouteHistoricalEvidence,
+) (int, error) {
+	if store == nil || len(evidence) == 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	normalized := normalizeSmartRouteHistoricalEvidence(evidence, nowMS)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	accepted := 0
+	for _, item := range normalized {
+		changed := false
+		if item.OutcomeObserved && !smartRouteOutcomeObservationSeenAny(store.outcomes[item.RouteID], item) &&
+			!(item.LegacyIdentity && len(store.outcomes[item.RouteID]) > 0) {
+			store.outcomes[item.RouteID] = appendBoundedSmartRouteOutcome(
+				store.outcomes[item.RouteID],
+				smartRouteOutcomeSample{AtMS: item.EventMS, Success: item.Success, ObservationID: item.ObservationID},
+				smartRouteLeaderboardWindowSize,
+			)
+			changed = true
+			history := store.history[item.RouteID]
+			value := 0.0
+			if item.Success {
+				value = 1
+			}
+			history.Stability = updateSmartRouteMetricHistory(history.Stability, value, item.EventMS, true)
+			store.history[item.RouteID] = history
+		}
+		if item.TTFTObserved && !smartRouteTTFTObservationSeenAny(store.ttft[item.RouteID], item) &&
+			!(item.LegacyIdentity && len(store.ttft[item.RouteID]) > 0) {
+			store.ttft[item.RouteID] = appendBoundedSmartRouteTTFT(
+				store.ttft[item.RouteID],
+				smartRouteTTFTSample{AtMS: item.EventMS, MS: item.TTFTMS, ObservationID: item.ObservationID},
+				store.config.TTFTWindowSize,
+			)
+			changed = true
+			history := store.history[item.RouteID]
+			history.TTFT = updateSmartRouteMetricHistory(history.TTFT, float64(item.TTFTMS), item.EventMS, false)
+			store.history[item.RouteID] = history
+		}
+		if changed {
+			accepted++
+			store.revision++
+		}
+	}
+	return accepted, nil
+}
+
+func (store *MemorySmartRouteStateStore) clearMemoryCapacityBlockLocked(domainID string) {
+	domainID = strings.TrimSpace(domainID)
+	if domainID == "" {
+		return
+	}
+	domain := store.capacity[domainID]
+	if domain == nil || domain.blockedUntilMS == 0 {
+		return
+	}
+	domain.blockedUntilMS = 0
+	store.revision++
+}
+
+func (store *MemorySmartRouteStateStore) clearMemoryRouteQuarantinesLocked(catalogVersion, routeID string) {
+	catalogVersion = strings.TrimSpace(catalogVersion)
+	routeID = strings.TrimSpace(routeID)
+	if catalogVersion == "" || routeID == "" {
+		return
+	}
+	changed := false
+	for key := range store.quarantine {
+		if key.catalogVersion == catalogVersion && key.routeID == routeID {
+			delete(store.quarantine, key)
+			changed = true
+		}
+	}
+	if changed {
+		store.revision++
+	}
+}
+
+func (store *MemorySmartRouteStateStore) recordMemoryCapacityBlockLocked(
+	record SmartRouteAttemptRecord,
+	nowMS int64,
+) {
+	domain := store.capacity[record.CapacityDomain]
+	if domain == nil {
+		domain = &memorySmartRouteCapacity{leases: make(map[string]int64)}
+		store.capacity[record.CapacityDomain] = domain
+	}
+	backoff := record.RetryAfter
+	if backoff < store.config.CapacityBackoff {
+		backoff = store.config.CapacityBackoff
+	}
+	backoff = capSmartRouteRecoveryDelay(backoff)
+	blockedUntilMS := addDurationMS(nowMS, backoff)
+	if blockedUntilMS > domain.blockedUntilMS {
+		domain.blockedUntilMS = blockedUntilMS
+		store.revision++
+	}
+}
+
+func (store *MemorySmartRouteStateStore) recordMemoryCredentialLocked(record SmartRouteAttemptRecord, nowMS int64) {
+	if record.CredentialDomain == "" {
+		return
+	}
+	state := store.credentials[record.CredentialDomain]
+	switch record.Outcome {
+	case smartrouter.OutcomeCredential:
+		if record.ObservationID != "" && record.ObservationID == state.LastFailureObservation {
+			return
+		}
+		windowMS := store.runtimeConfigSnapshot().Quality.HardFailureWindowMS
+		if state.LastFailureMS <= 0 || nowMS-state.LastFailureMS > windowMS {
+			state.ConsecutiveFailures = 1
+		} else {
+			state.ConsecutiveFailures++
+		}
+		state.LastFailureMS = nowMS
+		state.LastFailureObservation = record.ObservationID
+		delay := time.Duration(store.runtimeConfigSnapshot().Quality.CredentialBackoffMS) * time.Millisecond
+		if record.RetryAfter > delay {
+			delay = record.RetryAfter
+		}
+		delay = capSmartRouteRecoveryDelay(delay)
+		state.BlockedUntilMS = maxSmartRouteInt64(state.BlockedUntilMS, addDurationMS(nowMS, delay))
+		state.Revision++
+	case smartrouter.OutcomeSuccess:
+		if state.ConsecutiveFailures > 0 || state.BlockedUntilMS > 0 {
+			state.ConsecutiveFailures = 0
+			state.BlockedUntilMS = 0
+			state.LastFailureObservation = ""
+			state.LastSuccessMS = nowMS
+			state.Revision++
+		}
+	default:
+		return
+	}
+	store.credentials[record.CredentialDomain] = state
+	store.revision++
+}
+
+func smartRouteSharedOpenFailureThreshold(config smartrouter.QualityConfig) int {
+	if config.SharedOpenFailureThreshold >= 2 {
+		return config.SharedOpenFailureThreshold
+	}
+	return smartrouter.DefaultSharedOpenFailureThreshold
+}
+
+func (store *MemorySmartRouteStateStore) ResetRoute(
+	ctx context.Context,
+	request SmartRouteResetRequest,
+) (smartrouter.QualityState, error) {
+	config := store.runtimeConfigSnapshot()
+	request.RouteID = strings.TrimSpace(request.RouteID)
+	if request.RouteID == "" {
+		return smartrouter.QualityState{}, errors.New("smart router reset route is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return smartrouter.QualityState{}, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	store.mu.Lock()
+	state, exists := store.quality[request.RouteID]
+	if !exists {
+		state = smartrouter.InitialQuality(false)
+	}
+	state = smartrouter.ResetQuality(state, nowMS)
+	if !request.ForceProbe {
+		state.NextProbeAtMS = addDurationMS(nowMS, config.ProbeSubjectCooldown)
+	}
+	store.quality[request.RouteID] = state
+	for leaseKey, owner := range store.probeOwner {
+		if owner.routeID == request.RouteID {
+			delete(store.probeOwner, leaseKey)
+		}
+	}
+	store.revision++
+	store.mu.Unlock()
+	if store.config.DurableQuarantine != nil {
+		if err := store.config.DurableQuarantine.ClearAutoHealth(ctx, request.RouteID, state.Epoch); err != nil {
+			return smartrouter.QualityState{}, err
+		}
+	}
+	return state, nil
+}
+
+func (store *MemorySmartRouteStateStore) ScheduleProbe(
+	ctx context.Context,
+	routeID string,
+) (smartrouter.QualityState, error) {
+	config := store.runtimeConfigSnapshot()
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return smartrouter.QualityState{}, errors.New("smart router probe route is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return smartrouter.QualityState{}, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	state, exists := store.quality[routeID]
+	if !exists {
+		state = smartrouter.InitialQuality(false)
+	}
+	state, err := scheduleSmartRouteProbeState(state, nowMS, config.Quality)
+	if err != nil {
+		return smartrouter.QualityState{}, err
+	}
+	store.quality[routeID] = state
+	store.revision++
+	return state, nil
+}
+
+func scheduleSmartRouteProbeState(state smartrouter.QualityState, nowMS int64, config smartrouter.QualityConfig) (smartrouter.QualityState, error) {
+	state, _ = smartrouter.NormalizeAutomaticRecoveryStateWithConfig(state, nowMS, config)
+	if state.Epoch == 0 {
+		state.Epoch = 1
+	}
+	switch state.Phase {
+	case smartrouter.QualityHealthy, smartrouter.QualityBootstrap:
+		state.Phase = smartrouter.QualityDegraded
+		state.SampleDueAtMS = nowMS
+	case smartrouter.QualityDegraded, smartrouter.QualityWarming:
+		state.SampleDueAtMS = nowMS
+	case smartrouter.QualityUnknown, smartrouter.QualityOpen:
+		state.NextProbeAtMS = nowMS
+	case smartrouter.QualityHalfOpen:
+		// An existing fenced owner already represents the scheduled probe.
+	}
+	state.LastUpdatedMS = maxSmartRouteInt64(state.LastUpdatedMS, nowMS)
+	state.Revision++
+	return state, nil
+}
+
+func jitterSmartRouteProbeDeadline(state smartrouter.QualityState, routeID string, nowMS int64) smartrouter.QualityState {
+	if state.PassiveRecovery || state.DemandRecovery {
+		return state // The configured media ceiling and exponential intervals are exact.
+	}
+	if state.LastFailureMS != nowMS || state.NextProbeAtMS <= nowMS || routeID == "" {
+		return state
+	}
+	hash := uint64(14695981039346656037)
+	for index := 0; index < len(routeID); index++ {
+		hash ^= uint64(routeID[index])
+		hash *= 1099511628211
+	}
+	hash ^= uint64(state.OpenCount) + state.Epoch*0x9e3779b97f4a7c15
+	delay := state.NextProbeAtMS - nowMS
+	percent := int64(90 + hash%21)
+	state.NextProbeAtMS = addSmartRouteMilliseconds(nowMS, delay*percent/100)
+	maximum := smartrouter.MaximumRecoveryProbeIntervalMS
+	if state.PassiveRecovery {
+		maximum = smartrouter.MaximumMediaRecoveryIntervalMS
+	}
+	maximumDue := addSmartRouteMilliseconds(nowMS, maximum)
+	if state.NextProbeAtMS > maximumDue {
+		state.NextProbeAtMS = maximumDue
+	}
+	return state
+}
+
+func (store *MemorySmartRouteStateStore) QuarantineRoute(
+	ctx context.Context,
+	request SmartRouteQuarantineRequest,
+) error {
+	request = normalizeSmartRouteQuarantineRequest(request)
+	if err := validateSmartRouteQuarantineRequest(request); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	expiresAtMS := addDurationMS(nowMS, request.TTL)
+	key := smartRouteQuarantineKey{
+		catalogVersion: request.CatalogVersion,
+		routeID:        request.RouteID,
+		failureScope:   request.FailureScope,
+	}
+	store.mu.Lock()
+	store.pruneExpiredQuarantinesLocked(nowMS)
+	if expiresAtMS > store.quarantine[key] {
+		store.quarantine[key] = expiresAtMS
+		store.revision++
+	}
+	store.mu.Unlock()
+	return nil
+}
+
+func (store *MemorySmartRouteStateStore) RouteExclusions(
+	ctx context.Context,
+	request SmartRouteExclusionRequest,
+) (SmartRouteExclusionSnapshot, error) {
+	normalized, err := normalizeSmartRouteExclusionRequest(request)
+	if err != nil {
+		return SmartRouteExclusionSnapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SmartRouteExclusionSnapshot{}, err
+	}
+	nowMS := store.config.Clock().UnixMilli()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.pruneExpiredQuarantinesLocked(nowMS)
+	entries := make([]SmartRouteExclusion, 0)
+	excluded := make(map[string]bool)
+	for _, route := range normalized.Routes {
+		for _, scope := range normalized.FailureScopes {
+			key := smartRouteQuarantineKey{
+				catalogVersion: normalized.CatalogVersion,
+				routeID:        route.RouteID,
+				failureScope:   scope,
+			}
+			expiresAtMS, exists := store.quarantine[key]
+			if !exists {
+				continue
+			}
+			entries = append(entries, SmartRouteExclusion{
+				RouteID: route.RouteID, FailureScope: scope, ExpiresAtMS: expiresAtMS,
+			})
+			excluded[route.RouteID] = true
+		}
+	}
+	return SmartRouteExclusionSnapshot{
+		Version:  "memory-quarantine:" + strconv.FormatUint(store.revision, 10),
+		RouteIDs: sortedSmartRouteIDs(excluded),
+		Entries:  entries,
+	}, nil
+}
+
+func (store *MemorySmartRouteStateStore) pruneExpiredQuarantinesLocked(nowMS int64) {
+	changed := false
+	for key, expiresAtMS := range store.quarantine {
+		if expiresAtMS <= nowMS {
+			delete(store.quarantine, key)
+			changed = true
+		}
+	}
+	if changed {
+		store.revision++
+	}
+}
+
+func (store *MemorySmartRouteStateStore) memoryCapacityStateLocked(
+	domainID string,
+	maxInflight int,
+	nowMS int64,
+) smartrouter.CapacityState {
+	domain := store.capacity[domainID]
+	if domain == nil {
+		return smartrouter.CapacityState{Known: true, MaxInflight: maxInflight}
+	}
+	changed := false
+	earliestLeaseMS := int64(0)
+	for leaseID, expiresAtMS := range domain.leases {
+		if expiresAtMS <= nowMS {
+			delete(domain.leases, leaseID)
+			changed = true
+			continue
+		}
+		if earliestLeaseMS == 0 || expiresAtMS < earliestLeaseMS {
+			earliestLeaseMS = expiresAtMS
+		}
+	}
+	if domain.blockedUntilMS <= nowMS && domain.blockedUntilMS != 0 {
+		domain.blockedUntilMS = 0
+		changed = true
+	}
+	if changed {
+		store.revision++
+	}
+	waitUntilMS := domain.blockedUntilMS
+	if maxInflight > 0 && len(domain.leases) >= maxInflight && earliestLeaseMS > waitUntilMS {
+		waitUntilMS = earliestLeaseMS
+	}
+	estimatedWaitMS := int64(0)
+	if waitUntilMS > nowMS {
+		estimatedWaitMS = waitUntilMS - nowMS
+	}
+	return smartrouter.CapacityState{
+		Known:           true,
+		MaxInflight:     maxInflight,
+		Inflight:        len(domain.leases),
+		BlockedUntilMS:  domain.blockedUntilMS,
+		EstimatedWaitMS: estimatedWaitMS,
+	}
+}
+
+func (store *MemorySmartRouteStateStore) recoverExpiredProbeOwnersLocked(nowMS int64) {
+	for leaseKey, owner := range store.probeOwner {
+		if owner.expiresAtMS <= nowMS {
+			store.expireProbeOwnerLocked(leaseKey, owner, nowMS)
+		}
+	}
+}
+
+func (store *MemorySmartRouteStateStore) memoryProbeOwnerByLeaseIDLocked(
+	leaseID string,
+) (memorySmartRouteProbe, bool) {
+	for _, owner := range store.probeOwner {
+		if owner.id == leaseID {
+			return owner, true
+		}
+	}
+	return memorySmartRouteProbe{}, false
+}
+
+func (store *MemorySmartRouteStateStore) consumeProbeBudgetLocked(
+	nowMS int64,
+	budgetNamespace string,
+	subjectKey string,
+	budgetLimit int,
+	budgetWindow time.Duration,
+	subjectCooldown time.Duration,
+) bool {
+	cutoffMS := nowMS - budgetWindow.Milliseconds()
+	starts := store.probeStarts[budgetNamespace]
+	kept := starts[:0]
+	for _, startedAtMS := range starts {
+		if startedAtMS > cutoffMS {
+			kept = append(kept, startedAtMS)
+		}
+	}
+	store.probeStarts[budgetNamespace] = kept
+	if subjectKey != "" {
+		subjectKey = budgetNamespace + ":" + subjectKey
+	}
+	for key, blockedUntilMS := range store.probeSubjects {
+		if blockedUntilMS <= nowMS {
+			delete(store.probeSubjects, key)
+		}
+	}
+	if len(store.probeStarts[budgetNamespace]) >= budgetLimit {
+		return false
+	}
+	if subjectKey != "" && store.probeSubjects[subjectKey] > nowMS {
+		return false
+	}
+	store.probeStarts[budgetNamespace] = append(store.probeStarts[budgetNamespace], nowMS)
+	if subjectKey != "" {
+		store.probeSubjects[subjectKey] = addDurationMS(nowMS, subjectCooldown)
+	}
+	return true
+}
+
+func smartRouteProbeSubjectKey(subjectKey string, epoch uint64) string {
+	subjectKey = strings.TrimSpace(subjectKey)
+	if subjectKey == "" {
+		return ""
+	}
+	if epoch == 0 {
+		epoch = 1
+	}
+	return subjectKey + ":epoch:" + strconv.FormatUint(epoch, 10)
+}
+
+func normalizeSmartRouteProbeBudgetNamespace(namespace string) string {
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return SmartRouteProbeBudgetRecovery
+	}
+	return namespace
+}
+
+func normalizeSmartRouteProbeLeaseKey(routeID, leaseKey string) string {
+	leaseKey = strings.TrimSpace(leaseKey)
+	if leaseKey == "" {
+		return strings.TrimSpace(routeID)
+	}
+	return leaseKey
+}
+
+func (store *MemorySmartRouteStateStore) expireProbeOwnerLocked(
+	leaseKey string,
+	owner memorySmartRouteProbe,
+	nowMS int64,
+) {
+	current, exists := store.probeOwner[leaseKey]
+	if !exists || current.id != owner.id {
+		return
+	}
+	delete(store.probeOwner, leaseKey)
+	if owner.sample {
+		store.deferAbandonedSampleLocked(owner.routeID, nowMS)
+	} else {
+		store.reopenAbandonedProbeLocked(owner.routeID, nowMS)
+	}
+	store.revision++
+}
+
+func (store *MemorySmartRouteStateStore) deferAbandonedSampleLocked(routeID string, nowMS int64) {
+	state, exists := store.quality[routeID]
+	if !exists || (state.Phase != smartrouter.QualityWarming && state.Phase != smartrouter.QualityDegraded) {
+		return
+	}
+	state.SampleDueAtMS = addSmartRouteMilliseconds(nowMS, store.runtimeConfigSnapshot().Quality.WarmingSampleIntervalMS)
+	state.LastUpdatedMS = maxSmartRouteInt64(state.LastUpdatedMS, nowMS)
+	state.Revision++
+	store.quality[routeID] = state
+}
+
+func (store *MemorySmartRouteStateStore) reopenAbandonedProbeLocked(routeID string, nowMS int64) {
+	state, exists := store.quality[routeID]
+	if !exists || state.Phase != smartrouter.QualityHalfOpen {
+		return
+	}
+	state.Phase = smartrouter.QualityOpen
+	state.NextProbeAtMS = nowMS
+	state.LastUpdatedMS = maxSmartRouteInt64(state.LastUpdatedMS, nowMS)
+	state.Revision++
+	store.quality[routeID] = state
+}
+
+type redisSmartRouteState struct {
+	Quality  smartrouter.QualityState  `json:"quality"`
+	TTFT     []smartRouteTTFTSample    `json:"ttft,omitempty"`
+	Outcomes []smartRouteOutcomeSample `json:"outcomes,omitempty"`
+	History  smartRouteRecentHistory   `json:"history,omitempty"`
+}
+
+type RedisSmartRouteStateStore struct {
+	client        *redis.Client
+	config        SmartRouteStateConfig
+	runtimeConfig atomic.Pointer[SmartRouteStateConfig]
+	fallback      *MemorySmartRouteStateStore
+}
+
+func NewRedisSmartRouteStateStore(client *redis.Client, config SmartRouteStateConfig) (*RedisSmartRouteStateStore, error) {
+	if client == nil {
+		return nil, errors.New("smart router Redis client is required")
+	}
+	normalized, err := normalizeSmartRouteStateConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	fallback, err := NewMemorySmartRouteStateStore(normalized)
+	if err != nil {
+		return nil, err
+	}
+	store := &RedisSmartRouteStateStore{client: client, config: normalized, fallback: fallback}
+	store.runtimeConfig.Store(&normalized)
+	return store, nil
+}
+
+func (store *RedisSmartRouteStateStore) UpdateConfig(config SmartRouteStateConfig) error {
+	if store == nil {
+		return errors.New("smart router Redis state store is unavailable")
+	}
+	normalized, err := normalizeSmartRouteStateConfig(config)
+	if err != nil {
+		return err
+	}
+	if err := store.fallback.UpdateConfig(normalized); err != nil {
+		return err
+	}
+	store.runtimeConfig.Store(&normalized)
+	return nil
+}
+
+func (store *RedisSmartRouteStateStore) runtimeConfigSnapshot() SmartRouteStateConfig {
+	if store != nil {
+		if current := store.runtimeConfig.Load(); current != nil {
+			return *current
+		}
+	}
+	return store.config
+}
+
+func (store *RedisSmartRouteStateStore) Snapshot(
+	ctx context.Context,
+	request SmartRouteStateSnapshotRequest,
+) (SmartRouteRuntimeSnapshot, error) {
+	routes, domains, err := normalizeSmartRouteSnapshotRequest(request)
+	if err != nil {
+		return SmartRouteRuntimeSnapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SmartRouteRuntimeSnapshot{}, err
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		fallbackNowMS := store.config.Clock().UnixMilli()
+		return store.failClosedSnapshot(ctx, request, routes, domains, fallbackNowMS, err), nil
+	}
+	quality := make(map[string]smartrouter.QualityState, len(routes))
+	ttft := make(map[string]smartrouter.TTFTState, len(routes))
+	recent := make(map[string]SmartRouteRecentMetrics, len(routes))
+	credentials := make(map[string]smartrouter.CredentialState)
+	for _, route := range routes {
+		state, err := store.loadRedisRouteState(ctx, route, nowMS)
+		if err != nil {
+			return store.failClosedSnapshot(ctx, request, routes, domains, nowMS, err), nil
+		}
+		quality[route.RouteID] = state.Quality
+		if current := calculateSmartRouteTTFT(state.TTFT, nowMS, store.config.TTFTFreshness); current.Samples > 0 {
+			ttft[route.RouteID] = current
+		}
+		recent[route.RouteID] = calculateSmartRouteRecentMetrics(state.TTFT, state.Outcomes, state.History, nowMS)
+		if route.CredentialDomain != "" {
+			credential, credentialErr := store.getRedisCredentialState(ctx, route.CredentialDomain)
+			if credentialErr != nil {
+				return store.failClosedSnapshot(ctx, request, routes, domains, nowMS, credentialErr), nil
+			}
+			credentials[route.CredentialDomain] = credential
+		}
+	}
+	capacity := make(map[string]smartrouter.CapacityState, len(domains))
+	for domainID, input := range domains {
+		state, err := store.redisCapacityState(ctx, domainID, input.maxInflight)
+		if err != nil {
+			return store.failClosedSnapshot(ctx, request, routes, domains, nowMS, err), nil
+		}
+		capacity[domainID] = state
+	}
+	version := "redis:" + strconv.FormatInt(nowMS, 10)
+	return SmartRouteRuntimeSnapshot{
+		Quality:     smartrouter.QualitySnapshot{Version: version, Routes: quality},
+		TTFT:        smartrouter.TTFTSnapshot{Version: version, Routes: ttft},
+		Recent:      SmartRouteRecentSnapshot{Version: version, Routes: recent},
+		Capacity:    smartrouter.CapacitySnapshot{Version: version, Domains: capacity},
+		Credentials: smartrouter.CredentialSnapshot{Version: version, Domains: credentials},
+	}, nil
+}
+
+func (store *RedisSmartRouteStateStore) TryAcquireProbe(
+	ctx context.Context,
+	request SmartRouteProbeRequest,
+) (*SmartRouteLease, bool, error) {
+	config := store.runtimeConfigSnapshot()
+	request.RouteID = strings.TrimSpace(request.RouteID)
+	request.LeaseKey = normalizeSmartRouteProbeLeaseKey(request.RouteID, request.LeaseKey)
+	request.SubjectKey = strings.TrimSpace(request.SubjectKey)
+	request.BudgetNamespace = normalizeSmartRouteProbeBudgetNamespace(request.BudgetNamespace)
+	if request.RouteID == "" {
+		return nil, false, errors.New("smart router probe route is required")
+	}
+	ttl, err := smartRouteLeaseTTL(request.TTL, config.DefaultProbeTTL)
+	if err != nil {
+		return nil, false, err
+	}
+	id, err := newSmartRouteLeaseID()
+	if err != nil {
+		return nil, false, err
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	expiresAtMS := addDurationMS(nowMS, ttl)
+	budgetLimit := request.BudgetLimit
+	if budgetLimit <= 0 {
+		budgetLimit = config.ProbeBudgetLimit
+	}
+	maxConcurrency := request.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = config.ProbeMaxConcurrency
+	}
+	budgetWindow := request.BudgetWindow
+	if budgetWindow <= 0 {
+		budgetWindow = config.ProbeBudgetWindow
+	}
+	subjectCooldown := request.SubjectCooldown
+	if subjectCooldown <= 0 {
+		subjectCooldown = config.ProbeSubjectCooldown
+	}
+	routeKey := store.redisRouteKey(request.RouteID)
+	probeKey := store.redisProbeKey(request.LeaseKey)
+	probeRouteKey := store.redisProbeRouteKey(request.RouteID)
+	probeActiveKey := store.redisProbeActiveKey(request.BudgetNamespace)
+	for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		current, raw, err := store.getRedisRouteState(ctx, request.RouteID, request.StableFallback)
+		if err != nil {
+			return nil, false, err
+		}
+		if request.ExpectedEpoch > 0 && current.Quality.Epoch != request.ExpectedEpoch {
+			return nil, false, nil
+		}
+		if request.VirginBootstrap && !smartrouter.IsVirginUnknown(current.Quality) {
+			return nil, false, nil
+		}
+		if current.Quality.Phase == smartrouter.QualityHalfOpen {
+			owner, err := store.client.Get(ctx, probeKey).Result()
+			if err == nil && owner != "" {
+				return nil, false, nil
+			}
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return nil, false, err
+			}
+			current.Quality.Phase = smartrouter.QualityOpen
+			current.Quality.NextProbeAtMS = nowMS
+			current.Quality.LastUpdatedMS = maxSmartRouteInt64(current.Quality.LastUpdatedMS, nowMS)
+			current.Quality.Revision++
+		}
+		next := current.Quality
+		sample := current.Quality.Phase == smartrouter.QualityWarming ||
+			current.Quality.Phase == smartrouter.QualityDegraded
+		if sample && !request.Force {
+			if current.Quality.SampleDueAtMS > nowMS {
+				return nil, false, nil
+			}
+		} else {
+			var acquired bool
+			next, acquired = smartrouter.BeginProbe(current.Quality, nowMS)
+			if !acquired && !request.Force {
+				return nil, false, nil
+			}
+			if request.Force && !acquired {
+				next = current.Quality
+				next.Phase = smartrouter.QualityHalfOpen
+				next.LastUpdatedMS = nowMS
+				next.Revision++
+			}
+		}
+		current.Quality = next
+		nextRaw, err := common.Marshal(current)
+		if err != nil {
+			return nil, false, err
+		}
+		subjectEnabled := 0
+		if request.SubjectKey != "" {
+			subjectEnabled = 1
+		}
+		// A reset advances the route epoch, so the next sample receives a new
+		// bounded subject bucket without deleting unrelated Redis keys.
+		probeSubjectKey := smartRouteProbeSubjectKey(request.SubjectKey, current.Quality.Epoch)
+		result, err := store.client.Eval(ctx, redisAcquireSmartRouteProbeScript,
+			[]string{
+				routeKey,
+				probeKey,
+				store.redisProbeBudgetKey(request.BudgetNamespace),
+				store.redisProbeSubjectKey(request.BudgetNamespace, probeSubjectKey),
+				probeActiveKey,
+				probeRouteKey,
+			},
+			raw,
+			string(nextRaw),
+			id,
+			ttl.Milliseconds(),
+			budgetWindow.Milliseconds(),
+			budgetLimit,
+			subjectEnabled,
+			subjectCooldown.Milliseconds(),
+			smartRouteRedisLeaseCleanupGrace.Milliseconds(),
+			maxConcurrency,
+		).Int64()
+		if err != nil {
+			return nil, false, err
+		}
+		switch result {
+		case 1:
+			lease := &SmartRouteLease{ID: id, Epoch: current.Quality.Epoch, expiresAtMS: expiresAtMS, renewTTL: ttl}
+			lease.release = func(releaseCtx context.Context) error {
+				_, releaseErr := store.client.Eval(releaseCtx, redisReleaseSmartRouteProbeScript,
+					[]string{probeKey, probeActiveKey, probeRouteKey}, id).Result()
+				return releaseErr
+			}
+			lease.renew = func(renewCtx context.Context, renewTTL time.Duration) (int64, error) {
+				result, renewErr := store.client.Eval(renewCtx, redisRenewSmartRouteProbeScript,
+					[]string{probeKey, probeActiveKey, probeRouteKey}, id, renewTTL.Milliseconds(), smartRouteRedisLeaseCleanupGrace.Milliseconds()).Int64()
+				if renewErr != nil {
+					return 0, renewErr
+				}
+				if result <= 0 {
+					return 0, ErrSmartRouteLeaseNotOwned
+				}
+				return result, nil
+			}
+			return lease, true, nil
+		case -1, -2, -3, -4:
+			return nil, false, nil
+		}
+	}
+	return nil, false, ErrSmartRouteStateConflict
+}
+
+func (store *RedisSmartRouteStateStore) TryAcquireCapacity(
+	ctx context.Context,
+	request SmartRouteCapacityRequest,
+) (SmartRouteCapacityAcquisition, error) {
+	request.CapacityDomain = strings.TrimSpace(request.CapacityDomain)
+	if err := validateSmartRouteCapacityRequest(request); err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	ttl, err := smartRouteLeaseTTL(request.TTL, store.config.DefaultLeaseTTL)
+	if err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	id, err := newSmartRouteLeaseID()
+	if err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	result, err := store.client.Eval(ctx, redisAcquireSmartRouteCapacityScript,
+		[]string{store.redisCapacityLeaseKey(request.CapacityDomain), store.redisCapacityBlockKey(request.CapacityDomain)},
+		ttl.Milliseconds(), request.MaxInflight, id, smartRouteRedisLeaseCleanupGrace.Milliseconds(), boolToSmartRouteRedisInt(request.IdleOnly), boolToSmartRouteRedisInt(request.RecoveryFallback)).Result()
+	if err != nil {
+		return store.failClosedCapacity(ctx, request, err)
+	}
+	values, err := redisInt64Values(result, 4)
+	if err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	state := smartrouter.CapacityState{
+		Known:          true,
+		MaxInflight:    request.MaxInflight,
+		Inflight:       int(values[1]),
+		BlockedUntilMS: values[2],
+	}
+	if values[0] != 1 {
+		return SmartRouteCapacityAcquisition{Disposition: SmartRouteCapacitySpill, State: state}, nil
+	}
+	lease := &SmartRouteLease{ID: id, expiresAtMS: values[3], renewTTL: ttl}
+	lease.release = func(releaseCtx context.Context) error {
+		_, releaseErr := store.client.Eval(releaseCtx, redisReleaseSmartRouteCapacityScript,
+			[]string{store.redisCapacityLeaseKey(request.CapacityDomain)}, id).Result()
+		return releaseErr
+	}
+	lease.renew = func(renewCtx context.Context, renewTTL time.Duration) (int64, error) {
+		result, renewErr := store.client.Eval(renewCtx, redisRenewSmartRouteCapacityScript,
+			[]string{store.redisCapacityLeaseKey(request.CapacityDomain)},
+			id, renewTTL.Milliseconds(), smartRouteRedisLeaseCleanupGrace.Milliseconds()).Int64()
+		if renewErr != nil {
+			return 0, renewErr
+		}
+		if result <= 0 {
+			return 0, ErrSmartRouteLeaseNotOwned
+		}
+		return result, nil
+	}
+	return SmartRouteCapacityAcquisition{
+		Disposition: SmartRouteCapacityGranted,
+		Lease:       lease,
+		State:       state,
+	}, nil
+}
+
+func (store *RedisSmartRouteStateStore) RecordAttempt(ctx context.Context, record SmartRouteAttemptRecord) error {
+	config := store.runtimeConfigSnapshot()
+	record.ImageAttempt = record.ImageAttempt || record.Endpoint == SmartEndpointImages || record.Endpoint == SmartEndpointImageEdits
+	if record.ImageAttempt {
+		record.ObservationID = SmartRouteImageObservationID(record.ObservationID)
+	}
+	record.RouteID = strings.TrimSpace(record.RouteID)
+	record.CapacityDomain = strings.TrimSpace(record.CapacityDomain)
+	record.CredentialDomain = strings.TrimSpace(record.CredentialDomain)
+	record.ObservationID = smartRouteObservationDigest(record.ObservationID)
+	record.ErrorSummary = sanitizeSmartRouteErrorSummary(record.ErrorSummary)
+	if err := validateSmartRouteAttempt(record); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		return err
+	}
+	probeKey := store.redisProbeKey(record.RouteID)
+	routeKey := store.redisRouteKey(record.RouteID)
+	if record.ImageAttempt {
+		routeKey = store.redisImageRouteKey(record.RouteID)
+	}
+	if record.ProbeLeaseID != "" {
+		probeKey, err = store.redisProbeKeyForRoute(ctx, record.RouteID)
+		if err != nil {
+			return err
+		}
+	}
+	for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		current, raw, err := store.getRedisRouteStateAtKey(ctx, routeKey, record.StableFallback)
+		if err != nil {
+			return err
+		}
+		if smartRouteAttemptUsesProbeFence(record) && record.RouteEpoch > 0 && current.Quality.Epoch != record.RouteEpoch {
+			return nil
+		}
+		previousQuality := current.Quality
+		factAccepted := !smartRouteObservationSeen(current.Outcomes, record.ObservationID)
+		if record.ImageAttempt {
+			factAccepted = smartrouter.ImageQualityEventAccepted(current.Quality, smartrouter.QualityEvent{
+				ObservationID: record.ObservationID, Outcome: record.Outcome, SyntheticProbe: record.SyntheticProbe, AtMS: smartRouteAttemptAtMS(record, nowMS),
+			})
+		}
+		if !record.SkipHealthUpdate {
+			if factAccepted || isSmartRouteRecoveryAdmission(record.Admission) {
+				current.Quality = smartrouter.ReduceQuality(current.Quality, smartrouter.QualityEvent{
+					ImageAttempt:    record.ImageAttempt,
+					AtMS:            smartRouteAttemptAtMS(record, nowMS),
+					StartedAtMS:     record.StartedAtMS,
+					ObservationID:   record.ObservationID,
+					Outcome:         record.Outcome,
+					RetryAfterMS:    durationMilliseconds(record.RetryAfter),
+					Probe:           isSmartRouteRecoveryAdmission(record.Admission),
+					DemandRecovery:  record.DemandRecovery,
+					PassiveRecovery: record.PassiveRecovery,
+					SyntheticProbe:  record.SyntheticProbe,
+					VirginBootstrap: record.Admission == smartrouter.AdmissionVirginBootstrap,
+					HTTPStatus:      record.HTTPStatus,
+					ErrorSummary:    record.ErrorSummary,
+				}, config.Quality)
+			}
+			current.Quality = jitterSmartRouteProbeDeadline(current.Quality, record.RouteID, nowMS)
+			current.Quality = deferNeutralSmartRouteSample(
+				previousQuality,
+				current.Quality,
+				record,
+				nowMS,
+				config.Quality.WarmingSampleIntervalMS,
+			)
+		}
+		if record.Outcome == smartrouter.OutcomeSuccess && record.TTFTObserved && !record.SkipHealthUpdate && factAccepted {
+			sample := smartRouteTTFTSample{
+				AtMS:          nowMS,
+				MS:            durationMilliseconds(record.TTFT),
+				Synthetic:     record.SyntheticProbe || (isSmartRouteRecoveryAdmission(record.Admission) && !record.PassiveRecovery && !record.DemandRecovery),
+				ObservationID: record.ObservationID,
+				Warmup:        record.Warmup,
+			}
+			current.TTFT = appendBoundedSmartRouteTTFT(current.TTFT, sample, store.config.TTFTWindowSize)
+			if !sample.Synthetic {
+				current.History.TTFT = updateSmartRouteMetricHistoryWeighted(current.History.TTFT, float64(sample.MS), nowMS, false, smartRouteWarmupMetricWeight(record.Warmup))
+			}
+		}
+		if success, count := smartRouteLeaderboardOutcome(record); count && factAccepted {
+			current.Outcomes = appendBoundedSmartRouteOutcome(
+				current.Outcomes,
+				smartRouteOutcomeSample{AtMS: nowMS, Success: success, ObservationID: record.ObservationID, Warmup: record.Warmup},
+				smartRouteLeaderboardWindowSize,
+			)
+			value := 0.0
+			if success {
+				value = 1
+			}
+			current.History.Stability = updateSmartRouteMetricHistoryWeighted(current.History.Stability, value, nowMS, true, smartRouteWarmupMetricWeight(record.Warmup))
+		}
+		nextRaw, err := common.Marshal(current)
+		if err != nil {
+			return err
+		}
+		updated, err := store.client.Eval(ctx, redisCASFencedSmartRouteStateScript,
+			[]string{routeKey, probeKey},
+			raw, string(nextRaw), record.ProbeLeaseID).Int64()
+		if err != nil {
+			return err
+		}
+		if updated == 1 {
+			if !record.SkipDomainUpdate && factAccepted {
+				if err := store.recordRedisCapacity(ctx, record); err != nil {
+					return err
+				}
+				if err := store.recordRedisCredential(ctx, record, nowMS); err != nil {
+					return err
+				}
+			}
+			if record.Outcome == smartrouter.OutcomeSuccess && factAccepted {
+				if err := store.clearRedisSuccessfulRouteEvidence(ctx, record); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if updated == -1 {
+			return nil
+		}
+	}
+	return ErrSmartRouteStateConflict
+}
+
+func (store *RedisSmartRouteStateStore) ImportRecentEvidence(
+	ctx context.Context,
+	evidence []SmartRouteHistoricalEvidence,
+) (int, error) {
+	if store == nil || len(evidence) == 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		return 0, err
+	}
+	normalized := normalizeSmartRouteHistoricalEvidence(evidence, nowMS)
+	byRoute := make(map[string][]SmartRouteHistoricalEvidence)
+	for _, item := range normalized {
+		byRoute[item.RouteID] = append(byRoute[item.RouteID], item)
+	}
+	routeIDs := make([]string, 0, len(byRoute))
+	for routeID := range byRoute {
+		routeIDs = append(routeIDs, routeID)
+	}
+	sort.Strings(routeIDs)
+	accepted := 0
+	for _, routeID := range routeIDs {
+		items := byRoute[routeID]
+		for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+			if err := ctx.Err(); err != nil {
+				return accepted, err
+			}
+			current, raw, err := store.getRedisRouteState(ctx, routeID, items[0].StableFallback)
+			if err != nil {
+				return accepted, err
+			}
+			changed := 0
+			for _, item := range items {
+				itemChanged := false
+				if item.OutcomeObserved && !smartRouteOutcomeObservationSeenAny(current.Outcomes, item) &&
+					!(item.LegacyIdentity && len(current.Outcomes) > 0) {
+					current.Outcomes = appendBoundedSmartRouteOutcome(
+						current.Outcomes,
+						smartRouteOutcomeSample{AtMS: item.EventMS, Success: item.Success, ObservationID: item.ObservationID},
+						smartRouteLeaderboardWindowSize,
+					)
+					itemChanged = true
+					value := 0.0
+					if item.Success {
+						value = 1
+					}
+					current.History.Stability = updateSmartRouteMetricHistory(current.History.Stability, value, item.EventMS, true)
+				}
+				if item.TTFTObserved && !smartRouteTTFTObservationSeenAny(current.TTFT, item) &&
+					!(item.LegacyIdentity && len(current.TTFT) > 0) {
+					current.TTFT = appendBoundedSmartRouteTTFT(
+						current.TTFT,
+						smartRouteTTFTSample{AtMS: item.EventMS, MS: item.TTFTMS, ObservationID: item.ObservationID},
+						store.config.TTFTWindowSize,
+					)
+					itemChanged = true
+					current.History.TTFT = updateSmartRouteMetricHistory(current.History.TTFT, float64(item.TTFTMS), item.EventMS, false)
+				}
+				if itemChanged {
+					changed++
+				}
+			}
+			if changed == 0 {
+				break
+			}
+			nextRaw, err := common.Marshal(current)
+			if err != nil {
+				return accepted, err
+			}
+			updated, err := store.client.Eval(ctx, redisCASFencedSmartRouteStateScript,
+				[]string{store.redisRouteKey(routeID), store.redisProbeKey(routeID)},
+				raw, string(nextRaw), "").Int64()
+			if err != nil {
+				return accepted, err
+			}
+			if updated == 1 {
+				accepted += changed
+				break
+			}
+			if updated == -1 {
+				break
+			}
+			if attempt == maxSmartRouteStateCASAttempts-1 {
+				return accepted, ErrSmartRouteStateConflict
+			}
+		}
+	}
+	return accepted, nil
+}
+
+func (store *RedisSmartRouteStateStore) clearRedisSuccessfulRouteEvidence(
+	ctx context.Context,
+	record SmartRouteAttemptRecord,
+) error {
+	keys := make([]string, 0, 3)
+	if !record.SkipDomainUpdate && strings.TrimSpace(record.CapacityDomain) != "" {
+		keys = append(keys, store.redisCapacityBlockKey(record.CapacityDomain))
+	}
+	if strings.TrimSpace(record.CatalogVersion) != "" && strings.TrimSpace(record.RouteID) != "" {
+		for _, scope := range []SmartRouteFailureScope{SmartFailureRouteModel, SmartFailureRouteContract} {
+			keys = append(keys, store.redisQuarantineKey(SmartRouteQuarantineRequest{
+				CatalogVersion: record.CatalogVersion,
+				RouteID:        record.RouteID,
+				FailureScope:   scope,
+			}))
+		}
+		store.fallback.mu.Lock()
+		store.fallback.clearMemoryRouteQuarantinesLocked(record.CatalogVersion, record.RouteID)
+		store.fallback.mu.Unlock()
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return store.client.Del(ctx, keys...).Err()
+}
+
+func (store *RedisSmartRouteStateStore) recordRedisCapacity(
+	ctx context.Context,
+	record SmartRouteAttemptRecord,
+) error {
+	if record.Outcome != smartrouter.OutcomeCapacityLimited ||
+		strings.TrimSpace(record.CapacityDomain) == "" {
+		return nil
+	}
+	backoff := record.RetryAfter
+	if backoff < store.config.CapacityBackoff {
+		backoff = store.config.CapacityBackoff
+	}
+	backoff = capSmartRouteRecoveryDelay(backoff)
+	_, err := store.client.Eval(ctx, redisBlockSmartRouteCapacityScript,
+		[]string{store.redisCapacityBlockKey(record.CapacityDomain)},
+		backoff.Milliseconds(), smartRouteRedisLeaseCleanupGrace.Milliseconds()).Result()
+	return err
+}
+
+func (store *RedisSmartRouteStateStore) recordRedisCredential(
+	ctx context.Context,
+	record SmartRouteAttemptRecord,
+	nowMS int64,
+) error {
+	if record.CredentialDomain == "" || (record.Outcome != smartrouter.OutcomeCredential && record.Outcome != smartrouter.OutcomeSuccess) {
+		return nil
+	}
+	key := store.redisCredentialKey(record.CredentialDomain)
+	for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+		raw, err := store.client.Get(ctx, key).Result()
+		if errors.Is(err, redis.Nil) {
+			raw = ""
+		} else if err != nil {
+			return err
+		}
+		state := smartrouter.CredentialState{Epoch: 1}
+		if raw != "" {
+			if err := common.Unmarshal([]byte(raw), &state); err != nil {
+				return fmt.Errorf("decode smart router credential state: %w", err)
+			}
+			if state.Epoch == 0 {
+				state.Epoch = 1
+			}
+		}
+		switch record.Outcome {
+		case smartrouter.OutcomeCredential:
+			if record.ObservationID != "" && record.ObservationID == state.LastFailureObservation {
+				return nil
+			}
+			windowMS := store.runtimeConfigSnapshot().Quality.HardFailureWindowMS
+			if state.LastFailureMS <= 0 || nowMS-state.LastFailureMS > windowMS {
+				state.ConsecutiveFailures = 1
+			} else {
+				state.ConsecutiveFailures++
+			}
+			state.LastFailureMS = nowMS
+			state.LastFailureObservation = record.ObservationID
+			delay := time.Duration(store.runtimeConfigSnapshot().Quality.CredentialBackoffMS) * time.Millisecond
+			if record.RetryAfter > delay {
+				delay = record.RetryAfter
+			}
+			delay = capSmartRouteRecoveryDelay(delay)
+			state.BlockedUntilMS = maxSmartRouteInt64(state.BlockedUntilMS, addDurationMS(nowMS, delay))
+			state.Revision++
+		case smartrouter.OutcomeSuccess:
+			if state.ConsecutiveFailures == 0 && state.BlockedUntilMS == 0 {
+				return nil
+			}
+			state.ConsecutiveFailures = 0
+			state.BlockedUntilMS = 0
+			state.LastFailureObservation = ""
+			state.LastSuccessMS = nowMS
+			state.Revision++
+		}
+		nextRaw, err := common.Marshal(state)
+		if err != nil {
+			return err
+		}
+		updated, err := store.client.Eval(ctx, redisCASSmartRouteStateScript,
+			[]string{key}, raw, string(nextRaw)).Int64()
+		if err != nil {
+			return err
+		}
+		if updated == 1 {
+			return nil
+		}
+	}
+	return ErrSmartRouteStateConflict
+}
+
+func (store *RedisSmartRouteStateStore) getRedisCredentialState(
+	ctx context.Context,
+	domain string,
+) (smartrouter.CredentialState, error) {
+	raw, err := store.client.Get(ctx, store.redisCredentialKey(domain)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return smartrouter.CredentialState{Epoch: 1}, nil
+	}
+	if err != nil {
+		return smartrouter.CredentialState{}, err
+	}
+	var state smartrouter.CredentialState
+	if err := common.Unmarshal(raw, &state); err != nil {
+		return smartrouter.CredentialState{}, fmt.Errorf("decode smart router credential state: %w", err)
+	}
+	if state.Epoch == 0 {
+		state.Epoch = 1
+	}
+	return state, nil
+}
+
+func (store *RedisSmartRouteStateStore) ResetRoute(
+	ctx context.Context,
+	request SmartRouteResetRequest,
+) (smartrouter.QualityState, error) {
+	config := store.runtimeConfigSnapshot()
+	request.RouteID = strings.TrimSpace(request.RouteID)
+	if request.RouteID == "" {
+		return smartrouter.QualityState{}, errors.New("smart router reset route is required")
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		return smartrouter.QualityState{}, err
+	}
+	for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+		current, raw, err := store.getRedisRouteState(ctx, request.RouteID, false)
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		current.Quality = smartrouter.ResetQuality(current.Quality, nowMS)
+		if !request.ForceProbe {
+			current.Quality.NextProbeAtMS = addDurationMS(nowMS, config.ProbeSubjectCooldown)
+		}
+		nextRaw, err := common.Marshal(current)
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		probeKey, probeKeyErr := store.redisProbeKeyForRoute(ctx, request.RouteID)
+		if probeKeyErr != nil {
+			return smartrouter.QualityState{}, probeKeyErr
+		}
+		updated, err := store.client.Eval(ctx, redisResetSmartRouteScript,
+			[]string{
+				store.redisRouteKey(request.RouteID), probeKey,
+				store.redisProbeActiveKey(SmartRouteProbeBudgetRecovery),
+				store.redisProbeActiveKey(SmartRouteProbeBudgetColdStart),
+				store.redisProbeRouteKey(request.RouteID),
+			},
+			raw, string(nextRaw)).Int64()
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		if updated != 1 {
+			continue
+		}
+		if store.config.DurableQuarantine != nil {
+			if err := store.config.DurableQuarantine.ClearAutoHealth(ctx, request.RouteID, current.Quality.Epoch); err != nil {
+				return smartrouter.QualityState{}, err
+			}
+		}
+		return current.Quality, nil
+	}
+	return smartrouter.QualityState{}, ErrSmartRouteStateConflict
+}
+
+func (store *RedisSmartRouteStateStore) ScheduleProbe(
+	ctx context.Context,
+	routeID string,
+) (smartrouter.QualityState, error) {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return smartrouter.QualityState{}, errors.New("smart router probe route is required")
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		return smartrouter.QualityState{}, err
+	}
+	for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+		current, raw, err := store.getRedisRouteState(ctx, routeID, false)
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		current.Quality, err = scheduleSmartRouteProbeState(current.Quality, nowMS, store.runtimeConfigSnapshot().Quality)
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		nextRaw, err := common.Marshal(current)
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		updated, err := store.client.Eval(ctx, redisCASSmartRouteStateScript,
+			[]string{store.redisRouteKey(routeID)}, raw, string(nextRaw)).Int64()
+		if err != nil {
+			return smartrouter.QualityState{}, err
+		}
+		if updated == 1 {
+			return current.Quality, nil
+		}
+	}
+	return smartrouter.QualityState{}, ErrSmartRouteStateConflict
+}
+
+func (store *RedisSmartRouteStateStore) QuarantineRoute(
+	ctx context.Context,
+	request SmartRouteQuarantineRequest,
+) error {
+	request = normalizeSmartRouteQuarantineRequest(request)
+	if err := validateSmartRouteQuarantineRequest(request); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Mirror locally before the shared write so a subsequent Redis outage still
+	// remembers a known-bad stable fallback on this instance.
+	if err := store.fallback.QuarantineRoute(ctx, request); err != nil {
+		return err
+	}
+	_, err := store.client.Eval(ctx, redisQuarantineSmartRouteScript,
+		[]string{store.redisQuarantineKey(request)}, request.TTL.Milliseconds()).Result()
+	return err
+}
+
+func (store *RedisSmartRouteStateStore) RouteExclusions(
+	ctx context.Context,
+	request SmartRouteExclusionRequest,
+) (SmartRouteExclusionSnapshot, error) {
+	normalized, err := normalizeSmartRouteExclusionRequest(request)
+	if err != nil {
+		return SmartRouteExclusionSnapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SmartRouteExclusionSnapshot{}, err
+	}
+	nowMS, err := store.redisNowMS(ctx)
+	if err != nil {
+		return store.failClosedRouteExclusions(ctx, normalized, err), nil
+	}
+	keys := make([]string, 0, len(normalized.Routes)*len(normalized.FailureScopes))
+	coordinates := make([]SmartRouteExclusion, 0, cap(keys))
+	for _, route := range normalized.Routes {
+		for _, scope := range normalized.FailureScopes {
+			keys = append(keys, store.redisQuarantineKey(SmartRouteQuarantineRequest{
+				CatalogVersion: normalized.CatalogVersion,
+				RouteID:        route.RouteID,
+				FailureScope:   scope,
+			}))
+			coordinates = append(coordinates, SmartRouteExclusion{RouteID: route.RouteID, FailureScope: scope})
+		}
+	}
+	if len(keys) == 0 {
+		return SmartRouteExclusionSnapshot{
+			Version: "redis-quarantine:" + strconv.FormatInt(nowMS, 10),
+		}, nil
+	}
+	values, err := store.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return store.failClosedRouteExclusions(ctx, normalized, err), nil
+	}
+	entries := make([]SmartRouteExclusion, 0)
+	excluded := make(map[string]bool)
+	for index, value := range values {
+		if value == nil {
+			continue
+		}
+		raw, ok := value.(string)
+		if !ok {
+			return store.failClosedRouteExclusions(ctx, normalized,
+				fmt.Errorf("unexpected smart router quarantine value %T", value)), nil
+		}
+		expiresAtMS, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			return store.failClosedRouteExclusions(ctx, normalized,
+				fmt.Errorf("parse smart router quarantine expiry: %w", parseErr)), nil
+		}
+		if expiresAtMS <= nowMS {
+			continue
+		}
+		entry := coordinates[index]
+		entry.ExpiresAtMS = expiresAtMS
+		entries = append(entries, entry)
+		excluded[entry.RouteID] = true
+	}
+	return SmartRouteExclusionSnapshot{
+		Version:  "redis-quarantine:" + strconv.FormatInt(nowMS, 10),
+		RouteIDs: sortedSmartRouteIDs(excluded),
+		Entries:  entries,
+	}, nil
+}
+
+func (store *RedisSmartRouteStateStore) loadRedisRouteState(
+	ctx context.Context,
+	route SmartRouteStateRoute,
+	nowMS int64,
+) (redisSmartRouteState, error) {
+	for attempt := 0; attempt < maxSmartRouteStateCASAttempts; attempt++ {
+		routeKey := store.redisRouteKey(route.RouteID)
+		imageKey := store.redisImageRouteKey(route.RouteID)
+		exists, err := store.client.Exists(ctx, imageKey).Result()
+		if err != nil {
+			return redisSmartRouteState{}, err
+		}
+		if exists > 0 {
+			routeKey = imageKey
+		}
+		state, raw, err := store.getRedisRouteStateAtKey(ctx, routeKey, route.StableFallback)
+		if err != nil {
+			return redisSmartRouteState{}, err
+		}
+		if migrated, changed := smartrouter.NormalizeAutomaticRecoveryStateWithConfig(state.Quality, nowMS, store.runtimeConfigSnapshot().Quality); changed {
+			state.Quality = migrated
+			nextRaw, marshalErr := common.Marshal(state)
+			if marshalErr != nil {
+				return redisSmartRouteState{}, marshalErr
+			}
+			updated, updateErr := store.client.Eval(ctx, redisCASSmartRouteStateScript,
+				[]string{routeKey}, raw, string(nextRaw)).Int64()
+			if updateErr != nil {
+				return redisSmartRouteState{}, updateErr
+			}
+			if updated != 1 {
+				continue
+			}
+			raw = string(nextRaw)
+		}
+		if state.Quality.Phase != smartrouter.QualityHalfOpen {
+			return state, nil
+		}
+		probeKey, probeKeyErr := store.redisProbeKeyForRoute(ctx, route.RouteID)
+		if probeKeyErr != nil {
+			return redisSmartRouteState{}, probeKeyErr
+		}
+		_, err = store.client.Get(ctx, probeKey).Result()
+		if err == nil {
+			return state, nil
+		}
+		if !errors.Is(err, redis.Nil) {
+			return redisSmartRouteState{}, err
+		}
+		state.Quality.Phase = smartrouter.QualityOpen
+		state.Quality.NextProbeAtMS = nowMS
+		state.Quality.LastUpdatedMS = maxSmartRouteInt64(state.Quality.LastUpdatedMS, nowMS)
+		state.Quality.Revision++
+		nextRaw, err := common.Marshal(state)
+		if err != nil {
+			return redisSmartRouteState{}, err
+		}
+		updated, err := store.client.Eval(ctx, redisCASSmartRouteStateScript,
+			[]string{routeKey}, raw, string(nextRaw)).Int64()
+		if err != nil {
+			return redisSmartRouteState{}, err
+		}
+		if updated == 1 {
+			return state, nil
+		}
+	}
+	return redisSmartRouteState{}, ErrSmartRouteStateConflict
+}
+
+func (store *RedisSmartRouteStateStore) getRedisRouteState(
+	ctx context.Context,
+	routeID string,
+	stableFallback bool,
+) (redisSmartRouteState, string, error) {
+	return store.getRedisRouteStateAtKey(ctx, store.redisRouteKey(routeID), stableFallback)
+}
+
+func (store *RedisSmartRouteStateStore) getRedisRouteStateAtKey(
+	ctx context.Context,
+	key string,
+	stableFallback bool,
+) (redisSmartRouteState, string, error) {
+	raw, err := store.client.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return redisSmartRouteState{Quality: smartrouter.InitialQuality(stableFallback)}, "", nil
+	}
+	if err != nil {
+		return redisSmartRouteState{}, "", err
+	}
+	var state redisSmartRouteState
+	if err := common.Unmarshal([]byte(raw), &state); err != nil {
+		return redisSmartRouteState{}, "", fmt.Errorf("decode smart router Redis route state: %w", err)
+	}
+	if state.Quality.Phase == "" {
+		state.Quality = smartrouter.InitialQuality(stableFallback)
+	}
+	if state.Quality.Epoch == 0 {
+		state.Quality.Epoch = 1
+	}
+	if state.Quality.ReliabilitySamples == 0 && state.Quality.ReliabilityPPM == 0 {
+		state.Quality.ReliabilityPPM = 500_000
+	}
+	state.Quality, _ = smartrouter.NormalizeAutomaticRecoveryStateWithConfig(
+		state.Quality,
+		store.config.Clock().UnixMilli(),
+		store.runtimeConfigSnapshot().Quality,
+	)
+	if state.Quality.FailureWindowUntilMS == 0 && state.Quality.LastFailureMS > 0 &&
+		state.Quality.ConsecutiveHardFailures > 0 {
+		state.Quality.FailureWindowUntilMS = addSmartRouteMilliseconds(
+			state.Quality.LastFailureMS, store.runtimeConfigSnapshot().Quality.HardFailureWindowMS,
+		)
+	}
+	if err := state.Quality.Validate(); err != nil {
+		return redisSmartRouteState{}, "", err
+	}
+	for _, sample := range state.TTFT {
+		if sample.MS < 0 {
+			return redisSmartRouteState{}, "", errors.New("smart router Redis TTFT sample is negative")
+		}
+	}
+	return state, raw, nil
+}
+
+func (store *RedisSmartRouteStateStore) redisCapacityState(
+	ctx context.Context,
+	domainID string,
+	maxInflight int,
+) (smartrouter.CapacityState, error) {
+	result, err := store.client.Eval(ctx, redisSnapshotSmartRouteCapacityScript,
+		[]string{store.redisCapacityLeaseKey(domainID), store.redisCapacityBlockKey(domainID)}).Result()
+	if err != nil {
+		return smartrouter.CapacityState{}, err
+	}
+	values, err := redisInt64Values(result, 4)
+	if err != nil {
+		return smartrouter.CapacityState{}, err
+	}
+	waitUntilMS := values[1]
+	if maxInflight > 0 && int(values[0]) >= maxInflight && values[2] > waitUntilMS {
+		waitUntilMS = values[2]
+	}
+	estimatedWaitMS := int64(0)
+	if waitUntilMS > values[3] {
+		estimatedWaitMS = waitUntilMS - values[3]
+	}
+	return smartrouter.CapacityState{
+		Known:           true,
+		MaxInflight:     maxInflight,
+		Inflight:        int(values[0]),
+		BlockedUntilMS:  values[1],
+		EstimatedWaitMS: estimatedWaitMS,
+	}, nil
+}
+
+func (store *RedisSmartRouteStateStore) redisNowMS(ctx context.Context) (int64, error) {
+	now, err := store.client.Time(ctx).Result()
+	if err != nil {
+		return 0, err
+	}
+	return now.UnixMilli(), nil
+}
+
+func (store *RedisSmartRouteStateStore) failClosedSnapshot(
+	ctx context.Context,
+	request SmartRouteStateSnapshotRequest,
+	routes []SmartRouteStateRoute,
+	domains map[string]smartRouteCapacityDomainInput,
+	nowMS int64,
+	storeErr error,
+) SmartRouteRuntimeSnapshot {
+	fallback, fallbackErr := store.fallback.Snapshot(ctx, request)
+	if fallbackErr != nil {
+		fallback = emptySmartRouteRuntimeSnapshot()
+	}
+	fallback.FailClosed = true
+	fallback.StoreError = storeErr
+	version := smartRouteFailClosedVersionPrefix + ":" + strconv.FormatInt(nowMS, 10)
+	fallback.Quality.Version = version
+	fallback.TTFT.Version = version
+	fallback.Capacity.Version = version
+	fallback.Credentials.Version = version
+	fallback.TTFT.Routes = make(map[string]smartrouter.TTFTState)
+	for _, route := range routes {
+		if _, exists := fallback.Quality.Routes[route.RouteID]; !exists {
+			// A Redis outage falls back to the last local evidence. A route with
+			// no local evidence is unknown and may use one controlled real
+			// request; it is not silently treated as an administrator whitelist
+			// miss or permanently quarantined.
+			fallback.Quality.Routes[route.RouteID] = smartrouter.InitialQuality(false)
+		}
+	}
+	for domainID, input := range domains {
+		state := fallback.Capacity.Domains[domainID]
+		state.Known = true
+		state.MaxInflight = input.maxInflight
+		fallback.Capacity.Domains[domainID] = state
+	}
+	for _, route := range routes {
+		if route.CredentialDomain == "" {
+			continue
+		}
+		state := fallback.Credentials.Domains[route.CredentialDomain]
+		state.Epoch = 1
+		fallback.Credentials.Domains[route.CredentialDomain] = state
+	}
+	return fallback
+}
+
+func (store *RedisSmartRouteStateStore) failClosedCapacity(
+	ctx context.Context,
+	request SmartRouteCapacityRequest,
+	storeErr error,
+) (SmartRouteCapacityAcquisition, error) {
+	fallbackRequest := request
+	if fallbackRequest.MaxInflight <= 0 || fallbackRequest.MaxInflight > 1 {
+		fallbackRequest.MaxInflight = 1
+	}
+	acquisition, err := store.fallback.TryAcquireCapacity(ctx, fallbackRequest)
+	if err != nil {
+		return SmartRouteCapacityAcquisition{}, err
+	}
+	acquisition.FailClosed = true
+	acquisition.StoreError = storeErr
+	return acquisition, nil
+}
+
+func (store *RedisSmartRouteStateStore) failClosedRouteExclusions(
+	ctx context.Context,
+	request SmartRouteExclusionRequest,
+	storeErr error,
+) SmartRouteExclusionSnapshot {
+	snapshot, err := store.fallback.RouteExclusions(ctx, request)
+	if err != nil {
+		snapshot = SmartRouteExclusionSnapshot{}
+	}
+	excluded := make(map[string]bool, len(snapshot.RouteIDs)+len(request.Routes))
+	for _, routeID := range snapshot.RouteIDs {
+		excluded[routeID] = true
+	}
+	snapshot.Version = smartRouteFailClosedVersionPrefix + "-quarantine:" +
+		strconv.FormatInt(store.config.Clock().UnixMilli(), 10)
+	snapshot.RouteIDs = sortedSmartRouteIDs(excluded)
+	snapshot.FailClosed = true
+	snapshot.StoreError = storeErr
+	return snapshot
+}
+
+func (store *RedisSmartRouteStateStore) redisRouteKey(routeID string) string {
+	return store.config.RedisKeyPrefix + ":route:" + smartRouteRedisComponent(routeID)
+}
+
+func (store *RedisSmartRouteStateStore) redisImageRouteKey(routeID string) string {
+	return store.config.RedisKeyPrefix + ":image-route:v2:" + smartRouteRedisComponent(routeID)
+}
+
+func (store *RedisSmartRouteStateStore) redisProbeKey(leaseKey string) string {
+	return store.config.RedisKeyPrefix + ":probe:" + smartRouteRedisComponent(leaseKey)
+}
+
+func (store *RedisSmartRouteStateStore) redisProbeRouteKey(routeID string) string {
+	return store.config.RedisKeyPrefix + ":probe-route:" + smartRouteRedisComponent(routeID)
+}
+
+func (store *RedisSmartRouteStateStore) redisProbeKeyForRoute(
+	ctx context.Context,
+	routeID string,
+) (string, error) {
+	probeKey, err := store.client.Get(ctx, store.redisProbeRouteKey(routeID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return store.redisProbeKey(routeID), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	probeKey = strings.TrimSpace(probeKey)
+	if probeKey == "" {
+		return store.redisProbeKey(routeID), nil
+	}
+	return probeKey, nil
+}
+
+func (store *RedisSmartRouteStateStore) redisProbeBudgetKey(namespace string) string {
+	return store.config.RedisKeyPrefix + ":probe-budget:" + smartRouteRedisComponent(normalizeSmartRouteProbeBudgetNamespace(namespace))
+}
+
+func (store *RedisSmartRouteStateStore) redisProbeSubjectKey(namespace, subjectKey string) string {
+	return store.config.RedisKeyPrefix + ":probe-budget:" +
+		smartRouteRedisComponent(normalizeSmartRouteProbeBudgetNamespace(namespace)) +
+		":subject:" + smartRouteRedisComponent(subjectKey)
+}
+
+func (store *RedisSmartRouteStateStore) redisProbeActiveKey(namespace string) string {
+	return store.config.RedisKeyPrefix + ":probe-active:" + smartRouteRedisComponent(normalizeSmartRouteProbeBudgetNamespace(namespace))
+}
+
+func (store *RedisSmartRouteStateStore) redisCredentialKey(domain string) string {
+	return store.config.RedisKeyPrefix + ":credential:" + smartRouteRedisComponent(domain)
+}
+
+func (store *RedisSmartRouteStateStore) redisCapacityLeaseKey(domainID string) string {
+	return store.config.RedisKeyPrefix + ":capacity-leases:" + smartRouteRedisComponent(domainID)
+}
+
+func (store *RedisSmartRouteStateStore) redisCapacityBlockKey(domainID string) string {
+	return store.config.RedisKeyPrefix + ":capacity-block:" + smartRouteRedisComponent(domainID)
+}
+
+func (store *RedisSmartRouteStateStore) redisQuarantineKey(request SmartRouteQuarantineRequest) string {
+	return store.config.RedisKeyPrefix + ":route-quarantine:" +
+		smartRouteRedisComponent(request.CatalogVersion) + ":" +
+		smartRouteRedisComponent(request.RouteID) + ":" +
+		smartRouteRedisComponent(string(request.FailureScope))
+}
+
+type smartRouteCapacityDomainInput struct {
+	maxInflight       int
+	hasStableFallback bool
+}
+
+func normalizeSmartRouteSnapshotRequest(
+	request SmartRouteStateSnapshotRequest,
+) ([]SmartRouteStateRoute, map[string]smartRouteCapacityDomainInput, error) {
+	routeByID := make(map[string]SmartRouteStateRoute, len(request.Routes))
+	for _, route := range request.Routes {
+		route.RouteID = strings.TrimSpace(route.RouteID)
+		route.CapacityDomain = strings.TrimSpace(route.CapacityDomain)
+		route.CredentialDomain = strings.TrimSpace(route.CredentialDomain)
+		if route.RouteID == "" || route.CapacityDomain == "" {
+			return nil, nil, errors.New("smart router snapshot routes require route and capacity domain IDs")
+		}
+		if route.MaxInflight < 0 {
+			return nil, nil, errors.New("smart router max inflight cannot be negative")
+		}
+		if previous, exists := routeByID[route.RouteID]; exists {
+			if previous.CapacityDomain != route.CapacityDomain || previous.CredentialDomain != route.CredentialDomain || previous.MaxInflight != route.MaxInflight ||
+				previous.StableFallback != route.StableFallback {
+				return nil, nil, fmt.Errorf("smart router route %q has conflicting runtime metadata", route.RouteID)
+			}
+			continue
+		}
+		routeByID[route.RouteID] = route
+	}
+	routes := make([]SmartRouteStateRoute, 0, len(routeByID))
+	for _, route := range routeByID {
+		routes = append(routes, route)
+	}
+	sort.Slice(routes, func(left, right int) bool { return routes[left].RouteID < routes[right].RouteID })
+	domains := make(map[string]smartRouteCapacityDomainInput)
+	for _, route := range routes {
+		input, exists := domains[route.CapacityDomain]
+		if !exists {
+			input.maxInflight = route.MaxInflight
+		} else {
+			input.maxInflight = strictSmartRouteCapacityLimit(input.maxInflight, route.MaxInflight)
+		}
+		input.hasStableFallback = input.hasStableFallback || route.StableFallback
+		domains[route.CapacityDomain] = input
+	}
+	return routes, domains, nil
+}
+
+func validateSmartRouteAttempt(record SmartRouteAttemptRecord) error {
+	if record.RouteID == "" {
+		return errors.New("smart router attempt route is required")
+	}
+	if record.RetryAfter < 0 {
+		return errors.New("smart router retry-after cannot be negative")
+	}
+	if record.TTFTObserved && record.TTFT < 0 {
+		return errors.New("smart router observed TTFT cannot be negative")
+	}
+	if record.HTTPStatus < 0 || record.HTTPStatus > 999 {
+		return errors.New("smart router HTTP status is out of range")
+	}
+	switch record.Outcome {
+	case smartrouter.OutcomeImagePending:
+		if !record.ImageAttempt {
+			return errors.New("smart router image pending requires an image attempt")
+		}
+	case smartrouter.OutcomeSuccess,
+		smartrouter.OutcomeInfrastructure,
+		smartrouter.OutcomeCredential,
+		smartrouter.OutcomeCapacityLimited,
+		smartrouter.OutcomeUserRejected,
+		smartrouter.OutcomeContentRejected,
+		smartrouter.OutcomeClientCancelled:
+	default:
+		return fmt.Errorf("smart router attempt outcome %q is unsupported", record.Outcome)
+	}
+	if record.Outcome == smartrouter.OutcomeCapacityLimited && record.CapacityDomain == "" {
+		return errors.New("smart router capacity outcome requires a capacity domain")
+	}
+	if record.ImageAttempt && (record.ObservationID == "" || record.AtMS < 0 || record.StartedAtMS < 0) {
+		return errors.New("smart router image attempt requires an observation ID and nonnegative timestamps")
+	}
+	return nil
+}
+
+func validateSmartRouteCapacityRequest(request SmartRouteCapacityRequest) error {
+	if request.CapacityDomain == "" {
+		return errors.New("smart router capacity domain is required")
+	}
+	if request.MaxInflight < 0 {
+		return errors.New("smart router max inflight cannot be negative")
+	}
+	switch request.QueueMode {
+	case "", smartrouter.QueueModeNoQueue, smartrouter.QueueModeShortWait:
+		return nil
+	default:
+		return fmt.Errorf("smart router queue mode %q is unsupported", request.QueueMode)
+	}
+}
+
+func normalizeSmartRouteQuarantineRequest(request SmartRouteQuarantineRequest) SmartRouteQuarantineRequest {
+	request.CatalogVersion = strings.TrimSpace(request.CatalogVersion)
+	request.RouteID = strings.TrimSpace(request.RouteID)
+	return request
+}
+
+func validateSmartRouteQuarantineRequest(request SmartRouteQuarantineRequest) error {
+	if request.CatalogVersion == "" || request.RouteID == "" {
+		return errors.New("smart router quarantine requires catalog version and route ID")
+	}
+	if !validSmartRouteQuarantineScope(request.FailureScope) {
+		return fmt.Errorf("smart router quarantine scope %q is unsupported", request.FailureScope)
+	}
+	if request.TTL < time.Millisecond {
+		return errors.New("smart router quarantine TTL must be positive")
+	}
+	return nil
+}
+
+func normalizeSmartRouteExclusionRequest(request SmartRouteExclusionRequest) (SmartRouteExclusionRequest, error) {
+	request.CatalogVersion = strings.TrimSpace(request.CatalogVersion)
+	if request.CatalogVersion == "" {
+		return SmartRouteExclusionRequest{}, errors.New("smart router exclusion catalog version is required")
+	}
+	routes, _, err := normalizeSmartRouteSnapshotRequest(SmartRouteStateSnapshotRequest{Routes: request.Routes})
+	if err != nil {
+		return SmartRouteExclusionRequest{}, err
+	}
+	request.Routes = routes
+	if len(request.FailureScopes) == 0 {
+		request.FailureScopes = []SmartRouteFailureScope{SmartFailureRouteContract, SmartFailureRouteModel}
+	}
+	uniqueScopes := make(map[SmartRouteFailureScope]bool, len(request.FailureScopes))
+	for _, scope := range request.FailureScopes {
+		if !validSmartRouteQuarantineScope(scope) {
+			return SmartRouteExclusionRequest{}, fmt.Errorf("smart router exclusion scope %q is unsupported", scope)
+		}
+		uniqueScopes[scope] = true
+	}
+	request.FailureScopes = request.FailureScopes[:0]
+	for scope := range uniqueScopes {
+		request.FailureScopes = append(request.FailureScopes, scope)
+	}
+	sort.Slice(request.FailureScopes, func(left, right int) bool {
+		return request.FailureScopes[left] < request.FailureScopes[right]
+	})
+	return request, nil
+}
+
+func validSmartRouteQuarantineScope(scope SmartRouteFailureScope) bool {
+	return scope == SmartFailureRouteModel || scope == SmartFailureRouteContract
+}
+
+func sortedSmartRouteIDs(routeIDs map[string]bool) []string {
+	result := make([]string, 0, len(routeIDs))
+	for routeID := range routeIDs {
+		result = append(result, routeID)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func emptySmartRouteQualityConfig(config smartrouter.QualityConfig) bool {
+	return config.ImageFailureWindowMS == 0 && config.ImageFailureThreshold == 0 &&
+		config.SharedOpenFailureThreshold == 0 && config.HardFailureWindowMS == 0 && config.FastRecoveryIntervalMS == 0 &&
+		config.FastRecoveryWindowMS == 0 && len(config.SlowRecoveryBackoffMS) == 0 && len(config.OpenBackoffMS) == 0 &&
+		config.CredentialBackoffMS == 0 && config.DegradedRecoverySuccesses == 0 &&
+		config.HealthyWarmSamples == 0 && config.FastCanaryMinSamples == 0 &&
+		config.FastCanaryMinReliabilityPPM == 0 && config.WarmingSampleIntervalMS == 0 && len(config.WarmingStages) == 0
+}
+
+func deferNeutralSmartRouteSample(
+	previous smartrouter.QualityState,
+	next smartrouter.QualityState,
+	record SmartRouteAttemptRecord,
+	nowMS int64,
+	intervalMS int64,
+) smartrouter.QualityState {
+	if record.ImageAttempt || record.Admission != smartrouter.AdmissionWarmSample || !smartRouteHealthEquivalent(previous, next) ||
+		(previous.Phase != smartrouter.QualityWarming && previous.Phase != smartrouter.QualityDegraded) {
+		return next
+	}
+	delayMS := intervalMS
+	if retryAfterMS := durationMilliseconds(record.RetryAfter); retryAfterMS > delayMS {
+		delayMS = retryAfterMS
+	}
+	if delayMS < 1 {
+		delayMS = 1
+	}
+	next.SampleDueAtMS = maxSmartRouteInt64(next.SampleDueAtMS, addSmartRouteMilliseconds(nowMS, delayMS))
+	next.LastUpdatedMS = maxSmartRouteInt64(next.LastUpdatedMS, nowMS)
+	next.Revision++
+	return next
+}
+
+func smartRouteHealthEquivalent(left, right smartrouter.QualityState) bool {
+	right.Revision = left.Revision
+	right.LastUpdatedMS = left.LastUpdatedMS
+	right.LastOutcome = left.LastOutcome
+	right.LastHTTPStatus = left.LastHTTPStatus
+	right.LastErrorSummary = left.LastErrorSummary
+	// Probe telemetry is observational and must not turn a neutral warming
+	// sample into a health transition. The sample defer path compares only
+	// health evidence, not the timestamp/result of the probe itself.
+	right.LastProbeAtMS = left.LastProbeAtMS
+	right.LastProbeOutcome = left.LastProbeOutcome
+	right.LastProbeHTTPStatus = left.LastProbeHTTPStatus
+	right.LastProbeErrorSummary = left.LastProbeErrorSummary
+	right.ProbeSuccesses = left.ProbeSuccesses
+	return left == right
+}
+
+func appendBoundedSmartRouteTTFT(
+	samples []smartRouteTTFTSample,
+	sample smartRouteTTFTSample,
+	limit int,
+) []smartRouteTTFTSample {
+	if len(samples) >= limit {
+		start := len(samples) - limit + 1
+		copy(samples, samples[start:])
+		samples = samples[:limit-1]
+	}
+	return append(samples, sample)
+}
+
+func appendBoundedSmartRouteOutcome(
+	samples []smartRouteOutcomeSample,
+	sample smartRouteOutcomeSample,
+	limit int,
+) []smartRouteOutcomeSample {
+	if len(samples) >= limit {
+		start := len(samples) - limit + 1
+		copy(samples, samples[start:])
+		samples = samples[:limit-1]
+	}
+	return append(samples, sample)
+}
+
+func smartRouteLeaderboardOutcome(record SmartRouteAttemptRecord) (bool, bool) {
+	if record.SkipHealthUpdate || record.SyntheticProbe || (isSmartRouteRecoveryAdmission(record.Admission) && !record.PassiveRecovery && !record.DemandRecovery) {
+		return false, false
+	}
+	switch record.Outcome {
+	case smartrouter.OutcomeSuccess:
+		return true, true
+	case smartrouter.OutcomeInfrastructure, smartrouter.OutcomeCredential, smartrouter.OutcomeCapacityLimited:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func smartRouteObservationSeen(samples []smartRouteOutcomeSample, observationID string) bool {
+	observationID = strings.TrimSpace(observationID)
+	if observationID == "" {
+		return false
+	}
+	for index := len(samples) - 1; index >= 0; index-- {
+		if samples[index].ObservationID == observationID {
+			return true
+		}
+	}
+	return false
+}
+
+func smartRouteTTFTObservationSeen(samples []smartRouteTTFTSample, observationID string) bool {
+	observationID = strings.TrimSpace(observationID)
+	if observationID == "" {
+		return false
+	}
+	for index := len(samples) - 1; index >= 0; index-- {
+		if samples[index].ObservationID == observationID {
+			return true
+		}
+	}
+	return false
+}
+
+func smartRouteOutcomeObservationSeenAny(samples []smartRouteOutcomeSample, item SmartRouteHistoricalEvidence) bool {
+	if smartRouteObservationSeen(samples, item.ObservationID) {
+		return true
+	}
+	for _, alias := range item.LegacyObservationIDs {
+		if smartRouteObservationSeen(samples, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+func smartRouteTTFTObservationSeenAny(samples []smartRouteTTFTSample, item SmartRouteHistoricalEvidence) bool {
+	if smartRouteTTFTObservationSeen(samples, item.ObservationID) {
+		return true
+	}
+	for _, alias := range item.LegacyObservationIDs {
+		if smartRouteTTFTObservationSeen(samples, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSmartRouteHistoricalEvidence(
+	evidence []SmartRouteHistoricalEvidence,
+	nowMS int64,
+) []SmartRouteHistoricalEvidence {
+	cutoffMS := nowMS - smartRouteLeaderboardWindowHorizon.Milliseconds()
+	valid := make([]SmartRouteHistoricalEvidence, 0, len(evidence))
+	for _, item := range evidence {
+		item.RouteID = strings.TrimSpace(item.RouteID)
+		item.ObservationID = smartRouteObservationDigest(item.ObservationID)
+		aliases := make([]string, 0, len(item.LegacyObservationIDs))
+		seenAliases := make(map[string]struct{}, len(item.LegacyObservationIDs))
+		for _, alias := range item.LegacyObservationIDs {
+			alias = smartRouteObservationDigest(alias)
+			if alias == "" || alias == item.ObservationID {
+				continue
+			}
+			if _, exists := seenAliases[alias]; exists {
+				continue
+			}
+			seenAliases[alias] = struct{}{}
+			aliases = append(aliases, alias)
+		}
+		item.LegacyObservationIDs = aliases
+		if item.RouteID == "" || item.ObservationID == "" || item.EventMS < cutoffMS || item.EventMS > nowMS ||
+			(!item.OutcomeObserved && !item.TTFTObserved) || (item.TTFTObserved && item.TTFTMS < 0) {
+			continue
+		}
+		valid = append(valid, item)
+	}
+	// Keep only each route/metric's newest bounded window before importing.
+	// This prevents a Web/Worker restart from replaying thousands of older
+	// observations merely to evict them again from the same 100-sample window.
+	sort.SliceStable(valid, func(left, right int) bool {
+		if valid[left].EventMS != valid[right].EventMS {
+			return valid[left].EventMS > valid[right].EventMS
+		}
+		if valid[left].RouteID != valid[right].RouteID {
+			return valid[left].RouteID < valid[right].RouteID
+		}
+		return valid[left].ObservationID < valid[right].ObservationID
+	})
+	result := make([]SmartRouteHistoricalEvidence, 0, len(valid))
+	outcomeCounts := make(map[string]int)
+	ttftCounts := make(map[string]int)
+	for _, item := range valid {
+		keepOutcome := item.OutcomeObserved && outcomeCounts[item.RouteID] < smartRouteLeaderboardWindowSize
+		keepTTFT := item.TTFTObserved && ttftCounts[item.RouteID] < smartRouteLeaderboardWindowSize
+		if !keepOutcome && !keepTTFT {
+			continue
+		}
+		item.OutcomeObserved = keepOutcome
+		item.TTFTObserved = keepTTFT
+		if keepOutcome {
+			outcomeCounts[item.RouteID]++
+		}
+		if keepTTFT {
+			ttftCounts[item.RouteID]++
+		}
+		result = append(result, item)
+	}
+	sort.SliceStable(result, func(left, right int) bool {
+		if result[left].EventMS != result[right].EventMS {
+			return result[left].EventMS < result[right].EventMS
+		}
+		if result[left].RouteID != result[right].RouteID {
+			return result[left].RouteID < result[right].RouteID
+		}
+		return result[left].ObservationID < result[right].ObservationID
+	})
+	return result
+}
+
+func smartRouteAttemptUsesProbeFence(record SmartRouteAttemptRecord) bool {
+	return record.ProbeLeaseID != "" || isSmartRouteRecoveryAdmission(record.Admission)
+}
+
+func calculateSmartRouteRecentMetrics(
+	ttftSamples []smartRouteTTFTSample,
+	outcomeSamples []smartRouteOutcomeSample,
+	history smartRouteRecentHistory,
+	nowMS int64,
+) SmartRouteRecentMetrics {
+	cutoffMS := nowMS - smartRouteLeaderboardWindowHorizon.Milliseconds()
+	halfLifeMS := float64(smartRouteLeaderboardWindowHalfLife.Milliseconds())
+	weightAt := func(atMS int64) float64 {
+		ageMS := nowMS - atMS
+		if ageMS < 0 {
+			ageMS = 0
+		}
+		return math.Pow(2, -float64(ageMS)/halfLifeMS)
+	}
+	warmupWeight := func(warmup bool) float64 {
+		if warmup {
+			return 0.10
+		}
+		return 1
+	}
+	result := SmartRouteRecentMetrics{}
+	historyIsFresh := func(metric smartRouteMetricHistory) bool {
+		if metric.Version != "route-history-v1" || metric.TotalSamples <= 0 || metric.LastEventMS <= 0 || metric.LastEventMS > nowMS {
+			return false
+		}
+		return nowMS-metric.LastEventMS <= smartRouteLeaderboardHistoryHorizon.Milliseconds()
+	}
+	recentTTFT := make([]smartRouteTTFTSample, 0, min(len(ttftSamples), smartRouteLeaderboardWindowSize))
+	for _, sample := range ttftSamples {
+		if sample.AtMS < cutoffMS || sample.AtMS > nowMS || sample.MS < 0 || sample.Synthetic {
+			continue
+		}
+		recentTTFT = append(recentTTFT, sample)
+	}
+	sort.SliceStable(recentTTFT, func(left, right int) bool {
+		return recentTTFT[left].AtMS > recentTTFT[right].AtMS
+	})
+	if len(recentTTFT) > smartRouteLeaderboardWindowSize {
+		recentTTFT = recentTTFT[:smartRouteLeaderboardWindowSize]
+	}
+	result.TTFTSamples = len(recentTTFT)
+	realTTFTSamples := len(recentTTFT)
+	if len(recentTTFT) >= 10 {
+		sort.SliceStable(recentTTFT, func(left, right int) bool {
+			if recentTTFT[left].MS != recentTTFT[right].MS {
+				return recentTTFT[left].MS < recentTTFT[right].MS
+			}
+			return recentTTFT[left].AtMS > recentTTFT[right].AtMS
+		})
+		trimEachSide := len(recentTTFT) / 10
+		if trimEachSide > 0 && trimEachSide*2 < len(recentTTFT) {
+			recentTTFT = recentTTFT[trimEachSide : len(recentTTFT)-trimEachSide]
+		}
+	}
+	var ttftWeightedSum float64
+	var ttftWeight float64
+	for _, sample := range recentTTFT {
+		weight := weightAt(sample.AtMS) * warmupWeight(sample.Warmup)
+		ttftWeightedSum += float64(sample.MS) * weight
+		ttftWeight += weight
+		if sample.AtMS > result.LastObservedAtMS {
+			result.LastObservedAtMS = sample.AtMS
+		}
+	}
+	historicalTTFT := float64((10 * time.Second).Milliseconds())
+	hasTTFTHistory := historyIsFresh(history.TTFT) && history.TTFT.Value >= 0
+	if hasTTFTHistory {
+		historicalTTFT = history.TTFT.Value
+		result.TTFTHistoricalAverageMS = int64(math.Round(history.TTFT.Value))
+		result.TTFTHistoricalP50MS = int64(math.Round(history.TTFT.P50))
+		result.TTFTHistoricalP95MS = int64(math.Round(history.TTFT.P95))
+		result.TTFTHistoricalSamples = history.TTFT.TotalSamples
+		result.LastObservedAtMS = max(result.LastObservedAtMS, history.TTFT.LastEventMS)
+	}
+	if ttftWeight > 0 {
+		result.TTFTRecentAverageMS = int64(math.Round(ttftWeightedSum / ttftWeight))
+		recentShare := float64(realTTFTSamples) / float64(smartRouteLeaderboardWindowSize)
+		result.TTFTAverageMS = int64(math.Round(float64(result.TTFTRecentAverageMS)*recentShare + historicalTTFT*(1-recentShare)))
+		result.TTFTConfidencePPM = int64(realTTFTSamples) * 1_000_000 / smartRouteLeaderboardWindowSize
+		if recentShare >= 1 {
+			result.TTFTSource = "recent"
+		} else if hasTTFTHistory {
+			result.TTFTSource = "recent_route_history"
+		} else {
+			result.TTFTSource = "recent_system_reference"
+		}
+	} else {
+		result.TTFTAverageMS = int64(math.Round(historicalTTFT))
+		if hasTTFTHistory {
+			result.TTFTSource = "route_history"
+		} else {
+			result.TTFTSource = "system_reference"
+		}
+	}
+
+	outcomeStart := 0
+	if len(outcomeSamples) > smartRouteLeaderboardWindowSize {
+		outcomeStart = len(outcomeSamples) - smartRouteLeaderboardWindowSize
+	}
+	var successWeight float64
+	var outcomeWeight float64
+	for _, sample := range outcomeSamples[outcomeStart:] {
+		if sample.AtMS < cutoffMS || sample.AtMS > nowMS {
+			continue
+		}
+		weight := weightAt(sample.AtMS) * warmupWeight(sample.Warmup)
+		outcomeWeight += weight
+		result.StabilitySamples++
+		if sample.Success {
+			result.StabilitySuccesses++
+			result.RecentUsageCount++
+			successWeight += weight
+		} else {
+			result.StabilityFailures++
+		}
+		if sample.AtMS > result.LastObservedAtMS {
+			result.LastObservedAtMS = sample.AtMS
+		}
+	}
+	historicalStability := 0.985
+	hasStabilityHistory := historyIsFresh(history.Stability) && history.Stability.Value >= 0 && history.Stability.Value <= 1
+	if hasStabilityHistory {
+		historicalStability = history.Stability.Value
+		result.StabilityHistoricalRate = history.Stability.Value
+		result.StabilityHistoricalSamples = history.Stability.TotalSamples
+		result.LastObservedAtMS = max(result.LastObservedAtMS, history.Stability.LastEventMS)
+	} else {
+		result.StabilityHistoricalRate = historicalStability
+	}
+	if outcomeWeight > 0 {
+		result.StabilityRecentRate = successWeight / outcomeWeight
+		recentShare := float64(result.StabilitySamples) / float64(smartRouteLeaderboardWindowSize)
+		result.StabilityRate = result.StabilityRecentRate*recentShare + historicalStability*(1-recentShare)
+		result.StabilityConfidencePPM = int64(result.StabilitySamples) * 1_000_000 / smartRouteLeaderboardWindowSize
+		if recentShare >= 1 {
+			result.StabilitySource = "recent"
+		} else if hasStabilityHistory {
+			result.StabilitySource = "recent_route_history"
+		} else {
+			result.StabilitySource = "recent_system_reference"
+		}
+	} else {
+		result.StabilityRate = historicalStability
+		if hasStabilityHistory {
+			result.StabilitySource = "route_history"
+		} else {
+			result.StabilitySource = "system_reference"
+		}
+	}
+	return result
+}
+
+func updateSmartRouteMetricHistory(
+	history smartRouteMetricHistory,
+	value float64,
+	eventMS int64,
+	binary bool,
+) smartRouteMetricHistory {
+	return updateSmartRouteMetricHistoryWeighted(history, value, eventMS, binary, 1)
+}
+
+func updateSmartRouteMetricHistoryWeighted(
+	history smartRouteMetricHistory,
+	value float64,
+	eventMS int64,
+	binary bool,
+	observationWeight float64,
+) smartRouteMetricHistory {
+	if math.IsNaN(value) || math.IsInf(value, 0) || eventMS <= 0 {
+		return history
+	}
+	if math.IsNaN(observationWeight) || math.IsInf(observationWeight, 0) || observationWeight <= 0 {
+		return history
+	}
+	if binary && value != 0 && value != 1 {
+		return history
+	}
+	if history.PendingStartedMS <= 0 {
+		history.PendingStartedMS = eventMS
+	}
+	history.Pending = append(history.Pending, smartRouteMetricHistorySample{Value: value, EventMS: eventMS, Weight: observationWeight})
+	if len(history.Pending) < smartRouteLeaderboardHistoryBatchSize &&
+		eventMS-history.PendingStartedMS < smartRouteLeaderboardHistoryBatchAge.Milliseconds() {
+		return history
+	}
+	pending := append([]smartRouteMetricHistorySample(nil), history.Pending...)
+	history.Pending = nil
+	history.PendingStartedMS = 0
+	values := make([]float64, 0, len(pending))
+	lastEventMS := int64(0)
+	for _, sample := range pending {
+		if sample.EventMS <= 0 || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
+			continue
+		}
+		if binary && sample.Value != 0 && sample.Value != 1 {
+			continue
+		}
+		values = append(values, sample.Value)
+		if sample.EventMS > lastEventMS {
+			lastEventMS = sample.EventMS
+		}
+	}
+	if len(values) == 0 {
+		return history
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	batchP50 := smartRoutePercentile(sorted, 0.5)
+	batchP95 := smartRoutePercentile(sorted, 0.95)
+	deviations := make([]float64, 0, len(sorted))
+	for _, current := range sorted {
+		deviations = append(deviations, math.Abs(current-batchP50))
+	}
+	sort.Float64s(deviations)
+	batchMAD := smartRoutePercentile(deviations, 0.5)
+	accepted := pending
+	if !binary && len(sorted) >= 10 {
+		trimEachSide := len(sorted) / 10
+		lower := sorted[trimEachSide]
+		upper := sorted[len(sorted)-trimEachSide-1]
+		accepted = make([]smartRouteMetricHistorySample, 0, len(pending)-2*trimEachSide)
+		for _, sample := range pending {
+			if sample.Value >= lower && sample.Value <= upper {
+				accepted = append(accepted, sample)
+			}
+		}
+	}
+	var weightedSum float64
+	var weightSum float64
+	for _, sample := range accepted {
+		ageMS := lastEventMS - sample.EventMS
+		if ageMS < 0 {
+			ageMS = 0
+		}
+		weight := math.Pow(2, -float64(ageMS)/float64(smartRouteLeaderboardWindowHalfLife.Milliseconds()))
+		if sample.Weight > 0 {
+			weight *= sample.Weight
+		}
+		weightedSum += sample.Value * weight
+		weightSum += weight
+	}
+	if weightSum <= 0 {
+		return history
+	}
+	batchValue := weightedSum / weightSum
+	count := len(values)
+	effectiveCount := weightSum
+	alpha := 1 - math.Pow(2, -effectiveCount/smartRouteLeaderboardHistoryHalfLife)
+	if alpha > smartRouteLeaderboardHistoryAlphaMax {
+		alpha = smartRouteLeaderboardHistoryAlphaMax
+	}
+	if alpha <= 0 || math.IsNaN(alpha) || math.IsInf(alpha, 0) {
+		return history
+	}
+	if history.Version == "route-history-v1" && history.TotalSamples > 0 && history.EffectiveSamples > 0 {
+		direction := 0
+		if batchP50 > history.P50+2*history.MAD {
+			direction = 1
+		} else if batchP50 < history.P50-2*history.MAD {
+			direction = -1
+		}
+		if direction != 0 && direction == history.DriftDirection {
+			history.ConsecutiveDriftBatches++
+		} else if direction != 0 {
+			history.DriftDirection = direction
+			history.ConsecutiveDriftBatches = 1
+		} else {
+			history.DriftDirection = 0
+			history.ConsecutiveDriftBatches = 0
+		}
+		if history.ConsecutiveDriftBatches >= 3 && alpha < smartRouteLeaderboardHistoryDriftAlpha {
+			alpha = smartRouteLeaderboardHistoryDriftAlpha
+		}
+		history.Value = history.Value*(1-alpha) + batchValue*alpha
+		history.P50 = history.P50*(1-alpha) + batchP50*alpha
+		history.P95 = history.P95*(1-alpha) + batchP95*alpha
+		history.MAD = history.MAD*(1-alpha) + batchMAD*alpha
+		history.EffectiveSamples = history.EffectiveSamples*(1-alpha) + effectiveCount
+	} else {
+		history.Value = batchValue
+		history.P50 = batchP50
+		history.P95 = batchP95
+		history.MAD = batchMAD
+		history.EffectiveSamples = effectiveCount
+		history.DriftDirection = 0
+		history.ConsecutiveDriftBatches = 0
+	}
+	history.Version = "route-history-v1"
+	history.TotalSamples += int64(count)
+	if lastEventMS > history.LastEventMS {
+		history.LastEventMS = lastEventMS
+	}
+	return history
+}
+
+func smartRoutePercentile(sorted []float64, percentile float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if percentile <= 0 {
+		return sorted[0]
+	}
+	if percentile >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	position := percentile * float64(len(sorted)-1)
+	lower := int(math.Floor(position))
+	upper := int(math.Ceil(position))
+	if lower == upper {
+		return sorted[lower]
+	}
+	fraction := position - float64(lower)
+	return sorted[lower]*(1-fraction) + sorted[upper]*fraction
+}
+
+func calculateSmartRouteTTFT(samples []smartRouteTTFTSample, nowMS int64, freshness time.Duration) smartrouter.TTFTState {
+	if len(samples) == 0 {
+		return smartrouter.TTFTState{}
+	}
+	cutoffMS := nowMS - freshness.Milliseconds()
+	values := make([]int64, 0, len(samples))
+	latestMS := int64(math.MinInt64)
+	for _, sample := range samples {
+		if sample.AtMS < cutoffMS || sample.MS < 0 {
+			continue
+		}
+		values = append(values, sample.MS)
+		if sample.AtMS > latestMS {
+			latestMS = sample.AtMS
+		}
+	}
+	if len(values) == 0 {
+		return smartrouter.TTFTState{}
+	}
+	sort.Slice(values, func(left, right int) bool { return values[left] < values[right] })
+	rank := (95*len(values) + 99) / 100
+	return smartrouter.TTFTState{
+		Samples:      len(values),
+		P95MS:        values[rank-1],
+		FreshUntilMS: addDurationMS(latestMS, freshness),
+	}
+}
+
+func smartRouteLeaseTTL(requested, fallback time.Duration) (time.Duration, error) {
+	if requested == 0 {
+		requested = fallback
+	}
+	if requested < time.Millisecond {
+		return 0, ErrSmartRouteInvalidLease
+	}
+	return requested, nil
+}
+
+func newSmartRouteLeaseID() (string, error) {
+	buffer := make([]byte, 32)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", fmt.Errorf("generate smart router lease ID: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buffer), nil
+}
+
+func smartRouteRedisComponent(value string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func durationMilliseconds(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	return duration.Milliseconds()
+}
+
+func smartRouteObservationDigest(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return common.Sha1([]byte("smart-route-observation\x00" + value))
+}
+
+func capSmartRouteRecoveryDelay(delay time.Duration) time.Duration {
+	maximum := time.Duration(smartrouter.MaximumRecoveryProbeIntervalMS) * time.Millisecond
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func boolToSmartRouteRedisInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func addDurationMS(nowMS int64, duration time.Duration) int64 {
+	delta := durationMilliseconds(duration)
+	return addSmartRouteMilliseconds(nowMS, delta)
+}
+
+func addSmartRouteMilliseconds(nowMS, delta int64) int64 {
+	if delta > 0 && nowMS > math.MaxInt64-delta {
+		return math.MaxInt64
+	}
+	return nowMS + delta
+}
+
+func strictSmartRouteCapacityLimit(left, right int) int {
+	if left <= 0 {
+		return right
+	}
+	if right <= 0 || left < right {
+		return left
+	}
+	return right
+}
+
+func maxSmartRouteInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func redisInt64Values(result any, expected int) ([]int64, error) {
+	items, ok := result.([]any)
+	if !ok || len(items) != expected {
+		return nil, fmt.Errorf("unexpected smart router Redis script result %T", result)
+	}
+	values := make([]int64, len(items))
+	for index, item := range items {
+		switch typed := item.(type) {
+		case int64:
+			values[index] = typed
+		case string:
+			value, err := strconv.ParseInt(typed, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("parse smart router Redis integer: %w", err)
+			}
+			values[index] = value
+		default:
+			return nil, fmt.Errorf("unexpected smart router Redis integer %T", item)
+		}
+	}
+	return values, nil
+}
+
+func emptySmartRouteRuntimeSnapshot() SmartRouteRuntimeSnapshot {
+	return SmartRouteRuntimeSnapshot{
+		Quality:     smartrouter.QualitySnapshot{Routes: make(map[string]smartrouter.QualityState)},
+		TTFT:        smartrouter.TTFTSnapshot{Routes: make(map[string]smartrouter.TTFTState)},
+		Capacity:    smartrouter.CapacitySnapshot{Domains: make(map[string]smartrouter.CapacityState)},
+		Credentials: smartrouter.CredentialSnapshot{Domains: make(map[string]smartrouter.CredentialState)},
+	}
+}
+
+const redisCASSmartRouteStateScript = `
+local current = redis.call('GET', KEYS[1])
+if not current then current = '' end
+if current ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+`
+
+const redisCASFencedSmartRouteStateScript = `
+local current = redis.call('GET', KEYS[1])
+if not current then current = '' end
+if current ~= ARGV[1] then return 0 end
+if ARGV[3] ~= '' and redis.call('GET', KEYS[2]) ~= ARGV[3] then return -1 end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+`
+
+const redisResetSmartRouteScript = `
+local current = redis.call('GET', KEYS[1])
+if not current then current = '' end
+if current ~= ARGV[1] then return 0 end
+local owner = redis.call('GET', KEYS[2])
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[5])
+if owner then
+  redis.call('ZREM', KEYS[3], owner)
+  redis.call('ZREM', KEYS[4], owner)
+end
+return 1
+`
+
+const redisAcquireSmartRouteProbeScript = `
+if redis.call('EXISTS', KEYS[2]) == 1 then return -1 end
+if redis.call('EXISTS', KEYS[6]) == 1 then return -1 end
+local current = redis.call('GET', KEYS[1])
+if not current then current = '' end
+if current ~= ARGV[1] then return 0 end
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local window = tonumber(ARGV[5])
+redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', now)
+if redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[10]) then return -4 end
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now - window)
+if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[6]) then return -2 end
+if tonumber(ARGV[7]) == 1 and redis.call('EXISTS', KEYS[4]) == 1 then return -3 end
+local acquired = redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4], 'NX')
+if not acquired then return -1 end
+redis.call('SET', KEYS[6], KEYS[2], 'PX', ARGV[4])
+redis.call('ZADD', KEYS[3], now, ARGV[3])
+redis.call('PEXPIRE', KEYS[3], window + tonumber(ARGV[9]))
+redis.call('ZADD', KEYS[5], now + tonumber(ARGV[4]), ARGV[3])
+redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[4]) + tonumber(ARGV[9]))
+if tonumber(ARGV[7]) == 1 then
+  redis.call('SET', KEYS[4], ARGV[3], 'PX', ARGV[8])
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+`
+
+const redisReleaseSmartRouteProbeScript = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
+if redis.call('GET', KEYS[3]) == KEYS[1] then redis.call('DEL', KEYS[3]) end
+return 1
+`
+
+const redisRenewSmartRouteProbeScript = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+if redis.call('PEXPIRE', KEYS[1], ARGV[2]) ~= 1 then return 0 end
+redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[1])
+redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[2]) + tonumber(ARGV[3]))
+if redis.call('GET', KEYS[3]) == KEYS[1] then redis.call('PEXPIRE', KEYS[3], ARGV[2]) end
+return now + tonumber(ARGV[2])
+`
+
+const redisAcquireSmartRouteCapacityScript = `
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local expires = now + tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local count = redis.call('ZCARD', KEYS[1])
+local blocked = tonumber(redis.call('GET', KEYS[2]) or '0')
+if blocked > now and tonumber(ARGV[6] or '0') ~= 1 then return {0, count, blocked, 0} end
+if tonumber(ARGV[5]) == 1 and count > 0 then return {0, count, blocked, 0} end
+if limit > 0 and count >= limit then return {0, count, blocked, 0} end
+redis.call('ZADD', KEYS[1], expires, ARGV[3])
+local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+if #latest == 2 then redis.call('PEXPIREAT', KEYS[1], tonumber(latest[2]) + tonumber(ARGV[4])) end
+return {1, count + 1, blocked, expires}
+`
+
+const redisReleaseSmartRouteCapacityScript = `
+return redis.call('ZREM', KEYS[1], ARGV[1])
+`
+
+const redisRenewSmartRouteCapacityScript = `
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not current then return 0 end
+if tonumber(current) <= now then
+  redis.call('ZREM', KEYS[1], ARGV[1])
+  return 0
+end
+local expires = now + tonumber(ARGV[2])
+redis.call('ZADD', KEYS[1], 'XX', expires, ARGV[1])
+local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+if #latest == 2 then redis.call('PEXPIREAT', KEYS[1], tonumber(latest[2]) + tonumber(ARGV[3])) end
+return expires
+`
+
+const redisSnapshotSmartRouteCapacityScript = `
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local count = redis.call('ZCARD', KEYS[1])
+local blocked = tonumber(redis.call('GET', KEYS[2]) or '0')
+if blocked <= now then blocked = 0 end
+local earliest = 0
+local first = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+if #first == 2 then earliest = tonumber(first[2]) end
+return {count, blocked, earliest, now}
+`
+
+const redisBlockSmartRouteCapacityScript = `
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local requested = now + tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if requested > current then
+  redis.call('SET', KEYS[1], requested)
+  redis.call('PEXPIREAT', KEYS[1], requested + tonumber(ARGV[2]))
+  return requested
+end
+return current
+`
+
+const redisQuarantineSmartRouteScript = `
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local requested = now + tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if requested > current then
+  redis.call('SET', KEYS[1], requested, 'PX', ARGV[1])
+  return requested
+end
+return current
+`

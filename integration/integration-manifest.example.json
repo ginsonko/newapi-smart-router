@@ -1,5 +1,7 @@
 {
   "manifest_version": "1.1.0",
+  "release": "v0.4.0-alpha.1",
+  "bridge_protocol": "bridge-spi-v1alpha4",
   "integration_id": "synthetic-custom-fork-review",
   "host": {
     "project": "New API",
@@ -20,7 +22,10 @@
     {"hook_id": "HOOK-OUTCOME-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-BILL-001", "status": "pending", "evidence": []},
     {"hook_id": "HOOK-LOG-001", "status": "pending", "evidence": []},
-    {"hook_id": "HOOK-MEDIA-001", "status": "pending", "evidence": []}
+    {"hook_id": "HOOK-MEDIA-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-POLICY-MEMORY-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-CATALOG-SCOPE-001", "status": "pending", "evidence": []},
+    {"hook_id": "HOOK-IMAGE-JOB-001", "status": "pending", "evidence": []}
   ],
   "r52_evidence": {
     "bridge_protocol": "bridge-spi-v1alpha3",
@@ -33,6 +38,13 @@
     "web_worker_same_artifact": "pending"
   },
   "tests": [],
+  "r98_evidence": {
+    "nullable_per_key_memory": "pending",
+    "current_catalog_and_quote_scope": "pending",
+    "durable_image_refund_fallback": "pending",
+    "unknown_acceptance_no_replay": "pending",
+    "configurable_one_hour_image_health": "pending"
+  },
   "known_gaps": ["Host integration has not started."],
   "full_parity": false
 }

@@ -1,0 +1,56 @@
+package controller
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestImageTaskLookupIsOwnerScopedAndStudioRetryReusesTask(t *testing.T) {
+	previous := model.DB
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previous })
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+	task := &model.Task{TaskID: "studio_existing", UserId: 7, Platform: constant.TaskPlatformOpenAIImage, Status: model.TaskStatusSuccess,
+		Properties: model.Properties{MediaMode: "images"}, Data: []byte(`{"created":123,"data":[{"url":"https://images.example/result.png"}]}`),
+		PrivateData: model.TaskPrivateData{Key: "secret-key", UpstreamTaskID: "provider-private", ImageTask: &model.ImageTaskContext{Count: 1, NoRetention: true}}}
+	require.NoError(t, db.Create(task).Error)
+	for _, user := range []int{7, 8} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest("GET", "/v1/images/generations/studio_existing", nil)
+		c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+		c.Set("id", user)
+		GetImageTask(c)
+		if user == 7 {
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), "result.png")
+		} else {
+			assert.Equal(t, http.StatusNotFound, recorder.Code)
+		}
+		assert.NotContains(t, recorder.Body.String(), "secret-key")
+		assert.NotContains(t, recorder.Body.String(), "provider-private")
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("POST", "/api/media/studio/images", nil)
+	c.Set("id", 7)
+	c.Set("is_playground", true)
+	c.Set("task_media_mode", "images")
+	c.Set(mediaStudioOperationContextKey, task.TaskID)
+	assert.True(t, respondExistingStudioImageResponse(c))
+	assert.Equal(t, http.StatusAccepted, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), task.TaskID)
+	public := mediaTaskPublicMap(task, nil)
+	assert.NotEmpty(t, public["artifacts"])
+}

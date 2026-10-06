@@ -2,12 +2,31 @@ package smartrouter
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func reduceDistinctConfirmedFailures(
+	state QualityState,
+	config QualityConfig,
+	startMS int64,
+	outcome QualityOutcome,
+	count int,
+) QualityState {
+	for index := 0; index < count; index++ {
+		atMS := startMS + int64(index)
+		state = ReduceQuality(state, QualityEvent{
+			AtMS: atMS, StartedAtMS: atMS,
+			ObservationID: fmt.Sprintf("confirmed-%d-%d", startMS, index),
+			Outcome:       outcome,
+		}, config)
+	}
+	return state
+}
 
 func TestPolicyJSONNormalizeAndValidate(t *testing.T) {
 	raw := `{
@@ -63,7 +82,7 @@ func TestQualityColdStartAndRecoveryTransitions(t *testing.T) {
 	assert.Equal(t, int64(1_000_000), bootstrap.WarmingTrafficPPM)
 	assert.Zero(t, bootstrap.WarmingEpoch)
 
-	opened := ReduceQuality(InitialQuality(true), QualityEvent{AtMS: 2_000, Outcome: OutcomeInfrastructure}, config)
+	opened := reduceDistinctConfirmedFailures(InitialQuality(true), config, 2_000, OutcomeInfrastructure, 3)
 	assert.Equal(t, QualityOpen, opened.Phase)
 	halfOpen, acquired := BeginProbe(opened, opened.NextProbeAtMS)
 	assert.True(t, acquired)
@@ -74,17 +93,10 @@ func TestQualityColdStartAndRecoveryTransitions(t *testing.T) {
 	recovering := ReduceQuality(halfOpen, QualityEvent{
 		AtMS: opened.NextProbeAtMS + 2, Outcome: OutcomeSuccess, Probe: true, SyntheticProbe: true,
 	}, config)
-	assert.Equal(t, QualityWarming, recovering.Phase)
-	assert.Equal(t, int64(100_000), recovering.WarmingTrafficPPM)
-	assert.Equal(t, uint64(1), recovering.WarmingEpoch)
-	assert.Zero(t, recovering.SuccessfulWarmSamples, "a probe success opens canary traffic but is not a real sample")
-	for sample := 1; sample <= config.HealthyWarmSamples; sample++ {
-		recovering = ReduceQuality(recovering, QualityEvent{
-			AtMS: opened.NextProbeAtMS + int64(sample)*1_000, Outcome: OutcomeSuccess,
-		}, config)
-	}
 	assert.Equal(t, QualityHealthy, recovering.Phase)
 	assert.Equal(t, int64(1_000_000), recovering.WarmingTrafficPPM)
+	assert.Zero(t, recovering.SuccessfulWarmSamples)
+	assert.Zero(t, recovering.NextProbeAtMS)
 }
 
 func TestProbeEvidenceIsSeparateFromTrafficEvidence(t *testing.T) {
@@ -119,33 +131,31 @@ func TestSuccessfulRecoveryStartsFreshBackoffEpisode(t *testing.T) {
 	recovered := ReduceQuality(state, QualityEvent{
 		AtMS: 100_000, Outcome: OutcomeSuccess, Probe: true,
 	}, config)
-	assert.Equal(t, QualityWarming, recovered.Phase)
+	assert.Equal(t, QualityHealthy, recovered.Phase)
 	assert.Zero(t, recovered.OpenCount)
 	assert.Zero(t, recovered.NextProbeAtMS)
 	assert.Zero(t, recovered.LastHTTPStatus)
 	assert.Empty(t, recovered.LastErrorSummary)
 
-	failedAgain := ReduceQuality(recovered, QualityEvent{
-		AtMS: 101_000, Outcome: OutcomeInfrastructure,
-	}, config)
+	failedAgain := reduceDistinctConfirmedFailures(recovered, config, 101_000, OutcomeInfrastructure, 3)
 	assert.Equal(t, QualityOpen, failedAgain.Phase)
 	assert.Equal(t, 1, failedAgain.OpenCount)
-	assert.Equal(t, int64(161_000), failedAgain.NextProbeAtMS)
+	assert.Equal(t, int64(101_002), failedAgain.NextProbeAtMS)
 }
 
-func TestSyntheticProbeMovesDegradedRouteIntoRealTrafficWarming(t *testing.T) {
+func TestSyntheticProbeImmediatelyRecoversUnavailableRoute(t *testing.T) {
 	config := DefaultQualityConfig()
 	state := QualityState{Phase: QualityHealthy, StableSinceMS: 1}
-	state = ReduceQuality(state, QualityEvent{AtMS: 1_000, Outcome: OutcomeInfrastructure}, config)
-	require.Equal(t, QualityDegraded, state.Phase)
+	state = reduceDistinctConfirmedFailures(state, config, 1_000, OutcomeInfrastructure, 3)
+	require.Equal(t, QualityOpen, state.Phase)
 
 	state = ReduceQuality(state, QualityEvent{
 		AtMS: 2_000, Outcome: OutcomeSuccess, Probe: true, SyntheticProbe: true,
 	}, config)
-	assert.Equal(t, QualityWarming, state.Phase)
+	assert.Equal(t, QualityHealthy, state.Phase)
 	assert.Zero(t, state.SuccessfulWarmSamples)
-	assert.Equal(t, int64(100_000), state.WarmingTrafficPPM)
-	assert.Equal(t, uint64(1), state.WarmingEpoch)
+	assert.Equal(t, int64(1_000_000), state.WarmingTrafficPPM)
+	assert.Zero(t, state.NextProbeAtMS)
 }
 
 func TestVirginBootstrapRealSuccessBecomesImmediatelyHealthy(t *testing.T) {
@@ -168,18 +178,15 @@ func TestQualityFailuresAndNeutralOutcomes(t *testing.T) {
 	config := DefaultQualityConfig()
 	healthy := QualityState{Phase: QualityHealthy, StableSinceMS: 1}
 
-	unchanged := ReduceQuality(healthy, QualityEvent{AtMS: 10, Outcome: OutcomeCapacityLimited}, config)
-	assert.Equal(t, healthy.Phase, unchanged.Phase)
-	assert.Equal(t, healthy.ConsecutiveHardFailures, unchanged.ConsecutiveHardFailures)
-	assert.Equal(t, OutcomeCapacityLimited, unchanged.LastOutcome)
-	unchanged = ReduceQuality(healthy, QualityEvent{AtMS: 10, Outcome: OutcomeClientCancelled}, config)
+	capacityUnavailable := reduceDistinctConfirmedFailures(healthy, config, 10, OutcomeCapacityLimited, 3)
+	assert.Equal(t, QualityOpen, capacityUnavailable.Phase)
+	assert.Equal(t, OutcomeCapacityLimited, capacityUnavailable.LastOutcome)
+	unchanged := ReduceQuality(healthy, QualityEvent{AtMS: 10, Outcome: OutcomeClientCancelled}, config)
 	assert.Equal(t, healthy, unchanged)
 
-	degraded := ReduceQuality(healthy, QualityEvent{AtMS: 20, Outcome: OutcomeInfrastructure}, config)
-	assert.Equal(t, QualityDegraded, degraded.Phase)
-	opened := ReduceQuality(degraded, QualityEvent{AtMS: 30, Outcome: OutcomeInfrastructure}, config)
+	opened := reduceDistinctConfirmedFailures(healthy, config, 20, OutcomeInfrastructure, 3)
 	assert.Equal(t, QualityOpen, opened.Phase)
-	assert.Equal(t, int64(60_030), opened.NextProbeAtMS)
+	assert.Equal(t, int64(22), opened.NextProbeAtMS)
 
 	_, acquired := BeginProbe(opened, opened.NextProbeAtMS-1)
 	assert.False(t, acquired)
@@ -188,10 +195,10 @@ func TestQualityFailuresAndNeutralOutcomes(t *testing.T) {
 	assert.Equal(t, QualityHalfOpen, halfOpen.Phase)
 }
 
-func TestBootstrapHardFailureImmediatelyOpens(t *testing.T) {
-	state := ReduceQuality(InitialQuality(true), QualityEvent{AtMS: 50, Outcome: OutcomeInfrastructure}, DefaultQualityConfig())
+func TestBootstrapRequiresThreeDistinctFailuresToOpen(t *testing.T) {
+	state := reduceDistinctConfirmedFailures(InitialQuality(true), DefaultQualityConfig(), 50, OutcomeInfrastructure, 3)
 	assert.Equal(t, QualityOpen, state.Phase)
-	assert.Equal(t, int64(60_050), state.NextProbeAtMS)
+	assert.Equal(t, int64(52), state.NextProbeAtMS)
 }
 
 func TestDeterministicAdmissionHasNoProcessRandomness(t *testing.T) {
@@ -236,22 +243,21 @@ func TestLegacyAutomaticQuarantineBecomesImmediatelyRecoverable(t *testing.T) {
 
 func TestAutomaticRecoveryNeverEndsAndUsesFiniteFastThenSlowDeadlines(t *testing.T) {
 	config := DefaultQualityConfig()
-	state := InitialQuality(false)
-	state = ReduceQuality(state, QualityEvent{AtMS: 1_000, Outcome: OutcomeInfrastructure, Probe: true}, config)
-	assert.Equal(t, int64(61_000), state.NextProbeAtMS)
+	state := reduceDistinctConfirmedFailures(InitialQuality(false), config, 1_000, OutcomeInfrastructure, 3)
+	assert.Equal(t, int64(1_002), state.NextProbeAtMS)
 	assert.NotEqual(t, int64(math.MaxInt64), state.NextProbeAtMS)
 
-	state = ReduceQuality(state, QualityEvent{
-		AtMS:    1_000 + config.FastRecoveryWindowMS + 1,
-		Outcome: OutcomeInfrastructure, Probe: true,
-	}, config)
-	assert.Equal(t, int64(1_000+config.FastRecoveryWindowMS+1+config.SlowRecoveryBackoffMS[0]), state.NextProbeAtMS)
 	for attempt := 0; attempt < 20; attempt++ {
+		probeAt := state.NextProbeAtMS
+		var acquired bool
+		state, acquired = BeginProbe(state, probeAt)
+		require.True(t, acquired)
 		state = ReduceQuality(state, QualityEvent{
-			AtMS: state.NextProbeAtMS, Outcome: OutcomeInfrastructure, Probe: true,
+			AtMS: probeAt, Outcome: OutcomeInfrastructure, Probe: true,
 		}, config)
 		assert.Equal(t, QualityOpen, state.Phase)
-		assert.Greater(t, state.NextProbeAtMS, state.LastFailureMS)
+		assert.Greater(t, state.NextProbeAtMS, probeAt)
+		assert.LessOrEqual(t, state.NextProbeAtMS-probeAt, MaximumRecoveryProbeIntervalMS)
 		assert.NotEqual(t, int64(math.MaxInt64), state.NextProbeAtMS)
 	}
 }
@@ -284,6 +290,7 @@ func TestRecoveredRouteWithoutHistoryKeepsBoundedCanary(t *testing.T) {
 	}
 
 	next := ReduceQuality(state, QualityEvent{AtMS: 2, Outcome: OutcomeSuccess}, config)
-	assert.Equal(t, QualityWarming, next.Phase)
-	assert.Equal(t, 1, next.SuccessfulWarmSamples)
+	assert.Equal(t, QualityHealthy, next.Phase)
+	assert.Zero(t, next.SuccessfulWarmSamples)
+	assert.Equal(t, int64(1_000_000), next.WarmingTrafficPPM)
 }

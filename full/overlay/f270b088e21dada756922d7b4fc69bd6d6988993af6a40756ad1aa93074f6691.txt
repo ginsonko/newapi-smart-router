@@ -1,0 +1,483 @@
+package service
+
+import (
+	"context"
+	"math"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+)
+
+const SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes = "sample_weighted_physical_routes"
+
+type SmartRouteActualInputCostModelGroupSummary struct {
+	Model            string   `json:"model"`
+	Group            string   `json:"group"`
+	Endpoint         string   `json:"endpoint"`
+	Basis            string   `json:"actual_input_cost_basis,omitempty"`
+	CacheReadRatePPM int64    `json:"recent_cache_rate_ppm"`
+	EstimatedUSDPerM *float64 `json:"estimated_input_usd_per_million,omitempty"`
+	Samples          int64    `json:"actual_input_cost_samples"`
+	CostSamples      int64    `json:"actual_input_cost_price_samples,omitempty"`
+	CostSource       string   `json:"actual_input_cost_price_source,omitempty"`
+	Source           string   `json:"actual_input_cost_source,omitempty"`
+	ConfidencePPM    int64    `json:"actual_input_cost_confidence_ppm,omitempty"`
+	EvidenceAgeMS    int64    `json:"actual_input_cost_evidence_age_ms,omitempty"`
+	SampledRoutes    int      `json:"sampled_route_count"`
+	RouteCount       int      `json:"route_count"`
+	LastObservedAtMS int64    `json:"actual_input_cost_last_observed_at_ms"`
+}
+
+type SmartRouteActualInputCostGroupSummary struct {
+	Group            string `json:"group"`
+	Basis            string `json:"actual_input_cost_basis,omitempty"`
+	CacheReadRatePPM int64  `json:"recent_cache_rate_ppm"`
+	ModelCount       int    `json:"actual_input_cost_model_count"`
+	Samples          int64  `json:"actual_input_cost_samples"`
+	LastObservedAtMS int64  `json:"actual_input_cost_last_observed_at_ms"`
+	Source           string `json:"actual_input_cost_source,omitempty"`
+	ConfidencePPM    int64  `json:"actual_input_cost_confidence_ppm,omitempty"`
+	EvidenceAgeMS    int64  `json:"actual_input_cost_evidence_age_ms,omitempty"`
+}
+
+type SmartRouteActualInputCostVisibility struct {
+	ModelGroups map[string]map[string]SmartRouteActualInputCostModelGroupSummary
+	Groups      map[string]SmartRouteActualInputCostGroupSummary
+}
+
+type smartRouteActualInputCostAggregate struct {
+	model         string
+	group         string
+	endpoint      string
+	price         smartrouter.RoutePrice
+	priceSet      bool
+	consistent    bool
+	profiles      []smartrouter.ActualInputCostProfile
+	routeProfiles []smartRouteActualInputCostRouteProfile
+	lastSeenMS    int64
+	routes        int
+	seen          map[string]struct{}
+}
+
+// smartRouteActualInputCostRouteProfile keeps the price contract paired with
+// its physical route evidence. A model/group can legitimately contain routes
+// with different input prices; collapsing those prices before applying the
+// two-price formula would either fabricate a cost or hide the whole group.
+type smartRouteActualInputCostRouteProfile struct {
+	routeID    string
+	price      smartrouter.RoutePrice
+	profile    smartrouter.ActualInputCostProfile
+	hasProfile bool
+}
+
+// mergeSmartRouteActualInputCostProfiles is retained for callers that need a
+// compatibility symbol, but it merges only raw request-level Window samples.
+// Historical/EWMA counters and warmup weights are never used for prediction.
+func mergeSmartRouteActualInputCostProfiles(
+	profiles ...smartrouter.ActualInputCostProfile,
+) (smartrouter.ActualInputCostProfile, bool) {
+	return smartrouter.MergeActualInputCostProfiles(profiles...)
+}
+
+func mergeSmartRouteActualInputCostObservedProfiles(
+	nowMS int64,
+	profiles ...smartrouter.ActualInputCostProfile,
+) (smartrouter.ActualInputCostProfile, bool) {
+	regular, read, create5m, create1h, samples, lastEventMS, ok :=
+		smartrouter.ActualInputCostObservedTokenMixForProfilesAt(profiles, nowMS)
+	if !ok {
+		return smartrouter.ActualInputCostProfile{}, false
+	}
+	return smartrouter.ActualInputCostProfile{
+		Version:                  smartrouter.ActualInputCostFeatureVersion,
+		WeightedRegularTokens:    regular,
+		WeightedCacheReadTokens:  read,
+		WeightedCacheCreation5m:  create5m,
+		WeightedCacheCreation1h:  create1h,
+		WeightedTotalInputTokens: regular + read + create5m + create1h,
+		TotalSamples:             samples,
+		WeightedSamples:          float64(samples),
+		LastEventMS:              lastEventMS,
+		Window:                   mergeActualInputCostWindowsForVisibility(profiles...),
+	}, true
+}
+
+func mergeActualInputCostWindowsForVisibility(profiles ...smartrouter.ActualInputCostProfile) []smartrouter.ActualInputCostWindowSample {
+	merged, ok := smartrouter.MergeActualInputCostProfiles(profiles...)
+	if !ok {
+		return nil
+	}
+	return merged.Window
+}
+
+func newSmartRouteActualInputCostVisibility() SmartRouteActualInputCostVisibility {
+	return SmartRouteActualInputCostVisibility{
+		ModelGroups: make(map[string]map[string]SmartRouteActualInputCostModelGroupSummary),
+		Groups:      make(map[string]SmartRouteActualInputCostGroupSummary),
+	}
+}
+
+// ActualInputCostVisibility projects the already-published global learning
+// snapshot through the current user-group price contract. The price manager is
+// allowed to populate its in-memory cache here so a pricing-page read does not
+// depend on whether the same user group has routed a request since startup or
+// the latest catalog revision. Failure remains an empty optional report;
+// observability must never make a user request or management page fail.
+func (engine *SmartRouterEngine) ActualInputCostVisibility(
+	ctx context.Context,
+	userGroup string,
+) SmartRouteActualInputCostVisibility {
+	empty := newSmartRouteActualInputCostVisibility()
+	if engine == nil || engine.Catalogs == nil || engine.Prices == nil || engine.ActualInputCosts == nil {
+		return empty
+	}
+	catalog, ok := engine.Catalogs.Current()
+	if !ok || catalog == nil {
+		return empty
+	}
+	prices, err := engine.Prices.GetOrRefresh(ctx, userGroup)
+	if err != nil || prices == nil {
+		return empty
+	}
+	return buildSmartRouteActualInputCostVisibilityAt(
+		*catalog, *prices, engine.ActualInputCosts.Snapshot(), time.Now().UnixMilli(),
+	)
+}
+
+func buildSmartRouteActualInputCostVisibility(
+	catalog smartrouter.CertifiedRouteCatalog,
+	prices smartrouter.PriceSnapshot,
+	snapshot smartrouter.ActualInputCostSnapshot,
+) SmartRouteActualInputCostVisibility {
+	return buildSmartRouteActualInputCostVisibilityAt(catalog, prices, snapshot, time.Now().UnixMilli())
+}
+
+func buildSmartRouteActualInputCostVisibilityAt(
+	catalog smartrouter.CertifiedRouteCatalog,
+	prices smartrouter.PriceSnapshot,
+	snapshot smartrouter.ActualInputCostSnapshot,
+	nowMS int64,
+) SmartRouteActualInputCostVisibility {
+	result := newSmartRouteActualInputCostVisibility()
+	if len(catalog.Contracts) == 0 {
+		return result
+	}
+	// A newly started route may not have a request-level profile yet. Keep an
+	// empty, non-nil snapshot so the established cache estimator can publish
+	// its configured cold-start prior instead of making the whole group vanish.
+	if snapshot == nil {
+		snapshot = make(smartrouter.ActualInputCostSnapshot)
+	}
+	aggregates := make(map[string]*smartRouteActualInputCostAggregate)
+	seenRoutes := make(map[string]struct{})
+	for _, contract := range catalog.Contracts {
+		if !isActualInputCostTextEndpoint(contract.Contract.Endpoint) {
+			continue
+		}
+		usageSemantic := (smartrouter.RouteRequest{Endpoint: contract.Contract.Endpoint}).UsageSemantic()
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				if _, duplicate := seenRoutes[route.RouteID]; duplicate {
+					continue
+				}
+				seenRoutes[route.RouteID] = struct{}{}
+				price, priced := prices.RoutePrices[route.RouteID]
+				key := contract.Contract.CanonicalModel + "\x00" + route.Group + "\x00" + contract.Contract.Endpoint
+				aggregate := aggregates[key]
+				if aggregate == nil {
+					aggregate = &smartRouteActualInputCostAggregate{
+						model: contract.Contract.CanonicalModel, group: route.Group,
+						endpoint:   contract.Contract.Endpoint,
+						consistent: true, seen: make(map[string]struct{}),
+					}
+					aggregates[key] = aggregate
+				}
+				if _, exists := aggregate.seen[route.RouteID]; exists {
+					continue
+				}
+				aggregate.seen[route.RouteID] = struct{}{}
+				aggregate.routes++
+				if priced && !aggregate.priceSet {
+					aggregate.price = price
+					aggregate.priceSet = true
+				} else if priced && !sameSmartRouteActualInputCostPrice(aggregate.price, price) {
+					aggregate.consistent = false
+				}
+				routeProfile := smartRouteActualInputCostRouteProfile{routeID: route.RouteID, price: price}
+				exactKey := smartrouter.ActualInputCostKey(
+					route.CacheNamespaceIdentity(), route.UpstreamModel,
+					contract.Contract.CanonicalModel, contract.Contract.Endpoint, usageSemantic,
+				)
+				if profile, exists := snapshot[exactKey]; exists {
+					// Count only profiles accepted by the estimator's own merge
+					// validator. A malformed/future-version record must not inflate
+					// sampled-route counts or suppress a valid sibling route.
+					if _, valid := smartrouter.MergeActualInputCostProfiles(profile); valid {
+						// Keep both raw recent evidence and the established aged
+						// profile/history state. The latter supplies the cache-rate
+						// prior when a route has no current request window; only the
+						// final rate is passed to the single cost formula.
+						aggregate.profiles = append(aggregate.profiles, profile)
+						routeProfile.profile = profile
+						routeProfile.hasProfile = true
+						if profile.LastEventMS > aggregate.lastSeenMS && profile.LastEventMS <= nowMS {
+							aggregate.lastSeenMS = profile.LastEventMS
+						}
+						if profile.History.LastEventMS > aggregate.lastSeenMS && profile.History.LastEventMS <= nowMS {
+							aggregate.lastSeenMS = profile.History.LastEventMS
+						}
+					}
+				}
+				if priced {
+					aggregate.routeProfiles = append(aggregate.routeProfiles, routeProfile)
+				}
+			}
+		}
+	}
+
+	modelGroupCandidates := make(map[string]map[string][]SmartRouteActualInputCostModelGroupSummary)
+	groupProfiles := make(map[string][]smartrouter.ActualInputCostProfile)
+	groupLastSeen := make(map[string]int64)
+	for _, aggregate := range aggregates {
+		if aggregate == nil {
+			continue
+		}
+		var estimate smartrouter.ActualInputCostEstimate
+		var estimatedUSD *float64
+		if len(aggregate.routeProfiles) > 0 {
+			// Apply the exact same estimator independently to each physical route,
+			// then combine the resulting costs by that route's evidence weight.
+			// This preserves different model/cache price contracts and prevents a
+			// stale sibling route from diluting a fresh route's one-hour evidence.
+			var weightedCost, weightTotal float64
+			var weightedCacheRate float64
+			var weightedSamples int64
+			var newest smartrouter.ActualInputCostEstimate
+			var newestAt int64
+			for _, routeProfile := range aggregate.routeProfiles {
+				if !smartrouter.SupportsActualInputCost(routeProfile.price) {
+					continue
+				}
+				key := "actual-input-cost-visibility:" + routeProfile.routeID
+				routeEstimate := smartrouter.EstimateActualInputCostAt(
+					routeProfile.price, routeProfile.price.ScorePPM, key, "",
+					smartrouter.ActualInputCostSnapshot{key: routeProfile.profile}, nowMS,
+				)
+				if !routeEstimate.Comparable {
+					continue
+				}
+				weight := float64(routeEstimate.Samples)
+				// A route with no current one-hour samples still contributes its
+				// established cold-start/history prior. Give that prior one bounded
+				// unit of weight; observed samples naturally dominate as they accrue.
+				if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+					weight = 1
+				}
+				weightedCost += float64(routeEstimate.EffectivePPM) * weight
+				weightedCacheRate += float64(routeEstimate.CacheReadRatePPM) * weight
+				weightTotal += weight
+				weightedSamples += routeEstimate.Samples
+				if routeEstimate.LastObservedAtMS >= newestAt {
+					newestAt = routeEstimate.LastObservedAtMS
+					newest = routeEstimate
+				}
+			}
+			if weightTotal > 0 {
+				estimate = newest
+				estimate.EffectivePPM = int64(math.Round(weightedCost / weightTotal))
+				estimate.CacheReadRatePPM = int64(math.Round(weightedCacheRate / weightTotal))
+				estimate.Samples = weightedSamples
+				estimate.Comparable = true
+				estimate.CostSource = smartrouter.ActualInputCostCostSourceRatio
+				value := float64(estimate.EffectivePPM) * 2 / 1_000_000
+				if value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+					estimatedUSD = &value
+				}
+			}
+		}
+		if !estimate.Comparable {
+			// No valid price contract means there is no honest prediction to
+			// display. Keep the group out rather than showing a static score as
+			// if it were a predicted input cost.
+			continue
+		}
+		cacheRate := estimate.CacheReadRatePPM
+		cacheSamples := estimate.Samples
+		cacheObservedMS := estimate.LastObservedAtMS
+		if modelGroupCandidates[aggregate.model] == nil {
+			modelGroupCandidates[aggregate.model] = make(map[string][]SmartRouteActualInputCostModelGroupSummary)
+		}
+		modelGroupCandidates[aggregate.model][aggregate.group] = append(
+			modelGroupCandidates[aggregate.model][aggregate.group],
+			SmartRouteActualInputCostModelGroupSummary{
+				Model: aggregate.model, Group: aggregate.group,
+				Endpoint:         aggregate.endpoint,
+				Basis:            SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes,
+				CacheReadRatePPM: cacheRate, EstimatedUSDPerM: estimatedUSD,
+				Samples: cacheSamples, CostSamples: estimate.CostSamples, CostSource: estimate.CostSource,
+				Source: estimate.Source, ConfidencePPM: estimate.ConfidencePPM, EvidenceAgeMS: estimate.EvidenceAgeMS,
+				SampledRoutes: len(aggregate.profiles), RouteCount: aggregate.routes,
+				LastObservedAtMS: cacheObservedMS,
+			},
+		)
+		groupProfiles[aggregate.group] = append(groupProfiles[aggregate.group], aggregate.profiles...)
+		if aggregate.lastSeenMS > groupLastSeen[aggregate.group] {
+			groupLastSeen[aggregate.group] = aggregate.lastSeenMS
+		}
+	}
+	for model, groups := range modelGroupCandidates {
+		result.ModelGroups[model] = make(map[string]SmartRouteActualInputCostModelGroupSummary, len(groups))
+		for group, candidates := range groups {
+			selected := candidates[0]
+			for _, candidate := range candidates[1:] {
+				if smartRouteActualInputCostSummaryPreferred(candidate, selected) {
+					selected = candidate
+				}
+			}
+			result.ModelGroups[model][group] = selected
+		}
+	}
+
+	// Build group summaries from the model/group summaries as well as raw
+	// profiles. This keeps a configured group visible during cold start (the
+	// estimator supplies its prior) instead of dropping it until the first
+	// request happens to hit that physical route.
+	groupNames := make(map[string]struct{}, len(groupProfiles))
+	for group := range groupProfiles {
+		groupNames[group] = struct{}{}
+	}
+	for _, groups := range result.ModelGroups {
+		for group := range groups {
+			groupNames[group] = struct{}{}
+		}
+	}
+	for group := range groupNames {
+		var cacheRate, samples, observedMS int64
+		// Group summaries must use the same per-route estimates as model
+		// summaries. Merging raw profiles here would discard cold-start priors
+		// and reintroduce the very split-brain metric this projection fixes.
+		for _, groups := range result.ModelGroups {
+			if summary, exists := groups[group]; exists {
+				if summary.LastObservedAtMS >= observedMS {
+					cacheRate, samples, observedMS = summary.CacheReadRatePPM, summary.Samples, summary.LastObservedAtMS
+				}
+			}
+		}
+		modelCount := 0
+		for _, groups := range result.ModelGroups {
+			if _, exists := groups[group]; exists {
+				modelCount++
+			}
+		}
+		groupSource := ""
+		groupConfidence := int64(0)
+		groupAge := int64(0)
+		groupLastObserved := int64(0)
+		for _, groups := range result.ModelGroups {
+			if summary, exists := groups[group]; exists {
+				if summary.LastObservedAtMS >= groupLastObserved {
+					groupSource, groupConfidence, groupAge = summary.Source, summary.ConfidencePPM, summary.EvidenceAgeMS
+					groupLastObserved = summary.LastObservedAtMS
+				}
+			}
+		}
+		result.Groups[group] = SmartRouteActualInputCostGroupSummary{
+			Group: group, Basis: SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes,
+			CacheReadRatePPM: cacheRate, ModelCount: modelCount,
+			Samples: samples, LastObservedAtMS: maxInt64(groupLastSeen[group], observedMS),
+			Source: groupSource, ConfidencePPM: groupConfidence, EvidenceAgeMS: groupAge,
+		}
+	}
+	return result
+}
+
+func smartRouteActualInputCostSummaryPreferred(
+	left SmartRouteActualInputCostModelGroupSummary,
+	right SmartRouteActualInputCostModelGroupSummary,
+) bool {
+	leftPriority := smartRouteActualInputCostEndpointPriority(left.Endpoint)
+	rightPriority := smartRouteActualInputCostEndpointPriority(right.Endpoint)
+	if leftPriority != rightPriority {
+		return leftPriority < rightPriority
+	}
+	if left.Samples != right.Samples {
+		return left.Samples > right.Samples
+	}
+	if left.LastObservedAtMS != right.LastObservedAtMS {
+		return left.LastObservedAtMS > right.LastObservedAtMS
+	}
+	return left.Endpoint < right.Endpoint
+}
+
+func smartRouteActualInputCostEndpointPriority(endpoint string) int {
+	switch endpoint {
+	case SmartEndpointResponses:
+		return 0
+	case SmartEndpointMessages:
+		return 1
+	case SmartEndpointChat:
+		return 2
+	case SmartEndpointCompletions:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func smartRouteActualInputCostPriceComparable(price smartrouter.RoutePrice) bool {
+	return smartrouter.SupportsActualInputCost(price)
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func sameSmartRouteActualInputCostPrice(left, right smartrouter.RoutePrice) bool {
+	return left.BillingMode == right.BillingMode && left.BillingUnit == right.BillingUnit &&
+		left.ActualInputComparisonClass == right.ActualInputComparisonClass &&
+		left.ScorePPM == right.ScorePPM && left.CacheReadRatioPPM == right.CacheReadRatioPPM &&
+		left.CacheCreation5mRatioPPM == right.CacheCreation5mRatioPPM &&
+		left.CacheCreation1hRatioPPM == right.CacheCreation1hRatioPPM &&
+		left.TieredExpressionHash == right.TieredExpressionHash &&
+		left.TieredInputPredictable == right.TieredInputPredictable
+}
+
+func smartRouteActualInputCostEstimate(
+	route smartrouter.CertifiedRoute,
+	model string,
+	endpoint string,
+	price smartrouter.RoutePrice,
+	snapshot smartrouter.ActualInputCostSnapshot,
+) (smartrouter.ActualInputCostEstimate, float64, bool) {
+	return smartRouteActualInputCostEstimateAt(route, model, endpoint, price, snapshot, time.Now().UnixMilli())
+}
+
+func smartRouteActualInputCostEstimateAt(
+	route smartrouter.CertifiedRoute,
+	model string,
+	endpoint string,
+	price smartrouter.RoutePrice,
+	snapshot smartrouter.ActualInputCostSnapshot,
+	nowMS int64,
+) (smartrouter.ActualInputCostEstimate, float64, bool) {
+	if !isActualInputCostTextEndpoint(endpoint) {
+		return smartrouter.ActualInputCostEstimate{}, 0, false
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: endpoint}).UsageSemantic()
+	exactKey := smartrouter.ActualInputCostKey(
+		route.CacheNamespaceIdentity(), route.UpstreamModel, model, endpoint, usageSemantic,
+	)
+	poolKey := smartrouter.ActualInputCostPoolKey(route.UpstreamModel, model, endpoint, usageSemantic)
+	estimate := smartrouter.EstimateActualInputCostAt(price, price.ScorePPM, exactKey, poolKey, snapshot, nowMS)
+	if !estimate.Comparable {
+		return estimate, 0, false
+	}
+	estimatedUSD := float64(estimate.EffectivePPM) * 2 / 1_000_000
+	if estimatedUSD < 0 || math.IsNaN(estimatedUSD) || math.IsInf(estimatedUSD, 0) {
+		return smartrouter.ActualInputCostEstimate{}, 0, false
+	}
+	return estimate, estimatedUSD, true
+}

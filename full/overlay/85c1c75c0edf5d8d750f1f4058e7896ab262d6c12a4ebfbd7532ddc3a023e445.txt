@@ -1,0 +1,1139 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type CommissionReserveSpec struct {
+	OperationKey       string
+	RequestIdentity    string
+	Source             string
+	SourceStableID     string
+	ConsumerUserID     int
+	TokenID            int
+	UserSubscriptionID int
+	TargetQuota        int64
+}
+
+type CommissionFundingSnapshot struct {
+	OperationPublicID       string `json:"operation_public_id"`
+	FinancialStatus         string `json:"financial_status"`
+	ReservedTotalQuota      int64  `json:"reserved_total_quota"`
+	ReservedCommissionQuota int64  `json:"reserved_commission_quota"`
+	ReservedOrdinaryQuota   int64  `json:"reserved_ordinary_quota"`
+	FinalTotalQuota         int64  `json:"final_total_quota"`
+	FinalCommissionQuota    int64  `json:"final_commission_quota"`
+	FinalOrdinaryQuota      int64  `json:"final_ordinary_quota"`
+	EligibleOrdinaryQuota   int64  `json:"eligible_ordinary_quota"`
+	AwardQuota              int64  `json:"award_quota"`
+	Version                 int64  `json:"version"`
+}
+
+func (operation *CommissionOperationV1) FundingSnapshot() CommissionFundingSnapshot {
+	if operation == nil {
+		return CommissionFundingSnapshot{}
+	}
+	return CommissionFundingSnapshot{
+		OperationPublicID:       operation.PublicID,
+		FinancialStatus:         operation.FinancialStatus,
+		ReservedTotalQuota:      operation.ReservedTotalQuota,
+		ReservedCommissionQuota: operation.ReservedCommissionQuota,
+		ReservedOrdinaryQuota:   operation.ReservedOrdinaryQuota,
+		FinalTotalQuota:         operation.FinalTotalQuota,
+		FinalCommissionQuota:    operation.FinalCommissionQuota,
+		FinalOrdinaryQuota:      operation.FinalOrdinaryQuota,
+		EligibleOrdinaryQuota:   operation.EligibleOrdinaryQuota,
+		AwardQuota:              operation.AwardQuota,
+		Version:                 operation.Version,
+	}
+}
+
+func normalizeCommissionReserveSpec(spec CommissionReserveSpec) (CommissionReserveSpec, string, string, error) {
+	spec.OperationKey = strings.TrimSpace(spec.OperationKey)
+	spec.RequestIdentity = strings.TrimSpace(spec.RequestIdentity)
+	spec.Source = strings.ToLower(strings.TrimSpace(spec.Source))
+	spec.SourceStableID = strings.TrimSpace(spec.SourceStableID)
+	if spec.OperationKey == "" || spec.ConsumerUserID <= 0 || spec.TargetQuota < 0 {
+		return spec, "", "", errors.New("invalid commission reserve specification")
+	}
+	if spec.SourceStableID == "" {
+		spec.SourceStableID = spec.OperationKey
+	}
+	if len(spec.Source) > 24 || len(spec.SourceStableID) > 191 {
+		return spec, "", "", errors.New("commission operation identity is too long")
+	}
+	switch spec.Source {
+	case "http", "stream", "realtime", "task", "midjourney", "p0":
+	default:
+		return spec, "", "", errors.New("unsupported commission operation source")
+	}
+	operationHash := commissionHash("r29-operation-v1", spec.OperationKey)
+	requestHash := commissionHash(
+		"r29-request-v1",
+		spec.RequestIdentity,
+		fmt.Sprintf("%d", spec.ConsumerUserID),
+		fmt.Sprintf("%d", spec.TokenID),
+		fmt.Sprintf("%d", spec.UserSubscriptionID),
+		spec.Source,
+		spec.SourceStableID,
+	)
+	return spec, operationHash, requestHash, nil
+}
+
+func loadCommissionSettingsTx(tx *gorm.DB) (*CommissionSettingsV1, error) {
+	var settings CommissionSettingsV1
+	if err := tx.Where("id = ?", 1).First(&settings).Error; err != nil {
+		return nil, err
+	}
+	if settings.SchemaVersion != CommissionSchemaVersion || !validCommissionMode(settings.Mode) || !validCommissionSpendPriority(settings.SpendPriority) {
+		return nil, ErrCommissionInvariant
+	}
+	return &settings, nil
+}
+
+func loadCommissionOperationForUpdateTx(tx *gorm.DB, operationHash string) (*CommissionOperationV1, error) {
+	var operation CommissionOperationV1
+	err := lockForUpdate(tx).Where("operation_key_hash = ?", operationHash).First(&operation).Error
+	if err != nil {
+		return nil, err
+	}
+	return &operation, nil
+}
+
+func loadCommissionOperationByPublicIDForUpdateTx(tx *gorm.DB, publicID string) (*CommissionOperationV1, error) {
+	var operation CommissionOperationV1
+	err := lockForUpdate(tx).Where("public_id = ?", publicID).First(&operation).Error
+	if err != nil {
+		return nil, err
+	}
+	return &operation, nil
+}
+
+func loadCommissionUsersForUpdateTx(tx *gorm.DB, userIDs ...int) (map[int]*User, error) {
+	unique := make(map[int]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID > 0 {
+			unique[userID] = struct{}{}
+		}
+	}
+	ids := make([]int, 0, len(unique))
+	for userID := range unique {
+		ids = append(ids, userID)
+	}
+	sort.Ints(ids)
+	users := make(map[int]*User, len(ids))
+	for _, userID := range ids {
+		var user User
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ?", userID).First(&user).Error; err != nil {
+			return nil, err
+		}
+		users[userID] = &user
+	}
+	return users, nil
+}
+
+func loadCommissionAccountForUpdateTx(tx *gorm.DB, userID int) (*CommissionAccountV1, error) {
+	var account CommissionAccountV1
+	err := lockForUpdate(tx).Where("user_id = ?", userID).First(&account).Error
+	if err == nil {
+		return &account, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	candidate := CommissionAccountV1{
+		PublicID: commissionPublicID("cca"),
+		UserID:   userID,
+		Version:  1,
+	}
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&candidate).Error; err != nil {
+		return nil, err
+	}
+	if err := lockForUpdate(tx).Where("user_id = ?", userID).First(&account).Error; err != nil {
+		return nil, err
+	}
+	return &account, nil
+}
+
+func loadCommissionAccountsForUpdateTx(tx *gorm.DB, userIDs ...int) (map[int]*CommissionAccountV1, error) {
+	unique := make(map[int]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID > 0 {
+			unique[userID] = struct{}{}
+		}
+	}
+	ids := make([]int, 0, len(unique))
+	for userID := range unique {
+		ids = append(ids, userID)
+	}
+	sort.Ints(ids)
+	accounts := make(map[int]*CommissionAccountV1, len(ids))
+	for _, userID := range ids {
+		account, err := loadCommissionAccountForUpdateTx(tx, userID)
+		if err != nil {
+			return nil, err
+		}
+		accounts[userID] = account
+	}
+	return accounts, nil
+}
+
+func validateCommissionAccount(account *CommissionAccountV1, userQuota int64) error {
+	if account == nil || account.AvailableQuota < 0 || account.UsageReservedQuota < 0 ||
+		account.WithdrawalHeldQuota < 0 || account.DebtQuota < 0 || account.PendingCapacityQuota < 0 ||
+		account.GrossLifetimeEligibleQuota < 0 || account.NetEntitledQuota < 0 ||
+		account.FractionalNumerator < 0 || account.FractionalNumerator >= commissionRateBase {
+		return ErrCommissionInvariant
+	}
+	_ = userQuota
+	return nil
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func minInt64(left, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func persistCommissionUserQuotaTx(tx *gorm.DB, user *User, previousQuota, nextQuota int64) error {
+	quota, err := commissionCheckedWalletBalance(nextQuota)
+	if err != nil {
+		return err
+	}
+	result := tx.Unscoped().Model(&User{}).
+		Where("id = ? AND quota = ?", user.Id, previousQuota).
+		Update("quota", quota)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrCommissionVersionConflict
+	}
+	user.Quota = quota
+	return nil
+}
+
+func persistCommissionAccountTx(tx *gorm.DB, account *CommissionAccountV1, previousVersion int64) error {
+	result := tx.Model(&CommissionAccountV1{}).
+		Where("id = ? AND version = ?", account.ID, previousVersion).
+		Updates(map[string]interface{}{
+			"available_quota":                account.AvailableQuota,
+			"usage_reserved_quota":           account.UsageReservedQuota,
+			"withdrawal_held_quota":          account.WithdrawalHeldQuota,
+			"debt_quota":                     account.DebtQuota,
+			"pending_capacity_quota":         account.PendingCapacityQuota,
+			"gross_lifetime_eligible_quota":  account.GrossLifetimeEligibleQuota,
+			"net_entitled_quota":             account.NetEntitledQuota,
+			"fractional_numerator":           account.FractionalNumerator,
+			"lifetime_earned_quota":          account.LifetimeEarnedQuota,
+			"lifetime_spent_quota":           account.LifetimeSpentQuota,
+			"lifetime_spend_refunded_quota":  account.LifetimeSpendRefundedQuota,
+			"lifetime_withdrawal_paid_quota": account.LifetimeWithdrawalPaidQuota,
+			"net_manual_adjustment_quota":    account.NetManualAdjustmentQuota,
+			"version":                        previousVersion + 1,
+			"updated_at":                     time.Now().UnixMilli(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrCommissionVersionConflict
+	}
+	account.Version = previousVersion + 1
+	return nil
+}
+
+func persistCommissionOperationTx(tx *gorm.DB, operation *CommissionOperationV1, previousVersion int64) error {
+	result := tx.Model(&CommissionOperationV1{}).
+		Where("id = ? AND version = ?", operation.ID, previousVersion).
+		Updates(map[string]interface{}{
+			"financial_status":            operation.FinancialStatus,
+			"projection_status":           operation.ProjectionStatus,
+			"reserved_total_quota":        operation.ReservedTotalQuota,
+			"reserved_commission_quota":   operation.ReservedCommissionQuota,
+			"reserved_ordinary_quota":     operation.ReservedOrdinaryQuota,
+			"reserved_subscription_quota": operation.ReservedSubscriptionQuota,
+			"final_total_quota":           operation.FinalTotalQuota,
+			"final_commission_quota":      operation.FinalCommissionQuota,
+			"final_ordinary_quota":        operation.FinalOrdinaryQuota,
+			"final_subscription_quota":    operation.FinalSubscriptionQuota,
+			"eligible_ordinary_quota":     operation.EligibleOrdinaryQuota,
+			"award_numerator":             operation.AwardNumerator,
+			"award_quota":                 operation.AwardQuota,
+			"corrected_numerator":         operation.CorrectedNumerator,
+			"reservation_corrections":     operation.ReservationCorrections,
+			"site_unfunded_cost_quota":    operation.SiteUnfundedCostQuota,
+			"projection_payload":          operation.ProjectionPayload,
+			"error_code":                  operation.ErrorCode,
+			"finalized_at":                operation.FinalizedAt,
+			"version":                     previousVersion + 1,
+			"updated_at":                  time.Now().UnixMilli(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrCommissionVersionConflict
+	}
+	operation.Version = previousVersion + 1
+	return nil
+}
+
+type commissionLedgerMutation struct {
+	EventKey              string
+	EventType             string
+	OperationID           int64
+	WithdrawalID          int64
+	Account               *CommissionAccountV1
+	ConsumerUserID        int
+	AvailableDelta        int64
+	UsageReservedDelta    int64
+	WithdrawalHeldDelta   int64
+	DebtDelta             int64
+	PendingCapacityDelta  int64
+	UserQuotaDelta        int64
+	EligibleOrdinaryQuota int64
+	RateBps               int64
+	TierThreshold         int64
+	NumeratorDelta        int64
+	UserQuotaAfter        int64
+	RelatedEventID        *int64
+	ActorUserID           int
+	ReasonCode            string
+	RequestHash           string
+}
+
+func appendCommissionLedgerTx(tx *gorm.DB, mutation commissionLedgerMutation) (*CommissionLedgerV1, error) {
+	if mutation.Account == nil || strings.TrimSpace(mutation.EventKey) == "" {
+		return nil, ErrCommissionInvariant
+	}
+	event := CommissionLedgerV1{
+		EventUUID:             commissionPublicID("cce"),
+		EventKeyHash:          commissionHash("r29-ledger-v1", mutation.EventKey),
+		OperationID:           mutation.OperationID,
+		WithdrawalID:          mutation.WithdrawalID,
+		AccountID:             mutation.Account.ID,
+		ConsumerUserID:        mutation.ConsumerUserID,
+		EventType:             mutation.EventType,
+		AvailableDelta:        mutation.AvailableDelta,
+		UsageReservedDelta:    mutation.UsageReservedDelta,
+		WithdrawalHeldDelta:   mutation.WithdrawalHeldDelta,
+		DebtDelta:             mutation.DebtDelta,
+		PendingCapacityDelta:  mutation.PendingCapacityDelta,
+		UserQuotaDelta:        mutation.UserQuotaDelta,
+		EligibleOrdinaryQuota: mutation.EligibleOrdinaryQuota,
+		RateBps:               mutation.RateBps,
+		TierThreshold:         mutation.TierThreshold,
+		NumeratorDelta:        mutation.NumeratorDelta,
+		AvailableAfter:        mutation.Account.AvailableQuota,
+		UsageReservedAfter:    mutation.Account.UsageReservedQuota,
+		WithdrawalHeldAfter:   mutation.Account.WithdrawalHeldQuota,
+		DebtAfter:             mutation.Account.DebtQuota,
+		PendingCapacityAfter:  mutation.Account.PendingCapacityQuota,
+		UserQuotaAfter:        mutation.UserQuotaAfter,
+		RelatedEventID:        mutation.RelatedEventID,
+		ActorUserID:           mutation.ActorUserID,
+		ReasonCode:            mutation.ReasonCode,
+		RequestHash:           mutation.RequestHash,
+	}
+	if err := tx.Create(&event).Error; err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+func splitCommissionFunding(priority string, target, commissionAvailable, ordinaryAvailable int64, allowCommission bool) (int64, int64, error) {
+	if target < 0 || commissionAvailable < 0 || ordinaryAvailable < 0 {
+		return 0, 0, ErrCommissionInvariant
+	}
+	if !allowCommission {
+		if ordinaryAvailable < target {
+			return 0, 0, ErrCommissionInsufficientOrdinary
+		}
+		return 0, target, nil
+	}
+	if commissionAvailable > math.MaxInt64-ordinaryAvailable || commissionAvailable+ordinaryAvailable < target {
+		return 0, 0, ErrCommissionInsufficientOrdinary
+	}
+	switch priority {
+	case CommissionSpendFirst:
+		commissionQuota := minInt64(commissionAvailable, target)
+		return commissionQuota, target - commissionQuota, nil
+	case CommissionOrdinaryFirst:
+		ordinaryQuota := minInt64(ordinaryAvailable, target)
+		return target - ordinaryQuota, ordinaryQuota, nil
+	default:
+		return 0, 0, ErrCommissionInvariant
+	}
+}
+
+func commissionProfileSnapshotTx(tx *gorm.DB, consumer *User, settings *CommissionSettingsV1) (int, int64, int64, int64, string, bool, error) {
+	if consumer == nil || settings == nil || settings.CurrentProgramID <= 0 ||
+		consumer.InviterId <= 0 || consumer.InviterId == consumer.Id {
+		return 0, 0, 0, 0, "", false, nil
+	}
+	var inviter User
+	if err := tx.Where("id = ? AND status = ?", consumer.InviterId, common.UserStatusEnabled).First(&inviter).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, 0, 0, 0, "", false, nil
+		}
+		return 0, 0, 0, 0, "", false, err
+	}
+	var program CommissionProgramV1
+	if err := tx.Where("id = ? AND status = ?", settings.CurrentProgramID, CommissionProgramPublished).First(&program).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, 0, 0, 0, "", false, nil
+		}
+		return 0, 0, 0, 0, "", false, err
+	}
+	if _, canonical, err := normalizeCommissionTierJSON(program.TiersJSON); err != nil {
+		return 0, 0, 0, 0, "", false, err
+	} else if commissionHash("r29-program-v1", canonical) != program.ContentSHA256 {
+		return 0, 0, 0, 0, "", false, ErrCommissionInvariant
+	}
+	return inviter.Id, 0, program.ID, program.Version, program.TiersJSON, true, nil
+}
+
+func reserveCommissionWalletTx(tx *gorm.DB, raw CommissionReserveSpec) (*CommissionOperationV1, bool, error) {
+	spec, operationHash, requestHash, err := normalizeCommissionReserveSpec(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := loadCommissionOperationForUpdateTx(tx, operationHash)
+	if err == nil {
+		if existing.RequestHash != requestHash || existing.ConsumerUserID != spec.ConsumerUserID || existing.Source != spec.Source || existing.SourceStableID != spec.SourceStableID {
+			return nil, true, ErrCommissionOperationConflict
+		}
+		if existing.FinancialStatus != CommissionFinancialReserved {
+			if existing.ReservedTotalQuota == spec.TargetQuota || existing.FinalTotalQuota == spec.TargetQuota {
+				return existing, true, nil
+			}
+			return nil, true, ErrCommissionOperationFinalized
+		}
+		if spec.TargetQuota <= existing.ReservedTotalQuota {
+			return existing, true, nil
+		}
+		if existing.CommissionSpendEnabled || existing.ReservedCommissionQuota != 0 ||
+			existing.ReservedOrdinaryQuota != existing.ReservedTotalQuota {
+			return nil, true, ErrCommissionInvariant
+		}
+		users, err := loadCommissionUsersForUpdateTx(tx, existing.ConsumerUserID)
+		if err != nil {
+			return nil, true, err
+		}
+		user := users[existing.ConsumerUserID]
+		delta := spec.TargetQuota - existing.ReservedTotalQuota
+		if int64(user.Quota) < delta {
+			return nil, true, ErrCommissionInsufficientOrdinary
+		}
+		oldUserQuota := int64(user.Quota)
+		if err := persistCommissionUserQuotaTx(tx, user, oldUserQuota, oldUserQuota-delta); err != nil {
+			return nil, true, err
+		}
+		oldOperationVersion := existing.Version
+		existing.ReservedTotalQuota += delta
+		existing.ReservedOrdinaryQuota += delta
+		if err := persistCommissionOperationTx(tx, existing, oldOperationVersion); err != nil {
+			return nil, true, err
+		}
+		return existing, true, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, err
+	}
+	settings, err := loadCommissionSettingsTx(tx)
+	if err != nil {
+		return nil, false, err
+	}
+	users, err := loadCommissionUsersForUpdateTx(tx, spec.ConsumerUserID)
+	if err != nil {
+		return nil, true, err
+	}
+	user := users[spec.ConsumerUserID]
+	if user.DeletedAt.Valid || user.Status != common.UserStatusEnabled {
+		return nil, true, ErrCommissionInvalidInput
+	}
+	if int64(user.Quota) < spec.TargetQuota {
+		return nil, true, ErrCommissionInsufficientOrdinary
+	}
+	beneficiaryID, profileID, programID, programVersion, tiersJSON, commissionable, err := commissionProfileSnapshotTx(tx, user, settings)
+	if err != nil {
+		return nil, true, err
+	}
+	now := time.Now().UnixMilli()
+	operation := &CommissionOperationV1{
+		PublicID:                commissionPublicID("cco"),
+		OperationKeyHash:        operationHash,
+		RequestHash:             requestHash,
+		Source:                  spec.Source,
+		SourceStableID:          spec.SourceStableID,
+		ConsumerUserID:          spec.ConsumerUserID,
+		TokenID:                 spec.TokenID,
+		UserSubscriptionID:      spec.UserSubscriptionID,
+		BeneficiaryUserID:       beneficiaryID,
+		ProfileID:               profileID,
+		ProgramID:               programID,
+		ProgramVersion:          programVersion,
+		ProgramTiersJSON:        tiersJSON,
+		SpendPriority:           CommissionOrdinaryFirst,
+		CommissionSpendEnabled:  false,
+		Commissionable:          commissionable,
+		FinancialStatus:         CommissionFinancialReserved,
+		ProjectionStatus:        CommissionProjectionNone,
+		ReservedTotalQuota:      spec.TargetQuota,
+		ReservedCommissionQuota: 0,
+		ReservedOrdinaryQuota:   spec.TargetQuota,
+		Version:                 1,
+		ReservedAt:              now,
+	}
+	oldUserQuota := int64(user.Quota)
+	if spec.TargetQuota > 0 {
+		if err := persistCommissionUserQuotaTx(tx, user, oldUserQuota, oldUserQuota-spec.TargetQuota); err != nil {
+			return nil, true, err
+		}
+	}
+	if err := tx.Create(operation).Error; err != nil {
+		return nil, true, err
+	}
+	return operation, true, nil
+}
+
+func ReserveCommissionWallet(spec CommissionReserveSpec) (*CommissionFundingSnapshot, bool, error) {
+	var operation *CommissionOperationV1
+	var handled bool
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		operation, handled, err = reserveCommissionWalletTx(tx, spec)
+		return err
+	})
+	if err != nil {
+		return nil, handled, err
+	}
+	if !handled || operation == nil {
+		return nil, handled, nil
+	}
+	if err := invalidateUserCache(operation.ConsumerUserID); err != nil {
+		common.SysLog("failed to invalidate commission consumer cache: " + err.Error())
+	}
+	snapshot := operation.FundingSnapshot()
+	return &snapshot, true, nil
+}
+
+type commissionAwardSegment struct {
+	Threshold int64
+	RateBps   int64
+	Eligible  int64
+	Numerator int64
+}
+
+func calculateCommissionAwardSegments(start, eligible int64, tiersJSON string) ([]commissionAwardSegment, int64, error) {
+	if start < 0 || eligible < 0 {
+		return nil, 0, ErrCommissionInvariant
+	}
+	tiers, _, err := normalizeCommissionTierJSON(tiersJSON)
+	if err != nil {
+		return nil, 0, err
+	}
+	if eligible == 0 {
+		return nil, 0, nil
+	}
+	if start > math.MaxInt64-eligible {
+		return nil, 0, ErrCommissionInvariant
+	}
+	end := start + eligible
+	position := start
+	totalNumerator := int64(0)
+	segments := make([]commissionAwardSegment, 0, len(tiers))
+	for position < end {
+		index := sort.Search(len(tiers), func(i int) bool { return tiers[i].ThresholdQuota > position }) - 1
+		if index < 0 {
+			index = 0
+		}
+		segmentEnd := end
+		if index+1 < len(tiers) && tiers[index+1].ThresholdQuota < segmentEnd {
+			segmentEnd = tiers[index+1].ThresholdQuota
+		}
+		quantity := segmentEnd - position
+		if tiers[index].RateBps != 0 && quantity > math.MaxInt64/tiers[index].RateBps {
+			return nil, 0, ErrCommissionInvariant
+		}
+		numerator := quantity * tiers[index].RateBps
+		if totalNumerator > math.MaxInt64-numerator {
+			return nil, 0, ErrCommissionInvariant
+		}
+		totalNumerator += numerator
+		segments = append(segments, commissionAwardSegment{
+			Threshold: tiers[index].ThresholdQuota,
+			RateBps:   tiers[index].RateBps,
+			Eligible:  quantity,
+			Numerator: numerator,
+		})
+		position = segmentEnd
+	}
+	return segments, totalNumerator, nil
+}
+
+type commissionCreditDelta struct {
+	Available       int64
+	Debt            int64
+	PendingCapacity int64
+	UserQuota       int64
+}
+
+func applyCommissionCreditLocked(account *CommissionAccountV1, user *User, quota int64) (commissionCreditDelta, error) {
+	delta := commissionCreditDelta{}
+	if quota < 0 || account == nil || user == nil {
+		return delta, ErrCommissionInvariant
+	}
+	remaining := quota
+	if account.DebtQuota > 0 {
+		paid := minInt64(account.DebtQuota, remaining)
+		account.DebtQuota -= paid
+		remaining -= paid
+		delta.Debt -= paid
+	}
+	if remaining > 0 {
+		if account.AvailableQuota > math.MaxInt64-remaining {
+			return delta, ErrCommissionInvariant
+		}
+		account.AvailableQuota += remaining
+		delta.Available += remaining
+	}
+	return delta, validateCommissionAccount(account, int64(user.Quota))
+}
+
+func releaseCommissionPendingCapacityLocked(account *CommissionAccountV1, user *User) (commissionCreditDelta, error) {
+	if account == nil || user == nil || account.PendingCapacityQuota <= 0 {
+		return commissionCreditDelta{}, nil
+	}
+	pending := account.PendingCapacityQuota
+	account.PendingCapacityQuota = 0
+	delta, err := applyCommissionCreditLocked(account, user, pending)
+	delta.PendingCapacity -= pending
+	return delta, err
+}
+
+func settleCommissionAwardTx(
+	tx *gorm.DB,
+	operation *CommissionOperationV1,
+	beneficiary *User,
+	account *CommissionAccountV1,
+	eligible int64,
+) (int64, int64, error) {
+	if operation == nil || beneficiary == nil || account == nil || eligible <= 0 || !operation.Commissionable {
+		return 0, 0, nil
+	}
+	segments, totalNumerator, err := calculateCommissionAwardSegments(account.GrossLifetimeEligibleQuota, eligible, operation.ProgramTiersJSON)
+	if err != nil {
+		return 0, 0, err
+	}
+	totalCredited := int64(0)
+	for index, segment := range segments {
+		if account.NetEntitledQuota > (math.MaxInt64-account.FractionalNumerator)/commissionRateBase {
+			return 0, 0, ErrCommissionInvariant
+		}
+		beforeNumerator := account.NetEntitledQuota*commissionRateBase + account.FractionalNumerator
+		afterNumerator, err := commissionSafeAdd(beforeNumerator, segment.Numerator)
+		if err != nil || afterNumerator < 0 {
+			return 0, 0, ErrCommissionInvariant
+		}
+		newEntitled := afterNumerator / commissionRateBase
+		credited := newEntitled - account.NetEntitledQuota
+		account.NetEntitledQuota = newEntitled
+		account.FractionalNumerator = afterNumerator % commissionRateBase
+		account.GrossLifetimeEligibleQuota += segment.Eligible
+		account.LifetimeEarnedQuota += credited
+		oldUserQuota := int64(beneficiary.Quota)
+		oldAccountVersion := account.Version
+		creditDelta, err := applyCommissionCreditLocked(account, beneficiary, credited)
+		if err != nil {
+			return 0, 0, err
+		}
+		if creditDelta.UserQuota != 0 {
+			if err := persistCommissionUserQuotaTx(tx, beneficiary, oldUserQuota, int64(beneficiary.Quota)); err != nil {
+				beneficiary.Quota = int(oldUserQuota)
+				return 0, 0, err
+			}
+		}
+		if err := persistCommissionAccountTx(tx, account, oldAccountVersion); err != nil {
+			return 0, 0, err
+		}
+		if _, err := appendCommissionLedgerTx(tx, commissionLedgerMutation{
+			EventKey:              fmt.Sprintf("%s:award:%d:%d", operation.PublicID, operation.Version, index),
+			EventType:             "commission_awarded",
+			OperationID:           operation.ID,
+			Account:               account,
+			ConsumerUserID:        operation.ConsumerUserID,
+			AvailableDelta:        creditDelta.Available,
+			DebtDelta:             creditDelta.Debt,
+			PendingCapacityDelta:  creditDelta.PendingCapacity,
+			UserQuotaDelta:        creditDelta.UserQuota,
+			EligibleOrdinaryQuota: segment.Eligible,
+			RateBps:               segment.RateBps,
+			TierThreshold:         segment.Threshold,
+			NumeratorDelta:        segment.Numerator,
+			UserQuotaAfter:        int64(beneficiary.Quota),
+			ReasonCode:            "ordinary_consumption_award",
+		}); err != nil {
+			return 0, 0, err
+		}
+		totalCredited += credited
+	}
+	return totalNumerator, totalCredited, nil
+}
+
+func finalCommissionFundingSplit(operation *CommissionOperationV1, actualQuota int64) (int64, int64, error) {
+	if operation == nil || actualQuota < 0 || actualQuota > operation.ReservedTotalQuota {
+		return 0, 0, ErrCommissionInvariant
+	}
+	switch operation.SpendPriority {
+	case CommissionSpendFirst:
+		commissionQuota := minInt64(operation.ReservedCommissionQuota, actualQuota)
+		ordinaryQuota := actualQuota - commissionQuota
+		if ordinaryQuota > operation.ReservedOrdinaryQuota {
+			return 0, 0, ErrCommissionInvariant
+		}
+		return commissionQuota, ordinaryQuota, nil
+	case CommissionOrdinaryFirst:
+		ordinaryQuota := minInt64(operation.ReservedOrdinaryQuota, actualQuota)
+		commissionQuota := actualQuota - ordinaryQuota
+		if commissionQuota > operation.ReservedCommissionQuota {
+			return 0, 0, ErrCommissionInvariant
+		}
+		return commissionQuota, ordinaryQuota, nil
+	default:
+		return 0, 0, ErrCommissionInvariant
+	}
+}
+
+func settleCommissionWalletTx(tx *gorm.DB, publicID string, actualQuota int64) (*CommissionOperationV1, error) {
+	if strings.TrimSpace(publicID) == "" || actualQuota < 0 {
+		return nil, errors.New("invalid commission settlement")
+	}
+	operation, err := loadCommissionOperationByPublicIDForUpdateTx(tx, publicID)
+	if err != nil {
+		return nil, err
+	}
+	switch operation.FinancialStatus {
+	case CommissionFinancialSettled:
+		if operation.FinalTotalQuota == actualQuota {
+			return operation, nil
+		}
+		return nil, ErrCommissionOperationConflict
+	case CommissionFinancialRefunded:
+		return nil, ErrCommissionOperationFinalized
+	case CommissionFinancialReserved:
+	default:
+		return nil, ErrCommissionInvariant
+	}
+	if operation.CommissionSpendEnabled || operation.ReservedCommissionQuota != 0 ||
+		operation.ReservedOrdinaryQuota != operation.ReservedTotalQuota {
+		return nil, ErrCommissionInvariant
+	}
+	userIDs := []int{operation.ConsumerUserID}
+	if operation.Commissionable && operation.BeneficiaryUserID > 0 && operation.BeneficiaryUserID != operation.ConsumerUserID {
+		userIDs = append(userIDs, operation.BeneficiaryUserID)
+	}
+	users, err := loadCommissionUsersForUpdateTx(tx, userIDs...)
+	if err != nil {
+		return nil, err
+	}
+	consumer := users[operation.ConsumerUserID]
+	deliveredQuota := actualQuota
+	fundedQuota := actualQuota
+	if fundedQuota > operation.ReservedTotalQuota {
+		delta := fundedQuota - operation.ReservedTotalQuota
+		if int64(consumer.Quota) < delta {
+			operation.SiteUnfundedCostQuota = delta
+			fundedQuota = operation.ReservedTotalQuota
+		} else {
+			oldUserQuota := int64(consumer.Quota)
+			if err := persistCommissionUserQuotaTx(tx, consumer, oldUserQuota, oldUserQuota-delta); err != nil {
+				return nil, err
+			}
+			operation.ReservedTotalQuota += delta
+			operation.ReservedOrdinaryQuota += delta
+		}
+	}
+	finalOrdinary := fundedQuota
+	unusedOrdinary := operation.ReservedOrdinaryQuota - finalOrdinary
+	if unusedOrdinary < 0 {
+		return nil, ErrCommissionInvariant
+	}
+	oldConsumerQuota := int64(consumer.Quota)
+	consumer.Quota += int(unusedOrdinary)
+	if int64(consumer.Quota) != oldConsumerQuota {
+		if err := persistCommissionUserQuotaTx(tx, consumer, oldConsumerQuota, int64(consumer.Quota)); err != nil {
+			return nil, err
+		}
+	}
+	awardNumerator := int64(0)
+	awardQuota := int64(0)
+	if operation.Commissionable && finalOrdinary > 0 && operation.BeneficiaryUserID > 0 && operation.BeneficiaryUserID != operation.ConsumerUserID {
+		beneficiary := users[operation.BeneficiaryUserID]
+		beneficiaryAccount, err := loadCommissionAccountForUpdateTx(tx, operation.BeneficiaryUserID)
+		if err != nil {
+			return nil, err
+		}
+		awardNumerator, awardQuota, err = settleCommissionAwardTx(tx, operation, beneficiary, beneficiaryAccount, finalOrdinary)
+		if err != nil {
+			return nil, err
+		}
+	}
+	previousOperationVersion := operation.Version
+	operation.FinancialStatus = CommissionFinancialSettled
+	operation.ProjectionStatus = CommissionProjectionPending
+	operation.FinalTotalQuota = deliveredQuota
+	operation.FinalCommissionQuota = 0
+	operation.FinalOrdinaryQuota = finalOrdinary
+	operation.EligibleOrdinaryQuota = finalOrdinary
+	operation.AwardNumerator = awardNumerator
+	operation.AwardQuota = awardQuota
+	operation.FinalizedAt = time.Now().UnixMilli()
+	if err := persistCommissionOperationTx(tx, operation, previousOperationVersion); err != nil {
+		return nil, err
+	}
+	return operation, nil
+}
+
+func SettleCommissionWallet(publicID string, actualQuota int64) (*CommissionFundingSnapshot, error) {
+	var operation *CommissionOperationV1
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		operation, err = settleCommissionWalletTx(tx, publicID, actualQuota)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if operation != nil {
+		for _, userID := range []int{operation.ConsumerUserID, operation.BeneficiaryUserID} {
+			if userID > 0 {
+				if err := invalidateUserCache(userID); err != nil {
+					common.SysLog("failed to invalidate commission settlement cache: " + err.Error())
+				}
+			}
+		}
+	}
+	snapshot := operation.FundingSnapshot()
+	return &snapshot, nil
+}
+
+func refundCommissionWalletTx(tx *gorm.DB, publicID string, reasonCode string) (*CommissionOperationV1, error) {
+	operation, err := loadCommissionOperationByPublicIDForUpdateTx(tx, strings.TrimSpace(publicID))
+	if err != nil {
+		return nil, err
+	}
+	switch operation.FinancialStatus {
+	case CommissionFinancialRefunded:
+		return operation, nil
+	case CommissionFinancialSettled:
+		return nil, ErrCommissionOperationFinalized
+	case CommissionFinancialReserved:
+	default:
+		return nil, ErrCommissionInvariant
+	}
+	if operation.CommissionSpendEnabled || operation.ReservedCommissionQuota != 0 ||
+		operation.ReservedOrdinaryQuota != operation.ReservedTotalQuota {
+		return nil, ErrCommissionInvariant
+	}
+	users, err := loadCommissionUsersForUpdateTx(tx, operation.ConsumerUserID)
+	if err != nil {
+		return nil, err
+	}
+	user := users[operation.ConsumerUserID]
+	oldUserQuota := int64(user.Quota)
+	user.Quota += int(operation.ReservedOrdinaryQuota)
+	if operation.ReservedTotalQuota > 0 {
+		if err := persistCommissionUserQuotaTx(tx, user, oldUserQuota, int64(user.Quota)); err != nil {
+			return nil, err
+		}
+	}
+	previousVersion := operation.Version
+	operation.FinancialStatus = CommissionFinancialRefunded
+	operation.ProjectionStatus = CommissionProjectionPending
+	operation.FinalTotalQuota = 0
+	operation.FinalCommissionQuota = 0
+	operation.FinalOrdinaryQuota = 0
+	operation.EligibleOrdinaryQuota = 0
+	operation.FinalizedAt = time.Now().UnixMilli()
+	if err := persistCommissionOperationTx(tx, operation, previousVersion); err != nil {
+		return nil, err
+	}
+	return operation, nil
+}
+
+func RefundCommissionWallet(publicID string, reasonCode string) (*CommissionFundingSnapshot, error) {
+	var operation *CommissionOperationV1
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		operation, err = refundCommissionWalletTx(tx, publicID, reasonCode)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if operation != nil {
+		if err := invalidateUserCache(operation.ConsumerUserID); err != nil {
+			common.SysLog("failed to invalidate commission refund cache: " + err.Error())
+		}
+	}
+	snapshot := operation.FundingSnapshot()
+	return &snapshot, nil
+}
+
+func GetCommissionOperationByPublicID(publicID string) (*CommissionOperationV1, error) {
+	var operation CommissionOperationV1
+	if err := DB.Where("public_id = ?", strings.TrimSpace(publicID)).First(&operation).Error; err != nil {
+		return nil, err
+	}
+	return &operation, nil
+}
+
+func GetCommissionOperationByKey(operationKey string) (*CommissionOperationV1, error) {
+	var operation CommissionOperationV1
+	hash := commissionHash("r29-operation-v1", strings.TrimSpace(operationKey))
+	if err := DB.Where("operation_key_hash = ?", hash).First(&operation).Error; err != nil {
+		return nil, err
+	}
+	return &operation, nil
+}
+
+func reverseCommissionAwardTx(
+	tx *gorm.DB,
+	operation *CommissionOperationV1,
+	beneficiary *User,
+	account *CommissionAccountV1,
+	eligibleReduction int64,
+) (int64, int64, error) {
+	if eligibleReduction <= 0 || operation == nil || beneficiary == nil || account == nil {
+		return 0, 0, nil
+	}
+	var awards []CommissionLedgerV1
+	if err := tx.Where("operation_id = ? AND event_type = ?", operation.ID, "commission_awarded").
+		Order("id DESC").Find(&awards).Error; err != nil {
+		return 0, 0, err
+	}
+	remaining := eligibleReduction
+	totalNumerator := int64(0)
+	totalReclaimed := int64(0)
+	for _, award := range awards {
+		if remaining == 0 {
+			break
+		}
+		var alreadyCorrected int64
+		if err := tx.Model(&CommissionLedgerV1{}).
+			Where("related_event_id = ? AND event_type = ?", award.ID, "commission_award_reversed").
+			Select("COALESCE(SUM(-eligible_ordinary_quota), 0)").Scan(&alreadyCorrected).Error; err != nil {
+			return 0, 0, err
+		}
+		availableEligible := award.EligibleOrdinaryQuota - alreadyCorrected
+		if availableEligible <= 0 {
+			continue
+		}
+		take := minInt64(availableEligible, remaining)
+		if award.RateBps != 0 && take > math.MaxInt64/award.RateBps {
+			return 0, 0, ErrCommissionInvariant
+		}
+		numerator := take * award.RateBps
+		if account.NetEntitledQuota > (math.MaxInt64-account.FractionalNumerator)/commissionRateBase {
+			return 0, 0, ErrCommissionInvariant
+		}
+		beforeNumerator := account.NetEntitledQuota*commissionRateBase + account.FractionalNumerator
+		if numerator > beforeNumerator {
+			return 0, 0, ErrCommissionInvariant
+		}
+		afterNumerator := beforeNumerator - numerator
+		newEntitled := afterNumerator / commissionRateBase
+		reclaim := account.NetEntitledQuota - newEntitled
+		account.NetEntitledQuota = newEntitled
+		account.FractionalNumerator = afterNumerator % commissionRateBase
+		oldAccountVersion := account.Version
+		pendingReclaim := minInt64(account.PendingCapacityQuota, reclaim)
+		account.PendingCapacityQuota -= pendingReclaim
+		remainingReclaim := reclaim - pendingReclaim
+		availableReclaim := minInt64(account.AvailableQuota, remainingReclaim)
+		account.AvailableQuota -= availableReclaim
+		remainingReclaim -= availableReclaim
+		account.DebtQuota += remainingReclaim
+		if err := validateCommissionAccount(account, int64(beneficiary.Quota)); err != nil {
+			return 0, 0, err
+		}
+		if err := persistCommissionAccountTx(tx, account, oldAccountVersion); err != nil {
+			return 0, 0, err
+		}
+		relatedID := award.ID
+		if _, err := appendCommissionLedgerTx(tx, commissionLedgerMutation{
+			EventKey:              fmt.Sprintf("%s:award-reversal:%d:%d", operation.PublicID, award.ID, alreadyCorrected+take),
+			EventType:             "commission_award_reversed",
+			OperationID:           operation.ID,
+			Account:               account,
+			ConsumerUserID:        operation.ConsumerUserID,
+			AvailableDelta:        -availableReclaim,
+			DebtDelta:             remainingReclaim,
+			PendingCapacityDelta:  -pendingReclaim,
+			UserQuotaDelta:        0,
+			EligibleOrdinaryQuota: -take,
+			RateBps:               award.RateBps,
+			TierThreshold:         award.TierThreshold,
+			NumeratorDelta:        -numerator,
+			UserQuotaAfter:        int64(beneficiary.Quota),
+			RelatedEventID:        &relatedID,
+			ReasonCode:            "linked_consumption_correction",
+		}); err != nil {
+			return 0, 0, err
+		}
+		remaining -= take
+		totalNumerator += numerator
+		totalReclaimed += reclaim
+	}
+	if remaining != 0 {
+		return 0, 0, ErrCommissionInvariant
+	}
+	return totalNumerator, totalReclaimed, nil
+}
+
+func reconcileCommissionWalletTx(tx *gorm.DB, publicID string, correctedTotal int64) (*CommissionOperationV1, error) {
+	if correctedTotal < 0 {
+		return nil, errors.New("commission correction must not be negative")
+	}
+	operation, err := loadCommissionOperationByPublicIDForUpdateTx(tx, strings.TrimSpace(publicID))
+	if err != nil {
+		return nil, err
+	}
+	if operation.Source == CommissionProjectionSourceReservation {
+		// Sidecar operations do not own the consumer wallet. Corrections must
+		// run inside the reservation/receipt owner's refund transaction.
+		return nil, ErrCommissionOperationConflict
+	}
+	if operation.FinancialStatus == CommissionFinancialReserved {
+		return settleCommissionWalletTx(tx, publicID, correctedTotal)
+	}
+	if operation.FinancialStatus != CommissionFinancialSettled {
+		return nil, ErrCommissionOperationFinalized
+	}
+	if operation.FinalTotalQuota == correctedTotal {
+		return operation, nil
+	}
+	if operation.CommissionSpendEnabled || operation.FinalCommissionQuota != 0 ||
+		operation.FinalOrdinaryQuota+operation.SiteUnfundedCostQuota != operation.FinalTotalQuota {
+		return nil, ErrCommissionInvariant
+	}
+	userIDs := []int{operation.ConsumerUserID}
+	if operation.BeneficiaryUserID > 0 && operation.BeneficiaryUserID != operation.ConsumerUserID {
+		userIDs = append(userIDs, operation.BeneficiaryUserID)
+	}
+	users, err := loadCommissionUsersForUpdateTx(tx, userIDs...)
+	if err != nil {
+		return nil, err
+	}
+	consumer := users[operation.ConsumerUserID]
+	previousOperationVersion := operation.Version
+	if correctedTotal < operation.FinalTotalQuota {
+		reduction := operation.FinalTotalQuota - correctedTotal
+		siteReduction := minInt64(operation.SiteUnfundedCostQuota, reduction)
+		operation.SiteUnfundedCostQuota -= siteReduction
+		reduction -= siteReduction
+		ordinaryReduction := reduction
+		if ordinaryReduction > operation.FinalOrdinaryQuota {
+			return nil, ErrCommissionInvariant
+		}
+		oldConsumerQuota := int64(consumer.Quota)
+		consumer.Quota += int(ordinaryReduction)
+		if ordinaryReduction > 0 {
+			if err := persistCommissionUserQuotaTx(tx, consumer, oldConsumerQuota, int64(consumer.Quota)); err != nil {
+				return nil, err
+			}
+		}
+		if ordinaryReduction > 0 && operation.Commissionable && operation.BeneficiaryUserID > 0 {
+			beneficiary := users[operation.BeneficiaryUserID]
+			beneficiaryAccount, err := loadCommissionAccountForUpdateTx(tx, operation.BeneficiaryUserID)
+			if err != nil {
+				return nil, err
+			}
+			numerator, reclaimed, err := reverseCommissionAwardTx(tx, operation, beneficiary, beneficiaryAccount, ordinaryReduction)
+			if err != nil {
+				return nil, err
+			}
+			operation.CorrectedNumerator += numerator
+			operation.AwardQuota -= minInt64(operation.AwardQuota, reclaimed)
+		}
+		operation.FinalOrdinaryQuota -= ordinaryReduction
+		operation.EligibleOrdinaryQuota -= ordinaryReduction
+		operation.FinalTotalQuota = correctedTotal
+	} else {
+		increase := correctedTotal - operation.FinalTotalQuota
+		ordinaryPart := increase
+		if int64(consumer.Quota) < increase {
+			operation.SiteUnfundedCostQuota += increase
+			ordinaryPart = 0
+		}
+		oldConsumerQuota := int64(consumer.Quota)
+		consumer.Quota -= int(ordinaryPart)
+		if int64(consumer.Quota) != oldConsumerQuota {
+			if err := persistCommissionUserQuotaTx(tx, consumer, oldConsumerQuota, int64(consumer.Quota)); err != nil {
+				return nil, err
+			}
+		}
+		if ordinaryPart > 0 && operation.Commissionable && operation.BeneficiaryUserID > 0 {
+			beneficiary := users[operation.BeneficiaryUserID]
+			beneficiaryAccount, err := loadCommissionAccountForUpdateTx(tx, operation.BeneficiaryUserID)
+			if err != nil {
+				return nil, err
+			}
+			numerator, credited, err := settleCommissionAwardTx(tx, operation, beneficiary, beneficiaryAccount, ordinaryPart)
+			if err != nil {
+				return nil, err
+			}
+			operation.AwardNumerator += numerator
+			operation.AwardQuota += credited
+		}
+		operation.FinalOrdinaryQuota += ordinaryPart
+		operation.EligibleOrdinaryQuota += ordinaryPart
+		operation.FinalTotalQuota = correctedTotal
+	}
+	if err := persistCommissionOperationTx(tx, operation, previousOperationVersion); err != nil {
+		return nil, err
+	}
+	return operation, nil
+}
+
+func ReconcileCommissionWallet(publicID string, correctedTotal int64) (*CommissionFundingSnapshot, error) {
+	var operation *CommissionOperationV1
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		operation, err = reconcileCommissionWalletTx(tx, publicID, correctedTotal)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if operation != nil {
+		for _, userID := range []int{operation.ConsumerUserID, operation.BeneficiaryUserID} {
+			if userID > 0 {
+				if err := invalidateUserCache(userID); err != nil {
+					common.SysLog("failed to invalidate commission correction cache: " + err.Error())
+				}
+			}
+		}
+	}
+	snapshot := operation.FundingSnapshot()
+	return &snapshot, nil
+}

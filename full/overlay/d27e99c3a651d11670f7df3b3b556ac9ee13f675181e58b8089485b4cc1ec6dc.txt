@@ -1,0 +1,141 @@
+package service
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+)
+
+func convertClaudeMessagesForTest(t *testing.T, input string) ([]json.RawMessage, dto.ClaudeRequest) {
+	t.Helper()
+	var request dto.ClaudeRequest
+	require.NoError(t, json.Unmarshal([]byte(input), &request))
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	converted, err := ClaudeToOpenAIRequest(request, info)
+	require.NoError(t, err)
+	serialized, err := json.Marshal(converted)
+	require.NoError(t, err)
+	var result struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	require.NoError(t, json.Unmarshal(serialized, &result))
+	return result.Messages, request
+}
+
+func TestClaudeToolResultImageAndMessageOrder(t *testing.T) {
+	messages, request := convertClaudeMessagesForTest(t, `{
+		"model":"claude-test", "messages":[
+			{"role":"assistant","content":[
+				{"type":"text","text":"I will inspect both files."},
+				{"type":"tool_use","id":"call_a","name":"read_file","input":{"path":"a"}},
+				{"type":"tool_use","id":"call_b","name":"read_file","input":{"path":"b"}}
+			]},
+			{"role":"user","content":[
+				{"type":"text","text":"Before results."},
+				{"type":"tool_result","tool_use_id":"call_a","content":[
+					{"type":"text","text":"Screenshot: "},
+					{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJDREVGRw=="}}
+				]},
+				{"type":"tool_result","tool_use_id":"call_b","content":[{"type":"text","text":"First"},{"type":"text","text":" second"}]},
+				{"type":"text","text":"Please compare them."}
+			]}
+		]}`)
+	require.Len(t, messages, 4)
+	var assistant struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		ToolCalls []struct {
+			ID string `json:"id"`
+		} `json:"tool_calls"`
+	}
+	require.NoError(t, json.Unmarshal(messages[0], &assistant))
+	require.Equal(t, "I will inspect both files.", assistant.Content[0].Text)
+	require.Equal(t, []string{"call_a", "call_b"}, []string{assistant.ToolCalls[0].ID, assistant.ToolCalls[1].ID})
+	var imageResult struct {
+		Role       string `json:"role"`
+		ToolCallID string `json:"tool_call_id"`
+		Content    []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			ImageURL *struct {
+				URL string `json:"url"`
+			} `json:"image_url"`
+		} `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(messages[1], &imageResult))
+	require.Equal(t, "tool", imageResult.Role)
+	require.Equal(t, "call_a", imageResult.ToolCallID)
+	require.Len(t, imageResult.Content, 2)
+	require.Equal(t, "Screenshot: ", imageResult.Content[0].Text)
+	require.Equal(t, "image_url", imageResult.Content[1].Type)
+	require.Equal(t, "data:image/png;base64,QUJDREVGRw==", imageResult.Content[1].ImageURL.URL)
+	var textResult struct {
+		ToolCallID string `json:"tool_call_id"`
+		Content    string `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(messages[2], &textResult))
+	require.Equal(t, "call_b", textResult.ToolCallID)
+	require.Equal(t, "First second", textResult.Content)
+	var trailing struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(messages[3], &trailing))
+	require.Equal(t, "user", trailing.Role)
+	require.Len(t, trailing.Content, 2)
+	require.Equal(t, "Before results.", trailing.Content[0].Text)
+	require.Equal(t, "Please compare them.", trailing.Content[1].Text)
+	meta := request.GetTokenCountMeta()
+	require.Len(t, meta.Files, 1)
+	require.NotContains(t, meta.CombineText, "QUJDREVGRw==")
+	require.Contains(t, meta.CombineText, "Screenshot: ")
+}
+
+func TestClaudeToolResultRejectsUnrepresentableContent(t *testing.T) {
+	for _, content := range []string{
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}`,
+		`{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"QUJD"}}`,
+	} {
+		var request dto.ClaudeRequest
+		input := `{"model":"claude-test","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":[` + content + `]}]}]}`
+		require.NoError(t, json.Unmarshal([]byte(input), &request))
+		_, err := ClaudeToOpenAIRequest(request, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+		require.Error(t, err)
+	}
+}
+
+func TestClaudeToolResultOmitsUnknownOptionalName(t *testing.T) {
+	messages, _ := convertClaudeMessagesForTest(t, `{"model":"claude-test","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"missing","content":"ok"}]}]}`)
+	require.Len(t, messages, 1)
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(messages[0], &result))
+	require.Equal(t, "missing", result["tool_call_id"])
+	require.NotContains(t, result, "name")
+}
+
+func TestClaudeOpenRouterToolResultPreservesCacheControl(t *testing.T) {
+	var request dto.ClaudeRequest
+	require.NoError(t, json.Unmarshal([]byte(`{"model":"anthropic/claude-test","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":[{"type":"text","text":"cached result","cache_control":{"type":"ephemeral"}}]}]}]}`), &request))
+	converted, err := ClaudeToOpenAIRequest(request, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter}})
+	require.NoError(t, err)
+	serialized, err := json.Marshal(converted)
+	require.NoError(t, err)
+	var body struct {
+		Messages []struct {
+			Content []struct {
+				Text         string            `json:"text"`
+				CacheControl map[string]string `json:"cache_control"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	require.NoError(t, json.Unmarshal(serialized, &body))
+	require.Equal(t, "cached result", body.Messages[0].Content[0].Text)
+	require.Equal(t, "ephemeral", body.Messages[0].Content[0].CacheControl["type"])
+}

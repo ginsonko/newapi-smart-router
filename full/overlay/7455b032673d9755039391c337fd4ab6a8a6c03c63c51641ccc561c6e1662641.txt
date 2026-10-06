@@ -1,0 +1,302 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupTenantCostWorkerDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previous := model.DB
+	previousMain := common.MainDatabaseType()
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:tenant-cost-worker-%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previous
+		common.SetMainDatabaseType(previousMain)
+	})
+	// Keep the worker fixture in lockstep with the production migration list.
+	// Worker pause state is durable and must exist even when a test starts with
+	// an otherwise empty database; omitting it makes RunOnce fail before any
+	// publish assertion can run.
+	require.NoError(t, db.AutoMigrate(&model.TenantCostDownstream{}, &model.TenantCostSequence{}, &model.TenantCostEvent{}, &model.TenantCostOutbox{}, &model.TenantCostProjectionRetry{}, &model.TenantCostWorkerControl{}, &model.TenantCostAuditEvent{}))
+	require.NoError(t, model.EnsureDefaultTenantCostDownstream())
+	return db
+}
+
+func workerTestSpec(id string) model.TenantCostEventSpec {
+	amount := "0.00100000"
+	return model.TenantCostEventSpec{
+		TenantID: model.DownstreamTenantID, EventID: id, EventType: model.TenantCostEventSettlement,
+		OccurredAt: time.Now().UTC(), FinalizedAt: time.Now().UTC(), ProductPoolID: "openai_gpt",
+		ServiceTier: "pro", RouteProfileID: "profile", ProfileRevision: "rev", KeyID: "key",
+		RequestedModel: "gpt", CanonicalModel: "gpt", BillingMode: "token", BillingUnit: "token",
+		GatewayChargeQuota: 1000, GatewayChargeAmount: amount, Currency: "USD", ProcurementAmount: &amount,
+		ProcurementCurrency: "USD", Evidence: model.TenantCostEvidenceFallback, Status: model.TenantCostStatusFinal,
+	}
+}
+
+func TestTenantCostOutboxWorkerPublishesOnce(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	_, err := model.AppendTenantCostEvent(workerTestSpec("event-worker"))
+	require.NoError(t, err)
+	var published []string
+	worker, err := NewTenantCostOutboxWorker(5*time.Second, 10, func(_ context.Context, event model.TenantCostEvent) error {
+		published = append(published, event.EventID)
+		return nil
+	})
+	require.NoError(t, err)
+	stats, err := worker.RunOnce(context.Background(), time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, TenantCostOutboxRunStats{Claimed: 1, Sent: 1, Failed: 0}, stats)
+	assert.Equal(t, []string{"event-worker"}, published)
+	var row model.TenantCostOutbox
+	require.NoError(t, db.Where("event_id = ?", "event-worker").First(&row).Error)
+	assert.Equal(t, model.TenantOutboxSent, row.State)
+}
+
+func TestTenantCostHTTPPublisherUsesIdempotencyAndTreatsConflictAsReplay(t *testing.T) {
+	var gotAuth, gotKey, gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotKey = r.Header.Get("Idempotency-Key")
+		body := make([]byte, 4096)
+		n, _ := r.Body.Read(body)
+		gotBody = string(body[:n])
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+	publish, err := NewTenantCostHTTPPublisher(server.URL, "report-secret", server.Client())
+	require.NoError(t, err)
+	err = publish(context.Background(), model.TenantCostEvent{TenantID: model.DownstreamTenantID, EventID: "event-http", Payload: `{"schema_version":"upstream-cost.v2"}`})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer report-secret", gotAuth)
+	assert.Equal(t, "event-http", gotKey)
+	assert.Contains(t, gotBody, "upstream-cost.v2")
+}
+
+func TestTenantCostHTTPPublisherRejectsHeaderCollisions(t *testing.T) {
+	for _, header := range []string{"Authorization", "Content-Type", "Idempotency-Key", "X Bad", "\r\nX-Leak: yes"} {
+		publish, err := NewTenantCostHTTPPublisherWithTenantHeader("https://example.invalid", "secret", nil, header)
+		assert.Error(t, err, header)
+		assert.Nil(t, publish, header)
+	}
+	for _, header := range []string{"X-Gateway-Tenant", "Partner-Tenant"} {
+		publish, err := NewTenantCostHTTPPublisherWithTenantHeader("https://example.invalid", "secret", nil, header)
+		assert.NoError(t, err, header)
+		assert.NotNil(t, publish, header)
+	}
+}
+
+func TestTenantCostOutboxReclaimsStalePendingAfterWorkerRestart(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	_, err := model.AppendTenantCostEvent(workerTestSpec("event-stale"))
+	require.NoError(t, err)
+	claimed, err := model.ClaimTenantCostOutbox(10, time.Now().UTC().UnixNano())
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	// A process crash leaves the row pending. Ten minutes later a fresh worker
+	// can reclaim it, and the partner idempotency key remains the same.
+	reclaimed, err := model.ClaimTenantCostOutbox(10, time.Now().UTC().Add(11*time.Minute).UnixNano())
+	require.NoError(t, err)
+	require.Len(t, reclaimed, 1)
+	assert.Equal(t, claimed[0].EventID, reclaimed[0].EventID)
+	assert.Equal(t, claimed[0].Attempts+1, reclaimed[0].Attempts)
+
+	var published int
+	worker, err := NewTenantCostOutboxWorker(5*time.Second, 10, func(_ context.Context, event model.TenantCostEvent) error {
+		published++
+		assert.Equal(t, "event-stale", event.EventID)
+		return nil
+	})
+	require.NoError(t, err)
+	stats, err := worker.RunOnce(context.Background(), time.Now().UTC().Add(22*time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Sent)
+	assert.Equal(t, 1, published)
+	var row model.TenantCostOutbox
+	require.NoError(t, db.Where("event_id = ?", "event-stale").First(&row).Error)
+	assert.Equal(t, model.TenantOutboxSent, row.State)
+}
+
+func TestTenantCostProjectionRetryWorkerAppendsOnce(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	spec := workerTestSpec("projection-retry-worker")
+	require.NoError(t, model.EnqueueTenantCostProjection(spec, fmt.Errorf("temporary")))
+	worker := NewTenantCostProjectionRetryWorker(10*time.Second, 10)
+	stats, err := worker.RunOnce(context.Background(), time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Claimed)
+	assert.Equal(t, 1, stats.Sent)
+	var events int64
+	require.NoError(t, db.Model(&model.TenantCostEvent{}).Count(&events).Error)
+	assert.EqualValues(t, 1, events)
+	// A second pass sees no due retry row and cannot duplicate the event.
+	stats, err = worker.RunOnce(context.Background(), time.Now().UTC().Add(time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, 0, stats.Claimed)
+}
+
+func TestTenantCostProjectionRetryWorkerQuarantinesCrossTenantPayload(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	second := &model.TenantCostDownstream{TenantID: "worker-payload-tenant", DisplayName: "Worker Payload Tenant", ConfigKey: "worker_payload_tenant", Status: model.TenantCostDownstreamActive}
+	require.NoError(t, model.UpsertTenantCostDownstream(second))
+	spec := workerTestSpec("worker-cross-tenant-payload")
+	require.NoError(t, model.EnqueueTenantCostProjection(spec, fmt.Errorf("temporary")))
+	var row model.TenantCostProjectionRetry
+	require.NoError(t, db.Where("tenant_id = ? AND event_id = ?", model.DownstreamTenantID, spec.EventID).First(&row).Error)
+
+	forged := spec
+	forged.TenantID = second.TenantID
+	forgedJSON, err := common.Marshal(forged)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.TenantCostProjectionRetry{}).Where("id = ?", row.ID).Updates(map[string]interface{}{
+		"spec_json": string(forgedJSON),
+	}).Error)
+
+	worker := NewTenantCostProjectionRetryWorker(10*time.Second, 10)
+	stats, err := worker.RunOnce(context.Background(), time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Claimed)
+	assert.Equal(t, 1, stats.Review)
+	var events int64
+	require.NoError(t, db.Model(&model.TenantCostEvent{}).Count(&events).Error)
+	assert.Zero(t, events)
+	var reviewed model.TenantCostProjectionRetry
+	require.NoError(t, db.Where("id = ?", row.ID).First(&reviewed).Error)
+	assert.Equal(t, model.TenantCostProjectionReview, reviewed.State)
+	assert.Contains(t, reviewed.LastError, "scope")
+}
+
+func TestTenantCostOutboxResolverRoutesByRegisteredTenant(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	require.NoError(t, model.UpsertTenantCostDownstream(&model.TenantCostDownstream{
+		TenantID: "media-partner", DisplayName: "Media Partner", ConfigKey: "media_partner", Status: model.TenantCostDownstreamActive,
+	}))
+	var receivedTenant string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedTenant = r.Header.Get("X-Gateway-Tenant")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	// The legacy unqualified pair is deliberately scoped to the default seed;
+	// a second tenant cannot accidentally publish into that sink.
+	t.Setenv("TENANT_COST_OUTBOX_URL", server.URL)
+	t.Setenv("TENANT_COST_OUTBOX_TOKEN", "default-secret")
+	secondPublisher, err := tenantCostSinkEnvResolver(context.Background(), "media-partner")
+	assert.ErrorIs(t, err, ErrTenantCostSinkUnavailable)
+	assert.Nil(t, secondPublisher)
+	defaultPublisher, err := tenantCostSinkEnvResolver(context.Background(), model.DefaultTenantCostTenantID)
+	require.NoError(t, err)
+	require.NotNil(t, defaultPublisher)
+	require.NoError(t, defaultPublisher(context.Background(), model.TenantCostEvent{
+		TenantID: model.DefaultTenantCostTenantID, EventID: "default-event", Payload: `{"schema_version":"upstream-cost.v2"}`,
+	}))
+	assert.Equal(t, model.DefaultTenantCostTenantID, receivedTenant)
+
+	// A keyed pair enables only its own tenant and uses the same standard
+	// generic header, never the first tenant's credentials.
+	t.Setenv("TENANT_COST_OUTBOX_MEDIA_PARTNER_URL", server.URL)
+	t.Setenv("TENANT_COST_OUTBOX_MEDIA_PARTNER_TOKEN", "media-secret")
+	mediaPublisher, err := tenantCostSinkEnvResolver(context.Background(), "media-partner")
+	require.NoError(t, err)
+	require.NoError(t, mediaPublisher(context.Background(), model.TenantCostEvent{
+		TenantID: "media-partner", EventID: "media-event", Payload: `{"schema_version":"upstream-cost.v2"}`,
+	}))
+	assert.Equal(t, "media-partner", receivedTenant)
+	assert.NotNil(t, db)
+}
+
+func TestTenantCostOutboxWorkerSkipsPausedOrDisabledTenantWithoutCrossSend(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	require.NoError(t, model.UpsertTenantCostDownstream(&model.TenantCostDownstream{
+		TenantID: "media-partner", DisplayName: "Media Partner", ConfigKey: "media_partner", Status: model.TenantCostDownstreamActive,
+	}))
+	spec := workerTestSpec("media-paused")
+	spec.TenantID = "media-partner"
+	_, err := model.AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	require.NoError(t, model.SetTenantCostWorkerPausedForTenant("media-partner", true, 1))
+	sent := 0
+	worker, err := NewTenantCostOutboxWorkerWithResolver(5*time.Second, 10, func(_ context.Context, tenantID string) (TenantCostOutboxPublisher, error) {
+		return func(_ context.Context, event model.TenantCostEvent) error {
+			sent++
+			assert.Equal(t, tenantID, event.TenantID)
+			return nil
+		}, nil
+	})
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	stats, err := worker.RunOnce(context.Background(), now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Claimed)
+	assert.Equal(t, 1, stats.Skipped)
+	assert.Zero(t, sent)
+	var outbox model.TenantCostOutbox
+	require.NoError(t, db.Where("event_id = ?", "media-paused").First(&outbox).Error)
+	assert.Equal(t, model.TenantOutboxFailed, outbox.State)
+	assert.Contains(t, outbox.LastError, "paused")
+	assert.Greater(t, outbox.NextAttemptAt, now.UnixNano())
+}
+
+func TestTenantCostOutboxFairClaimDoesNotLetBrokenTenantStarveHealthyTenant(t *testing.T) {
+	db := setupTenantCostWorkerDB(t)
+	require.NoError(t, model.UpsertTenantCostDownstream(&model.TenantCostDownstream{
+		TenantID: "broken-partner", DisplayName: "Broken Partner", ConfigKey: "broken_partner", Status: model.TenantCostDownstreamActive,
+	}))
+	require.NoError(t, model.UpsertTenantCostDownstream(&model.TenantCostDownstream{
+		TenantID: "healthy-partner", DisplayName: "Healthy Partner", ConfigKey: "healthy_partner", Status: model.TenantCostDownstreamActive,
+	}))
+	for i := 0; i < 40; i++ {
+		spec := workerTestSpec(fmt.Sprintf("broken-%02d", i))
+		spec.TenantID = "broken-partner"
+		_, err := model.AppendTenantCostEvent(spec)
+		require.NoError(t, err)
+	}
+	healthy := workerTestSpec("healthy-event")
+	healthy.TenantID = "healthy-partner"
+	_, err := model.AppendTenantCostEvent(healthy)
+	require.NoError(t, err)
+
+	var published []string
+	worker, err := NewTenantCostOutboxWorkerWithResolver(time.Second, 2, func(_ context.Context, tenantID string) (TenantCostOutboxPublisher, error) {
+		if tenantID == "broken-partner" {
+			return nil, ErrTenantCostSinkUnavailable
+		}
+		return func(_ context.Context, event model.TenantCostEvent) error {
+			published = append(published, event.EventID)
+			return nil
+		}, nil
+	})
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	stats, err := worker.RunOnce(context.Background(), now)
+	require.NoError(t, err)
+	assert.Equal(t, 2, stats.Claimed)
+	assert.Equal(t, 1, stats.Sent)
+	assert.Equal(t, 1, stats.Skipped)
+	assert.Equal(t, []string{"healthy-event"}, published)
+
+	var brokenRow model.TenantCostOutbox
+	require.NoError(t, db.Where("tenant_id = ? AND state = ?", "broken-partner", model.TenantOutboxFailed).First(&brokenRow).Error)
+	assert.Contains(t, brokenRow.LastError, "sink unavailable")
+	assert.Greater(t, brokenRow.NextAttemptAt, now.UnixNano())
+	var healthyRow model.TenantCostOutbox
+	require.NoError(t, db.Where("tenant_id = ? AND event_id = ?", "healthy-partner", "healthy-event").First(&healthyRow).Error)
+	assert.Equal(t, model.TenantOutboxSent, healthyRow.State)
+}

@@ -1,0 +1,47 @@
+package controller
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestFirstSelectedAdvancedChannelPreservesNativeRoute(t *testing.T) {
+	for _, test := range []struct {
+		path    string
+		allowed bool
+	}{
+		{"/v1/messages?beta=true", true},
+		{"/v1/chat/completions", true},
+		{"/v1/responses", false},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", test.path, nil)
+			channel := &model.Channel{Id: 167, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled, Name: "native fixture", Key: "test-only"}
+			channel.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{
+				{IncomingPath: "/v1/messages", UpstreamPath: "/v1/messages", Converter: dto.AdvancedCustomConverterNone},
+				{IncomingPath: "/v1/chat/completions", UpstreamPath: "/v1/chat/completions", Converter: dto.AdvancedCustomConverterNone},
+			}}})
+			require.Nil(t, middleware.SetupContextForSelectedChannel(c, channel, "claude-test"))
+			selected, err := getChannel(c, &relaycommon.RelayInfo{}, &service.RetryParam{Ctx: c, RequestPath: c.Request.URL.Path})
+			if !test.allowed {
+				require.NotNil(t, err)
+				require.Nil(t, selected)
+				return
+			}
+			require.Nil(t, err)
+			require.Equal(t, channel.Id, selected.Id)
+			require.True(t, selected.GetOtherSettings().AdvancedCustom.SupportsPath(c.Request.URL.Path))
+		})
+	}
+}

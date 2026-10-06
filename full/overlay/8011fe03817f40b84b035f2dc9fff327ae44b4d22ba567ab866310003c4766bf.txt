@@ -1,0 +1,234 @@
+package helper
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func preserveGroupModelPricingForPriceTest(t *testing.T) {
+	t.Helper()
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	originalGroups := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroups))
+	})
+}
+
+func TestGroupModelPricingQuoteIsScopedFrozenAndDurationAware(t *testing.T) {
+	preserveGroupModelPricingForPriceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"second":1,"fixed":1}`))
+	first, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{
+			"second":{"jimeng-video":{"billing_mode":"fixed_price","model_price":0.2,"task_profile":{"unit":"per_second"}}},
+			"fixed":{"jimeng-video":{"billing_mode":"fixed_price","model_price":1.25,"task_profile":{"unit":"fixed_duration","fixed_duration_seconds":15}}}
+		}
+	}`)
+	require.NoError(t, err)
+
+	newInfo := func(group string) *relaycommon.RelayInfo {
+		return &relaycommon.RelayInfo{OriginModelName: "jimeng-video", UserGroup: group, UsingGroup: group}
+	}
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+
+	secondQuote, err := ModelPriceHelperPerCall(ctx, newInfo("second"))
+	require.NoError(t, err)
+	fixedQuote, err := ModelPriceHelperPerCall(ctx, newInfo("fixed"))
+	require.NoError(t, err)
+	require.NotEmpty(t, first.Revision)
+	require.NotEmpty(t, secondQuote.PricingRevision)
+	require.NotEqual(t, first.Revision, secondQuote.PricingRevision,
+		"the quote revision must include the effective group-ratio configuration, not only the model contract")
+	require.Equal(t, 0.2, secondQuote.ModelPrice)
+	require.Equal(t, 1.25, fixedQuote.ModelPrice)
+	require.Equal(t, common.QuotaFromFloat(0.2*common.QuotaPerUnit), secondQuote.Quota)
+	require.Equal(t, common.QuotaFromFloat(1.25*common.QuotaPerUnit), fixedQuote.Quota)
+
+	secondQuote.AddOtherRatio("seconds", 10)
+	fixedQuote.AddOtherRatio("seconds", 15)
+	fixedQuote.AddOtherRatio("size", 2)
+	require.Equal(t, 10.0, secondQuote.OtherRatioMultiplier())
+	require.Equal(t, 2.0, fixedQuote.OtherRatioMultiplier(), "fixed duration must not multiply seconds a second time")
+
+	secondRevision := secondQuote.PricingRevision
+	replayedQuote, err := ModelPriceHelperPerCall(ctx, newInfo("second"))
+	require.NoError(t, err)
+	require.Equal(t, secondRevision, replayedQuote.PricingRevision, "unchanged pricing semantics must keep a stable quote revision")
+	_, _, err = billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{"second":{"jimeng-video":{"billing_mode":"fixed_price","model_price":9,"task_profile":{"unit":"per_second"}}}}
+	}`)
+	require.NoError(t, err)
+	require.Equal(t, 0.2, secondQuote.ModelPrice, "an admitted quote must stay frozen after a hot update")
+	require.Equal(t, secondRevision, secondQuote.PricingRevision)
+
+	newQuote, err := ModelPriceHelperPerCall(ctx, newInfo("second"))
+	require.NoError(t, err)
+	require.Equal(t, 9.0, newQuote.ModelPrice)
+	require.NotEqual(t, secondRevision, newQuote.PricingRevision)
+}
+
+func TestGroupRatioChangeCreatesNewQuoteRevisionWithoutMutatingFrozenQuote(t *testing.T) {
+	preserveGroupModelPricingForPriceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"dynamic":0.2}`))
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{"dynamic":{"gpt-dynamic":{"billing_mode":"ratio","model_ratio":2,"completion_ratio":1}}}
+	}`)
+	require.NoError(t, err)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	newInfo := func() *relaycommon.RelayInfo {
+		return &relaycommon.RelayInfo{OriginModelName: "gpt-dynamic", UserGroup: "dynamic", UsingGroup: "dynamic"}
+	}
+
+	quoteA, err := ModelPriceHelper(ctx, newInfo(), 100, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	require.Equal(t, 0.2, quoteA.GroupRatioInfo.GroupRatio)
+
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"dynamic":0.35}`))
+	quoteB, err := ModelPriceHelper(ctx, newInfo(), 100, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	require.Equal(t, 0.35, quoteB.GroupRatioInfo.GroupRatio)
+	require.NotEqual(t, quoteA.PricingRevision, quoteB.PricingRevision)
+	require.Equal(t, 0.2, quoteA.GroupRatioInfo.GroupRatio, "an admitted quote must retain the A ratio")
+	preConsumedTokens := common.Max(100, common.PreConsumedQuota)
+	require.Equal(t, common.QuotaFromFloat(float64(preConsumedTokens)*2*0.2), quoteA.QuotaToPreConsume)
+	require.Equal(t, common.QuotaFromFloat(float64(preConsumedTokens)*2*0.35), quoteB.QuotaToPreConsume)
+}
+
+func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"tiered-test-model":"tiered_expr"}`,
+		"billing_setting.billing_expr": `{"tiered-test-model":"param(\"stream\") == true ? tier(\"stream\", p * 3) : tier(\"base\", p * 2)"}`,
+	}))
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/api/channel/test/1", nil)
+	req.Body = nil
+	req.ContentLength = 0
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	ctx.Set("group", "default")
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "tiered-test-model",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		RequestHeaders:  map[string]string{"Content-Type": "application/json"},
+		BillingRequestInput: &billingexpr.RequestInput{
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body:    []byte(`{"stream":true}`),
+		},
+	}
+
+	priceData, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	require.Equal(t, 1500, priceData.QuotaToPreConsume)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	require.Equal(t, "stream", info.TieredBillingSnapshot.EstimatedTier)
+	require.Equal(t, billing_setting.BillingModeTieredExpr, info.TieredBillingSnapshot.BillingMode)
+	require.Equal(t, common.QuotaPerUnit, info.TieredBillingSnapshot.QuotaPerUnit)
+}
+
+func TestModelPriceHelperTieredPreConsumeMaxTokensFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":    `{"tiered-fallback-model":"tiered_expr"}`,
+		"billing_setting.billing_expr":    `{"tiered-fallback-model":"tier(\"base\", p * 3 + c * 15)"}`,
+		"group_ratio_setting.group_ratio": `{"default":1,"free":0}`,
+	}))
+
+	const promptTokens = 1000
+
+	cases := []struct {
+		name      string
+		group     string
+		maxTokens int
+		expected  int
+	}{
+		{
+			// max_tokens omitted in a paid group -> fall back to 8192 completion tokens.
+			// p*3 + c*15 = 1000*3 + 8192*15 = 125880 -> /1e6 * 500000 = 62940
+			name:      "non-free group falls back to 8192 completion tokens",
+			group:     "default",
+			maxTokens: 0,
+			expected:  62940,
+		},
+		{
+			// explicit max_tokens is used verbatim, no fallback.
+			// 1000*3 + 100*15 = 4500 -> /1e6 * 500000 = 2250
+			name:      "explicit max_tokens is used verbatim",
+			group:     "default",
+			maxTokens: 100,
+			expected:  2250,
+		},
+		{
+			// free group (ratio 0) stays zero; fallback is gated on non-zero group ratio.
+			name:      "free group stays zero without fallback",
+			group:     "free",
+			maxTokens: 0,
+			expected:  0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req.Header.Set("Content-Type", "application/json")
+			ctx.Request = req
+			ctx.Set("group", tc.group)
+
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "tiered-fallback-model",
+				UserGroup:       tc.group,
+				UsingGroup:      tc.group,
+				RequestHeaders:  map[string]string{"Content-Type": "application/json"},
+				BillingRequestInput: &billingexpr.RequestInput{
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    []byte(`{}`),
+				},
+			}
+
+			priceData, err := ModelPriceHelper(ctx, info, promptTokens, &types.TokenCountMeta{MaxTokens: tc.maxTokens})
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, priceData.QuotaToPreConsume)
+		})
+	}
+}

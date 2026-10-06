@@ -1,0 +1,1121 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type smartRouteDecisionStatusFixture struct {
+	engine        *SmartRouterEngine
+	setting       smartroutersetting.Setting
+	state         *MemorySmartRouteStateStore
+	routesByGroup map[string]smartrouter.CertifiedRoute
+}
+
+type countingSmartRouteStateStore struct {
+	SmartRouteStateStore
+	snapshotCalls int
+}
+
+func (store *countingSmartRouteStateStore) Snapshot(
+	ctx context.Context,
+	request SmartRouteStateSnapshotRequest,
+) (SmartRouteRuntimeSnapshot, error) {
+	store.snapshotCalls++
+	return store.SmartRouteStateStore.Snapshot(ctx, request)
+}
+
+func newSmartRouteDecisionStatusFixture(
+	t *testing.T,
+	groupRatios map[string]*float64,
+) smartRouteDecisionStatusFixture {
+	t.Helper()
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalCompletionRatios := ratio_setting.CompletionRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(originalCompletionRatios))
+	})
+	groupDescriptions := make(map[string]string, len(groupRatios))
+	ratios := make(map[string]float64, len(groupRatios))
+	for group, ratio := range groupRatios {
+		groupDescriptions[group] = group
+		if ratio != nil {
+			ratios[group] = *ratio
+		}
+	}
+	encodedGroups, err := json.Marshal(groupDescriptions)
+	require.NoError(t, err)
+	encodedRatios, err := json.Marshal(ratios)
+	require.NoError(t, err)
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(string(encodedGroups)))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(encodedRatios)))
+	// Status-price tests need an explicit global price. Production routing must
+	// not revive the retired implicit 1x fallback for an unpriced model.
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"claude-opus":2.5}`))
+	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"claude-opus":6}`))
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeAnthropic)
+	setting.DefaultMaxEffectiveRatioPPM = 100_000
+	setting.AbsoluteMaxEffectiveRatioPPM = 1_000_000
+	setting.MaxFailureThreshold = 10
+	setting.BackgroundProbeEnabled = true
+	setting.DefaultPolicy.MaxEffectiveRatioPPM = 0
+	setting.DefaultPolicy.AllowFutureGroups = true
+	setting.DefaultPolicy.ManualGroupOrder = nil
+
+	priority := int64(10)
+	source := &staticCatalogSource{}
+	channelID := 1
+	for group := range groupRatios {
+		source.abilities = append(source.abilities, model.Ability{
+			Group: group, Model: "claude-opus", ChannelId: channelID,
+			Enabled: true, Priority: &priority, Weight: 100,
+		})
+		source.channels = append(source.channels, model.Channel{
+			Id: channelID, Type: constant.ChannelTypeAnthropic, Status: common.ChannelStatusEnabled,
+		})
+		channelID++
+	}
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	t.Cleanup(catalogs.Close)
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	contract := onlyContract(t, *catalog)
+	routesByGroup := make(map[string]smartrouter.CertifiedRoute)
+	for _, route := range contract.Pools[SmartRouteAutoDiscoveredPool].Candidates {
+		routesByGroup[route.Group] = route
+	}
+	prices := NewPriceSnapshotManager(catalogs, NewAPIRouteRatioSource{})
+	t.Cleanup(prices.Close)
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	engine, err := NewSmartRouterEngine(
+		catalogs, prices, state, NewMemorySmartRouteAffinityStore(nil, 100),
+		func() smartroutersetting.Setting { return setting },
+	)
+	require.NoError(t, err)
+	return smartRouteDecisionStatusFixture{
+		engine: engine, setting: setting, state: state, routesByGroup: routesByGroup,
+	}
+}
+
+func smartRouteTestRatio(value float64) *float64 { return &value }
+
+func smartRouteStatusActualCostProfile(
+	route smartrouter.CertifiedRoute,
+	regularTokens int64,
+	cacheReadTokens int64,
+	nowMS int64,
+) (string, smartrouter.ActualInputCostProfile) {
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointMessages}).UsageSemantic()
+	key := smartrouter.ActualInputCostKey(
+		route.CacheNamespaceIdentity(), route.UpstreamModel,
+		"claude-opus", SmartEndpointMessages, usageSemantic,
+	)
+	return key, smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			Key: key, TotalInputTokens: regularTokens + cacheReadTokens,
+			RegularInputTokens: regularTokens, CacheReadTokens: cacheReadTokens, Reliable: true,
+		},
+		nowMS,
+	)
+}
+
+func TestSmartRouteStatusCoverageReportsCurrentBackupsAndGap(t *testing.T) {
+	plan := smartrouter.PlanResult{
+		RouteID: "primary",
+		Candidates: []smartrouter.Candidate{
+			{Route: smartrouter.CertifiedRoute{RouteID: "primary", Group: "plus", FailureDomain: "pool-a"}, RatioPPM: 50_000, Admission: smartrouter.AdmissionNormal},
+			{Route: smartrouter.CertifiedRoute{RouteID: "backup", Group: "pro", FailureDomain: "pool-b"}, RatioPPM: 80_000, Admission: smartrouter.AdmissionNormal},
+		},
+	}
+
+	coverage := smartRouteStatusCoverage(plan, 3, nil, nil)
+	assert.Equal(t, 3, coverage.Target)
+	assert.Equal(t, 2, coverage.CandidateRoutes)
+	assert.Equal(t, 2, coverage.DistinctFailureDomains)
+	assert.Equal(t, 1, coverage.Missing)
+	assert.False(t, coverage.Complete)
+	require.Len(t, coverage.Candidates, 2)
+	assert.True(t, coverage.Candidates[0].Selected)
+	assert.Equal(t, "plus", coverage.Candidates[0].Group)
+	assert.False(t, coverage.Candidates[1].Selected)
+	assert.Equal(t, "pro", coverage.Candidates[1].Group)
+}
+
+func TestUserDecisionStatusUsesActualInputCostOrderingAndShowsOnlyRealEvidence(t *testing.T) {
+	originalCacheRatios := ratio_setting.CacheRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateCacheRatioByJSONString(originalCacheRatios))
+	})
+	require.NoError(t, ratio_setting.UpdateCacheRatioByJSONString(`{"claude-opus":0.1}`))
+
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"static-cheap": smartRouteTestRatio(0.1),
+		"cache-rich":   smartRouteTestRatio(0.2),
+	})
+	nowMS := time.Now().UnixMilli()
+	fixture.state.mu.Lock()
+	for _, route := range fixture.routesByGroup {
+		fixture.state.quality[route.RouteID] = smartrouter.QualityState{
+			Phase: smartrouter.QualityHealthy, ReliabilityPPM: 900_000,
+			ReliabilitySamples: 20, TotalSuccesses: 20, RealSuccesses: 20,
+			LastUpdatedMS: nowMS, LastSuccessMS: nowMS, LastRealSuccessMS: nowMS,
+		}
+	}
+	fixture.state.mu.Unlock()
+
+	staticKey, staticProfile := smartRouteStatusActualCostProfile(
+		fixture.routesByGroup["static-cheap"], 100, 0, nowMS,
+	)
+	cacheKey, cacheProfile := smartRouteStatusActualCostProfile(
+		fixture.routesByGroup["cache-rich"], 0, 100, nowMS,
+	)
+	fixture.engine.ActualInputCosts = visibilitySnapshotStore{snapshot: smartrouter.ActualInputCostSnapshot{
+		staticKey: staticProfile, cacheKey: cacheProfile,
+	}}
+
+	policy := fixture.setting.DefaultPolicy
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.MaxEffectiveRatioPPM = 300_000
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 42, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+		Page: 1, PageSize: 100, IncludeExcluded: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.True(t, report.EffectivePolicy.ActualInputCostRanking)
+	assert.True(t, report.EffectivePolicy.ActualInputCostSnapshotReady)
+	assert.Equal(t, "cache-rich", report.Preference.Group,
+		"the status planner must choose the route with lower observed input cost, not lower static price")
+	assert.Equal(t, "recent_actual_input_cost", report.Preference.RankingCostBasis)
+	assert.Equal(t, smartrouter.ActualInputCostObserved, report.Preference.RankingCostSource)
+	assert.True(t, report.Preference.RankingCostUsed)
+	require.NotNil(t, report.Preference.RecentCacheRatePPM)
+	assert.Equal(t, int64(1_000_000), *report.Preference.RecentCacheRatePPM)
+	require.NotNil(t, report.Preference.RoutingCacheWeightPPM)
+	assert.Equal(t, int64(1_000_000), *report.Preference.RoutingCacheWeightPPM)
+	require.NotNil(t, report.Preference.PredictedInputCostPPM)
+	require.NotNil(t, report.Preference.PredictedInputUSDPerMillion)
+	require.NotNil(t, report.Preference.EstimatedInputCostPPM)
+	require.NotNil(t, report.Preference.EstimatedInputUSDPerMillion)
+	assert.Equal(t, int64(1), report.Preference.ActualInputCostSamples)
+
+	items := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	staticItem, cacheItem := items["static-cheap"], items["cache-rich"]
+	require.NotNil(t, staticItem.Price)
+	require.NotNil(t, cacheItem.Price)
+	assert.Less(t, staticItem.Price.ScorePPM, cacheItem.Price.ScorePPM,
+		"the fixture must prove that static price alone would choose the other group")
+	assert.Equal(t, 1, cacheItem.SelectionRank)
+	assert.Equal(t, 2, staticItem.SelectionRank)
+	assert.Equal(t, "more_expensive", staticItem.RankingCostComparison)
+	assert.Equal(t, "equal", cacheItem.RankingCostComparison)
+	require.NotNil(t, staticItem.RecentCacheRatePPM)
+	assert.Zero(t, *staticItem.RecentCacheRatePPM, "a measured zero cache rate must not become missing evidence")
+	require.NotNil(t, staticItem.EstimatedInputCostPPM)
+	require.NotNil(t, cacheItem.EstimatedInputCostPPM)
+	assert.Greater(t, *staticItem.EstimatedInputCostPPM, *cacheItem.EstimatedInputCostPPM)
+}
+
+func TestUserDecisionStatusShowsColdStartPriorAndKeepsExplicitOptOutStatic(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"cheap": smartRouteTestRatio(0.1), "expensive": smartRouteTestRatio(0.2),
+	})
+	nowMS := time.Now().UnixMilli()
+	fixture.state.mu.Lock()
+	for _, route := range fixture.routesByGroup {
+		fixture.state.quality[route.RouteID] = smartrouter.QualityState{
+			Phase: smartrouter.QualityHealthy, ReliabilityPPM: 900_000,
+			ReliabilitySamples: 20, TotalSuccesses: 20, RealSuccesses: 20,
+			LastUpdatedMS: nowMS, LastSuccessMS: nowMS, LastRealSuccessMS: nowMS,
+		}
+	}
+	fixture.state.mu.Unlock()
+	fixture.engine.ActualInputCosts = visibilitySnapshotStore{snapshot: smartrouter.ActualInputCostSnapshot{}}
+
+	policy := fixture.setting.DefaultPolicy
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.MaxEffectiveRatioPPM = 300_000
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 42, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	assert.True(t, report.EffectivePolicy.ActualInputCostSnapshotReady)
+	for _, item := range report.Items {
+		assert.Equal(t, smartrouter.ActualInputCostOptimistic, item.RankingCostSource)
+		assert.Equal(t, "recent_actual_input_cost", item.RankingCostBasis)
+		assert.True(t, item.RankingCostUsed)
+		assert.NotNil(t, item.RoutingCacheWeightPPM)
+		assert.NotNil(t, item.PredictedInputCostPPM)
+		assert.NotNil(t, item.PredictedInputUSDPerMillion)
+		assert.NotNil(t, item.EstimatedInputCostPPM)
+		assert.NotNil(t, item.EstimatedInputUSDPerMillion)
+		assert.Zero(t, item.ActualInputCostSamples)
+	}
+
+	disabled := false
+	policy.ActualInputCostRanking = &disabled
+	key, profile := smartRouteStatusActualCostProfile(fixture.routesByGroup["expensive"], 0, 100, nowMS)
+	fixture.engine.ActualInputCosts = visibilitySnapshotStore{snapshot: smartrouter.ActualInputCostSnapshot{key: profile}}
+	report, err = fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 42, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.False(t, report.EffectivePolicy.ActualInputCostRanking)
+	assert.Equal(t, "cheap", report.Preference.Group, "explicit opt-out must keep static ordering")
+	expensive := map[string]SmartRouteUserStatusItem{}
+	for _, item := range report.Items {
+		expensive[item.Group] = item
+	}
+	assert.Equal(t, "static_price", expensive["expensive"].RankingCostBasis)
+	assert.False(t, expensive["expensive"].RankingCostUsed)
+	assert.Equal(t, smartrouter.ActualInputCostObserved, expensive["expensive"].RankingCostSource)
+	assert.NotNil(t, expensive["expensive"].RecentCacheRatePPM,
+		"real observations remain visible as reference when ordering is disabled")
+}
+
+func TestUserStatusReportRestoresAutomaticBlocksAndKeepsManualBlocksHidden(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+	})
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{
+		"economy":"Economy","fallback":"Fallback","manual":"Manual","normal":"Normal"
+	}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{
+		"economy":0.02,"fallback":0.03,"manual":0.04,"normal":0.05
+	}`))
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeAnthropic)
+	setting.DefaultPolicy.MaxEffectiveRatioPPM = 100_000
+	source := smartCatalogFixture("claude-opus", constant.ChannelTypeAnthropic)
+	source.abilities = append(source.abilities,
+		model.Ability{Group: "manual", Model: "claude-opus", ChannelId: 3, Enabled: true},
+		model.Ability{Group: "normal", Model: "claude-opus", ChannelId: 4, Enabled: true},
+	)
+	source.channels = append(source.channels,
+		model.Channel{Id: 3, Type: constant.ChannelTypeAnthropic, Status: common.ChannelStatusEnabled},
+		model.Channel{Id: 4, Type: constant.ChannelTypeAnthropic, Status: common.ChannelStatusEnabled},
+	)
+
+	initial, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	contract := onlyContract(t, initial)
+	routesByGroup := make(map[string]smartrouter.CertifiedRoute)
+	for _, route := range contract.Pools[SmartRouteAutoDiscoveredPool].Candidates {
+		routesByGroup[route.Group] = route
+	}
+	require.Len(t, routesByGroup, 4)
+	makeBlock := func(group, sourceName string) model.SmartRouteBlock {
+		route := routesByGroup[group]
+		return model.SmartRouteBlock{
+			Scope: SmartRouteBlockScopeRoute, RouteId: route.RouteID,
+			Group: group, ChannelId: route.ChannelID,
+			ContractId: contract.Contract.ContractID, Endpoint: contract.Contract.Endpoint,
+			Source: sourceName, CreatedAt: 1_725_000_000, Epoch: 7,
+		}
+	}
+	source.blocks = []model.SmartRouteBlock{
+		makeBlock("economy", SmartRouteBlockSourceAutoHealth),
+		makeBlock("fallback", SmartRouteBlockSourceManual),
+		makeBlock("manual", SmartRouteBlockSourceModel404),
+	}
+
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	t.Cleanup(catalogs.Close)
+	prices := NewPriceSnapshotManager(catalogs, NewAPIRouteRatioSource{})
+	t.Cleanup(prices.Close)
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	engine, err := NewSmartRouterEngine(
+		catalogs, prices, state, NewMemorySmartRouteAffinityStore(nil, 100),
+		func() smartroutersetting.Setting { return setting },
+	)
+	require.NoError(t, err)
+	state.mu.Lock()
+	state.quality[routesByGroup["economy"].RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, Epoch: 7,
+		TotalSuccesses: 4, TotalHardFailures: 2,
+		LastProbeAtMS: 1_725_000_123_000, LastProbeOutcome: smartrouter.OutcomeInfrastructure,
+		LastProbeHTTPStatus: 503, LastProbeErrorSummary: "temporary upstream outage",
+		NextProbeAtMS: 1_725_000_183_000,
+	}
+	state.mu.Unlock()
+
+	report, err := engine.UserStatusReport(
+		context.Background(), "", setting.DefaultPolicy, "claude-opus", SmartEndpointMessages,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, SmartRouteUserStatusSchemaVersion, report.SchemaVersion)
+	assert.Equal(t, "preference_snapshot", report.Kind)
+	assert.True(t, report.Assumptions.PreferenceSnapshot)
+	assert.Equal(t, int64(100_000), report.EffectivePolicy.MaxEffectiveRatioPPM)
+	require.Len(t, report.Items, 3)
+	itemsByGroup := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		itemsByGroup[item.Group] = item
+	}
+	recovering, ok := itemsByGroup["economy"]
+	require.True(t, ok)
+	assert.False(t, recovering.Quarantined)
+	assert.Equal(t, smartrouter.QualityOpen, recovering.Phase)
+	assert.False(t, recovering.RequiresAdminReview)
+	assert.True(t, recovering.PriceKnown)
+	assert.Equal(t, int64(20_000), recovering.EffectiveRatioPPM)
+	assert.NotEqual(t, "waiting_for_admin_review", recovering.SkippedReason)
+	assert.NotEqual(t, "no", recovering.Recovery.AutomaticCandidateReentry)
+	normal, normalVisible := itemsByGroup["normal"]
+	assert.True(t, normalVisible)
+	assert.Equal(t, "available_unproven", normal.Availability,
+		"an authorized, priced route with no samples is usable for safe text")
+	assert.Nil(t, normal.SuccessRate, "no evidence must serialize as null, never 0 percent")
+	_, manualVisible := itemsByGroup["fallback"]
+	assert.False(t, manualVisible)
+	model404, model404Visible := itemsByGroup["manual"]
+	assert.True(t, model404Visible)
+	assert.False(t, model404.Quarantined)
+	assert.False(t, model404.RequiresAdminReview)
+	assert.NotEqual(t, "no", model404.Recovery.AutomaticCandidateReentry)
+
+	encoded, err := json.Marshal(report)
+	require.NoError(t, err)
+	for _, route := range routesByGroup {
+		assert.NotContains(t, string(encoded), route.RouteID)
+		assert.NotContains(t, string(encoded), route.ChannelGeneration)
+	}
+	assert.Contains(t, string(encoded), contract.Contract.ContractID, "the canonical contract hash is safe and keeps frontend tabs stable")
+
+	index, err := engine.UserStatusModelIndex(context.Background(), SmartRouteUserModelIndexRequest{
+		TokenID: 1, Policy: setting.DefaultPolicy, Query: "CLAUDE",
+	})
+	require.NoError(t, err)
+	require.Len(t, index.Items, 1)
+	// Legacy auto-health evidence is recoverable state in V4.4, not a
+	// permanent administrator review item. Only explicit manual blocks remain
+	// in the review bucket.
+	assert.Equal(t, 0, index.Items[0].NeedsReviewGroups)
+	assert.Equal(t, "claude-opus", index.Items[0].Model)
+	indexJSON, err := json.Marshal(index)
+	require.NoError(t, err)
+	assert.NotContains(t, string(indexJSON), routesByGroup["economy"].RouteID)
+	assert.Contains(t, string(indexJSON), contract.Contract.ContractID)
+
+	health, err := engine.HealthReport(context.Background())
+	require.NoError(t, err)
+	var adminItem *SmartRouteHealthItem
+	for index := range health.Items {
+		if health.Items[index].RouteID == routesByGroup["economy"].RouteID {
+			adminItem = &health.Items[index]
+			break
+		}
+	}
+	require.NotNil(t, adminItem)
+	assert.False(t, adminItem.Quarantined)
+	assert.Equal(t, smartrouter.QualityOpen, adminItem.Phase)
+	assert.False(t, adminItem.RequiresAdminReview)
+	assert.Equal(t, int64(1_725_000_123_000), adminItem.LastProbeAtMS)
+	assert.Equal(t, int64(1_725_000_183_000), adminItem.NextProbeAtMS)
+	assert.Equal(t, 503, adminItem.LastProbeHTTPStatus)
+	assert.Equal(t, uint64(4), adminItem.Successes)
+	assert.Equal(t, uint64(2), adminItem.Failures)
+}
+
+func TestUserDecisionStatusUsesEffectivePolicyAndKeepsCheaperExcludedGroups(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"cheap": smartRouteTestRatio(0.02), "fallback": smartRouteTestRatio(0.08), "missing": nil,
+	})
+	nowMS := time.Now().UnixMilli()
+	fixture.state.mu.Lock()
+	for _, route := range fixture.routesByGroup {
+		fixture.state.quality[route.RouteID] = smartrouter.QualityState{
+			Phase: smartrouter.QualityHealthy, Epoch: 1, ReliabilityPPM: 900_000,
+			ReliabilitySamples: 20, TotalSuccesses: 20, RealSuccesses: 20,
+			LastUpdatedMS: nowMS, LastSuccessMS: nowMS, LastRealSuccessMS: nowMS,
+		}
+	}
+	fixture.state.mu.Unlock()
+
+	policy := fixture.setting.DefaultPolicy
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.AllowFutureGroups = false
+	policy.ManualGroupOrder = []string{"fallback"}
+	policy.MaxEffectiveRatioPPM = 0
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 42, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+		Page: 1, PageSize: 100, IncludeExcluded: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "fallback", report.Preference.Group)
+	assert.Equal(t, int64(100_000), report.EffectivePolicy.MaxEffectiveRatioPPM, "zero key cap must inherit the site default")
+	assert.False(t, report.EffectivePolicy.AttemptLimitEnabled)
+
+	items := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	cheap := items["cheap"]
+	assert.True(t, cheap.CheaperThanPreference)
+	assert.Equal(t, "cheaper", cheap.PriceComparison)
+	assert.Equal(t, string(smartrouter.RejectGroupNotSelected), cheap.ReasonCode)
+	assert.Equal(t, "rejected", cheap.Decision)
+	assert.False(t, cheap.Constraints.GroupSelected)
+	missing := items["missing"]
+	assert.False(t, missing.PriceKnown)
+	assert.Equal(t, string(smartrouter.RejectGroupNotSelected), missing.ReasonCode, "scope rejection precedes missing price exactly as planner does")
+	assert.NotNil(t, items["fallback"].SuccessRate)
+
+	encoded, err := json.Marshal(report)
+	require.NoError(t, err)
+	for _, route := range fixture.routesByGroup {
+		assert.NotContains(t, string(encoded), route.RouteID)
+		assert.NotContains(t, string(encoded), route.ChannelGeneration)
+	}
+}
+
+func TestUserDecisionStatusUsesRealModelPriceInsteadOfRatioForCheaperEvidence(t *testing.T) {
+	originalPricing := billing_setting.GetGroupModelPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalPricing)
+		require.NoError(t, err)
+	})
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{
+			"lower-cap":{"claude-opus":{"billing_mode":"fixed_price","model_price":10}},
+			"lower-real-price":{"claude-opus":{"billing_mode":"fixed_price","model_price":1}}
+		}
+	}`)
+	require.NoError(t, err)
+
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"lower-cap": smartRouteTestRatio(0.1), "lower-real-price": smartRouteTestRatio(0.2),
+	})
+	nowMS := time.Now().UnixMilli()
+	fixture.state.mu.Lock()
+	for _, route := range fixture.routesByGroup {
+		fixture.state.quality[route.RouteID] = smartrouter.QualityState{
+			Phase: smartrouter.QualityHealthy, Epoch: 1, ReliabilityPPM: 900_000,
+			ReliabilitySamples: 20, TotalSuccesses: 20, RealSuccesses: 20,
+			LastUpdatedMS: nowMS, LastSuccessMS: nowMS, LastRealSuccessMS: nowMS,
+		}
+	}
+	fixture.state.mu.Unlock()
+
+	policy := fixture.setting.DefaultPolicy
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.MaxEffectiveRatioPPM = 300_000
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 42, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+		Page: 1, PageSize: 100, IncludeExcluded: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "lower-real-price", report.Preference.Group)
+	assert.Equal(t, int64(200_000), report.Preference.Price.ScorePPM)
+
+	items := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	lowerCap := items["lower-cap"]
+	require.NotNil(t, lowerCap.Price)
+	assert.Equal(t, int64(1_000_000), lowerCap.Price.ScorePPM)
+	assert.Equal(t, "more_expensive", lowerCap.PriceComparison)
+	assert.False(t, lowerCap.CheaperThanPreference)
+	assert.Equal(t, int64(100_000), lowerCap.EffectiveRatioPPM, "the compatibility ratio remains the lower Key ceiling")
+}
+
+func TestSmartRouteStatusPriceComparisonRejectsDifferentBillingClasses(t *testing.T) {
+	perSecond := &smartrouter.RoutePrice{
+		BillingMode: "fixed_price", BillingUnit: "per_second", ComparisonClass: "fixed:second",
+		ScorePPM: 1, StaticComparable: true,
+	}
+	perRequest := &smartrouter.RoutePrice{
+		BillingMode: "fixed_price", BillingUnit: "per_request", ComparisonClass: "fixed:request",
+		ScorePPM: 10_000_000, StaticComparable: true,
+	}
+
+	comparison, reason := smartRouteStatusPriceComparison(perSecond, perRequest)
+	assert.Equal(t, "incomparable", comparison)
+	assert.Equal(t, "different_comparison_class", reason)
+}
+
+func TestUserDecisionStatusIgnoresFailureThresholdAndRecoversOnFirstSuccess(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"cheap": smartRouteTestRatio(0.02), "fallback": smartRouteTestRatio(0.08),
+	})
+	nowMS := time.Now().UnixMilli()
+	cheapRoute := fixture.routesByGroup["cheap"]
+	fallbackRoute := fixture.routesByGroup["fallback"]
+	fixture.state.mu.Lock()
+	fixture.state.quality[cheapRoute.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityDegraded, Epoch: 1, ReliabilityPPM: 700_000,
+		ReliabilitySamples: 5, TotalSuccesses: 4, TotalHardFailures: 1,
+		RealSuccesses: 4, RealHardFailures: 1, ConsecutiveHardFailures: 1,
+		LastFailureMS: nowMS, LastRealFailureMS: nowMS, LastUpdatedMS: nowMS,
+		FailureWindowUntilMS: nowMS + 60_000, SampleDueAtMS: nowMS + 30_000,
+	}
+	fixture.state.quality[fallbackRoute.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy, Epoch: 1, ReliabilityPPM: 950_000,
+		ReliabilitySamples: 20, TotalSuccesses: 20, RealSuccesses: 20,
+		LastSuccessMS: nowMS, LastRealSuccessMS: nowMS, LastUpdatedMS: nowMS,
+	}
+	fixture.state.mu.Unlock()
+
+	policy := fixture.setting.DefaultPolicy
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.FailureThreshold = 3
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 7, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "cheap", report.Preference.Group)
+	items := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Equal(t, "degraded_usable", items["cheap"].PrimaryState)
+	assert.Equal(t, "available_degraded", items["cheap"].Availability)
+	assert.Equal(t, "selected_lowest_price_available", items["cheap"].ReasonCode)
+	assert.False(t, items["cheap"].CheaperThanPreference)
+	assert.Equal(t, "none", items["cheap"].Recovery.NextAction)
+	assert.Zero(t, items["cheap"].Recovery.NextActionAtMS)
+
+	fixture.state.mu.Lock()
+	opened := fixture.state.quality[cheapRoute.RouteID]
+	opened.Phase = smartrouter.QualityOpen
+	opened.ConsecutiveHardFailures = smartrouter.DefaultSharedOpenFailureThreshold
+	opened.NextProbeAtMS = nowMS + 10_000
+	opened.WarmingTrafficPPM = 0
+	fixture.state.quality[cheapRoute.RouteID] = opened
+	fixture.state.mu.Unlock()
+	report, err = fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 7, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "fallback", report.Preference.Group)
+	items = make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Equal(t, "unavailable", items["cheap"].PrimaryState)
+	assert.Equal(t, "open_waiting", items["cheap"].Availability)
+	assert.Equal(t, string(smartrouter.RejectHealthUnavailable), items["cheap"].ReasonCode)
+	assert.True(t, items["cheap"].CheaperThanPreference)
+	assert.Equal(t, "recovery_probe", items["cheap"].Recovery.NextAction)
+	assert.Greater(t, items["cheap"].Recovery.NextActionAtMS, nowMS)
+	assert.LessOrEqual(t, items["cheap"].Recovery.NextActionAtMS-nowMS, smartrouter.MaximumRecoveryProbeIntervalMS)
+
+	policy.FailureThreshold = 1
+
+	fixture.state.mu.Lock()
+	recovered := fixture.state.quality[cheapRoute.RouteID]
+	recovered.ConsecutiveHardFailures = 0
+	recovered.LastSuccessMS = nowMS + 1
+	recovered.LastOutcome = smartrouter.OutcomeSuccess
+	fixture.state.quality[cheapRoute.RouteID] = recovered
+	fixture.state.mu.Unlock()
+	report, err = fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 7, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "cheap", report.Preference.Group,
+		"one newer success must restore the cheaper route regardless of the old threshold")
+	items = make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Equal(t, "healthy", items["cheap"].PrimaryState)
+	assert.Equal(t, "none", items["cheap"].Recovery.ProbeState)
+	assert.Equal(t, "none", items["cheap"].Recovery.NextAction)
+	assert.Zero(t, items["cheap"].Recovery.NextActionAtMS)
+	assert.Zero(t, items["cheap"].SampleDueAtMS)
+}
+
+func TestUserDecisionStatusNormalizesLegacyUnknownUnavailableAndCapacity(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"cheap": smartRouteTestRatio(0.02), "fallback": smartRouteTestRatio(0.08),
+	})
+	nowMS := time.Now().UnixMilli()
+	cheapRoute := fixture.routesByGroup["cheap"]
+	fallbackRoute := fixture.routesByGroup["fallback"]
+	policy := fixture.setting.DefaultPolicy
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.RecoveryProfile = smartrouter.RecoveryBalanced
+	fixture.state.mu.Lock()
+	fixture.state.quality[cheapRoute.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityWarming, Epoch: 2, ReliabilityPPM: 700_000,
+		ReliabilitySamples: 3, TotalSuccesses: 2, TotalHardFailures: 1,
+		WarmingEpoch: 1, WarmingTrafficPPM: 100_000, StableSinceMS: nowMS,
+		SampleDueAtMS: nowMS + 30_000, LastUpdatedMS: nowMS,
+	}
+	fixture.state.quality[fallbackRoute.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy, Epoch: 1, ReliabilityPPM: 900_000,
+		ReliabilitySamples: 10, TotalSuccesses: 10, RealSuccesses: 10, LastUpdatedMS: nowMS,
+	}
+	fixture.state.mu.Unlock()
+
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 99, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "cheap", report.Preference.Group,
+		"legacy warming without evidence is unknown and immediately usable")
+	items := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Equal(t, "selected_lowest_price_available", items["cheap"].ReasonCode)
+	assert.Equal(t, "unknown", items["cheap"].PrimaryState)
+	assert.Equal(t, "available_unproven", items["cheap"].Availability)
+	assert.Equal(t, "not_needed", items["cheap"].Recovery.ProbeState)
+	assert.Equal(t, "natural_traffic", items["cheap"].Recovery.NextAction)
+	assert.Zero(t, items["cheap"].Recovery.NextActionAtMS)
+	assert.Zero(t, items["cheap"].SampleDueAtMS)
+	assert.Equal(t, "not_needed", items["cheap"].Recovery.AutomaticCandidateReentry)
+
+	fixture.state.mu.Lock()
+	fixture.state.quality[cheapRoute.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, Epoch: 2, ReliabilityPPM: 500_000,
+		ReliabilitySamples: 2, TotalSuccesses: 1, TotalHardFailures: 1,
+		NextProbeAtMS: nowMS + 60_000, LastUpdatedMS: nowMS,
+	}
+	fixture.state.mu.Unlock()
+	report, err = fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 99, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	items = make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Equal(t, "open_waiting", items["cheap"].Availability)
+	assert.Equal(t, "unavailable", items["cheap"].PrimaryState)
+	assert.NotEqual(t, "healthy", items["cheap"].PrimaryState)
+
+	fixture.state.mu.Lock()
+	fixture.state.quality[cheapRoute.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy, Epoch: 3, ReliabilityPPM: 900_000,
+		ReliabilitySamples: 20, TotalSuccesses: 20, RealSuccesses: 20,
+		LastUpdatedMS: nowMS,
+	}
+	fixture.state.capacity[cheapRoute.CapacityDomain] = &memorySmartRouteCapacity{
+		blockedUntilMS: nowMS + 60_000, leases: map[string]int64{},
+	}
+	fixture.state.mu.Unlock()
+	report, err = fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 99, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.Preference)
+	assert.Equal(t, "fallback", report.Preference.Group)
+	items = make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Equal(t, "healthy", items["cheap"].PrimaryState, "capacity pressure must not poison shared health")
+	assert.Equal(t, "capacity_busy", items["cheap"].Availability)
+	assert.Equal(t, "capacity_release", items["cheap"].Recovery.NextAction)
+	assert.Equal(t, 1, items["cheap"].SelectionRank)
+	assert.Equal(t, 2, items["fallback"].SelectionRank)
+	require.GreaterOrEqual(t, len(report.Items), 2)
+	assert.Equal(t, "cheap", report.Items[0].Group, "candidate rank must remain visible even when capacity selects rank two")
+	assert.Equal(t, "fallback", report.Items[1].Group)
+	assert.True(t, report.Items[1].Selected)
+}
+
+func TestUserDecisionStatusReturnsNullSuccessRateForPendingSampleAndSeparatesEvidence(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"pending": smartRouteTestRatio(0.02), "observed": smartRouteTestRatio(0.08),
+	})
+	nowMS := time.Now().UnixMilli()
+	observed := fixture.routesByGroup["observed"]
+	fixture.state.mu.Lock()
+	fixture.state.quality[observed.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy, Epoch: 1,
+		TotalSuccesses: 3, TotalHardFailures: 1,
+		RealSuccesses: 2, RealHardFailures: 1, ProbeSuccesses: 1,
+		ReliabilitySamples: 4, ReliabilityPPM: 750_000,
+		LastRealSuccessMS: nowMS, LastRealOutcome: smartrouter.OutcomeSuccess,
+		LastProbeAtMS: nowMS - 1_000, LastProbeOutcome: smartrouter.OutcomeSuccess,
+		LastUpdatedMS: nowMS,
+	}
+	fixture.state.mu.Unlock()
+	report, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 1, Policy: fixture.setting.DefaultPolicy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	items := make(map[string]SmartRouteUserStatusItem)
+	for _, item := range report.Items {
+		items[item.Group] = item
+	}
+	assert.Nil(t, items["pending"].SuccessRate)
+	assert.Nil(t, items["pending"].Evidence.SuccessRate)
+	assert.Equal(t, "none", items["pending"].Evidence.Confidence)
+	assert.Equal(t, "unknown", items["pending"].PrimaryState,
+		"unknown means unobserved, not unavailable, for a certified safe-text route")
+	assert.Equal(t, uint64(2), items["observed"].Evidence.RealSuccesses)
+	assert.Equal(t, uint64(1), items["observed"].Evidence.RealHardFailures)
+	assert.Equal(t, uint64(1), items["observed"].Evidence.ProbeSuccesses)
+	assert.Equal(t, "low", items["observed"].Evidence.Confidence)
+}
+
+func TestUserStatusModelIndexUsesOneSnapshotAndRequiresAvailableGroupInKeyScope(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"cheap": smartRouteTestRatio(0.02), "fallback": smartRouteTestRatio(0.08),
+	})
+	nowMS := time.Now().UnixMilli()
+	cheap := fixture.routesByGroup["cheap"]
+	fallback := fixture.routesByGroup["fallback"]
+	fixture.state.mu.Lock()
+	fixture.state.quality[cheap.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy, ReliabilitySamples: 20, ReliabilityPPM: 990_000,
+		TotalSuccesses: 20, RealSuccesses: 20, LastUpdatedMS: nowMS,
+	}
+	fixture.state.quality[fallback.RouteID] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, ReliabilitySamples: 3, ReliabilityPPM: 300_000,
+		TotalSuccesses: 1, TotalHardFailures: 2, RealSuccesses: 1, RealHardFailures: 2,
+		ConsecutiveHardFailures: 2,
+		LastUpdatedMS:           nowMS, NextProbeAtMS: nowMS + 30_000,
+	}
+	fixture.state.mu.Unlock()
+
+	counter := &countingSmartRouteStateStore{SmartRouteStateStore: fixture.engine.State}
+	fixture.engine.State = counter
+	policy := fixture.setting.DefaultPolicy
+	policy.AllowFutureGroups = false
+	policy.FailureThreshold = 2
+	policy.ManualGroupOrder = []string{"fallback"}
+	report, err := fixture.engine.UserStatusModelIndex(context.Background(), SmartRouteUserModelIndexRequest{
+		TokenID: 17, Policy: policy, Query: "CLAUDE", Page: 1, PageSize: 1000,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, counter.snapshotCalls, "the whole index must use one shared runtime snapshot")
+	assert.Equal(t, smartRouteStatusMaxPageSize, report.PageSize)
+	assert.Equal(t, 1, report.Total)
+	require.Len(t, report.Items, 1)
+	item := report.Items[0]
+	assert.Equal(t, 2, item.GroupCount)
+	assert.Equal(t, []string{"cheap", "fallback"}, item.Groups)
+	assert.Equal(t, 1, item.InScopeGroupCount)
+	assert.Equal(t, 1, item.AvailableGroups)
+	assert.True(t, item.HasAvailableCandidate,
+		"the deployed recovery fallback can try an in-scope cooling route when no normal route remains")
+	assert.True(t, item.HasConditionalCandidate)
+	assert.Equal(t, 1, item.DispatchEligibleGroups)
+	assert.Equal(t, 1, item.ConditionalGroups)
+	assert.Equal(t, "serving_with_recovery", item.PrimaryState)
+
+	encoded, err := json.Marshal(report)
+	require.NoError(t, err)
+	for _, route := range fixture.routesByGroup {
+		assert.NotContains(t, string(encoded), route.RouteID)
+		assert.NotContains(t, string(encoded), route.ChannelGeneration)
+	}
+	assert.NotContains(t, string(encoded), "channel_id")
+	assert.NotContains(t, string(encoded), "upstream")
+
+	empty, err := fixture.engine.UserStatusModelIndex(context.Background(), SmartRouteUserModelIndexRequest{
+		TokenID: 17, Policy: policy, Query: "not-present", Page: 1, PageSize: 10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, counter.snapshotCalls)
+	assert.Zero(t, empty.Total)
+	assert.Empty(t, empty.Items)
+
+	policy.AllowFutureGroups = true
+	fixture.state.mu.Lock()
+	fixture.state.capacity[cheap.CapacityDomain] = &memorySmartRouteCapacity{
+		blockedUntilMS: nowMS + 60_000, leases: map[string]int64{},
+	}
+	fixture.state.capacity[fallback.CapacityDomain] = &memorySmartRouteCapacity{
+		blockedUntilMS: nowMS + 60_000, leases: map[string]int64{},
+	}
+	fixture.state.mu.Unlock()
+	busy, err := fixture.engine.UserStatusModelIndex(context.Background(), SmartRouteUserModelIndexRequest{
+		TokenID: 17, Policy: policy, Page: 1, PageSize: 10,
+	})
+	require.NoError(t, err)
+	require.Len(t, busy.Items, 1)
+	assert.True(t, busy.Items[0].HasAvailableCandidate, "recovery fallback may recheck temporary backoff; live inflight limits remain enforced by admission")
+	assert.True(t, busy.Items[0].HasConditionalCandidate, "capacity release is a conditional recovery path")
+}
+
+func TestUserStatusSeparatesCoolingHealthFromConditionalRecovery(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"fallback": smartRouteTestRatio(0.08),
+	})
+	nowMS := time.Now().UnixMilli()
+	route := fixture.routesByGroup["fallback"]
+	fixture.state.mu.Lock()
+	fixture.state.quality[route.RouteID] = smartrouter.QualityState{
+		Phase:                   smartrouter.QualityOpen,
+		Epoch:                   2,
+		ConsecutiveHardFailures: 1,
+		TotalHardFailures:       1,
+		LastFailureMS:           nowMS - 1_000,
+		NextProbeAtMS:           nowMS + 30_000,
+		LastUpdatedMS:           nowMS,
+	}
+	fixture.state.mu.Unlock()
+
+	policy := fixture.setting.DefaultPolicy
+	policy.FailureThreshold = 3
+	report, err := fixture.engine.UserStatusModelIndex(context.Background(), SmartRouteUserModelIndexRequest{
+		TokenID: 17, Policy: policy, Query: "claude-opus", Page: 1, PageSize: 10,
+	})
+	require.NoError(t, err)
+	require.Len(t, report.Items, 1)
+	assert.Zero(t, report.Items[0].AvailableGroups,
+		"cooldown does not count as healthy")
+	assert.True(t, report.Items[0].HasAvailableCandidate)
+	assert.True(t, report.Items[0].HasConditionalCandidate)
+	assert.Equal(t, 1, report.Items[0].DispatchEligibleGroups)
+	assert.Equal(t, 1, report.Items[0].ConditionalGroups)
+	assert.Equal(t, "serving_with_recovery", report.Items[0].PrimaryState)
+
+	status, err := fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 17, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.Len(t, status.Items, 1)
+	assert.Equal(t, "unavailable", status.Items[0].PrimaryState)
+	assert.Equal(t, "unavailable", status.Items[0].HealthState)
+	assert.Equal(t, "open_waiting", status.Items[0].Availability)
+	assert.Equal(t, "selected", status.Items[0].Decision)
+	assert.Equal(t, "safe_last_resort", status.Items[0].DispatchEligibility)
+	assert.Equal(t, "automatic_recovery_fallback", status.Items[0].DispatchReason)
+
+	disabled := false
+	setting := fixture.setting
+	setting.RecoveryFallbackEnabled = &disabled
+	fixture.engine.Settings = func() smartroutersetting.Setting { return setting }
+	status, err = fixture.engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 17, Policy: policy, Model: "claude-opus", Endpoint: SmartEndpointMessages,
+	})
+	require.NoError(t, err)
+	require.Len(t, status.Items, 1)
+	assert.Equal(t, "ineligible", status.Items[0].DispatchEligibility)
+}
+
+func TestUserStatusModelIndexKeepsSameModelEndpointsSeparate(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+	})
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"one":"One"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"one":0.03}`))
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse,
+	}
+	setting.TextContracts = []smartroutersetting.TextContractSetting{
+		{Endpoint: constant.EndpointTypeOpenAI, Capabilities: smartroutersetting.CapabilityText},
+		{Endpoint: constant.EndpointTypeOpenAIResponse, Capabilities: smartroutersetting.CapabilityText},
+	}
+	setting.DefaultMaxEffectiveRatioPPM = 100_000
+	setting.AbsoluteMaxEffectiveRatioPPM = 1_000_000
+	priority := int64(10)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{{
+			Group: "one", Model: "gpt-router-index", ChannelId: 1, Enabled: true, Priority: &priority,
+		}},
+		channels: []model.Channel{{
+			Id: 1, Type: constant.ChannelTypeXai, Status: common.ChannelStatusEnabled,
+		}},
+	}
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	t.Cleanup(catalogs.Close)
+	_, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	prices := NewPriceSnapshotManager(catalogs, NewAPIRouteRatioSource{})
+	t.Cleanup(prices.Close)
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	engine, err := NewSmartRouterEngine(
+		catalogs, prices, state, NewMemorySmartRouteAffinityStore(nil, 100),
+		func() smartroutersetting.Setting { return setting },
+	)
+	require.NoError(t, err)
+
+	report, err := engine.UserStatusModelIndex(context.Background(), SmartRouteUserModelIndexRequest{
+		TokenID: 3, Policy: setting.DefaultPolicy, Query: "router-index", Page: 1, PageSize: 100,
+	})
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, report.Total, 2)
+	seen := make(map[string]bool)
+	seenContracts := make(map[string]bool)
+	for _, item := range report.Items {
+		assert.Equal(t, "gpt-router-index", item.Model)
+		assert.False(t, seen[item.Endpoint], "each model + endpoint pair must appear once")
+		assert.NotEmpty(t, item.ContractID)
+		assert.False(t, seenContracts[item.ContractID], "each canonical contract must appear once")
+		seen[item.Endpoint] = true
+		seenContracts[item.ContractID] = true
+	}
+	assert.True(t, seen[SmartEndpointChat])
+	assert.True(t, seen[SmartEndpointResponses])
+}
+
+func TestUserDecisionStatusDoesNotInventRowsFromAnotherContract(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+	})
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"chat":"Chat","responses":"Responses"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"chat":0.03,"responses":0.02}`))
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse,
+	}
+	setting.TextContracts = []smartroutersetting.TextContractSetting{
+		{Endpoint: constant.EndpointTypeOpenAI, Capabilities: smartroutersetting.CapabilityText, ChannelAllow: []int{1}},
+		{Endpoint: constant.EndpointTypeOpenAIResponse, Capabilities: smartroutersetting.CapabilityText, ChannelAllow: []int{2}},
+	}
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{
+		"1": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAI}, Capabilities: smartroutersetting.CapabilityText},
+		"2": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAIResponse}, Capabilities: smartroutersetting.CapabilityText},
+	}
+	setting.DefaultMaxEffectiveRatioPPM = 100_000
+	setting.AbsoluteMaxEffectiveRatioPPM = 1_000_000
+	priority := int64(10)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "chat", Model: "gpt-contract-tabs", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "responses", Model: "gpt-contract-tabs", ChannelId: 2, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: constant.ChannelTypeXai, Status: common.ChannelStatusEnabled},
+			{Id: 2, Type: constant.ChannelTypeXai, Status: common.ChannelStatusEnabled},
+		},
+	}
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	t.Cleanup(catalogs.Close)
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	chatContract := contractByEndpoint(t, *catalog, SmartEndpointChat)
+
+	prices := NewPriceSnapshotManager(catalogs, NewAPIRouteRatioSource{})
+	t.Cleanup(prices.Close)
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	engine, err := NewSmartRouterEngine(
+		catalogs, prices, state, NewMemorySmartRouteAffinityStore(nil, 100),
+		func() smartroutersetting.Setting { return setting },
+	)
+	require.NoError(t, err)
+
+	report, err := engine.UserDecisionStatusReport(context.Background(), SmartRouteUserStatusRequest{
+		TokenID: 9, Policy: setting.DefaultPolicy, Model: "gpt-contract-tabs", Endpoint: SmartEndpointChat,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, chatContract.Contract.ContractID, report.ContractID)
+	require.Len(t, report.Items, 1)
+	assert.Equal(t, "chat", report.Items[0].Group)
+	assert.Equal(t, chatContract.Contract.ContractID, report.Items[0].ContractID)
+	assert.Equal(t, SmartEndpointChat, report.Items[0].Endpoint)
+	assert.NotEqual(t, "telemetry_unavailable", report.Items[0].PrimaryState)
+	assert.NotEqual(t, "endpoint_unsupported", report.Items[0].ReasonCode)
+}
+
+func TestGlobalLeaderboardSnapshotUsesSiteScopeWithoutSmartKey(t *testing.T) {
+	fixture := newSmartRouteDecisionStatusFixture(t, map[string]*float64{
+		"economy": smartRouteTestRatio(0.03),
+		"premium": smartRouteTestRatio(0.16),
+	})
+
+	index, err := fixture.engine.GlobalLeaderboardModelIndex(
+		context.Background(), SmartRouteGlobalLeaderboardModelIndexRequest{Page: 1, PageSize: 100},
+	)
+	require.NoError(t, err)
+	assert.Zero(t, index.TokenID, "a site leaderboard must not inherit a smart-key identity")
+	require.Len(t, index.Items, 1)
+	assert.ElementsMatch(t, []string{"economy", "premium"}, index.Items[0].Groups)
+
+	detail, err := fixture.engine.GlobalLeaderboardStatusReport(
+		context.Background(), SmartRouteGlobalLeaderboardStatusRequest{
+			Model: "claude-opus", Endpoint: SmartEndpointMessages,
+			Page: 1, PageSize: 100,
+		},
+	)
+	require.NoError(t, err)
+	assert.Zero(t, detail.TokenID)
+	assert.NotEmpty(t, index.FactSnapshotVersion)
+	assert.Equal(t, index.FactSnapshotVersion, detail.FactSnapshotVersion)
+	assert.NotEmpty(t, detail.SnapshotVersion)
+	require.Len(t, detail.Items, 2)
+	assert.ElementsMatch(t, []string{"economy", "premium"}, []string{
+		detail.Items[0].Group, detail.Items[1].Group,
+	})
+
+	keyA, err := fixture.engine.UserDecisionStatusReport(
+		context.Background(), SmartRouteUserStatusRequest{
+			TokenID: 101, Policy: fixture.setting.DefaultPolicy,
+			Model: "claude-opus", Endpoint: SmartEndpointMessages,
+			Page: 1, PageSize: 100,
+		},
+	)
+	require.NoError(t, err)
+	keyB, err := fixture.engine.UserDecisionStatusReport(
+		context.Background(), SmartRouteUserStatusRequest{
+			TokenID: 202, Policy: fixture.setting.DefaultPolicy,
+			Model: "claude-opus", Endpoint: SmartEndpointMessages,
+			Page: 1, PageSize: 100,
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, detail.FactSnapshotVersion, keyA.FactSnapshotVersion)
+	assert.Equal(t, keyA.FactSnapshotVersion, keyB.FactSnapshotVersion)
+	assert.Equal(t, detail.SnapshotVersion, keyA.SnapshotVersion)
+	assert.Equal(t, keyA.SnapshotVersion, keyB.SnapshotVersion)
+	require.Len(t, keyA.Items, len(detail.Items))
+	require.Len(t, keyB.Items, len(detail.Items))
+	for index := range detail.Items {
+		assert.Equal(t, detail.Items[index].Group, keyA.Items[index].Group)
+		assert.Equal(t, keyA.Items[index].Group, keyB.Items[index].Group)
+		assert.Equal(t, detail.Items[index].RecentUsageCount, keyA.Items[index].RecentUsageCount)
+		assert.Equal(t, keyA.Items[index].RecentUsageCount, keyB.Items[index].RecentUsageCount)
+		assert.Equal(t, detail.Items[index].RecentCacheRatePPM, keyA.Items[index].RecentCacheRatePPM)
+		assert.Equal(t, keyA.Items[index].RecentCacheRatePPM, keyB.Items[index].RecentCacheRatePPM)
+		assert.Equal(t, detail.Items[index].RecentTTFTAverageMS, keyA.Items[index].RecentTTFTAverageMS)
+		assert.Equal(t, keyA.Items[index].RecentTTFTAverageMS, keyB.Items[index].RecentTTFTAverageMS)
+		assert.Equal(t, detail.Items[index].RecentStabilityRate, keyA.Items[index].RecentStabilityRate)
+		assert.Equal(t, keyA.Items[index].RecentStabilityRate, keyB.Items[index].RecentStabilityRate)
+	}
+}

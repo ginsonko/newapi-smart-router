@@ -1,0 +1,16 @@
+package controller
+
+import (
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestMediaTaskFailureReasonReachesStudio(t *testing.T) {
+	task := &model.Task{TaskID: "owned-task", Properties: model.Properties{MediaMode: "videos"}, Status: model.TaskStatusFailure, FailReason: "task failed", Quota: 88, Data: []byte(`{"error":{"message":"参考图片不可访问，请更换图片"}}`)}
+	result := mediaTaskPublicMap(task, nil)
+	require.Equal(t, "failed", result["status"])
+	require.Equal(t, "参考图片不可访问，请更换图片", result["error"])
+	require.Equal(t, 88, task.Quota)
+	require.Equal(t, "task failed", task.FailReason)
+}

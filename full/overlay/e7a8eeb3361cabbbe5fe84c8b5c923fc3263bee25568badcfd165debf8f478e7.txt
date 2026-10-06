@@ -1,0 +1,78 @@
+package helper
+
+import (
+	"fmt"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+	"maps"
+)
+
+func bindParameterCommitment(c *gin.Context, q *types.ParameterPriceSnapshot) (*types.ParameterPriceSnapshot, error) {
+	if c == nil {
+		return q, nil
+	}
+	if c.GetHeader(types.ParameterQuoteHeader) != "" {
+		if _, ok := c.Get(types.ParameterQuoteContextKey); !ok {
+			return nil, fmt.Errorf("parameter quote is not valid for this endpoint; obtain a current quote")
+		}
+	}
+	if q == nil {
+		if _, ok := c.Get(types.ParameterQuoteContextKey); ok {
+			return nil, fmt.Errorf("%w: quoted parameter pricing is no longer available", types.ErrParameterCandidateUnavailable)
+		}
+		return nil, nil
+	}
+	q.SupplyRevision = q.Revision
+	q.SupplyRuleID = q.RuleID
+	q.SupplyGroup = q.Group
+	var previous *types.ParameterPriceSnapshot
+	for _, key := range []string{types.ParameterQuoteContextKey, types.ParameterCommitmentContextKey} {
+		if raw, ok := c.Get(key); ok {
+			previous, _ = raw.(*types.ParameterPriceSnapshot)
+			if previous != nil {
+				break
+			}
+		}
+	}
+	if previous == nil {
+		return q, nil
+	}
+	offered, err := decimal.NewFromString(q.Amount)
+	if err != nil {
+		return nil, err
+	}
+	committed, err := decimal.NewFromString(previous.Amount)
+	if err != nil {
+		return nil, err
+	}
+	if q.Model != previous.Model || q.Currency != previous.Currency || q.Unit != previous.Unit || q.Quantity != previous.Quantity || !maps.Equal(q.Parameters, previous.Parameters) {
+		return nil, fmt.Errorf("%w: quoted model and parameters differ", types.ErrParameterCandidateUnavailable)
+	}
+	if offered.GreaterThan(committed) {
+		return nil, fmt.Errorf("%w: candidate exceeds the agreed parameter price", types.ErrParameterCandidateUnavailable)
+	}
+	q.Revision = previous.Revision
+	q.RuleID = previous.RuleID
+	// Candidate group authorization belongs to the existing router/fallback
+	// policy. Preserve that actual supply separately from the customer's sale.
+	q.Group = previous.Group
+	q.UnitPrice = previous.UnitPrice
+	q.Amount = previous.Amount
+	q.Quota = previous.Quota
+	return q, nil
+}
+
+// FreezeParameterCommitment is called once a prepared candidate is about to
+// reserve/send. Rejected preliminary candidates cannot raise a later charge.
+func FreezeParameterCommitment(c *gin.Context, q *types.ParameterPriceSnapshot) {
+	if c == nil || q == nil {
+		return
+	}
+	if _, ok := c.Get(types.ParameterCommitmentContextKey); ok {
+		return
+	}
+	copy := *q
+	copy.Parameters = maps.Clone(q.Parameters)
+	c.Set(types.ParameterCommitmentContextKey, &copy)
+}

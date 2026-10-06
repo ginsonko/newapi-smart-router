@@ -1,0 +1,59 @@
+package media
+
+import (
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestImageRouteSpoolShortDeliveryTTLDoesNotExpireCapacity(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	token, err := ReserveImageRouteSpool(60, expiresAt)
+	require.NoError(t, err)
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	require.Equal(t, expiresAt, reservation.ExpiresAt)
+	require.NoError(t, database.Transaction(func(tx *gorm.DB) error {
+		return model.HoldImageRouteSpoolTx(tx, token)
+	}))
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	require.Equal(t, ImageRouteSpoolReservationExpiresAt, reservation.ExpiresAt)
+	require.NoError(t, ReconcileStorageState())
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	require.EqualValues(t, 60, state.ReservedBytes)
+	_, err = ReserveImageRouteSpool(41, time.Now().Add(time.Hour).Unix())
+	require.ErrorIs(t, err, ErrMediaCapacity)
+	require.NoError(t, GrowImageRouteSpool(token, 70))
+	require.NoError(t, database.First(&state, 1).Error)
+	require.EqualValues(t, 70, state.ReservedBytes)
+	require.NoError(t, ReleaseImageRouteSpool(token))
+	require.NoError(t, database.First(&state, 1).Error)
+	require.Zero(t, state.ReservedBytes)
+}
+
+func TestImageRouteSpoolUnboundReservationExpires(t *testing.T) {
+	database := setupImageRouteSpoolTest(t)
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	token, err := ReserveImageRouteSpool(60, expiresAt)
+	require.NoError(t, err)
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	require.Equal(t, expiresAt, reservation.ExpiresAt)
+	require.NoError(t, database.Model(&reservation).Update("expires_at", time.Now().Add(-time.Hour).Unix()).Error)
+	require.NoError(t, ReconcileStorageState())
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	require.Equal(t, "expired", reservation.State)
+	var state model.MediaStorageState
+	require.NoError(t, database.First(&state, 1).Error)
+	require.Zero(t, state.ReservedBytes)
+	require.ErrorIs(t, database.Transaction(func(tx *gorm.DB) error {
+		return model.HoldImageRouteSpoolTx(tx, token)
+	}), model.ErrImageRouteSpoolReservationUnavailable)
+	_, err = ReserveImageRouteSpool(80, expiresAt)
+	require.NoError(t, err)
+}

@@ -2,6 +2,7 @@ package smartrouter
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func TestEstimateActualInputCostExactFirstIgnoresPooledProfile(t *testing.T) {
 	assert.True(t, estimate.Comparable)
 }
 
-func TestEstimateActualInputCostUsesEachCacheBucketAndStaticFallback(t *testing.T) {
+func TestEstimateActualInputCostUsesEachCacheBucketAndColdStartPrior(t *testing.T) {
 	price := actualInputTestPrice()
 	exactKey := ActualInputCostKey("namespace", "upstream", "model", "endpoint", "openai")
 
@@ -69,8 +70,8 @@ func TestEstimateActualInputCostUsesEachCacheBucketAndStaticFallback(t *testing.
 	}
 
 	static := EstimateActualInputCostAt(price, price.ScorePPM, exactKey, "", nil, 1000)
-	assert.Equal(t, price.ScorePPM, static.EffectivePPM)
-	assert.Equal(t, ActualInputCostStaticFallback, static.Source)
+	assert.Equal(t, int64(19_000), static.EffectivePPM)
+	assert.Equal(t, ActualInputCostOptimistic, static.Source)
 
 	optimistic := EstimateActualInputCostAt(price, price.ScorePPM, exactKey, "", ActualInputCostSnapshot{}, 1000)
 	assert.Equal(t, int64(19_000), optimistic.EffectivePPM)
@@ -85,7 +86,7 @@ func TestEstimateActualInputCostUsesEachCacheBucketAndStaticFallback(t *testing.
 	assertEstimate(t, ActualInputCostObservation{Key: exactKey, TotalInputTokens: 100, CacheCreation1hTokens: 100, Reliable: true}, 20_000)
 }
 
-func TestEstimateActualInputCostEvidenceAgesContinuouslyTowardHiddenPrior(t *testing.T) {
+func TestEstimateActualInputCostLegacyEvidenceExpiresAfterOneHour(t *testing.T) {
 	price := actualInputTestPrice()
 	const eventMS = int64(1_000)
 	key := ActualInputCostKey("namespace", "upstream", "model", "endpoint", "openai")
@@ -98,22 +99,27 @@ func TestEstimateActualInputCostEvidenceAgesContinuouslyTowardHiddenPrior(t *tes
 	assert.Equal(t, int64(100_000), fresh.EffectivePPM)
 	assert.Zero(t, fresh.CacheReadRatePPM)
 
-	after72h := EstimateActualInputCostAt(price, price.ScorePPM, key, "", snapshot, eventMS+int64(72*time.Hour/time.Millisecond))
-	assert.Equal(t, int64(59_500), after72h.EffectivePPM)
-	assert.Equal(t, int64(450_000), after72h.CacheReadRatePPM)
-
-	after7d := EstimateActualInputCostAt(price, price.ScorePPM, key, "", snapshot, eventMS+int64(7*24*time.Hour/time.Millisecond))
-	assert.InDelta(t, 72.14, float64(after7d.CacheReadRatePPM)/10_000, 0.02)
-	assert.Less(t, after7d.EffectivePPM, after72h.EffectivePPM)
-	assert.Greater(t, after7d.EffectivePPM, int64(19_000))
-
-	effective, observed, age, ok := ActualInputCostEffectiveCacheReadRatePPMAt(
-		profile, eventMS+int64(72*time.Hour/time.Millisecond),
+	insideWindow := EstimateActualInputCostAt(
+		price, price.ScorePPM, key, "", snapshot,
+		eventMS+actualInputCostWindowHorizonMS-1,
 	)
-	require.True(t, ok)
-	assert.Equal(t, int64(450_000), effective)
-	assert.Zero(t, observed)
-	assert.Equal(t, int64(72*time.Hour/time.Millisecond), age)
+	assert.Equal(t, ActualInputCostObserved, insideWindow.Source)
+	assert.Equal(t, int64(100_000), insideWindow.EffectivePPM)
+	assert.Zero(t, insideWindow.CacheReadRatePPM)
+
+	expired := EstimateActualInputCostAt(
+		price, price.ScorePPM, key, "", snapshot,
+		eventMS+actualInputCostWindowHorizonMS+1,
+	)
+	assert.Equal(t, ActualInputCostOptimistic, expired.Source)
+	assert.Equal(t, int64(19_000), expired.EffectivePPM)
+	assert.Equal(t, int64(900_000), expired.CacheReadRatePPM)
+	assert.False(t, expired.HasRealEvidence)
+
+	_, _, _, ok := ActualInputCostEffectiveCacheReadRatePPMAt(
+		profile, eventMS+actualInputCostWindowHorizonMS+1,
+	)
+	assert.False(t, ok, "evidence outside the one-hour window must not remain visible")
 }
 
 func TestEstimateActualInputCostMissingEvidenceCooldownAndReliableReset(t *testing.T) {
@@ -197,6 +203,16 @@ func TestActualInputCostProfileMergePreservesZeroAndWeightedCacheRate(t *testing
 	assert.False(t, ok, "missing evidence must not be presented as zero percent")
 }
 
+func TestActualInputCostPPMForTokenMixUsesFrozenPriceFormula(t *testing.T) {
+	price := actualInputTestPrice()
+	projected, ok := ActualInputCostPPMForTokenMix(price, 1_000_000, 100, 900, 0, 0)
+	require.True(t, ok)
+	assert.Equal(t, int64(190_000), projected)
+
+	_, ok = ActualInputCostPPMForTokenMix(price, 1_000_000, -1, 900, 0, 0)
+	assert.False(t, ok)
+}
+
 func TestEstimateActualInputCostWeightsRecentSamplesWithoutAWindow(t *testing.T) {
 	price := actualInputTestPrice()
 	exactKey := ActualInputCostKey("namespace", "upstream", "model", "endpoint", "openai")
@@ -224,10 +240,10 @@ func TestActualInputCostPoolKeySeparatesUpstreamMappings(t *testing.T) {
 }
 
 func TestActualInputCostRankingCanChangeOnlyOrdering(t *testing.T) {
-	left := Candidate{Route: CertifiedRoute{RouteID: "left"}, RatioPPM: 20_000, Price: actualInputTestPrice(), ActualInputCostPPM: 200_000, ActualInputCostComparable: true}
+	left := Candidate{Route: CertifiedRoute{RouteID: "left"}, RatioPPM: 20_000, Price: actualInputTestPrice(), ActualInputCostPPM: 200_000, ActualInputCostComparable: true, ActualInputCostSource: ActualInputCostObserved}
 	rightPrice := actualInputTestPrice()
 	rightPrice.ScorePPM = 120_000
-	right := Candidate{Route: CertifiedRoute{RouteID: "right"}, RatioPPM: 30_000, Price: rightPrice, ActualInputCostPPM: 100_000, ActualInputCostComparable: true}
+	right := Candidate{Route: CertifiedRoute{RouteID: "right"}, RatioPPM: 30_000, Price: rightPrice, ActualInputCostPPM: 100_000, ActualInputCostComparable: true, ActualInputCostSource: ActualInputCostObserved}
 
 	actual := []Candidate{left, right}
 	sortCandidates(actual, StrategyPrice, false, false, true)
@@ -246,11 +262,11 @@ func TestActualInputCostRankingCrossesLegacyCachePriceClasses(t *testing.T) {
 
 	left := Candidate{
 		Route: CertifiedRoute{RouteID: "catalog-first"}, Price: leftPrice,
-		ActualInputCostPPM: 120_000, ActualInputCostComparable: true, priceClassRank: 0,
+		ActualInputCostPPM: 120_000, ActualInputCostComparable: true, ActualInputCostSource: ActualInputCostObserved, priceClassRank: 0,
 	}
 	right := Candidate{
 		Route: CertifiedRoute{RouteID: "actually-cheaper"}, Price: rightPrice,
-		ActualInputCostPPM: 80_000, ActualInputCostComparable: true, priceClassRank: 1,
+		ActualInputCostPPM: 80_000, ActualInputCostComparable: true, ActualInputCostSource: ActualInputCostObserved, priceClassRank: 1,
 	}
 
 	actual := []Candidate{left, right}
@@ -283,7 +299,7 @@ func TestActualInputCostEqualCostPrefersUnobservedThenOldestEvidence(t *testing.
 	}
 
 	sortCandidates(candidates, StrategyPrice, false, false, true)
-	assert.Equal(t, []string{"optimistic", "old", "fresh"}, []string{
+	assert.Equal(t, []string{"fresh", "old", "optimistic"}, []string{
 		candidates[0].Route.RouteID, candidates[1].Route.RouteID, candidates[2].Route.RouteID,
 	})
 }
@@ -315,6 +331,262 @@ func TestEstimateActualInputCostLookupRemainsBoundedWithMaximumSnapshot(t *testi
 		_ = EstimateActualInputCostAt(price, price.ScorePPM, target, "", snapshot, 1_000)
 	})
 	assert.LessOrEqual(t, allocations, 1.0, "ranking must remain an O(1) snapshot lookup without size-dependent allocation")
+}
+
+func TestActualInputCostWindowSingleRealSampleBlendsWithDefaultReference(t *testing.T) {
+	price := actualInputTestPrice()
+	key := ActualInputCostKey("namespace", "upstream", "model", "endpoint", "openai")
+	profile := ActualInputCostProfile{}
+	profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+		Key: key, TotalInputTokens: 100, CacheReadTokens: 100, Reliable: true, EventMS: 1_000,
+	}, 1_000)
+	estimate := EstimateActualInputCostAt(price, price.ScorePPM, key, "", ActualInputCostSnapshot{key: profile}, 1_000)
+	assert.Equal(t, ActualInputCostObserved, estimate.Source)
+	assert.Equal(t, int64(1_000_000), *estimate.ObservedCacheReadRatePPM)
+	assert.Equal(t, int64(901_000), estimate.CacheReadRatePPM,
+		"one real sample contributes exactly 1% while the cold-start reference fills the remaining 99%")
+	assert.Equal(t, int64(10_000), estimate.ConfidencePPM)
+	assert.Equal(t, int64(1), estimate.Samples)
+
+	stale := EstimateActualInputCostAt(price, price.ScorePPM, key, "", ActualInputCostSnapshot{key: profile}, 1_000+actualInputCostWindowHorizonMS+1)
+	assert.Equal(t, ActualInputCostOptimistic, stale.Source, "a route with only expired evidence still uses the bounded optimistic prior")
+	assert.Equal(t, int64(900_000), stale.CacheReadRatePPM)
+}
+
+func TestActualInputCostRecentHistoryMixMatrix(t *testing.T) {
+	price := actualInputTestPrice()
+	for _, sampleCount := range []int{0, 1, 9, 10, 20, 99, 100} {
+		t.Run(fmt.Sprintf("samples_%d", sampleCount), func(t *testing.T) {
+			const nowMS = int64(10_000)
+			profile := ActualInputCostProfile{History: ActualInputCostHistorySummary{
+				Version: actualInputCostHistoryVersion, RegularShare: 0.8, CacheReadShare: 0.2,
+				EffectiveSamples: 200, TotalSamples: 200, LastEventMS: nowMS - 1,
+			}}
+			for index := 0; index < sampleCount; index++ {
+				profile.Window = append(profile.Window, ActualInputCostWindowSample{
+					ObservationHash: fmt.Sprintf("mix-%d", index), EventMS: nowMS,
+					TotalInputTokens: 100, CacheReadTokens: 100,
+				})
+			}
+			estimate := EstimateActualInputCostAt(
+				price, price.ScorePPM, "route", "", ActualInputCostSnapshot{"route": profile}, nowMS,
+			)
+			wantRate := int64(math.Round((float64(sampleCount)/100 + (1-float64(sampleCount)/100)*0.2) * 1_000_000))
+			assert.Equal(t, wantRate, estimate.CacheReadRatePPM)
+			assert.Equal(t, int64(sampleCount)*10_000, estimate.ConfidencePPM)
+			assert.Equal(t, int64(200), estimate.HistoricalSamples)
+			if sampleCount == 0 {
+				assert.Equal(t, ActualInputCostHistorical, estimate.Source)
+				assert.Nil(t, estimate.ObservedCacheReadRatePPM)
+			} else {
+				assert.Equal(t, ActualInputCostObserved, estimate.Source)
+				require.NotNil(t, estimate.ObservedCacheReadRatePPM)
+				assert.Equal(t, int64(1_000_000), *estimate.ObservedCacheReadRatePPM)
+			}
+		})
+	}
+}
+
+func TestActualInputCostRecentWindowUsesExactThirtyMinuteHalfLife(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		age       time.Duration
+		wantShare float64
+	}{
+		{name: "thirty_minutes", age: 30 * time.Minute, wantShare: 1.0 / 1.5},
+		{name: "sixty_minutes", age: 60 * time.Minute, wantShare: 1.0 / 1.25},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			nowMS := int64(time.Hour/time.Millisecond) + 1_000
+			profile := ActualInputCostProfile{}
+			profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+				ObservationID: "old", Key: "route", EventMS: nowMS - testCase.age.Milliseconds(),
+				TotalInputTokens: 100, RegularInputTokens: 100, Reliable: true,
+			}, nowMS)
+			profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+				ObservationID: "new", Key: "route", EventMS: nowMS,
+				TotalInputTokens: 100, CacheReadTokens: 100, Reliable: true,
+			}, nowMS)
+			regular, read, _, _, _, _, count, ok := windowMixAt(profile, nowMS, false)
+			require.True(t, ok)
+			assert.Equal(t, 2, count)
+			assert.InDelta(t, testCase.wantShare, read/(regular+read), 1e-12)
+		})
+	}
+}
+
+func TestActualInputCostHistoryCommitsOnlyAfterBoundedBatch(t *testing.T) {
+	profile := ActualInputCostProfile{}
+	for index := 0; index < actualInputCostHistoryBatchSize; index++ {
+		nowMS := int64(1_000 + index)
+		observation := ActualInputCostObservation{
+			ObservationID: fmt.Sprintf("history-%d", index), Key: "route", EventMS: nowMS,
+			TotalInputTokens: 100, RegularInputTokens: 50, CacheReadTokens: 50, Reliable: true,
+		}
+		profile = ApplyActualInputCostObservation(profile, observation, nowMS)
+		profile = ApplyActualInputCostWindowObservation(profile, observation, nowMS)
+		if index < actualInputCostHistoryBatchSize-1 {
+			assert.Zero(t, profile.History.TotalSamples)
+		}
+	}
+	assert.Equal(t, int64(actualInputCostHistoryBatchSize), profile.History.TotalSamples)
+	assert.Empty(t, profile.History.Pending)
+	assert.InDelta(t, 0.5, profile.History.CacheReadShare, 1e-12)
+	assert.InDelta(t, 0.5, profile.History.RegularShare, 1e-12)
+}
+
+func TestActualInputCostApplyIsIdempotentAcrossRestartReplay(t *testing.T) {
+	observation := ActualInputCostObservation{
+		ObservationID: "request-one", Key: "route", PoolKey: "pool", EventMS: 1_000,
+		RegularInputTokens: 10, CacheReadTokens: 90, TotalInputTokens: 100, Reliable: true,
+	}
+	profile := ApplyActualInputCostObservation(ActualInputCostProfile{}, observation, 1_000)
+	profile = ApplyActualInputCostWindowObservation(profile, observation, 1_000)
+	replayed := ApplyActualInputCostObservation(profile, observation, 2_000)
+	replayed = ApplyActualInputCostWindowObservation(replayed, observation, 2_000)
+
+	assert.Equal(t, profile.TotalSamples, replayed.TotalSamples)
+	assert.Equal(t, profile.WeightedSamples, replayed.WeightedSamples)
+	assert.Len(t, replayed.Window, 1)
+}
+
+func TestActualInputCostWindowTrimsTenPercentAtEverySufficientSampleCount(t *testing.T) {
+	for _, sampleCount := range []int{9, 10, 37, 100} {
+		t.Run(fmt.Sprintf("samples_%d", sampleCount), func(t *testing.T) {
+			profile := ActualInputCostProfile{}
+			trimEachSide := sampleCount / 10
+			for i := 0; i < sampleCount; i++ {
+				read := int64(50)
+				if i < trimEachSide {
+					read = 100
+				} else if i >= sampleCount-trimEachSide {
+					read = 0
+				}
+				profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+					Key: "route", TotalInputTokens: 100, RegularInputTokens: 100 - read, CacheReadTokens: read,
+					Reliable: true, EventMS: int64(1_000 + i),
+				}, int64(1_000+i))
+			}
+
+			regular, read, _, _, _, _, count, ok := windowMixAt(profile, 1_200, false)
+			require.True(t, ok)
+			assert.Equal(t, sampleCount, count, "confidence must report raw real observations before trimming")
+			assert.InDelta(t, 0.5, read/(regular+read), 0.01)
+		})
+	}
+}
+
+func TestActualInputCostWindowUsesPerRequestRecencyWeights(t *testing.T) {
+	profile := ActualInputCostProfile{}
+	profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+		Key: "route", TotalInputTokens: 1_000_000, RegularInputTokens: 1_000_000,
+		Reliable: true, EventMS: 1_000,
+	}, 1_000)
+	profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+		Key: "route", TotalInputTokens: 100, CacheReadTokens: 100,
+		Reliable: true, EventMS: 1_000 + int64(10*time.Minute/time.Millisecond),
+	}, 1_000+int64(10*time.Minute/time.Millisecond))
+
+	regular, read, _, _, _, _, count, ok := windowMixAt(
+		profile, 1_000+int64(10*time.Minute/time.Millisecond), false,
+	)
+	require.True(t, ok)
+	assert.Equal(t, 2, count)
+	assert.InDelta(t, 1.0/(1.0+math.Pow(2, -1.0/3.0)), read/(regular+read), 0.001,
+		"a million-token old request must not overwhelm a newer request solely because it is larger")
+}
+
+func TestTieredExpressionActualInputCostUsesObservedMixWithoutCachePriceGate(t *testing.T) {
+	price := RoutePrice{
+		BillingMode: "tiered_expr", BillingUnit: "per_token",
+		ComparisonClass: "tiered-static", ActualInputComparisonClass: "normalized-input-v2",
+		ScorePPM: 100_000, StaticComparable: true,
+		TieredExpression:       "tier(\"input\", p * 2 + cr * 0.2 + cc * 2.5 + cc1h * 4)",
+		TieredInputPredictable: true,
+	}
+	key := ActualInputCostKey("channel:46:generation-7", "provider-sol", "gpt-5.6-sol", "openai-responses-v1", "openai")
+	profile := ApplyActualInputCostWindowObservation(ActualInputCostProfile{}, ActualInputCostObservation{
+		Key: key, TotalInputTokens: 100, RegularInputTokens: 50, CacheReadTokens: 50,
+		Reliable: true, EventMS: 1_000,
+	}, 1_000)
+
+	estimate := EstimateActualInputCostAt(price, price.ScorePPM, key, "", ActualInputCostSnapshot{key: profile}, 1_000)
+	require.Equal(t, ActualInputCostObserved, estimate.Source)
+	require.NotNil(t, estimate.ObservedCacheReadRatePPM)
+	assert.Equal(t, int64(500_000), *estimate.ObservedCacheReadRatePPM)
+	assert.Equal(t, int64(896_000), estimate.CacheReadRatePPM)
+	assert.Equal(t, int64(19_360), estimate.EffectivePPM)
+	assert.True(t, estimate.Comparable)
+	assert.Equal(t, int64(1), estimate.Samples)
+
+	defaultReference := EstimateActualInputCostAt(price, price.ScorePPM, key, "", ActualInputCostSnapshot{}, 1_000)
+	assert.Equal(t, ActualInputCostOptimistic, defaultReference.Source)
+	assert.Equal(t, int64(900_000), defaultReference.CacheReadRatePPM)
+	assert.Equal(t, int64(19_000), defaultReference.EffectivePPM)
+}
+
+func TestTieredExpressionHistoricalCostUsesExactExpressionHash(t *testing.T) {
+	price := RoutePrice{
+		BillingMode: "tiered_expr", BillingUnit: "per_token",
+		ComparisonClass: "tiered-static", ActualInputComparisonClass: "normalized-input-v2",
+		ScorePPM: 100_000, StaticComparable: true,
+		TieredExpression:     `tier("input", p * 2 + cr * 0.2)`,
+		TieredExpressionHash: "revision-a", TieredInputPredictable: true,
+	}
+	key := ActualInputCostKey("namespace", "provider-sol", "gpt-5.6-sol", "openai-responses-v1", "openai")
+	profile := ApplyActualInputCostWindowObservation(ActualInputCostProfile{}, ActualInputCostObservation{
+		ObservationID: "request-a", Key: key, TotalInputTokens: 100,
+		RegularInputTokens: 20, CacheReadTokens: 80, Reliable: true, EventMS: 1_000,
+		TieredExpressionHash: "revision-a", TieredInputPriceMicros: 2_500_000,
+	}, 1_000)
+
+	estimate := EstimateActualInputCostAt(price, price.ScorePPM, key, "", ActualInputCostSnapshot{key: profile}, 1_000)
+	require.Equal(t, ActualInputCostObserved, estimate.Source)
+	assert.Equal(t, ActualInputCostCostSourceRatio, estimate.CostSource)
+	assert.Equal(t, int64(1), estimate.CostSamples)
+	require.NotNil(t, estimate.ObservedCacheReadRatePPM)
+	assert.Equal(t, int64(800_000), *estimate.ObservedCacheReadRatePPM)
+	assert.Equal(t, int64(899_000), estimate.CacheReadRatePPM)
+	assert.Equal(t, int64(19_090), estimate.EffectivePPM)
+	assert.True(t, estimate.Comparable)
+
+	price.TieredExpressionHash = "revision-b"
+	revised := EstimateActualInputCostAt(price, price.ScorePPM, key, "", ActualInputCostSnapshot{key: profile}, 1_000)
+	assert.True(t, revised.HasRealEvidence, "price revisions must not hide cache facts")
+	assert.Equal(t, int64(899_000), revised.CacheReadRatePPM)
+	assert.Equal(t, int64(1), revised.CostSamples)
+	assert.Equal(t, int64(19_090), revised.EffectivePPM,
+		"a new expression revision uses its static cheapest tier; old cost samples never supply the price")
+	assert.True(t, revised.Comparable)
+}
+
+func TestTieredExpressionHistoricalCostTrimsEachTailAndWeightsRecentSamples(t *testing.T) {
+	price := RoutePrice{
+		BillingMode: "tiered_expr", BillingUnit: "per_token",
+		ComparisonClass: "tiered-static", ActualInputComparisonClass: "normalized-input-v2",
+		ScorePPM: 100_000, StaticComparable: true,
+		TieredExpression: `tier("input", p * 2 + cr * 0.2)`, TieredExpressionHash: "revision-a", TieredInputPredictable: true,
+	}
+	const nowMS = int64(10_000)
+	profile := ActualInputCostProfile{}
+	for index := 0; index < 10; index++ {
+		cost := int64(2_000_000)
+		if index == 0 {
+			cost = 0
+		}
+		if index == 9 {
+			cost = 20_000_000
+		}
+		profile = ApplyActualInputCostWindowObservation(profile, ActualInputCostObservation{
+			ObservationID: fmt.Sprintf("request-%d", index), Key: "route", TotalInputTokens: 100,
+			RegularInputTokens: 50, CacheReadTokens: 50, Reliable: true, EventMS: nowMS - int64(index),
+			TieredExpressionHash: "revision-a", TieredInputPriceMicros: cost,
+		}, nowMS)
+	}
+	estimate := EstimateActualInputCostAt(price, price.ScorePPM, "route", "", ActualInputCostSnapshot{"route": profile}, nowMS)
+	assert.Equal(t, int64(10), estimate.CostSamples)
+	assert.Equal(t, int64(22_600), estimate.EffectivePPM)
+	assert.Equal(t, ActualInputCostCostSourceRatio, estimate.CostSource)
 }
 
 func BenchmarkEstimateActualInputCost8192Profiles(b *testing.B) {

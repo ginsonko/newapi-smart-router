@@ -1,0 +1,520 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupImageRouteJobTest(t *testing.T) *gorm.DB {
+	t.Helper()
+	previousDB := DB
+	dsn := fmt.Sprintf("file:image-route-job-%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	database, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := database.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	DB = database
+	t.Cleanup(func() {
+		DB = previousDB
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, database.AutoMigrate(&Task{}, &TaskBillingReceipt{}, &ImageRouteJob{}))
+	return database
+}
+
+func newImageRouteJobTestInput(t *testing.T) (*ImageRouteJob, *Task) {
+	t.Helper()
+	bodyPath, err := filepath.Abs(filepath.Join("private-spool", "request.json"))
+	require.NoError(t, err)
+	return &ImageRouteJob{
+			PublicTaskID: "image-route-" + t.Name(), UserID: 71, TokenID: 72,
+			RequestPath: "/v1/images/generations", ContentType: "application/json", BodyPath: bodyPath,
+			PolicyJSON: `{"version":4,"enabled":true,"max_attempts":3}`, FrozenGroupsJSON: `["images"]`,
+			ResponseFormat: "b64_json", NoRetention: true, ClientIP: "127.0.0.1",
+			TenantRequestID: "tenant-request-1", QuoteToken: "signed-parameter-quote",
+			ResultReservation: "private-result-reservation",
+		}, &Task{
+			Group: "images", Action: "generate", ReconcileSince: 123, NextPollAt: 253402300799,
+			PrivateData: TaskPrivateData{ImageTask: &ImageTaskContext{ResponseFormat: "b64_json", Count: 2}},
+		}
+}
+
+func createImageRouteJobTest(t *testing.T) (*ImageRouteJob, *Task) {
+	t.Helper()
+	job, root := newImageRouteJobTestInput(t)
+	require.NoError(t, CreateImageRouteJob(job, root))
+	return job, root
+}
+
+func reloadImageRouteJobTest(t *testing.T, job *ImageRouteJob) *ImageRouteJob {
+	t.Helper()
+	loaded, found, err := GetImageRouteJob(job.PublicTaskID, job.UserID)
+	require.NoError(t, err)
+	require.True(t, found)
+	return loaded
+}
+
+func waitingImageRouteJobTest(t *testing.T) (*ImageRouteJob, *Task, *Task, *TaskBillingReceipt) {
+	t.Helper()
+	job, root := createImageRouteJobTest(t)
+	claimed, won, err := ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, RecordImageRouteJobChannel(claimed.ID, 73))
+	child := &Task{
+		TaskID: "child-" + t.Name(), UserId: job.UserID, ChannelId: 73, Platform: "openai_image",
+		Status: TaskStatusFailure, Quota: 0, FailReason: "provider explicitly rejected generation",
+		PrivateData: TaskPrivateData{TokenId: job.TokenID, ImageTask: &ImageTaskContext{RetryableFailure: true, RouteJobID: job.ID}},
+	}
+	require.NoError(t, DB.Create(child).Error)
+	require.NoError(t, BindImageRouteJobTask(job.ID, child.TaskID))
+	receipt := &TaskBillingReceipt{
+		TaskRowID: child.ID, UserID: job.UserID, TokenID: job.TokenID, ChannelID: child.ChannelId,
+		SubmissionQuota: 100, PreConsumedQuota: 100, Version: 4,
+		State: TaskBillingReceiptApplied, TerminalTargetStatus: TaskStatusFailure,
+		TargetQuota: 0, AppliedQuota: 0, UsageAppliedQuota: 0,
+	}
+	require.NoError(t, DB.Create(receipt).Error)
+	return reloadImageRouteJobTest(t, job), root, child, receipt
+}
+
+func TestImageRouteJobCreatePersistsPrivateSnapshotWithoutRootBilling(t *testing.T) {
+	database := setupImageRouteJobTest(t)
+	job, root := newImageRouteJobTestInput(t)
+	root.Quota, root.ChannelId = 900, 73
+	root.BillingReservationID = "must-not-charge-root"
+	root.PrivateData.Key, root.PrivateData.BillingSource = "provider-secret", "wallet"
+	job.PolicyJSON = `{"version":4,"enabled":true,"key":"must-not-persist"}`
+	require.NoError(t, CreateImageRouteJob(job, root))
+	loaded := reloadImageRouteJobTest(t, job)
+	assert.Equal(t, ImageRouteJobReady, loaded.State)
+	assert.EqualValues(t, 1, loaded.Version)
+	assert.Equal(t, "[]", loaded.AttemptedChannelsJSON)
+	assert.Equal(t, job.BodyPath, loaded.BodyPath)
+	assert.Equal(t, job.FrozenGroupsJSON, loaded.FrozenGroupsJSON)
+	assert.Equal(t, "signed-parameter-quote", loaded.QuoteToken)
+	assert.Empty(t, loaded.BodyReservation)
+	assert.Equal(t, "private-result-reservation", loaded.ResultReservation)
+	assert.NotContains(t, loaded.PolicyJSON, "must-not-persist")
+	var persisted Task
+	require.NoError(t, database.First(&persisted, root.ID).Error)
+	assert.Equal(t, "smart_image", string(persisted.Platform))
+	assert.Equal(t, job.PublicTaskID, persisted.TaskID)
+	assert.Zero(t, persisted.Quota)
+	assert.Zero(t, persisted.ChannelId)
+	assert.Empty(t, persisted.BillingReservationID)
+	assert.Empty(t, persisted.PrivateData.Key)
+	assert.Empty(t, persisted.PrivateData.BillingSource)
+	assert.Equal(t, "b64_json", persisted.PrivateData.ImageTask.ResponseFormat)
+	assert.Equal(t, 2, persisted.PrivateData.ImageTask.Count)
+	assert.True(t, persisted.PrivateData.ImageTask.NoRetention)
+	assert.EqualValues(t, 123, persisted.ReconcileSince)
+	assert.EqualValues(t, 253402300799, persisted.NextPollAt)
+	var receiptCount int64
+	require.NoError(t, database.Model(&TaskBillingReceipt{}).Count(&receiptCount).Error)
+	assert.Zero(t, receiptCount)
+	serialized, err := common.Marshal(loaded)
+	require.NoError(t, err)
+	for _, privateField := range []string{"body_path", "result_path", "body_reservation", "result_reservation", "private-body-reservation", "private-result-reservation", "policy_json", "quote_token", "client_ip", "token_id", "tenant_request_id"} {
+		assert.NotContains(t, string(serialized), privateField)
+	}
+	foreign, found, err := GetImageRouteJob(job.PublicTaskID, job.UserID+1)
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Nil(t, foreign)
+	duplicate, duplicateRoot := newImageRouteJobTestInput(t)
+	require.Error(t, CreateImageRouteJob(duplicate, duplicateRoot))
+	assert.Zero(t, duplicate.ID)
+	assert.Zero(t, duplicateRoot.ID)
+	var roots int64
+	require.NoError(t, database.Model(&Task{}).Count(&roots).Error)
+	assert.EqualValues(t, 1, roots)
+}
+
+func TestImageRouteJobCreateRollsBackJobWhenRootInsertFails(t *testing.T) {
+	database := setupImageRouteJobTest(t)
+	sentinel := errors.New("root insertion failed")
+	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("image_route_root_insert_failure", func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "tasks" {
+			tx.AddError(sentinel)
+		}
+	}))
+	job, root := newImageRouteJobTestInput(t)
+	require.ErrorIs(t, CreateImageRouteJob(job, root), sentinel)
+	assert.Zero(t, job.ID)
+	assert.Zero(t, root.ID)
+	var count int64
+	require.NoError(t, database.Model(&ImageRouteJob{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestImageRouteJobTemporaryTokenAndLegacyWorkerProtection(t *testing.T) {
+	setupImageRouteJobTest(t)
+	job, root := newImageRouteJobTestInput(t)
+	job.TokenID = 0
+	root.ReconcileSince, root.NextPollAt = 0, 0
+	root.PrivateData.BillingRequestID = "original-health-attempt"
+	require.NoError(t, CreateImageRouteJob(job, root))
+	assert.Zero(t, job.TokenID)
+	assert.EqualValues(t, TaskStatusSubmitted, root.Status)
+	assert.Equal(t, "5%", root.Progress)
+	assert.Equal(t, job.CreatedAt, root.ReconcileSince)
+	assert.EqualValues(t, 253402300799, root.NextPollAt)
+	assert.Equal(t, "original-health-attempt", root.PrivateData.BillingRequestID)
+	_, won, err := ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	require.True(t, won)
+	child := &Task{
+		TaskID: "temporary-token-child", UserId: job.UserID, Platform: "openai_image",
+		Status: TaskStatusFailure, PrivateData: TaskPrivateData{ImageTask: &ImageTaskContext{RouteJobID: job.ID, RetryableFailure: true}},
+	}
+	require.NoError(t, DB.Create(child).Error)
+	require.NoError(t, BindImageRouteJobTask(job.ID, child.TaskID))
+	receipt := &TaskBillingReceipt{TaskRowID: child.ID, UserID: job.UserID, State: TaskBillingReceiptApplied, TerminalTargetStatus: TaskStatusFailure}
+	require.NoError(t, DB.Create(receipt).Error)
+	waiting := reloadImageRouteJobTest(t, job)
+	resumed, err := ResumeImageRouteJob(job.ID, waiting.Version)
+	require.NoError(t, err)
+	assert.True(t, resumed)
+}
+
+func TestImageRouteJobClaimIsVersionedAndDispatchingNeverReclaimed(t *testing.T) {
+	setupImageRouteJobTest(t)
+	job, _ := createImageRouteJobTest(t)
+	claimed, won, err := ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	require.True(t, won)
+	assert.Equal(t, ImageRouteJobDispatching, claimed.State)
+	assert.Equal(t, job.Version+1, claimed.Version)
+	require.NoError(t, DB.Model(&ImageRouteJob{}).Where("id = ?", job.ID).Update("updated_at", 1).Error)
+	for _, version := range []int64{job.Version, claimed.Version} {
+		duplicate, won, err := ClaimImageRouteJob(job.ID, version)
+		require.NoError(t, err)
+		assert.False(t, won)
+		assert.Nil(t, duplicate)
+		resumed, err := ResumeImageRouteJob(job.ID, version)
+		require.NoError(t, err)
+		assert.False(t, resumed)
+	}
+	assert.Equal(t, ImageRouteJobDispatching, reloadImageRouteJobTest(t, job).State)
+}
+
+func TestImageRouteJobChannelIntentRejectsReuseAndCompetingCAS(t *testing.T) {
+	database := setupImageRouteJobTest(t)
+	job, _ := createImageRouteJobTest(t)
+	require.ErrorIs(t, RecordImageRouteJobChannel(job.ID, 73), ErrImageRouteJobConflict)
+	_, won, err := ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, RecordImageRouteJobChannel(job.ID, 73))
+	first := reloadImageRouteJobTest(t, job)
+	require.ErrorIs(t, RecordImageRouteJobChannel(job.ID, 73), ErrImageRouteJobConflict)
+	assert.Equal(t, first.Version, reloadImageRouteJobTest(t, job).Version)
+	require.NoError(t, RecordImageRouteJobChannel(job.ID, 74))
+	assert.Equal(t, "[73,74]", reloadImageRouteJobTest(t, job).AttemptedChannelsJSON)
+	injected := false
+	require.NoError(t, database.Callback().Query().After("gorm:query").Register("image_route_competing_channel", func(tx *gorm.DB) {
+		if injected || tx.Statement.Schema == nil || tx.Statement.Schema.Table != "image_route_jobs" {
+			return
+		}
+		injected = true
+		err := tx.Session(&gorm.Session{NewDB: true}).Model(&ImageRouteJob{}).Where("id = ?", job.ID).
+			Updates(map[string]any{"attempted_channels_json": "[73,74,75]", "version": gorm.Expr("version + 1")}).Error
+		tx.AddError(err)
+	}))
+	require.ErrorIs(t, RecordImageRouteJobChannel(job.ID, 76), ErrImageRouteJobConflict)
+	require.NoError(t, database.Callback().Query().Remove("image_route_competing_channel"))
+	assert.True(t, injected)
+	assert.Equal(t, "[73,74]", reloadImageRouteJobTest(t, job).AttemptedChannelsJSON)
+}
+
+func TestImageRouteJobBindRequiresDurableOwnedChildAndIsIdempotent(t *testing.T) {
+	setupImageRouteJobTest(t)
+	job, _ := createImageRouteJobTest(t)
+	require.ErrorIs(t, BindImageRouteJobTask(job.ID, "missing"), ErrImageRouteJobConflict)
+	_, won, err := ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.ErrorIs(t, BindImageRouteJobTask(job.ID, "missing"), ErrImageRouteJobConflict)
+	require.ErrorIs(t, BindImageRouteJobTask(job.ID, job.PublicTaskID), ErrImageRouteJobConflict)
+	child := &Task{TaskID: "persisted-child", UserId: job.UserID + 1, Platform: "openai_image", PrivateData: TaskPrivateData{TokenId: job.TokenID}}
+	require.NoError(t, DB.Create(child).Error)
+	require.ErrorIs(t, BindImageRouteJobTask(job.ID, child.TaskID), ErrImageRouteJobConflict)
+	require.NoError(t, DB.Model(child).Update("user_id", job.UserID).Error)
+	require.NoError(t, BindImageRouteJobTask(job.ID, child.TaskID))
+	waiting := reloadImageRouteJobTest(t, job)
+	require.NoError(t, BindImageRouteJobTask(job.ID, child.TaskID))
+	assert.Equal(t, waiting.Version, reloadImageRouteJobTest(t, job).Version)
+	assert.Equal(t, ImageRouteJobWaiting, waiting.State)
+	assert.Equal(t, child.TaskID, waiting.CurrentTaskID)
+	require.ErrorIs(t, BindImageRouteJobTask(job.ID, "different-child"), ErrImageRouteJobConflict)
+	require.ErrorIs(t, RecordImageRouteJobChannel(job.ID, 75), ErrImageRouteJobConflict)
+}
+
+func TestImageRouteJobResumeFailsClosedWithoutExplicitRefundedFailure(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Task, *TaskBillingReceipt)
+	}{
+		{"child pending", func(child *Task, receipt *TaskBillingReceipt) { child.Status = TaskStatusInProgress }},
+		{"child unknown", func(child *Task, receipt *TaskBillingReceipt) { child.Status = TaskStatusUnknown }},
+		{"child success", func(child *Task, receipt *TaskBillingReceipt) { child.Status = TaskStatusSuccess }},
+		{"timeout refund", func(child *Task, receipt *TaskBillingReceipt) { child.PrivateData.ImageTask.RetryableFailure = false }},
+		{"missing image context", func(child *Task, receipt *TaskBillingReceipt) { child.PrivateData.ImageTask = nil }},
+		{"child charged", func(child *Task, receipt *TaskBillingReceipt) { child.Quota = 1 }},
+		{"wrong owner", func(child *Task, receipt *TaskBillingReceipt) { child.UserId++ }},
+		{"wrong token", func(child *Task, receipt *TaskBillingReceipt) { child.PrivateData.TokenId++ }},
+		{"receipt pending", func(child *Task, receipt *TaskBillingReceipt) { receipt.State = TaskBillingReceiptTerminalPending }},
+		{"receipt tracking", func(child *Task, receipt *TaskBillingReceipt) { receipt.State = TaskBillingReceiptTracking }},
+		{"receipt review", func(child *Task, receipt *TaskBillingReceipt) { receipt.State = TaskBillingReceiptReview }},
+		{"receipt success", func(child *Task, receipt *TaskBillingReceipt) { receipt.TerminalTargetStatus = TaskStatusSuccess }},
+		{"receipt target charged", func(child *Task, receipt *TaskBillingReceipt) { receipt.TargetQuota = 1 }},
+		{"receipt applied charged", func(child *Task, receipt *TaskBillingReceipt) { receipt.AppliedQuota = 1 }},
+		{"receipt usage charged", func(child *Task, receipt *TaskBillingReceipt) { receipt.UsageAppliedQuota = 1 }},
+		{"receipt owner mismatch", func(child *Task, receipt *TaskBillingReceipt) { receipt.UserID++ }},
+		{"receipt token mismatch", func(child *Task, receipt *TaskBillingReceipt) { receipt.TokenID++ }},
+		{"receipt channel mismatch", func(child *Task, receipt *TaskBillingReceipt) { receipt.ChannelID++ }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupImageRouteJobTest(t)
+			job, root, child, receipt := waitingImageRouteJobTest(t)
+			test.mutate(child, receipt)
+			require.NoError(t, DB.Save(child).Error)
+			require.NoError(t, DB.Save(receipt).Error)
+			resumed, err := ResumeImageRouteJob(job.ID, job.Version)
+			require.NoError(t, err)
+			assert.False(t, resumed)
+			assert.Equal(t, job.Version, reloadImageRouteJobTest(t, job).Version)
+			assert.Equal(t, ImageRouteJobWaiting, reloadImageRouteJobTest(t, job).State)
+			var persisted Task
+			require.NoError(t, DB.First(&persisted, root.ID).Error)
+			assert.Zero(t, persisted.Quota)
+		})
+	}
+}
+
+func TestImageRouteJobResumeRequiresPresentChildAndReceipt(t *testing.T) {
+	for _, missing := range []string{"child", "receipt"} {
+		t.Run(missing, func(t *testing.T) {
+			setupImageRouteJobTest(t)
+			job, _, child, receipt := waitingImageRouteJobTest(t)
+			if missing == "child" {
+				require.NoError(t, DB.Delete(child).Error)
+			} else {
+				require.NoError(t, DB.Delete(receipt).Error)
+			}
+			resumed, err := ResumeImageRouteJob(job.ID, job.Version)
+			require.NoError(t, err)
+			assert.False(t, resumed)
+			assert.Equal(t, job.CurrentTaskID, reloadImageRouteJobTest(t, job).CurrentTaskID)
+		})
+	}
+}
+
+func TestImageRouteJobResumeRefundedFailureExactlyOncePreservesAttempts(t *testing.T) {
+	setupImageRouteJobTest(t)
+	job, root, _, receipt := waitingImageRouteJobTest(t)
+	resumed, err := ResumeImageRouteJob(job.ID, job.Version-1)
+	require.NoError(t, err)
+	assert.False(t, resumed)
+	resumed, err = ResumeImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	require.True(t, resumed)
+	ready := reloadImageRouteJobTest(t, job)
+	assert.Equal(t, ImageRouteJobReady, ready.State)
+	assert.Empty(t, ready.CurrentTaskID)
+	assert.Equal(t, "[73]", ready.AttemptedChannelsJSON)
+	assert.Equal(t, job.Version+1, ready.Version)
+	resumed, err = ResumeImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	assert.False(t, resumed)
+	_, won, err := ClaimImageRouteJob(job.ID, ready.Version)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.ErrorIs(t, RecordImageRouteJobChannel(job.ID, 73), ErrImageRouteJobConflict)
+	require.NoError(t, RecordImageRouteJobChannel(job.ID, 74))
+	var unchangedReceipt TaskBillingReceipt
+	require.NoError(t, DB.First(&unchangedReceipt, receipt.ID).Error)
+	assert.Equal(t, *receipt, unchangedReceipt)
+	var unchangedRoot Task
+	require.NoError(t, DB.First(&unchangedRoot, root.ID).Error)
+	assert.Zero(t, unchangedRoot.Quota)
+	assert.EqualValues(t, TaskStatusSubmitted, unchangedRoot.Status)
+}
+
+func TestImageRouteJobResumeRereadsChildAfterReceiptLock(t *testing.T) {
+	database := setupImageRouteJobTest(t)
+	job, _, child, _ := waitingImageRouteJobTest(t)
+	injected := false
+	require.NoError(t, database.Callback().Query().After("gorm:query").Register("image_route_child_changed", func(tx *gorm.DB) {
+		if injected || tx.Statement.Schema == nil || tx.Statement.Schema.Table != "task_billing_receipts" {
+			return
+		}
+		injected = true
+		err := tx.Session(&gorm.Session{NewDB: true}).Model(&Task{}).Where("id = ?", child.ID).Update("status", TaskStatusSuccess).Error
+		tx.AddError(err)
+	}))
+	resumed, err := ResumeImageRouteJob(job.ID, job.Version)
+	require.NoError(t, err)
+	assert.True(t, injected)
+	assert.False(t, resumed)
+	assert.Equal(t, ImageRouteJobWaiting, reloadImageRouteJobTest(t, job).State)
+}
+
+func TestImageRouteJobCompletionTerminalCASAndSafeProjection(t *testing.T) {
+	for _, terminal := range []struct {
+		state  string
+		status TaskStatus
+	}{
+		{ImageRouteJobSucceeded, TaskStatusSuccess},
+		{ImageRouteJobFailed, TaskStatusFailure},
+		{ImageRouteJobUnknown, TaskStatusUnknown},
+	} {
+		t.Run(terminal.state, func(t *testing.T) {
+			setupImageRouteJobTest(t)
+			job, root, _, _ := waitingImageRouteJobTest(t)
+			payload := []byte(`{"created":123,"data":[{"url":"https://images.example/output.png","revised_prompt":"private prompt"}],"metadata":{"key":"secret"}}`)
+			completed, err := CompleteImageRouteJob(job.ID, job.Version-1, terminal.state, payload, "safe failure")
+			require.NoError(t, err)
+			assert.False(t, completed)
+			completed, err = CompleteImageRouteJob(job.ID, job.Version, terminal.state, payload, "safe failure")
+			require.NoError(t, err)
+			require.True(t, completed)
+			finished := reloadImageRouteJobTest(t, job)
+			assert.Equal(t, job.Version+1, finished.Version)
+			assert.Equal(t, terminal.state, finished.State)
+			var task Task
+			require.NoError(t, DB.First(&task, root.ID).Error)
+			assert.Equal(t, terminal.status, task.Status)
+			assert.Zero(t, task.Quota)
+			assert.Equal(t, "b64_json", task.PrivateData.ImageTask.ResponseFormat)
+			assert.EqualValues(t, 253402300799, task.NextPollAt)
+			if terminal.state == ImageRouteJobSucceeded {
+				assert.JSONEq(t, `{"created":123,"data":[{"url":"https://images.example/output.png"}]}`, string(task.Data))
+				assert.Empty(t, task.FailReason)
+			} else {
+				assert.JSONEq(t, `{}`, string(task.Data))
+				assert.Equal(t, "safe failure", task.FailReason)
+			}
+			for _, version := range []int64{job.Version, finished.Version} {
+				for _, competing := range []string{ImageRouteJobFailed, ImageRouteJobSucceeded} {
+					completed, err := CompleteImageRouteJob(job.ID, version, competing, payload, "competing result")
+					require.NoError(t, err)
+					assert.False(t, completed)
+				}
+			}
+			resumed, err := ResumeImageRouteJob(job.ID, finished.Version)
+			require.NoError(t, err)
+			assert.False(t, resumed)
+		})
+	}
+}
+
+func TestImageRouteJobCompletionBase64RequiresPrivateResultPath(t *testing.T) {
+	setupImageRouteJobTest(t)
+	job, root := createImageRouteJobTest(t)
+	privateResult := filepath.Join(filepath.Dir(job.BodyPath), "result.json")
+	payload := []byte(`{"created":123,"data":[{"b64_json":"large-private-image"}]}`)
+	completed, err := CompleteImageRouteJob(job.ID, job.Version, ImageRouteJobSucceeded, payload, "")
+	require.ErrorIs(t, err, ErrImageRouteJobConflict)
+	assert.False(t, completed)
+	completed, err = CompleteImageRouteJob(job.ID, job.Version, ImageRouteJobSucceeded, payload, "", privateResult)
+	require.NoError(t, err)
+	require.True(t, completed)
+	assert.Equal(t, privateResult, reloadImageRouteJobTest(t, job).ResultPath)
+	assert.Equal(t, job.BodyPath, reloadImageRouteJobTest(t, job).BodyPath)
+	var task Task
+	require.NoError(t, DB.First(&task, root.ID).Error)
+	assert.JSONEq(t, `{}`, string(task.Data))
+	assert.True(t, task.PrivateData.ImageTask.NoRetention)
+}
+
+func TestImageRouteJobCompletionRejectsUnsafeOrInvalidResults(t *testing.T) {
+	for _, payload := range []string{
+		`{`,
+		`{"data":[{"url":"data:image/png;base64,private"}]}`,
+		`{"data":[{"url":"file:///private/result.png"}]}`,
+		`{"data":[{"url":"https://user:secret@images.example/result.png"}]}`,
+		`{"data":[{"url":"https://images.example/result.png?api_key=secret"}]}`,
+		`{"data":[{"url":"https://images.example/result.png?access-token=secret"}]}`,
+		`{"data":[]}`,
+	} {
+		t.Run(fmt.Sprintf("case-%d", len(payload)), func(t *testing.T) {
+			setupImageRouteJobTest(t)
+			job, _ := createImageRouteJobTest(t)
+			completed, err := CompleteImageRouteJob(job.ID, job.Version, ImageRouteJobSucceeded, []byte(payload), "")
+			require.Error(t, err)
+			assert.False(t, completed)
+			assert.Equal(t, job.Version, reloadImageRouteJobTest(t, job).Version)
+		})
+	}
+}
+
+func TestImageRouteJobCompletionRollsBackWhenRootIsUnavailable(t *testing.T) {
+	for _, rootState := range []string{"missing", "already succeeded", "duplicate"} {
+		t.Run(rootState, func(t *testing.T) {
+			setupImageRouteJobTest(t)
+			job, root := createImageRouteJobTest(t)
+			switch rootState {
+			case "missing":
+				require.NoError(t, DB.Delete(root).Error)
+			case "already succeeded":
+				require.NoError(t, DB.Model(root).Update("status", TaskStatusSuccess).Error)
+			case "duplicate":
+				duplicate := *root
+				duplicate.ID = 0
+				require.NoError(t, DB.Create(&duplicate).Error)
+			}
+			completed, err := CompleteImageRouteJob(job.ID, job.Version, ImageRouteJobFailed, nil, "safe failure")
+			require.ErrorIs(t, err, ErrImageRouteJobConflict)
+			assert.False(t, completed)
+			assert.Equal(t, job.Version, reloadImageRouteJobTest(t, job).Version)
+			assert.Equal(t, ImageRouteJobReady, reloadImageRouteJobTest(t, job).State)
+			if rootState != "missing" {
+				var persisted Task
+				require.NoError(t, DB.First(&persisted, root.ID).Error)
+				expectedStatus := TaskStatusSubmitted
+				if rootState == "already succeeded" {
+					expectedStatus = TaskStatusSuccess
+				}
+				assert.EqualValues(t, expectedStatus, persisted.Status)
+				assert.JSONEq(t, `{}`, string(persisted.Data))
+				assert.Zero(t, persisted.FinishTime)
+			}
+		})
+	}
+}
+
+func TestImageRouteJobCompletionRootWriteFailureRollsBackBothRows(t *testing.T) {
+	database := setupImageRouteJobTest(t)
+	job, root := createImageRouteJobTest(t)
+	sentinel := errors.New("root completion storage failed")
+	require.NoError(t, database.Callback().Update().After("gorm:update").Register("image_route_root_completion_failure", func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "tasks" {
+			tx.AddError(sentinel)
+		}
+	}))
+	completed, err := CompleteImageRouteJob(job.ID, job.Version, ImageRouteJobFailed, nil, "safe failure")
+	require.ErrorIs(t, err, sentinel)
+	assert.False(t, completed)
+	loaded := reloadImageRouteJobTest(t, job)
+	assert.Equal(t, job.State, loaded.State)
+	assert.Equal(t, job.Version, loaded.Version)
+	var persisted Task
+	require.NoError(t, database.First(&persisted, root.ID).Error)
+	assert.EqualValues(t, TaskStatusSubmitted, persisted.Status)
+	assert.Equal(t, "5%", persisted.Progress)
+	assert.Zero(t, persisted.FinishTime)
+	assert.Empty(t, persisted.FailReason)
+}

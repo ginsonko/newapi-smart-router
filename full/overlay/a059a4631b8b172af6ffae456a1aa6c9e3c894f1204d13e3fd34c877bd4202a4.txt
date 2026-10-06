@@ -1,0 +1,25 @@
+package sora
+
+import (
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestVideoFailureProviderErrorShapes(t *testing.T) {
+	for _, tc := range []struct{ raw, status, reason string }{
+		{`{"id":"query-error","error":{"code":429,"message":"temporary rate limit"}}`, model.TaskStatusInProgress, ""},
+		{`{"id":"string-query-error","error":"query temporarily unavailable"}`, model.TaskStatusInProgress, ""},
+		{`{"id":"one","status":"failed","error":"图片尺寸不符合要求"}`, model.TaskStatusFailure, "图片尺寸不符合要求"},
+		{`{"id":"two","status":"failed","error":{"code":400,"message":"只支持图片参考"}}`, model.TaskStatusFailure, "只支持图片参考"},
+		{`{"id":"three","status":"failed","data":{"fail_reason":"音频时长过长"}}`, model.TaskStatusFailure, "音频时长过长"},
+		{`{"id":"four","status":"processing","error":{"message":"临时重试"}}`, model.TaskStatusInProgress, ""},
+		{`{"id":"five","status":"unknown","error":{}}`, model.TaskStatusInProgress, ""},
+		{`{"id":"six","status":"unknown","error":{"message":"task failed"}}`, model.TaskStatusFailure, "上游已确认视频生成失败，但未提供具体原因。请提供任务编号联系支持核对。"},
+	} {
+		result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(tc.raw))
+		require.NoError(t, err)
+		require.Equal(t, tc.status, result.Status)
+		require.Equal(t, tc.reason, result.Reason)
+	}
+}

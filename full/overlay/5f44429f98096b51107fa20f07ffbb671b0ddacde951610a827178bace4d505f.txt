@@ -1,0 +1,395 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+
+import type { ParameterPrice } from '../pricing/types'
+
+export type MediaType = 'image' | 'video' | 'audio' | 'file'
+
+export type StudioMode =
+  | 'images'
+  | 'image-edits'
+  | 'videos'
+  | 'speech'
+  | 'transcriptions'
+  | 'translations'
+
+export type MediaAsset = {
+  id: string
+  type: MediaType | string
+  role: string
+  filename: string
+  mime_type: string
+  size_bytes: number
+  duration_seconds?: number
+  width?: number
+  height?: number
+  has_audio?: boolean
+  status: string
+  moderation_status: string
+  task_id?: string
+  model?: string
+  prompt?: string
+  prompt_truncated?: boolean
+  created_at: number
+  expires_at?: number
+  content_url: string
+  download_url: string
+  availability_status?: 'available' | 'unavailable'
+  availability_reason?: string
+  user_id?: number
+  username?: string
+  channel_id?: number
+  group?: string
+  source_kind?: string
+  storage_backend?: string
+  materialize_status?: string
+  materialize_attempts?: number
+  materialize_last_error?: string
+  moderation_reason?: string
+  admin_hold?: boolean
+  last_accessed_at?: number
+}
+
+export type MediaPage<T> = {
+  page: number
+  page_size: number
+  total: number
+  items: T[]
+}
+
+export type MediaCapabilityContract = {
+  runtime_enforced?: boolean
+  contract_revision?: string
+  resolution_aliases?: Record<string, string>
+  default_resolution?: string
+  require_resolution?: boolean
+  allowed_modes?: string[]
+  forbidden_modes?: string[]
+  forbidden_roles?: string[]
+  mixed_references?: boolean | null
+  native_human_images?: boolean | null
+  prompt_reference?: {
+    required: boolean
+    templates?: Partial<Record<'image' | 'video' | 'audio', string>>
+    index_scope: 'per_type' | 'global'
+    index_base: number
+  }
+  reference_image: boolean
+  reference_video: boolean
+  reference_audio: boolean
+  image_roles?: string[]
+  video_roles?: string[]
+  audio_roles?: string[]
+  max_images?: number
+  max_videos?: number
+  max_audios?: number
+  min_visual?: number
+  min_images?: number
+  max_total_references?: number
+  max_image_bytes?: number
+  max_video_bytes?: number
+  max_audio_bytes?: number
+  max_remote_image_bytes?: number
+  max_total_image_bytes?: number
+  image_mime_types?: string[]
+  min_reference_video_seconds?: number
+  max_reference_video_seconds?: number
+  max_total_reference_video_seconds?: number
+  aspect_ratios?: string[]
+  resolutions?: string[]
+  duration?: {
+    mode?: 'fixed' | 'range' | 'enum' | string
+    min?: number
+    max?: number
+    step?: number
+    default?: number
+    fixed?: number
+  }
+  output_count?: { min?: number; max?: number; default?: number }
+  provider_contract?: string
+  /** Provider field aliases, e.g. { seconds: 'duration', aspect_ratio: 'ratio' }. */
+  generation_fields?: Record<string, string>
+  /** Provider encoding, e.g. { image: 'data_url' }. Values come from the contract. */
+  reference_encoding?: Record<string, string>
+  billing_unit?: 'per_request' | 'per_second' | 'fixed_duration' | string
+  pricing_revision?: string
+}
+
+export type MediaCapabilities = {
+  parameter_prices?: ParameterPrice[]
+  model: string
+  group: string
+  mode: string
+  contract_version: string
+  route_count: number
+  groups: string[]
+  models: string[]
+  catalog: Array<{ group: string; models: string[] }>
+  available: MediaCapabilityContract
+  guaranteed: MediaCapabilityContract
+  route_capabilities: MediaCapabilityContract[]
+  routes?: MediaRouteSummary[]
+  sources: Record<'image' | 'video' | 'audio', string[]>
+  strict: boolean
+}
+
+export type MediaRouteSummary = {
+  channel_id: number
+  channel_name: string
+  group: string
+  model: string
+  billing_mode: string
+  price_unit?: string
+  actual_price?: number
+  effective_ratio?: number
+  price_known: boolean
+}
+
+export type StudioReference = {
+  id: string
+  type: 'image' | 'video' | 'audio'
+  role: string
+  fileId?: string
+  file?: File
+  name: string
+  previewUrl?: string
+}
+
+export type StudioFormValue = {
+  runtimeEnforced?: boolean
+  parameterPricing?: boolean
+  parameterResolution?: boolean
+  parameterQuality?: boolean
+  parameterExpectedAmount?: string
+  parameterExpectedCurrency?: string
+  mode: StudioMode
+  group: string
+  model: string
+  prompt: string
+  size: string
+  aspectRatio: string
+  resolution: string
+  duration: number
+  count: number
+  quality: string
+  voice: string
+  responseFormat: string
+  references: StudioReference[]
+  inputFile?: File
+  fallbackEnabled?: boolean
+  fallbackGroups?: string[]
+  image2PriceAscending?: boolean
+}
+
+export type StudioTask = {
+  id: string
+  status: string
+  progress?: string
+  mode?: StudioMode
+  model?: string
+  group?: string
+  prompt?: string
+  size?: string
+  aspect_ratio?: string
+  duration?: number
+  reference_count?: number
+  created_at?: number
+  updated_at?: number
+  completed_at?: number
+  error?: string
+  artifacts?: MediaAsset[]
+}
+
+export type StudioOutput = {
+  requestId: string
+  mode: StudioMode
+  status: 'running' | 'confirming' | 'succeeded' | 'failed' | 'unconfirmed'
+  taskId?: string
+  operationId?: string
+  expectedAssetCount?: number
+  confirmationStartedAt?: number
+  stage?: string
+  progress?: string
+  model?: string
+  group?: string
+  prompt?: string
+  size?: string
+  duration?: number
+  referenceCount?: number
+  references?: StudioReference[]
+  text?: string
+  assets: MediaAsset[]
+  raw?: unknown
+  createdAt: number
+  error?: string
+  errorDetails?: {
+    code?: string
+    category?: string
+    field?: string
+    requestId?: string
+    upstreamStatus?: number
+    detail?: string
+  }
+}
+
+export type MediaStorageOverview = {
+  used_bytes: number
+  reserved_bytes: number
+  physical_used_bytes: number
+  effective_used_bytes: number
+  untracked_bytes: number
+  temporary_bytes: number
+  physical_file_count: number
+  untracked_file_count: number
+  temporary_file_count: number
+  last_scanned_at: number
+  last_scan_error?: string
+  ready_count: number
+  uploading_count: number
+  failed_count: number
+  deleted_count: number
+  unreviewed_count: number
+  violation_count: number
+  protected_count: number
+  oldest_asset_at: number
+  newest_asset_at: number
+}
+
+export type MediaAdminOverview = {
+  storage: MediaStorageOverview
+  global_max_bytes: number
+  per_user_max_bytes: number
+  high_watermark_percent: number
+  low_watermark_percent: number
+  reserved_free_bytes: number
+}
+
+export type MediaCleanupRun = {
+  id: number
+  trigger: string
+  requested_by?: number
+  capacity_before: number
+  capacity_after: number
+  examined_count: number
+  deleted_count: number
+  freed_bytes: number
+  error_count: number
+  started_at: number
+  finished_at: number
+}
+
+export type MediaModerationEvent = {
+  id: number
+  asset_id: string
+  user_id: number
+  username: string
+  admin_user_id: number
+  action: string
+  reason: string
+  previous_status: string
+  new_status: string
+  created_at: number
+}
+
+export type MediaCapabilityOverride = {
+  channel_id?: number
+  model?: string
+  endpoint?: string
+  reference_image?: boolean
+  reference_video?: boolean
+  reference_audio?: boolean
+  image_roles?: string[]
+  video_roles?: string[]
+  audio_roles?: string[]
+  min_images?: number
+  max_images?: number
+  max_videos?: number
+  max_audios?: number
+  max_total_references?: number
+  max_image_bytes?: number
+  max_video_bytes?: number
+  max_audio_bytes?: number
+  duration_mode?: string
+  duration_min?: number
+  duration_max?: number
+  duration_step?: number
+  duration_default?: number
+  fixed_duration_seconds?: number
+  aspect_ratios?: string[]
+  resolutions?: string[]
+  provider_contract?: string
+  /**
+   * Extra JSON keys from the stored override document. The config form must
+   * round-trip them; do not reconstruct this object from a field whitelist.
+   */
+  [key: string]: unknown
+}
+
+export type MediaConfig = {
+  enabled: boolean
+  storage_path: string
+  input_ttl_hours: number
+  asset_ttl_hours: number
+  signed_url_ttl_seconds: number
+  reference_url_ttl_seconds: number
+  admin_preview_ttl_seconds: number
+  max_file_bytes: number
+  max_request_bytes: number
+  per_user_max_bytes: number
+  global_max_bytes: number
+  high_watermark_percent: number
+  low_watermark_percent: number
+  reserved_free_bytes: number
+  cleanup_interval_minutes: number
+  temporary_file_ttl_hours: number
+  cleanup_batch_size: number
+  upload_reservation_minutes: number
+  max_upload_concurrency: number
+  max_download_concurrency: number
+  max_event_stream_connections: number
+  max_event_stream_connections_per_user: number
+  event_stream_poll_milliseconds: number
+  event_stream_heartbeat_seconds: number
+  event_stream_max_lifetime_minutes: number
+  evidence_retention_days: number
+  remote_materialize_enabled: boolean
+  remote_materialize_max_bytes: number
+  remote_materialize_workers: number
+  remote_materialize_scan_seconds: number
+  remote_materialize_timeout_seconds: number
+  remote_materialize_max_attempts: number
+  remote_materialize_initial_backoff_seconds: number
+  remote_materialize_max_backoff_seconds: number
+  capability_overrides?: MediaCapabilityOverride[]
+  synthetic_probe_budget_per_day: number
+}
+
+export type AssetListParams = {
+  page?: number
+  pageSize?: number
+  type?: string
+  status?: string
+  moderationStatus?: string
+  search?: string
+  username?: string
+  model?: string
+  group?: string
+  taskId?: string
+  includeDeleted?: boolean
+}

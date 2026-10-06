@@ -1,0 +1,69 @@
+package openai
+
+import (
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestMarkExplicitOpenAIInputUsageNormalizesPromptTokens(t *testing.T) {
+	usage := &dto.Usage{PromptTokens: 123, CompletionTokens: 9}
+	markExplicitOpenAIInputUsage(usage, "openai-chat-completions")
+
+	assert.Equal(t, 123, usage.InputTokens)
+	assert.Equal(t, "openai-chat-completions", usage.UsageSource)
+}
+
+func TestMarkExplicitOpenAIInputUsageDoesNotMarkEstimatedOrExistingInput(t *testing.T) {
+	estimated := &dto.Usage{PromptTokens: 123}
+	markExplicitOpenAIInputUsage(estimated, "")
+	assert.Zero(t, estimated.InputTokens)
+	assert.Empty(t, estimated.UsageSource)
+
+	existing := &dto.Usage{PromptTokens: 123, InputTokens: 456, UsageSource: "adapter"}
+	markExplicitOpenAIInputUsage(existing, "openai-chat-completions")
+	assert.Equal(t, 456, existing.InputTokens)
+	assert.Equal(t, "adapter", existing.UsageSource)
+}
+
+func TestMarkFirstSemanticTextIgnoresTransportOnlyChunks(t *testing.T) {
+	start := time.Now().Add(-time.Second)
+	info := &relaycommon.RelayInfo{StartTime: start}
+
+	MarkFirstSemanticTextJSON(info, relayconstant.RelayModeChatCompletions,
+		`{"choices":[{"delta":{"role":"assistant"}}]}`)
+	MarkFirstSemanticTextJSON(info, relayconstant.RelayModeChatCompletions,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1}}`)
+
+	assert.False(t, info.HasSemanticText())
+}
+
+func TestMarkFirstSemanticTextMarksContentAndReasoning(t *testing.T) {
+	start := time.Now().Add(-time.Second)
+	contentInfo := &relaycommon.RelayInfo{StartTime: start}
+	MarkFirstSemanticTextJSON(contentInfo, relayconstant.RelayModeChatCompletions,
+		`{"choices":[{"delta":{"content":"hello"}}]}`)
+	assert.True(t, contentInfo.HasSemanticText())
+
+	reasoningInfo := &relaycommon.RelayInfo{StartTime: start}
+	MarkFirstSemanticTextJSON(reasoningInfo, relayconstant.RelayModeChatCompletions,
+		`{"choices":[{"delta":{"reasoning_content":"thinking"}}]}`)
+	assert.True(t, reasoningInfo.HasSemanticText())
+}
+
+func TestMarkFirstSemanticTextMarksCompletionsTextOnly(t *testing.T) {
+	start := time.Now().Add(-time.Second)
+	info := &relaycommon.RelayInfo{StartTime: start}
+	MarkFirstSemanticTextJSON(info, relayconstant.RelayModeCompletions,
+		`{"choices":[{"text":"hello"}]}`)
+	assert.True(t, info.HasSemanticText())
+
+	finishOnly := &relaycommon.RelayInfo{StartTime: start}
+	MarkFirstSemanticTextJSON(finishOnly, relayconstant.RelayModeCompletions,
+		`{"choices":[{"text":"","finish_reason":"stop"}]}`)
+	assert.False(t, finishOnly.HasSemanticText())
+}

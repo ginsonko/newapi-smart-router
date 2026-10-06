@@ -1,0 +1,210 @@
+package sora
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestParseTaskResultKeepsAcceptedUnknownStateNonTerminal(t *testing.T) {
+	result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(`{
+		"id":"task_upstream_accepted",
+		"status":"unknown",
+		"progress":0,
+		"error":null
+	}`))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, "task_upstream_accepted", result.TaskID)
+	assert.EqualValues(t, model.TaskStatusInProgress, result.Status)
+	assert.Empty(t, result.Reason)
+}
+
+func TestParseTaskResultExtractsCompletedMetadataURL(t *testing.T) {
+	const signedURL = "https://assets.example.test/download?signature=opaque"
+	result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(`{
+		"id":"task_upstream_completed",
+		"status":"completed",
+		"progress":100,
+		"metadata":{"url":"` + signedURL + `"}
+	}`))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.EqualValues(t, model.TaskStatusSuccess, result.Status)
+	assert.Equal(t, signedURL, result.Url)
+}
+
+func TestParseTaskResultExtractsCompletedResultURL(t *testing.T) {
+	const resultURL = "https://api.aizzz.xyz/v1/videos/task-upstream/content"
+	result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(`{
+		"id":"task_upstream_completed",
+		"status":"completed",
+		"progress":100,
+		"result_url":"` + resultURL + `"
+	}`))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.EqualValues(t, model.TaskStatusSuccess, result.Status)
+	assert.Equal(t, resultURL, result.Url)
+}
+
+func TestParseTaskResultRequiresExplicitFailureEvidence(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus model.TaskStatus
+	}{
+		{name: "new provider state", body: `{"id":"task_new_state","status":"allocating"}`, wantStatus: model.TaskStatusInProgress},
+		{name: "explicit failure", body: `{"id":"task_failed","status":"failed","error":{"message":"render rejected"}}`, wantStatus: model.TaskStatusFailure},
+		{name: "error without status", body: `{"id":"task_failed","error":{"message":"render rejected"}}`, wantStatus: model.TaskStatusFailure},
+		{name: "anonymous unknown", body: `{"status":"unknown"}`, wantStatus: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(test.body))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.EqualValues(t, test.wantStatus, result.Status)
+		})
+	}
+}
+
+func TestBuildRequestBodyUsesStandardSingleImageContractByDefault(t *testing.T) {
+	request := relaycommon.TaskSubmitReq{References: []relaycommon.MediaReference{
+		{Type: "image", Role: "reference", ResolvedURL: "https://media.example.test/first.png"},
+	}}
+	body := buildSoraJSONBody(t, request, mediasetting.Get())
+
+	assert.Equal(t, "https://media.example.test/first.png", body["input_reference"])
+	assert.NotContains(t, body, "references")
+}
+
+func TestBuildRequestBodyNormalizesSecondsToString(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "numeric public input", raw: `{"model":"client-model","prompt":"scene","seconds":10}`},
+		{name: "string public input", raw: `{"model":"client-model","prompt":"scene","seconds":"10"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request relaycommon.TaskSubmitReq
+			require.NoError(t, common.Unmarshal([]byte(test.raw), &request))
+			require.Equal(t, "10", request.Seconds)
+
+			body := buildSoraJSONBodyFromRaw(t, request, mediasetting.Get(), test.raw)
+
+			seconds, ok := body["seconds"].(string)
+			require.True(t, ok, "OpenAI video upstream requires seconds as a string")
+			assert.Equal(t, "10", seconds)
+		})
+	}
+}
+
+func TestBuildRequestBodyForwardsEveryNormalizedReferenceWhenRouteOverrideAllowsIt(t *testing.T) {
+	setting := mediasetting.Get()
+	truth := true
+	setting.CapabilityOverrides = []mediasetting.CapabilityOverride{{
+		ChannelID: 77, Model: "extended-video", Endpoint: "openai-videos-v1",
+		ReferenceImage: &truth, ReferenceVideo: &truth, ReferenceAudio: &truth,
+		ImageRoles: []string{"reference", "first_frame", "last_frame"},
+		VideoRoles: []string{"source"}, AudioRoles: []string{"driving_audio"},
+		MaxImages: 2, MaxVideos: 1, MaxAudios: 1,
+	}}
+	request := relaycommon.TaskSubmitReq{References: []relaycommon.MediaReference{
+		{Type: "image", Role: "first_frame", FileID: "private-file-id", ResolvedURL: "https://media.example.test/first.png"},
+		{Type: "image", Role: "last_frame", ResolvedURL: "https://media.example.test/last.png"},
+		{Type: "video", Role: "source", ResolvedURL: "https://media.example.test/source.mp4"},
+		{Type: "audio", Role: "driving_audio", ResolvedURL: "https://media.example.test/audio.mp3"},
+	}}
+
+	body := buildSoraJSONBody(t, request, setting)
+
+	references, ok := body["references"].([]any)
+	require.True(t, ok)
+	require.Len(t, references, 4)
+	first := references[0].(map[string]any)
+	assert.Equal(t, "image", first["type"])
+	assert.Equal(t, "first_frame", first["role"])
+	assert.Equal(t, "https://media.example.test/first.png", first["url"])
+	assert.NotContains(t, first, "file_id", "private site file IDs must never be sent upstream")
+	assert.Equal(t, "https://media.example.test/first.png", body["input_reference"])
+}
+
+func TestBuildRequestBodyUsesAIZZZReferenceAndFixedDurationContract(t *testing.T) {
+	request := relaycommon.TaskSubmitReq{
+		Seconds: "15", AspectRatio: "16:9",
+		References: []relaycommon.MediaReference{
+			{Type: "image", Role: "reference", ResolvedURL: "https://media.example.test/one.png"},
+			{Type: "image", Role: "reference", ResolvedURL: "https://media.example.test/two.png"},
+			{Type: "video", Role: "reference", ResolvedURL: "https://media.example.test/source.mp4"},
+			{Type: "audio", Role: "reference", ResolvedURL: "https://media.example.test/audio.mp3"},
+		},
+	}
+	body := buildSoraJSONBodyForRoute(
+		t, request, mediasetting.Get(), "https://api.aizzz.xyz",
+		"mg-seedance2.0 -720p-fast-gz-15s",
+		`{"model":"client-model","prompt":"scene"}`,
+	)
+
+	assert.Equal(t, "1", body["seconds"])
+	assert.Equal(t, "15", body["mySeconds"])
+	assert.Equal(t, "16:9", body["aspect_ratio"])
+	assert.Equal(t, "https://media.example.test/one.png", body["input_reference"])
+	assert.Equal(t, []any{"https://media.example.test/one.png", "https://media.example.test/two.png"}, body["reference_image_urls"])
+	assert.Equal(t, []any{"https://media.example.test/source.mp4"}, body["reference_videos"])
+	assert.Equal(t, []any{"https://media.example.test/audio.mp3"}, body["reference_audios"])
+	assert.NotContains(t, body, "references")
+}
+
+func buildSoraJSONBody(t *testing.T, request relaycommon.TaskSubmitReq, setting mediasetting.Setting) map[string]any {
+	return buildSoraJSONBodyFromRaw(t, request, setting, `{"model":"client-model","references":[{"file_id":"must-not-leak"}]}`)
+}
+
+func buildSoraJSONBodyFromRaw(t *testing.T, request relaycommon.TaskSubmitReq, setting mediasetting.Setting, requestBody string) map[string]any {
+	return buildSoraJSONBodyForRoute(t, request, setting, "", "extended-video", requestBody)
+}
+
+func buildSoraJSONBodyForRoute(t *testing.T, request relaycommon.TaskSubmitReq, setting mediasetting.Setting, baseURL, upstreamModel, requestBody string) map[string]any {
+	t.Helper()
+	previousSetting := mediasetting.Get()
+	require.NoError(t, mediasetting.Replace(setting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(requestBody))
+	context.Request.Header.Set("Content-Type", "application/json")
+	context.Set("task_request", request)
+	storage, err := common.GetBodyStorage(context)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, storage.Close()) })
+
+	reader, err := (&TaskAdaptor{}).BuildRequestBody(context, &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: 77, ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: upstreamModel,
+			ChannelBaseUrl: baseURL,
+		},
+	})
+	require.NoError(t, err)
+	raw, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	var body map[string]any
+	require.NoError(t, common.Unmarshal(raw, &body))
+	return body
+}

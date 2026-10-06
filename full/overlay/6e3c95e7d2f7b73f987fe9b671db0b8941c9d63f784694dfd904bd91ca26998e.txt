@@ -1,0 +1,877 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+const (
+	TaskBillingReceiptSubmissionPending = "submission_pending"
+	TaskBillingReceiptTracking          = "tracking"
+	TaskBillingReceiptTerminalPending   = "terminal_pending"
+	TaskBillingReceiptApplied           = "applied"
+	TaskBillingReceiptReview            = "review"
+
+	maxTaskBillingReceiptBatch = 100
+)
+
+var (
+	ErrTaskBillingReceiptNotFound        = errors.New("task billing receipt not found")
+	ErrTaskBillingReceiptConflict        = errors.New("task billing receipt conflict")
+	ErrTaskBillingReceiptReview          = errors.New("task billing receipt requires review")
+	ErrTaskBillingReceiptVersionConflict = errors.New("task billing receipt version conflict")
+)
+
+// TaskBillingReceipt is the durable authority for one asynchronous task's
+// financial amount. It keeps task publication and billing recoverable without
+// putting commission into the request or routing hot path.
+type TaskBillingReceipt struct {
+	ID                   int64      `json:"id" gorm:"primaryKey"`
+	TaskRowID            int64      `json:"task_row_id" gorm:"not null;uniqueIndex"`
+	ReservationID        *string    `json:"reservation_id,omitempty" gorm:"type:varchar(128);uniqueIndex"`
+	RequestID            string     `json:"request_id" gorm:"type:varchar(128);not null;index"`
+	UserID               int        `json:"user_id" gorm:"not null;index"`
+	TokenID              int        `json:"token_id" gorm:"not null;index"`
+	TokenUnlimited       bool       `json:"token_unlimited" gorm:"not null"`
+	ChannelID            int        `json:"channel_id" gorm:"not null;index"`
+	SubscriptionID       int        `json:"subscription_id" gorm:"not null;index"`
+	FundingSource        string     `json:"funding_source" gorm:"type:varchar(32);not null;index"`
+	SubmissionQuota      int        `json:"submission_quota" gorm:"not null"`
+	PreConsumedQuota     int        `json:"pre_consumed_quota" gorm:"not null"`
+	AppliedQuota         int        `json:"applied_quota" gorm:"not null"`
+	UsageAppliedQuota    int        `json:"usage_applied_quota" gorm:"not null"`
+	TargetQuota          int        `json:"target_quota" gorm:"not null"`
+	TerminalTargetStatus TaskStatus `json:"terminal_target_status" gorm:"type:varchar(20);not null"`
+	State                string     `json:"state" gorm:"type:varchar(32);not null;index"`
+	RequestCountApplied  bool       `json:"request_count_applied" gorm:"not null"`
+	Version              int64      `json:"version" gorm:"not null"`
+	Attempts             int        `json:"attempts" gorm:"not null"`
+	LastError            string     `json:"last_error" gorm:"type:text"`
+	CreatedAt            int64      `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt            int64      `json:"updated_at" gorm:"type:bigint;not null;index"`
+	AppliedAt            int64      `json:"applied_at" gorm:"type:bigint;not null"`
+	// Original terminal cost fact remains stable after later partial refunds.
+	ParameterTerminalCost *string `json:"-" gorm:"type:text"`
+}
+
+func (TaskBillingReceipt) TableName() string { return "task_billing_receipts" }
+
+type TaskBillingReconcileStats struct {
+	Scanned int
+	Applied int
+	Review  int
+	Failed  int
+}
+
+type TaskBillingReceiptSpec struct {
+	TaskRowID       int64
+	ReservationID   string
+	RequestID       string
+	UserID          int
+	TokenID         int
+	TokenUnlimited  bool
+	ChannelID       int
+	SubscriptionID  int
+	FundingSource   string
+	SubmissionQuota int
+}
+
+type TaskBillingReceiptTransition struct {
+	Receipt  TaskBillingReceipt
+	Replayed bool
+	Review   bool
+}
+
+func MigrateTaskBillingReceiptSchema(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	return db.AutoMigrate(&TaskBillingReceipt{})
+}
+
+func CreateTaskBillingReceiptTx(tx *gorm.DB, spec TaskBillingReceiptSpec) (*TaskBillingReceipt, bool, error) {
+	if tx == nil || spec.TaskRowID <= 0 || spec.UserID <= 0 || spec.SubmissionQuota < 0 ||
+		spec.SubmissionQuota > common.MaxQuota {
+		return nil, false, ErrTaskBillingReceiptConflict
+	}
+	spec.ReservationID = strings.TrimSpace(spec.ReservationID)
+	spec.RequestID = strings.TrimSpace(spec.RequestID)
+	spec.FundingSource = strings.TrimSpace(spec.FundingSource)
+	var existing TaskBillingReceipt
+	err := lockForUpdate(tx).Where("task_row_id = ?", spec.TaskRowID).First(&existing).Error
+	if err == nil {
+		if !taskBillingReceiptMatchesSpec(&existing, spec) {
+			return nil, false, ErrTaskBillingReceiptConflict
+		}
+		return &existing, true, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, err
+	}
+	if spec.ReservationID != "" {
+		var conflict TaskBillingReceipt
+		query := tx.Where("reservation_id = ?", spec.ReservationID).First(&conflict)
+		if query.Error == nil {
+			return nil, false, ErrTaskBillingReceiptConflict
+		}
+		if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return nil, false, query.Error
+		}
+	}
+	now := common.GetTimestamp()
+	receipt := &TaskBillingReceipt{
+		TaskRowID: spec.TaskRowID, RequestID: spec.RequestID, UserID: spec.UserID,
+		TokenID: spec.TokenID, TokenUnlimited: spec.TokenUnlimited, ChannelID: spec.ChannelID,
+		SubscriptionID: spec.SubscriptionID, FundingSource: spec.FundingSource,
+		SubmissionQuota: spec.SubmissionQuota, TargetQuota: spec.SubmissionQuota,
+		State: TaskBillingReceiptSubmissionPending, Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if spec.ReservationID != "" {
+		receipt.ReservationID = &spec.ReservationID
+	}
+	if err := tx.Create(receipt).Error; err != nil {
+		return nil, false, err
+	}
+	return receipt, false, nil
+}
+
+func taskBillingReceiptMatchesSpec(receipt *TaskBillingReceipt, spec TaskBillingReceiptSpec) bool {
+	if receipt == nil {
+		return false
+	}
+	reservationID := ""
+	if receipt.ReservationID != nil {
+		reservationID = *receipt.ReservationID
+	}
+	return receipt.TaskRowID == spec.TaskRowID && reservationID == spec.ReservationID &&
+		receipt.UserID == spec.UserID && receipt.TokenID == spec.TokenID &&
+		receipt.ChannelID == spec.ChannelID && receipt.SubscriptionID == spec.SubscriptionID &&
+		receipt.FundingSource == spec.FundingSource && receipt.SubmissionQuota == spec.SubmissionQuota
+}
+
+func RecordTaskBillingSubmissionAppliedTx(tx *gorm.DB, taskRowID int64, appliedQuota int) (TaskBillingReceiptTransition, error) {
+	var output TaskBillingReceiptTransition
+	if tx == nil || taskRowID <= 0 || appliedQuota < 0 || appliedQuota > common.MaxQuota {
+		return output, ErrTaskBillingReceiptConflict
+	}
+	var receipt TaskBillingReceipt
+	if err := lockForUpdate(tx).Where("task_row_id = ?", taskRowID).First(&receipt).Error; err != nil {
+		return output, err
+	}
+	if receipt.State == TaskBillingReceiptTracking && receipt.AppliedQuota == appliedQuota && receipt.RequestCountApplied {
+		output.Receipt = receipt
+		output.Replayed = true
+		return output, nil
+	}
+	if receipt.State != TaskBillingReceiptSubmissionPending || receipt.SubmissionQuota != appliedQuota {
+		return output, ErrTaskBillingReceiptConflict
+	}
+	receipt.State = TaskBillingReceiptTracking
+	receipt.AppliedQuota = appliedQuota
+	receipt.UsageAppliedQuota = appliedQuota
+	receipt.RequestCountApplied = true
+	receipt.Version++
+	receipt.UpdatedAt = common.GetTimestamp()
+	if err := tx.Save(&receipt).Error; err != nil {
+		return output, err
+	}
+	output.Receipt = receipt
+	return output, nil
+}
+
+func StageTaskBillingTerminalTx(tx *gorm.DB, taskRowID int64, targetStatus TaskStatus, targetQuota int) (TaskBillingReceiptTransition, error) {
+	var output TaskBillingReceiptTransition
+	if tx == nil || taskRowID <= 0 ||
+		(targetStatus != TaskStatusSuccess && targetStatus != TaskStatusFailure) ||
+		targetQuota < 0 || targetQuota > common.MaxQuota || (targetStatus == TaskStatusFailure && targetQuota != 0) {
+		return output, ErrTaskBillingReceiptConflict
+	}
+	var receipt TaskBillingReceipt
+	if err := lockForUpdate(tx).Where("task_row_id = ?", taskRowID).First(&receipt).Error; err != nil {
+		return output, err
+	}
+	if receipt.State == TaskBillingReceiptApplied {
+		if taskBillingTerminalMatches(&receipt, targetStatus, targetQuota) {
+			output.Receipt = receipt
+			output.Replayed = true
+			return output, nil
+		}
+		return output, ErrTaskBillingReceiptConflict
+	}
+	if receipt.State == TaskBillingReceiptTerminalPending {
+		if receipt.TerminalTargetStatus == targetStatus && receipt.TargetQuota == targetQuota {
+			output.Receipt = receipt
+			output.Replayed = true
+			return output, nil
+		}
+		receipt.State = TaskBillingReceiptReview
+		receipt.LastError = "terminal target conflicts with the previously staged target"
+		receipt.Attempts++
+		receipt.Version++
+		receipt.UpdatedAt = common.GetTimestamp()
+		if err := tx.Save(&receipt).Error; err != nil {
+			return output, err
+		}
+		output.Receipt = receipt
+		output.Review = true
+		return output, nil
+	}
+	if receipt.State != TaskBillingReceiptSubmissionPending && receipt.State != TaskBillingReceiptTracking {
+		return output, ErrTaskBillingReceiptConflict
+	}
+	receipt.TerminalTargetStatus = targetStatus
+	receipt.TargetQuota = targetQuota
+	receipt.State = TaskBillingReceiptTerminalPending
+	receipt.Version++
+	receipt.UpdatedAt = common.GetTimestamp()
+	receipt.LastError = ""
+	if err := tx.Save(&receipt).Error; err != nil {
+		return output, err
+	}
+	output.Receipt = receipt
+	return output, nil
+}
+
+func MarkTaskBillingReceiptAppliedTx(tx *gorm.DB, taskRowID, expectedVersion int64) (TaskBillingReceiptTransition, error) {
+	var output TaskBillingReceiptTransition
+	if tx == nil || taskRowID <= 0 {
+		return output, ErrTaskBillingReceiptConflict
+	}
+	var receipt TaskBillingReceipt
+	if err := lockForUpdate(tx).Where("task_row_id = ?", taskRowID).First(&receipt).Error; err != nil {
+		return output, err
+	}
+	if receipt.State == TaskBillingReceiptApplied {
+		output.Receipt = receipt
+		output.Replayed = true
+		return output, nil
+	}
+	if receipt.Version != expectedVersion {
+		return output, ErrTaskBillingReceiptVersionConflict
+	}
+	if receipt.State != TaskBillingReceiptTerminalPending {
+		return output, ErrTaskBillingReceiptConflict
+	}
+	receipt.State = TaskBillingReceiptApplied
+	receipt.AppliedQuota = receipt.TargetQuota
+	receipt.UsageAppliedQuota = receipt.TargetQuota
+	receipt.RequestCountApplied = true
+	receipt.Version++
+	receipt.UpdatedAt = common.GetTimestamp()
+	receipt.AppliedAt = receipt.UpdatedAt
+	if err := tx.Save(&receipt).Error; err != nil {
+		return output, err
+	}
+	output.Receipt = receipt
+	return output, nil
+}
+
+func ListPendingTaskBillingReceipts(afterID int64, limit int) ([]TaskBillingReceipt, error) {
+	if afterID < 0 || limit <= 0 || limit > maxTaskBillingReceiptBatch {
+		return nil, ErrTaskBillingReceiptConflict
+	}
+	var receipts []TaskBillingReceipt
+	err := DB.Where("id > ? AND state IN ?", afterID, []string{TaskBillingReceiptSubmissionPending, TaskBillingReceiptTerminalPending}).
+		Order("id ASC").Limit(limit).Find(&receipts).Error
+	return receipts, err
+}
+
+func EnsureTaskBillingReceipt(task *Task) (*TaskBillingReceipt, error) {
+	if task == nil || task.ID <= 0 {
+		return nil, ErrTaskBillingReceiptNotFound
+	}
+	var receipt *TaskBillingReceipt
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var locked Task
+		if err := lockForUpdate(tx).Where("id = ?", task.ID).First(&locked).Error; err != nil {
+			return err
+		}
+		var err error
+		receipt, err = ensureTaskBillingReceiptTx(tx, &locked, true)
+		return err
+	})
+	return receipt, err
+}
+
+func ensureTaskBillingReceiptTx(tx *gorm.DB, task *Task, existingTask bool) (*TaskBillingReceipt, error) {
+	if tx == nil || task == nil || task.ID <= 0 || task.UserId <= 0 {
+		return nil, ErrTaskBillingReceiptNotFound
+	}
+	var existing TaskBillingReceipt
+	err := tx.Where("task_row_id = ?", task.ID).First(&existing).Error
+	if err == nil {
+		return &existing, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	now := common.GetTimestamp()
+	if task.Status == TaskStatusUnknown {
+		return nil, nil
+	}
+	receipt := &TaskBillingReceipt{
+		TaskRowID: task.ID, RequestID: strings.TrimSpace(task.PrivateData.BillingRequestID),
+		UserID: task.UserId, TokenID: task.PrivateData.TokenId, ChannelID: task.ChannelId,
+		SubscriptionID: task.PrivateData.SubscriptionId, FundingSource: strings.TrimSpace(task.PrivateData.BillingSource),
+		SubmissionQuota: task.Quota, TargetQuota: task.Quota, State: TaskBillingReceiptSubmissionPending,
+		Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if receipt.SubmissionQuota < 0 || receipt.SubmissionQuota > common.MaxQuota {
+		return nil, ErrTaskBillingReceiptConflict
+	}
+
+	reservationID := strings.TrimSpace(task.BillingReservationID)
+	if reservationID != "" {
+		var reservation QuotaReservation
+		if err := lockForUpdate(tx).Where("reservation_id = ?", reservationID).First(&reservation).Error; err != nil {
+			return nil, err
+		}
+		if reservation.UserId != task.UserId ||
+			(task.PrivateData.TokenId > 0 && reservation.TokenId != task.PrivateData.TokenId) {
+			return nil, ErrTaskBillingReceiptConflict
+		}
+		if err := restoreParameterTaskBillingTx(tx, task, &reservation); err != nil {
+			return nil, err
+		}
+		receipt.ReservationID = &reservationID
+		receipt.RequestID = reservation.RequestId
+		receipt.TokenID = reservation.TokenId
+		receipt.TokenUnlimited = reservation.TokenUnlimited
+		receipt.SubscriptionID = reservation.UserSubscriptionId
+		receipt.FundingSource = reservation.FundingSource
+		switch reservation.Status {
+		case QuotaReservationStatusActive:
+			receipt.PreConsumedQuota = reservation.ReservedQuota
+		case QuotaReservationStatusSettled:
+			receipt.PreConsumedQuota = reservation.FinalQuota
+			if existingTask {
+				receipt.AppliedQuota = reservation.FinalQuota
+				receipt.UsageAppliedQuota = reservation.FinalQuota
+				receipt.RequestCountApplied = true
+				receipt.State = TaskBillingReceiptTracking
+			}
+		case QuotaReservationStatusRefunded:
+			if existingTask {
+				return nil, nil
+			}
+			return nil, ErrTaskBillingReceiptConflict
+		default:
+			return nil, ErrTaskBillingReceiptConflict
+		}
+	} else if receipt.FundingSource == QuotaReservationFundingSubscription && receipt.SubscriptionID > 0 {
+		if receipt.RequestID == "" {
+			return nil, ErrTaskBillingReceiptConflict
+		}
+		var preconsume SubscriptionPreConsumeRecord
+		if err := lockForUpdate(tx).Where("request_id = ?", receipt.RequestID).First(&preconsume).Error; err != nil {
+			return nil, err
+		}
+		if preconsume.UserId != receipt.UserID || preconsume.UserSubscriptionId != receipt.SubscriptionID {
+			return nil, ErrTaskBillingReceiptConflict
+		}
+		if preconsume.Status != "refunded" {
+			receipt.PreConsumedQuota = int(preconsume.PreConsumed)
+		}
+		if receipt.TokenID > 0 {
+			var token Token
+			if err := tx.Unscoped().Select("id", "user_id", "unlimited_quota").Where("id = ?", receipt.TokenID).First(&token).Error; err != nil {
+				return nil, err
+			}
+			if token.UserId != receipt.UserID {
+				return nil, ErrTaskBillingReceiptConflict
+			}
+			receipt.TokenUnlimited = token.UnlimitedQuota
+		}
+		if existingTask {
+			receipt.AppliedQuota = task.Quota
+			receipt.UsageAppliedQuota = task.Quota
+			receipt.RequestCountApplied = true
+			receipt.State = TaskBillingReceiptTracking
+		}
+	} else {
+		// Free/probe/legacy tasks without a durable billing identity are not
+		// silently enrolled into the new financial lifecycle.
+		return nil, nil
+	}
+
+	if receipt.PreConsumedQuota < 0 || receipt.PreConsumedQuota > common.MaxQuota {
+		return nil, ErrTaskBillingReceiptConflict
+	}
+	if err := tx.Create(receipt).Error; err != nil {
+		var raced TaskBillingReceipt
+		if loadErr := tx.Where("task_row_id = ?", task.ID).First(&raced).Error; loadErr == nil {
+			return &raced, nil
+		}
+		return nil, err
+	}
+	return receipt, nil
+}
+
+func GetTaskBillingReceipt(taskRowID int64) (*TaskBillingReceipt, error) {
+	if taskRowID <= 0 {
+		return nil, ErrTaskBillingReceiptNotFound
+	}
+	var receipt TaskBillingReceipt
+	err := DB.Where("task_row_id = ?", taskRowID).First(&receipt).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrTaskBillingReceiptNotFound
+	}
+	return &receipt, err
+}
+
+func ApplyTaskBillingSubmission(taskRowID int64) (*TaskBillingReceipt, error) {
+	return applyTaskBillingReceipt(taskRowID, false)
+}
+
+// StageTaskBillingTerminal persists the deterministic terminal target before
+// any final adjustment. The public task remains FINALIZING until application.
+func StageTaskBillingTerminal(task *Task, targetStatus TaskStatus, targetQuota int) error {
+	if task == nil || task.ID <= 0 ||
+		(targetStatus != TaskStatusSuccess && targetStatus != TaskStatusFailure) ||
+		targetQuota < 0 || targetQuota > common.MaxQuota ||
+		(targetStatus == TaskStatusFailure && targetQuota != 0) {
+		return ErrTaskBillingReceiptConflict
+	}
+	reviewRequired := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var locked Task
+		if err := lockForUpdate(tx).Where("id = ?", task.ID).First(&locked).Error; err != nil {
+			return err
+		}
+		receipt, err := ensureTaskBillingReceiptTx(tx, &locked, true)
+		if err != nil {
+			return err
+		}
+		if receipt == nil {
+			return ErrTaskBillingReceiptNotFound
+		}
+		if receipt.State == TaskBillingReceiptReview {
+			return ErrTaskBillingReceiptReview
+		}
+		if receipt.State == TaskBillingReceiptApplied {
+			if taskBillingTerminalMatches(receipt, targetStatus, targetQuota) {
+				return nil
+			}
+			if err := markTaskBillingReceiptReviewTx(tx, receipt, "terminal target changed after application"); err != nil {
+				return err
+			}
+			reviewRequired = true
+			return nil
+		}
+		if receipt.State == TaskBillingReceiptTerminalPending &&
+			(receipt.TerminalTargetStatus != targetStatus || receipt.TargetQuota != targetQuota) {
+			if err := markTaskBillingReceiptReviewTx(tx, receipt, "terminal target changed while pending"); err != nil {
+				return err
+			}
+			reviewRequired = true
+			return nil
+		}
+
+		updates := map[string]interface{}{
+			"target_quota": targetQuota, "terminal_target_status": targetStatus,
+			"state": TaskBillingReceiptTerminalPending, "updated_at": common.GetTimestamp(),
+			"version": gorm.Expr("version + 1"), "last_error": "",
+		}
+		if err := tx.Model(&TaskBillingReceipt{}).Where("id = ?", receipt.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+
+		staged := *task
+		staged.Status = TaskStatusFinalizing
+		if staged.Progress == "100%" {
+			staged.Progress = "99%"
+		}
+		result := tx.Model(&Task{}).Where("id = ? AND status NOT IN ?", task.ID, []TaskStatus{TaskStatusSuccess, TaskStatusFailure}).
+			Select("status", "progress", "start_time", "finish_time", "fail_reason", "private_data", "data", "properties", "updated_at").Updates(&staged)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			var current Task
+			if err := tx.Where("id = ?", task.ID).First(&current).Error; err != nil {
+				return err
+			}
+			if current.Status != targetStatus || current.Quota != targetQuota {
+				return ErrTaskBillingReceiptConflict
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if reviewRequired {
+		return ErrTaskBillingReceiptReview
+	}
+	return nil
+}
+
+func ApplyTaskBillingTerminal(taskRowID int64) (*TaskBillingReceipt, error) {
+	return applyTaskBillingReceipt(taskRowID, true)
+}
+
+func taskBillingTerminalMatches(receipt *TaskBillingReceipt, status TaskStatus, quota int) bool {
+	if receipt.TerminalTargetStatus != status {
+		return false
+	}
+	if receipt.TargetQuota == quota {
+		return true
+	}
+	if receipt.ParameterTerminalCost == nil {
+		return false
+	}
+	var original TenantCostEventSpec
+	return common.UnmarshalJsonStr(*receipt.ParameterTerminalCost, &original) == nil && original.GatewayChargeQuota == int64(quota)
+}
+
+func applyTaskBillingReceipt(taskRowID int64, terminal bool) (*TaskBillingReceipt, error) {
+	if taskRowID <= 0 {
+		return nil, ErrTaskBillingReceiptNotFound
+	}
+	var output TaskBillingReceipt
+	mutation := quotaReservationCacheMutation{}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var receipt TaskBillingReceipt
+		if err := lockForUpdate(tx).Where("task_row_id = ?", taskRowID).First(&receipt).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrTaskBillingReceiptNotFound
+			}
+			return err
+		}
+		if receipt.State == TaskBillingReceiptReview {
+			return ErrTaskBillingReceiptReview
+		}
+		var task Task
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", taskRowID, receipt.UserID).First(&task).Error; err != nil {
+			return err
+		}
+
+		target := receipt.SubmissionQuota
+		if terminal {
+			if receipt.State == TaskBillingReceiptApplied {
+				output = receipt
+				return nil
+			}
+			if receipt.State != TaskBillingReceiptTerminalPending ||
+				(receipt.TerminalTargetStatus != TaskStatusSuccess && receipt.TerminalTargetStatus != TaskStatusFailure) {
+				return ErrTaskBillingReceiptConflict
+			}
+			target = receipt.TargetQuota
+		} else {
+			if receipt.State == TaskBillingReceiptTracking || receipt.State == TaskBillingReceiptApplied {
+				output = receipt
+				return nil
+			}
+			if receipt.State != TaskBillingReceiptSubmissionPending {
+				return ErrTaskBillingReceiptConflict
+			}
+		}
+
+		receipt.LastError = ""
+		if err := applyTaskReceiptFundingTx(tx, &receipt, target, &mutation); err != nil {
+			return err
+		}
+		if err := applyTaskReceiptUsageTx(tx, &receipt, target, &mutation); err != nil {
+			return err
+		}
+
+		now := common.GetTimestamp()
+		receipt.AppliedQuota = target
+		receipt.UsageAppliedQuota = target
+		receipt.RequestCountApplied = true
+		receipt.Attempts++
+		receipt.Version++
+		receipt.UpdatedAt = now
+		if terminal {
+			receipt.State = TaskBillingReceiptApplied
+			receipt.AppliedAt = now
+			task.Status = receipt.TerminalTargetStatus
+			task.Quota = target
+			task.Progress = "100%"
+			if task.FinishTime == 0 {
+				task.FinishTime = now
+			}
+			if err := tx.Model(&Task{}).Where("id = ?", task.ID).
+				Select("status", "quota", "progress", "finish_time", "fail_reason", "private_data", "data", "properties", "updated_at").Updates(&task).Error; err != nil {
+				return err
+			}
+		} else {
+			receipt.State = TaskBillingReceiptTracking
+		}
+		if err := tx.Save(&receipt).Error; err != nil {
+			return err
+		}
+		if terminal {
+			if err := enqueueParameterTaskTerminalTx(tx, &task, &receipt); err != nil {
+				return err
+			}
+		}
+		output = receipt
+		return nil
+	})
+	if err != nil {
+		_ = markTaskBillingReceiptAttempt(taskRowID, err)
+		return nil, err
+	}
+	if mutation.changed() {
+		invalidateQuotaReservationCaches(mutation)
+	}
+	return &output, nil
+}
+
+func applyTaskReceiptFundingTx(tx *gorm.DB, receipt *TaskBillingReceipt, target int, mutation *quotaReservationCacheMutation) error {
+	if tx == nil || receipt == nil || mutation == nil || target < 0 || target > common.MaxQuota {
+		return ErrTaskBillingReceiptConflict
+	}
+	if receipt.ReservationID != nil {
+		var reservation QuotaReservation
+		if err := lockForUpdate(tx).Where("reservation_id = ?", *receipt.ReservationID).First(&reservation).Error; err != nil {
+			return err
+		}
+		if reservation.UserId != receipt.UserID || reservation.FundingSource != receipt.FundingSource {
+			return ErrTaskBillingReceiptConflict
+		}
+		current := 0
+		resumeFromRefund := false
+		switch reservation.Status {
+		case QuotaReservationStatusActive:
+			current = reservation.ReservedQuota
+		case QuotaReservationStatusSettled:
+			current = reservation.FinalQuota
+		case QuotaReservationStatusRefunded:
+			resumeFromRefund = receipt.State == TaskBillingReceiptSubmissionPending &&
+				!receipt.RequestCountApplied && receipt.AppliedQuota == 0 && receipt.UsageAppliedQuota == 0 &&
+				reservation.FinalQuota == 0 && reservation.ReservedQuota == receipt.PreConsumedQuota
+			if target != 0 && !resumeFromRefund {
+				return ErrTaskBillingReceiptReview
+			}
+		default:
+			return ErrTaskBillingReceiptConflict
+		}
+		currentApplied := receipt.AppliedQuota
+		if !receipt.RequestCountApplied && !resumeFromRefund {
+			currentApplied = receipt.PreConsumedQuota
+		}
+		if current != currentApplied {
+			return ErrTaskBillingReceiptConflict
+		}
+		delta := target - current
+		if delta != 0 {
+			if delta > 0 {
+				if err := validateReservationFundingTx(tx, &reservation); err != nil {
+					return err
+				}
+			}
+			if err := adjustReservationFundingTx(tx, &reservation, delta, mutation); err != nil {
+				return err
+			}
+			warning, err := adjustReservationTokenFinalizationTx(tx, &reservation, delta, mutation)
+			if err != nil {
+				return err
+			}
+			if warning != "" {
+				receipt.LastError = "token_projection_warning=" + warning
+			}
+		}
+		peak := reservation.ReservedQuota
+		if target > peak {
+			peak = target
+		}
+		now := common.GetTimestamp()
+		where := tx.Model(&QuotaReservation{}).Where("id = ? AND status = ?", reservation.Id, reservation.Status)
+		if reservation.Status == QuotaReservationStatusActive {
+			where = where.Where("reserved_quota = ?", reservation.ReservedQuota)
+		} else {
+			where = where.Where("final_quota = ?", reservation.FinalQuota)
+		}
+		result := where.Updates(map[string]interface{}{
+			"reserved_quota": peak, "final_quota": target, "pending_final_quota": target,
+			"settlement_pending": false, "settlement_quota_known": true,
+			"status": QuotaReservationStatusSettled, "finalized_at": now, "updated_at": now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrTaskBillingReceiptConflict
+		}
+		return nil
+	}
+	currentApplied := receipt.AppliedQuota
+	if !receipt.RequestCountApplied {
+		currentApplied = receipt.PreConsumedQuota
+	}
+	delta := target - currentApplied
+
+	if receipt.FundingSource != QuotaReservationFundingSubscription || receipt.SubscriptionID <= 0 {
+		return ErrTaskBillingReceiptConflict
+	}
+	var subscription UserSubscription
+	if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", receipt.SubscriptionID, receipt.UserID).First(&subscription).Error; err != nil {
+		return err
+	}
+	newUsed := subscription.AmountUsed + int64(delta)
+	if newUsed < 0 || (subscription.AmountTotal > 0 && newUsed > subscription.AmountTotal) {
+		return ErrTaskBillingReceiptReview
+	}
+	if delta != 0 {
+		if err := tx.Model(&UserSubscription{}).Where("id = ? AND amount_used = ?", subscription.Id, subscription.AmountUsed).
+			Update("amount_used", newUsed).Error; err != nil {
+			return err
+		}
+		pseudo := QuotaReservation{UserId: receipt.UserID, TokenId: receipt.TokenID, TokenUnlimited: receipt.TokenUnlimited}
+		warning, err := adjustReservationTokenFinalizationTx(tx, &pseudo, delta, mutation)
+		if err != nil {
+			return err
+		}
+		if warning != "" {
+			receipt.LastError = "token_projection_warning=" + warning
+		}
+	}
+	if target == 0 && receipt.RequestID != "" {
+		if err := tx.Model(&SubscriptionPreConsumeRecord{}).Where("request_id = ? AND status <> ?", receipt.RequestID, "refunded").
+			Update("status", "refunded").Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyTaskReceiptUsageTx(tx *gorm.DB, receipt *TaskBillingReceipt, target int, mutation *quotaReservationCacheMutation) error {
+	usageDelta := target - receipt.UsageAppliedQuota
+	requestDelta := 0
+	if !receipt.RequestCountApplied {
+		requestDelta = 1
+	}
+	if usageDelta != 0 || requestDelta != 0 {
+		var user User
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ?", receipt.UserID).First(&user).Error; err != nil {
+			return err
+		}
+		newUsed := int64(user.UsedQuota) + int64(usageDelta)
+		newRequests := int64(user.RequestCount) + int64(requestDelta)
+		maxInt := int64(^uint(0) >> 1)
+		if newUsed < 0 || newUsed > maxInt || newRequests < 0 || newRequests > maxInt {
+			return ErrTaskBillingReceiptReview
+		}
+		result := tx.Unscoped().Model(&User{}).Where("id = ? AND used_quota = ? AND request_count = ?", user.Id, user.UsedQuota, user.RequestCount).
+			Updates(map[string]interface{}{"used_quota": int(newUsed), "request_count": int(newRequests)})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrTaskBillingReceiptConflict
+		}
+		mutation.walletChanged = true
+		mutation.userId = receipt.UserID
+	}
+	if usageDelta != 0 && receipt.ChannelID > 0 {
+		var channel Channel
+		if err := lockForUpdate(tx).Select("id", "used_quota").Where("id = ?", receipt.ChannelID).First(&channel).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				appendTaskBillingReceiptWarning(receipt, fmt.Sprintf("channel_projection_warning=channel %d no longer exists", receipt.ChannelID))
+				return nil
+			}
+			return err
+		}
+		newUsed := channel.UsedQuota + int64(usageDelta)
+		if newUsed < 0 {
+			appendTaskBillingReceiptWarning(receipt, fmt.Sprintf(
+				"channel_projection_warning=channel %d used quota %d cannot apply delta %d",
+				receipt.ChannelID, channel.UsedQuota, usageDelta,
+			))
+			return nil
+		}
+		result := tx.Model(&Channel{}).Where("id = ? AND used_quota = ?", channel.Id, channel.UsedQuota).Update("used_quota", newUsed)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			appendTaskBillingReceiptWarning(receipt, fmt.Sprintf("channel_projection_warning=channel %d changed concurrently", receipt.ChannelID))
+		}
+	}
+	return nil
+}
+
+func appendTaskBillingReceiptWarning(receipt *TaskBillingReceipt, warning string) {
+	if receipt == nil {
+		return
+	}
+	warning = strings.TrimSpace(warning)
+	if warning == "" {
+		return
+	}
+	if receipt.LastError != "" {
+		receipt.LastError += "; "
+	}
+	receipt.LastError += warning
+	if len(receipt.LastError) > 2048 {
+		receipt.LastError = receipt.LastError[:2048]
+	}
+}
+
+func markTaskBillingReceiptReviewTx(tx *gorm.DB, receipt *TaskBillingReceipt, message string) error {
+	if tx == nil || receipt == nil {
+		return ErrTaskBillingReceiptConflict
+	}
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	if err := tx.Model(&TaskBillingReceipt{}).Where("id = ?", receipt.ID).Updates(map[string]interface{}{
+		"state": TaskBillingReceiptReview, "last_error": message,
+		"attempts": gorm.Expr("attempts + 1"), "version": gorm.Expr("version + 1"),
+		"updated_at": common.GetTimestamp(),
+	}).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+func markTaskBillingReceiptAttempt(taskRowID int64, failure error) error {
+	if taskRowID <= 0 || failure == nil {
+		return nil
+	}
+	message := failure.Error()
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	updates := map[string]interface{}{
+		"attempts": gorm.Expr("attempts + 1"), "last_error": message, "updated_at": common.GetTimestamp(),
+	}
+	if errors.Is(failure, ErrTaskBillingReceiptConflict) || errors.Is(failure, ErrTaskBillingReceiptReview) {
+		updates["state"] = TaskBillingReceiptReview
+	}
+	return DB.Model(&TaskBillingReceipt{}).Where("task_row_id = ? AND state <> ?", taskRowID, TaskBillingReceiptApplied).Updates(updates).Error
+}
+
+func ReconcileTaskBillingReceipts(limit int) (TaskBillingReconcileStats, error) {
+	stats := TaskBillingReconcileStats{}
+	if limit <= 0 || limit > maxTaskBillingReceiptBatch {
+		limit = maxTaskBillingReceiptBatch
+	}
+	var receipts []TaskBillingReceipt
+	if err := DB.Where("state IN ?", []string{TaskBillingReceiptSubmissionPending, TaskBillingReceiptTerminalPending}).
+		Order("updated_at ASC, id ASC").Limit(limit).Find(&receipts).Error; err != nil {
+		return stats, err
+	}
+	for _, receipt := range receipts {
+		stats.Scanned++
+		terminal := receipt.State == TaskBillingReceiptTerminalPending
+		_, err := applyTaskBillingReceipt(receipt.TaskRowID, terminal)
+		if err == nil {
+			stats.Applied++
+			continue
+		}
+		if errors.Is(err, ErrTaskBillingReceiptReview) || errors.Is(err, ErrTaskBillingReceiptConflict) {
+			stats.Review++
+		} else {
+			stats.Failed++
+		}
+	}
+	return stats, nil
+}

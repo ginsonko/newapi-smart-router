@@ -1,0 +1,146 @@
+package service_test
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCodeQViolationFeeAfterResponsesFailureRefund(tester *testing.T) {
+	settings := model_setting.GetGrokSettings()
+	originalSettings := *settings
+	tester.Cleanup(func() { *settings = originalSettings })
+	if !model.DB.Migrator().HasTable(&model.SubscriptionPlan{}) {
+		require.NoError(tester, model.DB.AutoMigrate(&model.SubscriptionPlan{}))
+	}
+	if !model.DB.Migrator().HasTable(&model.QuotaReservation{}) {
+		require.NoError(tester, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	}
+	for index, example := range []struct {
+		name      string
+		origin    string
+		upstream  string
+		marker    string
+		code      string
+		disabled  bool
+		cancelled bool
+		rawError  bool
+		charge    bool
+	}{
+		{name: "codeq_guidelines", origin: "gpt-6.1-sol", upstream: "gpt-6.1-sol", marker: service.ContentViolatesUsageMarker},
+		{name: "codeq_safety", origin: "gpt-6.1-sol", upstream: "gpt-6.1-sol", marker: service.CSAMViolationMarker},
+		{name: "codeq_unnormalized", origin: "gpt-6.1-sol", upstream: "gpt-6.1-sol", marker: service.ContentViolatesUsageMarker, rawError: true},
+		{name: "origin_grok_mapped_to_gpt", origin: "grok-4", upstream: "gpt-6.1-sol", marker: service.ContentViolatesUsageMarker},
+		{name: "grok_substring_is_not_grok", origin: "not-grok-4", upstream: "not-grok-4", marker: service.ContentViolatesUsageMarker},
+		{name: "unknown_model", marker: service.ContentViolatesUsageMarker},
+		{name: "codeq_provider_fee_code", origin: "gpt-6.1-sol", upstream: "gpt-6.1-sol", marker: "provider refused", code: string(types.ErrorCodeViolationFeeGrokCSAM)},
+		{name: "authorized_grok", origin: "grok-4", upstream: "grok-4", marker: service.ContentViolatesUsageMarker, charge: true},
+		{name: "grok_case_and_whitespace", origin: "chat-alias", upstream: " GROK-4 ", marker: service.ContentViolatesUsageMarker, charge: true},
+		{name: "alias_mapped_to_grok", origin: "chat-alias", upstream: "grok-4", marker: service.CSAMViolationMarker, charge: true},
+		{name: "grok_without_upstream_name", origin: "grok-4", marker: service.ContentViolatesUsageMarker, charge: true},
+		{name: "grok_setting_disabled", origin: "grok-4", upstream: "grok-4", marker: service.ContentViolatesUsageMarker, disabled: true},
+		{name: "grok_ordinary_failure", origin: "grok-4", upstream: "grok-4", marker: "provider unavailable"},
+		{name: "codeq_cancelled_context", origin: "gpt-6.1-sol", upstream: "gpt-6.1-sol", marker: service.ContentViolatesUsageMarker, cancelled: true},
+		{name: "grok_client_cancel_without_violation", origin: "grok-4", upstream: "grok-4", cancelled: true},
+	} {
+		tester.Run(example.name, func(test *testing.T) {
+			settings.ViolationDeductionEnabled = !example.disabled
+			settings.ViolationDeductionAmount = 0.05
+			userID, tokenID, channelID := 91000+index, 92000+index, 93000+index
+			startingQuota := 1000000
+			requestID := "violation-refund-" + example.name
+			tokenKey := "test-" + requestID
+			require.NoError(test, model.DB.Create(&model.User{Id: userID, Username: requestID, Quota: startingQuota, Status: common.UserStatusEnabled}).Error)
+			require.NoError(test, model.DB.Create(&model.Token{Id: tokenID, UserId: userID, Key: tokenKey, Name: requestID, RemainQuota: startingQuota, Status: common.TokenStatusEnabled}).Error)
+			require.NoError(test, model.DB.Create(&model.Channel{Id: channelID, Name: requestID, Key: "test-only", Status: common.ChannelStatusEnabled}).Error)
+			test.Cleanup(func() {
+				model.DB.Where("reservation_id = ?", "direct:"+requestID).Delete(&model.QuotaReservation{})
+				model.DB.Where("user_id = ?", userID).Delete(&model.Log{})
+				model.DB.Unscoped().Where("id = ?", tokenID).Delete(&model.Token{})
+				model.DB.Unscoped().Where("id = ?", userID).Delete(&model.User{})
+				model.DB.Unscoped().Where("id = ?", channelID).Delete(&model.Channel{})
+			})
+			recorder := httptest.NewRecorder()
+			requestContext, _ := gin.CreateTestContext(recorder)
+			requestContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			requestContext.Set(common.RequestIdKey, requestID)
+			info := &relaycommon.RelayInfo{
+				RequestId: requestID, UserId: userID, TokenId: tokenID, TokenKey: tokenKey,
+				OriginModelName: example.origin, IsStream: true, DisablePing: true,
+				ForcePreConsume: true, StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAI,
+				UserSetting: dto.UserSetting{BillingPreference: "wallet_only"},
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channelID, UpstreamModelName: example.upstream},
+			}
+			info.PriceData.GroupRatioInfo.GroupRatio = 1
+			require.Nil(test, service.PreConsumeBilling(requestContext, 100, info))
+			defer info.Billing.Refund(requestContext)
+			if example.cancelled {
+				cancelled, cancel := context.WithCancel(requestContext.Request.Context())
+				cancel()
+				requestContext.Request = requestContext.Request.WithContext(cancelled)
+			}
+			body := ""
+			if example.marker != "" {
+				body = fmt.Sprintf("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":%q,\"code\":%q}}}\n\n", example.marker, example.code)
+			}
+			response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}
+			usage, apiErr := openai.OaiResponsesStreamHandler(requestContext, info, response)
+			require.Nil(test, usage)
+			require.NotNil(test, apiErr)
+			assert.True(test, types.IsSkipRetryError(apiErr))
+			if example.marker != "" {
+				assert.Contains(test, apiErr.ToOpenAIError().Message, example.marker)
+			}
+			if !example.rawError {
+				apiErr = service.NormalizeViolationFeeError(apiErr)
+				apiErr = service.NormalizeViolationFeeError(apiErr)
+			}
+			info.Billing.Refund(requestContext)
+			charged := service.ChargeViolationFeeIfNeeded(requestContext, info, apiErr)
+			assert.Equal(test, example.charge, charged)
+			var reservation model.QuotaReservation
+			require.NoError(test, model.DB.Where("reservation_id = ?", "direct:"+requestID).First(&reservation).Error)
+			assert.Equal(test, model.QuotaReservationStatusRefunded, reservation.Status)
+			assert.Zero(test, reservation.FinalQuota)
+			fee := 0
+			if example.charge {
+				fee = int(0.05 * common.QuotaPerUnit)
+			}
+			var user model.User
+			require.NoError(test, model.DB.First(&user, userID).Error)
+			assert.Equal(test, startingQuota-fee, user.Quota)
+			assert.Equal(test, fee, user.UsedQuota)
+			var token model.Token
+			require.NoError(test, model.DB.First(&token, tokenID).Error)
+			assert.Equal(test, startingQuota-fee, token.RemainQuota)
+			assert.Equal(test, fee, token.UsedQuota)
+			var channel model.Channel
+			require.NoError(test, model.DB.First(&channel, channelID).Error)
+			assert.Equal(test, int64(fee), channel.UsedQuota)
+			var consumeLogs int64
+			require.NoError(test, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", userID, model.LogTypeConsume).Count(&consumeLogs).Error)
+			if example.charge {
+				assert.EqualValues(test, 1, consumeLogs)
+			} else {
+				assert.Zero(test, consumeLogs)
+			}
+		})
+	}
+}

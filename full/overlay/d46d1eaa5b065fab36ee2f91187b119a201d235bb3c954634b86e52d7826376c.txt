@@ -1,0 +1,847 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { api } from '@/lib/api'
+
+import {
+  createMultipartStudioRequest,
+  normalizeImageSize,
+  runBoundedBatch,
+  studioBatchIndexes,
+  studioFallbackGroups,
+  studioRoutingParams,
+  STUDIO_BATCH_CONCURRENCY,
+  validateStudioBatchCount,
+  StudioRequestDispatchedError,
+  type StudioProgressEvent,
+} from './lib'
+import {
+  ParameterQuotePreflightError,
+  quoteStudioPayload,
+} from './parameter-quote'
+import type {
+  AssetListParams,
+  MediaAdminOverview,
+  MediaAsset,
+  MediaCapabilities,
+  MediaCleanupRun,
+  MediaConfig,
+  MediaModerationEvent,
+  MediaPage,
+  StudioFormValue,
+  StudioReference,
+  StudioTask,
+} from './types'
+
+const VIDEO_SIZE_BY_RESOLUTION: Record<string, Record<string, string>> = {
+  '480p': {
+    '16:9': '854x480',
+    '9:16': '480x854',
+    '1:1': '480x480',
+    '4:3': '640x480',
+    '3:4': '480x640',
+    '21:9': '1120x480',
+  },
+  '720p': {
+    '16:9': '1280x720',
+    '9:16': '720x1280',
+    '1:1': '720x720',
+    '4:3': '960x720',
+    '3:4': '720x960',
+    '21:9': '1680x720',
+  },
+  '1080p': {
+    '16:9': '1920x1080',
+    '9:16': '1080x1920',
+    '1:1': '1080x1080',
+    '4:3': '1440x1080',
+    '3:4': '1080x1440',
+    '21:9': '2520x1080',
+  },
+}
+
+type ApiEnvelope<T> = {
+  success: boolean
+  message?: string
+  data: T
+}
+
+export type StudioBatchItem = {
+  index: number
+  operation_id: string
+  ok: boolean
+  dispatched: boolean
+  response?: unknown
+  error?: unknown
+  attempted_groups?: string[]
+}
+
+export type StudioBatchResponse = {
+  kind: 'studio_batch'
+  mode: 'images' | 'image-edits' | 'videos'
+  count: number
+  items: StudioBatchItem[]
+}
+
+export type StudioVideoBatchResponse = StudioBatchResponse & { mode: 'videos' }
+
+export type StudioCreateOptions = {
+  operationIds?: string[]
+  onProgress?: (event: StudioProgressEvent) => void
+}
+
+function studioOperationId(options: StudioCreateOptions, index: number) {
+  return options.operationIds?.[index] ?? `studio_${crypto.randomUUID()}`
+}
+
+function emitStudioProgress(
+  options: StudioCreateOptions,
+  operationId: string,
+  event: Omit<StudioProgressEvent, 'operationId'>
+) {
+  options.onProgress?.({ operationId, ...event })
+}
+
+function assetParams(params: AssetListParams) {
+  return {
+    p: params.page ?? 1,
+    page_size: params.pageSize ?? 24,
+    type: params.type || undefined,
+    status: params.status || undefined,
+    moderation_status: params.moderationStatus || undefined,
+    q: params.search || undefined,
+    username: params.username || undefined,
+    model: params.model || undefined,
+    group: params.group || undefined,
+    task_id: params.taskId || undefined,
+    include_deleted: params.includeDeleted || undefined,
+  }
+}
+
+export async function getMediaAssets(params: AssetListParams) {
+  const response = await api.get<ApiEnvelope<MediaPage<MediaAsset>>>(
+    '/api/media/assets',
+    { params: assetParams(params) }
+  )
+  return response.data.data
+}
+
+export async function deleteMediaAsset(assetId: string) {
+  const response = await api.delete<ApiEnvelope<{ deleted: boolean }>>(
+    `/api/media/assets/${encodeURIComponent(assetId)}`
+  )
+  return response.data.data
+}
+
+export async function deleteMediaAssets(assetIds: string[]) {
+  const ids = [...new Set(assetIds.filter(Boolean))]
+  const settled = await runBoundedBatch(
+    ids,
+    (assetId) => deleteMediaAsset(assetId),
+    STUDIO_BATCH_CONCURRENCY
+  )
+  return settled.map((item, index) => ({
+    id: ids[index],
+    ok: Boolean(item.value),
+    error: item.error,
+  }))
+}
+
+export async function downloadMediaAssetArchive(assetIds: string[]) {
+  const ids = [...new Set(assetIds.filter(Boolean))]
+  const response = await api.post<Blob>(
+    '/api/media/assets/download-archive',
+    { asset_ids: ids },
+    {
+      responseType: 'blob',
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    }
+  )
+  const disposition = String(response.headers['content-disposition'] ?? '')
+  const encodedFilename = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+  let filename = 'media-assets.zip'
+  if (encodedFilename) {
+    try {
+      filename = decodeURIComponent(encodedFilename)
+    } catch {
+      filename = 'media-assets.zip'
+    }
+  }
+  return {
+    blob: response.data,
+    filename,
+    success: Number.parseInt(
+      String(response.headers['x-media-archive-success-count'] ?? ids.length),
+      10
+    ),
+    failed: Number.parseInt(
+      String(response.headers['x-media-archive-failure-count'] ?? 0),
+      10
+    ),
+  }
+}
+
+export async function getMediaAsset(assetId: string) {
+  const response = await api.get<ApiEnvelope<MediaAsset>>(
+    `/api/media/assets/${encodeURIComponent(assetId)}`
+  )
+  return response.data.data
+}
+
+export async function getMediaCapabilities(
+  group: string,
+  model: string,
+  mode: string
+) {
+  const response = await api.get<ApiEnvelope<MediaCapabilities>>(
+    '/api/media/capabilities',
+    { params: { group, model, mode } }
+  )
+  return response.data.data
+}
+
+export async function uploadMediaReference(
+  file: File,
+  onProgress?: (progress: number) => void
+) {
+  const data = new FormData()
+  data.append('file', file)
+  data.append('purpose', 'user_data')
+  const response = await api.post<ApiEnvelope<{ id: string }>>(
+    '/api/media/files',
+    data,
+    {
+      onUploadProgress: (event) => {
+        if (event.total && event.total > 0) {
+          onProgress?.((event.loaded / event.total) * 100)
+        }
+      },
+    }
+  )
+  return response.data.data.id
+}
+
+async function uploadReferences(
+  references: StudioReference[],
+  options: StudioCreateOptions
+) {
+  const uploaded = await runBoundedBatch(
+    references,
+    async (reference) => ({
+      type: reference.type,
+      role: reference.role,
+      file_id:
+        reference.fileId ??
+        (reference.file
+          ? await uploadMediaReference(reference.file, (progress) => {
+              for (const operationId of options.operationIds ?? []) {
+                emitStudioProgress(options, operationId, {
+                  stage: 'uploading_reference',
+                  progress,
+                })
+              }
+            })
+          : undefined),
+    }),
+    STUDIO_BATCH_CONCURRENCY
+  )
+  return uploaded.map((result) => {
+    if (!result.value) {
+      throw result.error ?? new Error('Unable to upload reference')
+    }
+    return result.value
+  })
+}
+
+async function submitStudioVideoChild(
+  value: StudioFormValue,
+  references: Array<{
+    type: string
+    role: string
+    file_id?: string
+  }>,
+  index: number,
+  options: StudioCreateOptions
+): Promise<StudioBatchItem> {
+  const operationId = studioOperationId(options, index)
+  try {
+    emitStudioProgress(options, operationId, { stage: 'submitting_request' })
+    const payload = {
+      model: value.model,
+      prompt: value.prompt,
+      size:
+        (value.runtimeEnforced
+          ? undefined
+          : VIDEO_SIZE_BY_RESOLUTION[value.resolution]?.[value.aspectRatio]) ||
+        undefined,
+      aspect_ratio: value.aspectRatio,
+      resolution: value.resolution || undefined,
+      seconds: value.duration ? String(value.duration) : undefined,
+      quality: value.parameterQuality ? value.quality || undefined : undefined,
+      references,
+      count: 1,
+    }
+    const quoteHeaders = await quoteStudioPayload(
+      value.mode,
+      studioRoutingParams(value).group,
+      payload,
+      value.parameterExpectedAmount !== undefined &&
+        value.parameterExpectedCurrency
+        ? {
+            amount: value.parameterExpectedAmount,
+            currency: value.parameterExpectedCurrency,
+          }
+        : undefined
+    )
+    const pending = api.post('/api/media/studio/videos', payload, {
+      params: studioRoutingParams(value),
+      headers: { 'X-Media-Studio-Operation-ID': operationId, ...quoteHeaders },
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    })
+    emitStudioProgress(options, operationId, { stage: 'upstream_generating' })
+    const response = await pending
+    emitStudioProgress(options, operationId, { stage: 'archiving_result' })
+    return {
+      index,
+      operation_id: operationId,
+      ok: true,
+      dispatched: true,
+      response: response.data as unknown,
+    }
+  } catch (error) {
+    const candidate = error as { response?: unknown } | null
+    return {
+      index,
+      operation_id: operationId,
+      ok: false,
+      dispatched:
+        !(error instanceof ParameterQuotePreflightError) &&
+        candidate?.response === undefined,
+      error,
+    }
+  }
+}
+
+async function submitStudioImageChild(
+  value: StudioFormValue,
+  index: number,
+  options: StudioCreateOptions
+): Promise<StudioBatchItem> {
+  const operationId = studioOperationId(options, index)
+  try {
+    emitStudioProgress(options, operationId, { stage: 'submitting_request' })
+    const payload = {
+      model: value.model,
+      prompt: value.prompt,
+      n: 1,
+      size: normalizeImageSize(value.size) || undefined,
+      quality: value.quality || undefined,
+      resolution: value.parameterResolution
+        ? value.resolution || undefined
+        : undefined,
+      response_format: 'url',
+    }
+    const quoteHeaders = await quoteStudioPayload(
+      value.mode,
+      studioRoutingParams(value).group,
+      payload,
+      value.parameterExpectedAmount !== undefined &&
+        value.parameterExpectedCurrency
+        ? {
+            amount: value.parameterExpectedAmount,
+            currency: value.parameterExpectedCurrency,
+          }
+        : undefined
+    )
+    const pending = api.post('/api/media/studio/images', payload, {
+      params: studioRoutingParams(value),
+      headers: { 'X-Media-Studio-Operation-ID': operationId, ...quoteHeaders },
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    })
+    emitStudioProgress(options, operationId, { stage: 'upstream_generating' })
+    const response = await pending
+    emitStudioProgress(options, operationId, { stage: 'archiving_result' })
+    return {
+      index,
+      operation_id: operationId,
+      ok: true,
+      dispatched: true,
+      response: response.data as unknown,
+    }
+  } catch (error) {
+    const candidate = error as { response?: unknown } | null
+    return {
+      index,
+      operation_id: operationId,
+      ok: false,
+      dispatched:
+        !(error instanceof ParameterQuotePreflightError) &&
+        candidate?.response === undefined,
+      error,
+    }
+  }
+}
+
+async function submitStudioImageEditChild(
+  value: StudioFormValue,
+  index: number,
+  options: StudioCreateOptions
+): Promise<StudioBatchItem> {
+  const operationId = studioOperationId(options, index)
+  try {
+    emitStudioProgress(options, operationId, { stage: 'submitting_request' })
+    const payload = createMultipartStudioRequest(value)
+    const quoteHeaders = await quoteStudioPayload(
+      value.mode,
+      studioRoutingParams(value).group,
+      payload,
+      value.parameterExpectedAmount !== undefined &&
+        value.parameterExpectedCurrency
+        ? {
+            amount: value.parameterExpectedAmount,
+            currency: value.parameterExpectedCurrency,
+          }
+        : undefined
+    )
+    const pending = api.post('/api/media/studio/image-edits', payload, {
+      params: studioRoutingParams(value),
+      headers: { 'X-Media-Studio-Operation-ID': operationId, ...quoteHeaders },
+      skipBusinessError: true,
+      skipErrorHandler: true,
+      onUploadProgress: (event) => {
+        if (event.total && event.total > 0) {
+          const progress = (event.loaded / event.total) * 100
+          emitStudioProgress(options, operationId, {
+            stage:
+              progress >= 100 ? 'upstream_generating' : 'uploading_reference',
+            progress: progress >= 100 ? undefined : progress,
+          })
+        }
+      },
+    })
+    const response = await pending
+    emitStudioProgress(options, operationId, { stage: 'archiving_result' })
+    return {
+      index,
+      operation_id: operationId,
+      ok: true,
+      dispatched: true,
+      response: response.data as unknown,
+    }
+  } catch (error) {
+    const candidate = error as { response?: unknown } | null
+    return {
+      index,
+      operation_id: operationId,
+      ok: false,
+      dispatched:
+        !(error instanceof ParameterQuotePreflightError) &&
+        candidate?.response === undefined,
+      error,
+    }
+  }
+}
+
+export async function createStudioMedia(
+  value: StudioFormValue,
+  options: StudioCreateOptions = {}
+) {
+  if (
+    value.mode === 'images' ||
+    value.mode === 'image-edits' ||
+    value.mode === 'videos'
+  ) {
+    validateStudioBatchCount(value.count)
+    if (options.operationIds && options.operationIds.length !== value.count) {
+      throw new Error('studio operation ids must match the requested count')
+    }
+  }
+  const params = studioRoutingParams(value)
+  if (value.mode === 'image-edits') {
+    if (value.count > 1) {
+      const indexes = studioBatchIndexes(value.count)
+      const settled = await runBoundedBatch(
+        indexes,
+        (index) => submitStudioImageEditChild(value, index, options),
+        STUDIO_BATCH_CONCURRENCY
+      )
+      return {
+        kind: 'studio_batch',
+        mode: 'image-edits',
+        count: value.count,
+        items: settled.map(
+          (item) =>
+            item.value ?? {
+              index: item.index,
+              operation_id: studioOperationId(options, item.index),
+              ok: false,
+              dispatched: false,
+              error: item.error,
+            }
+        ),
+      } satisfies StudioBatchResponse
+    }
+    const operationId = studioOperationId(options, 0)
+    if (value.fallbackEnabled && studioFallbackGroups(value).length > 1) {
+      const item = await submitStudioImageEditChild(value, 0, options)
+      return {
+        kind: 'studio_batch',
+        mode: 'image-edits',
+        count: 1,
+        items: [item],
+      } satisfies StudioBatchResponse
+    }
+    try {
+      emitStudioProgress(options, operationId, { stage: 'submitting_request' })
+      const payload = createMultipartStudioRequest(value)
+      const quoteHeaders = await quoteStudioPayload(
+        value.mode,
+        studioRoutingParams(value).group,
+        payload,
+        value.parameterExpectedAmount !== undefined &&
+          value.parameterExpectedCurrency
+          ? {
+              amount: value.parameterExpectedAmount,
+              currency: value.parameterExpectedCurrency,
+            }
+          : undefined
+      )
+      const pending = api.post('/api/media/studio/image-edits', payload, {
+        params,
+        headers: {
+          'X-Media-Studio-Operation-ID': operationId,
+          ...quoteHeaders,
+        },
+        skipBusinessError: true,
+        skipErrorHandler: true,
+        onUploadProgress: (event) => {
+          if (event.total && event.total > 0) {
+            const progress = (event.loaded / event.total) * 100
+            emitStudioProgress(options, operationId, {
+              stage:
+                progress >= 100 ? 'upstream_generating' : 'uploading_reference',
+              progress: progress >= 100 ? undefined : progress,
+            })
+          }
+        },
+      })
+      const response = await pending
+      emitStudioProgress(options, operationId, { stage: 'archiving_result' })
+      return response.data as unknown
+    } catch (error) {
+      if (error instanceof ParameterQuotePreflightError) throw error
+      throw new StudioRequestDispatchedError(operationId, error)
+    }
+  }
+
+  if (value.mode === 'transcriptions' || value.mode === 'translations') {
+    const response = await api.post(
+      `/api/media/studio/${value.mode}`,
+      createMultipartStudioRequest(value),
+      { params, skipBusinessError: true }
+    )
+    return response.data as unknown
+  }
+
+  if (value.mode === 'videos') {
+    const references = await uploadReferences(value.references, options)
+    if (value.count > 1) {
+      const indexes = studioBatchIndexes(value.count)
+      const settled = await runBoundedBatch(
+        indexes,
+        (index) => submitStudioVideoChild(value, references, index, options),
+        STUDIO_BATCH_CONCURRENCY
+      )
+      return {
+        kind: 'studio_batch',
+        mode: 'videos',
+        count: value.count,
+        items: settled.map(
+          (item) =>
+            item.value ?? {
+              index: item.index,
+              operation_id: studioOperationId(options, item.index),
+              ok: false,
+              dispatched: false,
+              error: item.error,
+            }
+        ),
+      } satisfies StudioVideoBatchResponse
+    }
+    if (value.fallbackEnabled && studioFallbackGroups(value).length > 1) {
+      const item = await submitStudioVideoChild(value, references, 0, options)
+      return {
+        kind: 'studio_batch',
+        mode: 'videos',
+        count: 1,
+        items: [item],
+      } satisfies StudioVideoBatchResponse
+    }
+    const operationId = studioOperationId(options, 0)
+    try {
+      emitStudioProgress(options, operationId, { stage: 'submitting_request' })
+      const payload = {
+        model: value.model,
+        prompt: value.prompt,
+        size:
+          (value.runtimeEnforced
+            ? undefined
+            : VIDEO_SIZE_BY_RESOLUTION[value.resolution]?.[
+                value.aspectRatio
+              ]) || undefined,
+        aspect_ratio: value.aspectRatio,
+        resolution: value.resolution || undefined,
+        seconds: value.duration ? String(value.duration) : undefined,
+        quality: value.parameterQuality
+          ? value.quality || undefined
+          : undefined,
+        references,
+      }
+      const quoteHeaders = await quoteStudioPayload(
+        value.mode,
+        studioRoutingParams(value).group,
+        payload,
+        value.parameterExpectedAmount !== undefined &&
+          value.parameterExpectedCurrency
+          ? {
+              amount: value.parameterExpectedAmount,
+              currency: value.parameterExpectedCurrency,
+            }
+          : undefined
+      )
+      const pending = api.post('/api/media/studio/videos', payload, {
+        params,
+        headers: {
+          'X-Media-Studio-Operation-ID': operationId,
+          ...quoteHeaders,
+        },
+        skipBusinessError: true,
+        skipErrorHandler: true,
+      })
+      emitStudioProgress(options, operationId, { stage: 'upstream_generating' })
+      const response = await pending
+      emitStudioProgress(options, operationId, { stage: 'archiving_result' })
+      return response.data as unknown
+    } catch (error) {
+      if (error instanceof ParameterQuotePreflightError) throw error
+      throw new StudioRequestDispatchedError(operationId, error)
+    }
+  }
+
+  if (value.mode === 'speech') {
+    const response = await api.post(
+      '/api/media/studio/speech',
+      {
+        model: value.model,
+        input: value.prompt,
+        voice: value.voice,
+        response_format: value.responseFormat,
+      },
+      { params, responseType: 'blob', skipBusinessError: true }
+    )
+    return response.data as Blob
+  }
+
+  if (value.mode === 'images') {
+    if (value.count > 1) {
+      const indexes = studioBatchIndexes(value.count)
+      const settled = await runBoundedBatch(
+        indexes,
+        (index) => submitStudioImageChild(value, index, options),
+        STUDIO_BATCH_CONCURRENCY
+      )
+      return {
+        kind: 'studio_batch',
+        mode: 'images',
+        count: value.count,
+        items: settled.map(
+          (item) =>
+            item.value ?? {
+              index: item.index,
+              operation_id: studioOperationId(options, item.index),
+              ok: false,
+              dispatched: false,
+              error: item.error,
+            }
+        ),
+      } satisfies StudioBatchResponse
+    }
+    const operationId = studioOperationId(options, 0)
+    if (value.fallbackEnabled && studioFallbackGroups(value).length > 1) {
+      const item = await submitStudioImageChild(value, 0, options)
+      return {
+        kind: 'studio_batch',
+        mode: 'images',
+        count: 1,
+        items: [item],
+      } satisfies StudioBatchResponse
+    }
+    try {
+      emitStudioProgress(options, operationId, { stage: 'submitting_request' })
+      const payload = {
+        model: value.model,
+        prompt: value.prompt,
+        n: value.count,
+        size: normalizeImageSize(value.size) || undefined,
+        quality: value.quality || undefined,
+        resolution: value.parameterResolution
+          ? value.resolution || undefined
+          : undefined,
+        response_format: 'url',
+      }
+      const quoteHeaders = await quoteStudioPayload(
+        value.mode,
+        studioRoutingParams(value).group,
+        payload,
+        value.parameterExpectedAmount !== undefined &&
+          value.parameterExpectedCurrency
+          ? {
+              amount: value.parameterExpectedAmount,
+              currency: value.parameterExpectedCurrency,
+            }
+          : undefined
+      )
+      const pending = api.post('/api/media/studio/images', payload, {
+        params,
+        headers: {
+          'X-Media-Studio-Operation-ID': operationId,
+          ...quoteHeaders,
+        },
+        skipBusinessError: true,
+        skipErrorHandler: true,
+      })
+      emitStudioProgress(options, operationId, { stage: 'upstream_generating' })
+      const response = await pending
+      emitStudioProgress(options, operationId, { stage: 'archiving_result' })
+      return response.data as unknown
+    } catch (error) {
+      if (error instanceof ParameterQuotePreflightError) throw error
+      throw new StudioRequestDispatchedError(operationId, error)
+    }
+  }
+
+  throw new Error('Unsupported media creation mode')
+}
+
+export async function getStudioTask(taskId: string) {
+  const response = await api.get<ApiEnvelope<StudioTask>>(
+    `/api/media/tasks/${encodeURIComponent(taskId)}`,
+    { disableDuplicate: true }
+  )
+  return response.data.data
+}
+
+export async function getStudioTasks(pageSize = 50) {
+  const response = await api.get<ApiEnvelope<MediaPage<StudioTask>>>(
+    '/api/media/tasks',
+    {
+      params: { p: 1, page_size: pageSize },
+      disableDuplicate: true,
+    }
+  )
+  return response.data.data
+}
+
+export async function getAdminMediaAssets(params: AssetListParams) {
+  const response = await api.get<ApiEnvelope<MediaPage<MediaAsset>>>(
+    '/api/media/admin/assets',
+    { params: assetParams(params) }
+  )
+  return response.data.data
+}
+
+export async function getAdminMediaAsset(assetId: string) {
+  const response = await api.get<ApiEnvelope<MediaAsset>>(
+    `/api/media/admin/assets/${encodeURIComponent(assetId)}`
+  )
+  return response.data.data
+}
+
+export async function getMediaAdminOverview() {
+  const response = await api.get<ApiEnvelope<MediaAdminOverview>>(
+    '/api/media/admin/overview'
+  )
+  return response.data.data
+}
+
+export async function getMediaConfig() {
+  const response = await api.get<ApiEnvelope<MediaConfig>>(
+    '/api/media/admin/config'
+  )
+  return response.data.data
+}
+
+export async function updateMediaConfig(config: MediaConfig) {
+  const response = await api.put<ApiEnvelope<MediaConfig>>(
+    '/api/media/admin/config',
+    config
+  )
+  return response.data.data
+}
+
+export async function moderateMediaAsset(
+  assetId: string,
+  body: {
+    action: string
+    reason?: string
+    admin_hold?: boolean
+    ban_user?: boolean
+  }
+) {
+  const response = await api.post<ApiEnvelope<MediaAsset>>(
+    `/api/media/admin/assets/${encodeURIComponent(assetId)}/moderate`,
+    body
+  )
+  return response.data.data
+}
+
+export async function deleteAdminMediaAsset(assetId: string, reason: string) {
+  const response = await api.delete<ApiEnvelope<{ deleted: boolean }>>(
+    `/api/media/admin/assets/${encodeURIComponent(assetId)}`,
+    { params: { reason } }
+  )
+  return response.data.data
+}
+
+export async function runMediaCleanup(mode: 'expired' | 'all') {
+  const response = await api.post<ApiEnvelope<MediaCleanupRun>>(
+    '/api/media/admin/cleanup',
+    undefined,
+    { params: { mode } }
+  )
+  return response.data.data
+}
+
+export async function getMediaCleanupRuns(page = 1) {
+  const response = await api.get<ApiEnvelope<MediaPage<MediaCleanupRun>>>(
+    '/api/media/admin/cleanup-runs',
+    { params: { p: page, page_size: 20 } }
+  )
+  return response.data.data
+}
+
+export async function getMediaModerationEvents(page = 1) {
+  const response = await api.get<ApiEnvelope<MediaPage<MediaModerationEvent>>>(
+    '/api/media/admin/moderation-events',
+    { params: { p: page, page_size: 20 } }
+  )
+  return response.data.data
+}

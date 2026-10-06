@@ -1,0 +1,48 @@
+package relay
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestVideoFailureQueryReturnsOwnedReasonWithoutUpstream(t *testing.T) {
+	previous := model.DB
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previous; sqlDB, _ := db.DB(); _ = sqlDB.Close() })
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+	task := &model.Task{TaskID: "owned-failed", UserId: 5, Platform: constant.TaskPlatform("1"), Status: model.TaskStatusFailure, FailReason: "task failed", Data: []byte(`{"error":{"message":"参考图数量超限，请减少参考图"},"prompt":"private"}`)}
+	require.NoError(t, db.Create(task).Error)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/videos/owned-failed", nil)
+	c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+	c.Set("id", 5)
+	body, taskErr := videoFetchByIDRespBodyBuilder(c)
+	require.Nil(t, taskErr)
+	var payload map[string]any
+	require.NoError(t, common.Unmarshal(body, &payload))
+	require.Equal(t, "参考图数量超限，请减少参考图", payload["error"].(map[string]any)["message"])
+	require.NotContains(t, string(body), "private")
+	c.Set("id", 6)
+	body, taskErr = videoFetchByIDRespBodyBuilder(c)
+	require.NotNil(t, taskErr)
+	require.Empty(t, body)
+}
+func TestVideoFailureProjectionPreservesUnrelatedTaskData(t *testing.T) {
+	for _, task := range []*model.Task{
+		{Platform: constant.TaskPlatformSuno, Status: model.TaskStatusFailure, FailReason: "music error", Data: []byte(`{"clips":[]}`)},
+		{Status: model.TaskStatusFailure, FailReason: "image error", Properties: model.Properties{MediaMode: "images"}, Data: []byte(`{"images":[]}`)},
+	} {
+		dto := TaskModel2Dto(task)
+		require.Equal(t, task.FailReason, dto.FailReason)
+		require.Equal(t, task.Data, dto.Data)
+	}
+}

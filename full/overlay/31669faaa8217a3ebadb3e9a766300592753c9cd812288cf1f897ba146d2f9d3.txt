@@ -1,0 +1,531 @@
+package controller
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+type tenantReportingTokenRequest struct {
+	RequestID string `json:"request_id"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+type tenantBindingStatusRequest struct {
+	Status string `json:"status"`
+}
+
+type tenantCostReplayRequest struct {
+	EventIDs     []string `json:"event_ids"`
+	FromSequence int64    `json:"from_sequence"`
+	ToSequence   int64    `json:"to_sequence"`
+	Limit        int      `json:"limit"`
+}
+
+type tenantCostWorkerRequest struct {
+	Paused *bool `json:"paused"`
+}
+
+type tenantCostDownstreamRequest struct {
+	TenantID    string  `json:"tenant_id"`
+	DisplayName string  `json:"display_name"`
+	ConfigKey   string  `json:"config_key"`
+	Status      *string `json:"status"`
+}
+
+// tenantCostSlotProvisionRequest is deliberately narrower than the model
+// provisioning spec. Tenant identity is resolved by the shared selector
+// resolver, while key material and server-derived key identities are never
+// accepted from a caller.
+type tenantCostSlotProvisionRequest struct {
+	RequestID            string `json:"request_id"`
+	ProductPoolID        string `json:"product_pool_id"`
+	ProductFamily        string `json:"product_family"`
+	ServiceTier          string `json:"service_tier"`
+	PublicLabel          string `json:"public_label"`
+	SortOrder            int    `json:"sort_order"`
+	ProfileID            string `json:"profile_id"`
+	ProfileRevision      string `json:"profile_revision"`
+	ModelSelector        string `json:"model_selector"`
+	MinRatioPPM          int64  `json:"min_ratio_ppm"`
+	MaxRatioPPM          int64  `json:"max_ratio_ppm"`
+	ProviderClass        string `json:"provider_class"`
+	CandidateSpec        string `json:"candidate_spec"`
+	CapabilitySpec       string `json:"capability_spec"`
+	ProfileStatus        string `json:"profile_status"`
+	DisabledReason       string `json:"disabled_reason"`
+	TokenID              *int   `json:"token_id"`
+	ModelCatalogRevision string `json:"model_catalog_revision"`
+	BindingStatus        string `json:"binding_status"`
+}
+
+type tenantCostKeyRotationRequest struct {
+	RequestID string `json:"request_id"`
+}
+
+// These response views intentionally expose only logical metadata. In
+// particular, the model's private route fields and a raw server key are never
+// serialized by these handlers.
+type tenantCostProvisionSlotView struct {
+	ID            int64  `json:"id"`
+	TenantID      string `json:"tenant_id"`
+	ProductPoolID string `json:"product_pool_id"`
+	ProductFamily string `json:"product_family"`
+	ServiceTier   string `json:"service_tier"`
+	PublicLabel   string `json:"public_label"`
+	SortOrder     int    `json:"sort_order"`
+	CreatedAt     int64  `json:"created_at"`
+	UpdatedAt     int64  `json:"updated_at"`
+}
+
+type tenantCostProvisionProfileView struct {
+	ID             int64  `json:"id"`
+	TenantID       string `json:"tenant_id"`
+	ProfileID      string `json:"profile_id"`
+	Revision       string `json:"revision"`
+	ProductPoolID  string `json:"product_pool_id"`
+	ServiceTier    string `json:"service_tier"`
+	PublicLabel    string `json:"public_label"`
+	Status         string `json:"status"`
+	DisabledReason string `json:"disabled_reason,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
+	UpdatedAt      int64  `json:"updated_at"`
+}
+
+type tenantCostProvisionBindingView struct {
+	ID                   int64  `json:"id"`
+	TokenID              int    `json:"token_id"`
+	TenantID             string `json:"tenant_id"`
+	CredentialPurpose    string `json:"credential_purpose"`
+	KeyID                string `json:"key_id"`
+	KeySuffix            string `json:"key_suffix"`
+	ProductPoolID        string `json:"product_pool_id"`
+	ServiceTier          string `json:"service_tier"`
+	RouteProfileID       string `json:"route_profile_id"`
+	ProfileRevision      string `json:"profile_revision"`
+	ModelCatalogRevision string `json:"model_catalog_revision"`
+	BindingStatus        string `json:"binding_status"`
+	CreatedAt            int64  `json:"created_at"`
+	UpdatedAt            int64  `json:"updated_at"`
+	RevokedAt            int64  `json:"revoked_at"`
+}
+
+// decodeTenantCostAdminJSON rejects unknown fields and trailing JSON values.
+// This is important for the provisioning endpoints: silently ignoring a
+// client-supplied key/tenant field would make the HTTP contract appear safer
+// than it is.
+func decodeTenantCostAdminJSON(c *gin.Context, destination any) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return errors.New("request body is missing")
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("request contains multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func tenantCostProvisionSlotViewOf(slot model.TenantCostProductSlot) tenantCostProvisionSlotView {
+	return tenantCostProvisionSlotView{ID: slot.ID, TenantID: slot.TenantID, ProductPoolID: slot.ProductPoolID,
+		ProductFamily: slot.ProductFamily, ServiceTier: slot.ServiceTier, PublicLabel: slot.PublicLabel,
+		SortOrder: slot.SortOrder, CreatedAt: slot.CreatedAt, UpdatedAt: slot.UpdatedAt}
+}
+
+func tenantCostProvisionProfileViewOf(profile model.TenantRouteProfile) tenantCostProvisionProfileView {
+	return tenantCostProvisionProfileView{ID: profile.ID, TenantID: profile.TenantID, ProfileID: profile.ProfileID,
+		Revision: profile.Revision, ProductPoolID: profile.ProductPoolID, ServiceTier: profile.ServiceTier,
+		PublicLabel: profile.PublicLabel, Status: profile.Status, DisabledReason: profile.DisabledReason,
+		CreatedAt: profile.CreatedAt, UpdatedAt: profile.UpdatedAt}
+}
+
+func tenantCostProvisionBindingViewOf(binding *model.TenantCredentialBinding) *tenantCostProvisionBindingView {
+	if binding == nil {
+		return nil
+	}
+	return &tenantCostProvisionBindingView{ID: binding.ID, TokenID: binding.TokenID, TenantID: binding.TenantID,
+		CredentialPurpose: binding.CredentialPurpose,
+		KeyID:             tenantCostOpaqueIdentifier("key_", binding.KeyID), KeySuffix: binding.KeySuffix,
+		ProductPoolID: binding.ProductPoolID, ServiceTier: binding.ServiceTier,
+		RouteProfileID:  tenantCostOpaqueIdentifier("profile_", binding.RouteProfileID),
+		ProfileRevision: binding.ProfileRevision, ModelCatalogRevision: binding.ModelCatalogRevision,
+		BindingStatus: binding.BindingStatus, CreatedAt: binding.CreatedAt, UpdatedAt: binding.UpdatedAt,
+		RevokedAt: binding.RevokedAt}
+}
+
+// AdminProvisionTenantCostSlot performs the HTTP-side portion of a Root-only
+// slot/profile provisioning operation. All durable writes, binding identity
+// checks, and cache invalidation remain in the model transaction.
+func AdminProvisionTenantCostSlot(c *gin.Context) {
+	setTenantCostNoStore(c)
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	var request tenantCostSlotProvisionRequest
+	if err := decodeTenantCostAdminJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	if request.RequestID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 request_id"})
+		return
+	}
+	tokenID := 0
+	if request.TokenID != nil {
+		tokenID = *request.TokenID
+		if tokenID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "token_id 无效"})
+			return
+		}
+	}
+	result, err := model.ProvisionTenantCostSlot(model.TenantCostSlotProvisionSpec{
+		RequestID: request.RequestID, TenantID: tenantID, ProductPoolID: request.ProductPoolID, ProductFamily: request.ProductFamily,
+		ServiceTier: request.ServiceTier, PublicLabel: request.PublicLabel, SortOrder: request.SortOrder,
+		ProfileID: request.ProfileID, ProfileRevision: request.ProfileRevision, ModelSelector: request.ModelSelector,
+		MinRatioPPM: request.MinRatioPPM, MaxRatioPPM: request.MaxRatioPPM, ProviderClass: request.ProviderClass,
+		CandidateSpec: request.CandidateSpec, CapabilitySpec: request.CapabilitySpec,
+		ProfileStatus: request.ProfileStatus, DisabledReason: request.DisabledReason, TokenID: tokenID,
+		ModelCatalogRevision: request.ModelCatalogRevision, BindingStatus: request.BindingStatus,
+	}, c.GetInt("id"))
+	if err != nil {
+		tenantCostAdminError(c, err, "配置租户服务槽位失败")
+		return
+	}
+	markAuditLogged(c)
+	data := gin.H{
+		"slot":            tenantCostProvisionSlotViewOf(result.Slot),
+		"profile":         tenantCostProvisionProfileViewOf(result.Profile),
+		"binding":         tenantCostProvisionBindingViewOf(result.Binding),
+		"binding_created": result.BindingCreated,
+		"replayed":        result.Replayed,
+	}
+	// result.Secret is populated only for a newly-created binding by the model;
+	// an idempotent/repeated provisioning operation therefore cannot recover or
+	// re-disclose an old key through this endpoint.
+	if result.BindingCreated && result.Secret != "" {
+		data["secret"] = result.Secret
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// AdminRotateTenantCostBindingKey exposes the one-time secret returned by a
+// first successful rotation. Model-level receipt replay sets AlreadyRotated;
+// in that case this handler deliberately emits an empty secret.
+func AdminRotateTenantCostBindingKey(c *gin.Context) {
+	setTenantCostNoStore(c)
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	bindingID, err := strconv.ParseInt(strings.TrimSpace(c.Param("binding_id")), 10, 64)
+	if err != nil || bindingID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "绑定 ID 无效"})
+		return
+	}
+	var request tenantCostKeyRotationRequest
+	if err := decodeTenantCostAdminJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	if request.RequestID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 request_id"})
+		return
+	}
+	result, err := model.RotateTenantCostBindingKeyForTenant(tenantID, bindingID, request.RequestID, c.GetInt("id"))
+	if err != nil {
+		tenantCostAdminError(c, err, "轮换租户服务 Key 失败")
+		return
+	}
+	markAuditLogged(c)
+	data := gin.H{
+		"binding":         tenantCostProvisionBindingViewOf(&result.Binding),
+		"already_rotated": result.AlreadyRotated,
+	}
+	if !result.AlreadyRotated {
+		data["secret"] = result.Secret
+	}
+	if result.CacheWarning != "" {
+		data["cache_warning"] = result.CacheWarning
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func tenantCostAdminError(c *gin.Context, err error, fallback string) {
+	if err == nil {
+		return
+	}
+	status := http.StatusBadRequest
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		status = http.StatusNotFound
+	} else if errors.Is(err, model.ErrTenantCostConflict) {
+		status = http.StatusConflict
+	} else if errors.Is(err, model.ErrTenantCostScope) {
+		status = http.StatusForbidden
+	} else if errors.Is(err, model.ErrTenantCostBindingUnavailable) {
+		status = http.StatusServiceUnavailable
+	} else if strings.Contains(strings.ToLower(err.Error()), "database") || strings.Contains(strings.ToLower(err.Error()), "sql") {
+		status = http.StatusInternalServerError
+	}
+	c.JSON(status, gin.H{"success": false, "message": fallback})
+}
+
+func setTenantCostNoStore(c *gin.Context) {
+	if c != nil {
+		c.Header("Cache-Control", "no-store")
+	}
+}
+
+// AdminListTenantCostDownstreams returns only non-secret downstream metadata.
+// Endpoint credentials are deployment-owned and never cross this response.
+func AdminListTenantCostDownstreams(c *gin.Context) {
+	rows, err := model.ListTenantCostDownstreams(500)
+	if err != nil {
+		tenantCostAdminError(c, err, "获取下游列表失败")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": rows})
+}
+
+func AdminUpsertTenantCostDownstream(c *gin.Context) {
+	var request tenantCostDownstreamRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	request.TenantID = strings.TrimSpace(request.TenantID)
+	request.DisplayName = strings.TrimSpace(request.DisplayName)
+	request.ConfigKey = strings.TrimSpace(request.ConfigKey)
+	if request.Status != nil {
+		status := strings.TrimSpace(*request.Status)
+		request.Status = &status
+	}
+	if request.ConfigKey == "" {
+		request.ConfigKey = model.DefaultTenantCostConfigKey(request.TenantID)
+	}
+	status := model.TenantCostDownstreamActive
+	if request.Status != nil {
+		status = *request.Status
+	}
+	// The model transaction owns existing-row state preservation while holding
+	// the row lock. Avoid a second pre-read whose failure could otherwise be
+	// ignored and split status semantics between controller and model.
+	row := &model.TenantCostDownstream{TenantID: request.TenantID, DisplayName: request.DisplayName,
+		ConfigKey: request.ConfigKey, Status: status}
+	if err := model.UpsertTenantCostDownstreamWithAudit(row, c.GetInt("id")); err != nil {
+		tenantCostAdminError(c, err, "保存下游配置失败")
+		return
+	}
+	markAuditLogged(c)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": row})
+}
+
+func AdminSetTenantCostDownstreamStatus(c *gin.Context) {
+	tenantID, ok := resolveTenantCostPathTenant(c, c.Param("tenant_id"))
+	if !ok {
+		return
+	}
+	var request struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	if err := model.SetTenantCostDownstreamStatus(tenantID, strings.TrimSpace(request.Status), c.GetInt("id")); err != nil {
+		tenantCostAdminError(c, err, "更新下游状态失败")
+		return
+	}
+	markAuditLogged(c)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"tenant_id": tenantID, "status": strings.TrimSpace(request.Status)}})
+}
+
+func AdminListTenantReportingTokens(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantReportingTokensForTenant(tenantID, 100)
+	if err != nil {
+		tenantCostAdminError(c, err, "获取 reporting token 状态失败")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": rows})
+}
+
+func AdminCreateTenantReportingToken(c *gin.Context) {
+	setTenantCostNoStore(c)
+	var request tenantReportingTokenRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+			return
+		}
+	}
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	if request.RequestID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 request_id"})
+		return
+	}
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	mutation, err := model.CreateTenantReportingTokenWithAuditRequest(tenantID,
+		model.TenantCostReportingPermission, request.ExpiresAt, request.RequestID, c.GetInt("id"))
+	if err != nil {
+		tenantCostAdminError(c, err, "创建 reporting token 失败")
+		return
+	}
+	markAuditLogged(c)
+	row := mutation.Token
+	views := model.TenantReportingTokenView{ID: row.ID, TenantID: row.TenantID, TokenID: row.TokenID,
+		Permission: row.Permission, ExpiresAt: row.ExpiresAt, RevokedAt: row.RevokedAt,
+		LastUsedAt: row.LastUsedAt, CreatedAt: row.CreatedAt}
+	// The secret is intentionally present only in this creation response. It is
+	// never stored in the view, audit details, or subsequent list responses.
+	data := gin.H{"token": views, "replayed": mutation.Replayed}
+	if mutation.Secret != "" {
+		data["secret"] = mutation.Secret
+	}
+	c.JSON(http.StatusCreated, gin.H{"success": true, "data": data})
+}
+
+func AdminRotateTenantReportingToken(c *gin.Context) {
+	setTenantCostNoStore(c)
+	var request tenantReportingTokenRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+			return
+		}
+	}
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	if request.RequestID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 request_id"})
+		return
+	}
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	mutation, err := model.RotateTenantReportingTokenForTenantWithRequest(tenantID, c.Param("token_id"), request.ExpiresAt, request.RequestID, c.GetInt("id"))
+	if err != nil {
+		tenantCostAdminError(c, err, "轮换 reporting token 失败")
+		return
+	}
+	markAuditLogged(c)
+	row := mutation.Token
+	views := model.TenantReportingTokenView{ID: row.ID, TenantID: row.TenantID, TokenID: row.TokenID,
+		Permission: row.Permission, ExpiresAt: row.ExpiresAt, RevokedAt: row.RevokedAt,
+		LastUsedAt: row.LastUsedAt, CreatedAt: row.CreatedAt}
+	data := gin.H{"token": views, "replayed": mutation.Replayed}
+	if mutation.Secret != "" {
+		data["secret"] = mutation.Secret
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func AdminRevokeTenantReportingToken(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	if err := model.RevokeTenantReportingTokenForTenant(tenantID, c.Param("token_id"), c.GetInt("id")); err != nil {
+		tenantCostAdminError(c, err, "撤销 reporting token 失败")
+		return
+	}
+	markAuditLogged(c)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"revoked": true}})
+}
+
+func AdminSetTenantCostBindingStatus(c *gin.Context) {
+	bindingID, err := strconv.ParseInt(strings.TrimSpace(c.Param("binding_id")), 10, 64)
+	if err != nil || bindingID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "绑定 ID 无效"})
+		return
+	}
+	var request tenantBindingStatusRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	if err := model.SetTenantCredentialBindingStatusForTenant(tenantID, bindingID, request.Status, c.GetInt("id")); err != nil {
+		tenantCostAdminError(c, err, "更新服务槽位状态失败")
+		return
+	}
+	markAuditLogged(c)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"binding_id": bindingID, "status": strings.TrimSpace(request.Status)}})
+}
+
+func AdminReplayTenantCostOutbox(c *gin.Context) {
+	var request tenantCostReplayRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	count, err := model.ReplayTenantCostOutboxForTenant(tenantID, model.TenantCostOutboxReplaySelector{
+		EventIDs: request.EventIDs, FromSequence: request.FromSequence, ToSequence: request.ToSequence, Limit: request.Limit,
+	}, c.GetInt("id"))
+	if err != nil {
+		tenantCostAdminError(c, err, "有限范围重放失败")
+		return
+	}
+	markAuditLogged(c)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"replayed": count, "bounded": true}})
+}
+
+func AdminGetTenantCostWorkerControl(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	control, err := model.GetTenantCostWorkerControlForTenant(tenantID)
+	if err != nil {
+		tenantCostAdminError(c, err, "获取成本 worker 状态失败")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": control})
+}
+
+func AdminSetTenantCostWorkerControl(c *gin.Context) {
+	var request tenantCostWorkerRequest
+	if err := c.ShouldBindJSON(&request); err != nil || request.Paused == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须明确 paused=true 或 false"})
+		return
+	}
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	if err := model.SetTenantCostWorkerPausedForTenant(tenantID, *request.Paused, c.GetInt("id")); err != nil {
+		tenantCostAdminError(c, err, "更新成本 worker 状态失败")
+		return
+	}
+	markAuditLogged(c)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"paused": *request.Paused}})
+}

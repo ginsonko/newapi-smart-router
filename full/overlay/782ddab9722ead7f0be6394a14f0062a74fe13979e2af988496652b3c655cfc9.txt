@@ -1,0 +1,213 @@
+package controller
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"sort"
+
+	"github.com/gin-gonic/gin"
+)
+
+func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string]string) []model.Pricing {
+	if len(pricing) == 0 {
+		return pricing
+	}
+	if len(usableGroup) == 0 {
+		return []model.Pricing{}
+	}
+
+	filtered := make([]model.Pricing, 0, len(pricing))
+	for _, item := range pricing {
+		// GetPricing returns shared cached data. Build a per-request projection.
+		groups := make([]string, 0, len(item.EnableGroup))
+		if common.StringsContains(item.EnableGroup, "all") {
+			for group := range usableGroup {
+				if group != "all" {
+					groups = append(groups, group)
+				}
+			}
+			sort.Strings(groups)
+		} else {
+			seen := make(map[string]bool, len(item.EnableGroup))
+			for _, group := range item.EnableGroup {
+				if _, ok := usableGroup[group]; ok && !seen[group] {
+					groups = append(groups, group)
+					seen[group] = true
+				}
+			}
+		}
+		if len(groups) == 0 {
+			continue
+		}
+		item.EnableGroup = groups
+		contracts := make(map[string]model.GroupPricing, len(groups))
+		for _, group := range groups {
+			if contract, ok := item.GroupPricing[group]; ok {
+				contracts[group] = contract
+			}
+		}
+		item.GroupPricing = contracts
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func applyEffectiveGroupPricing(pricing []model.Pricing, groupRatios map[string]float64, specialGroups map[string]bool) []model.Pricing {
+	result := make([]model.Pricing, len(pricing))
+	for index, item := range pricing {
+		result[index] = item
+		if len(item.GroupPricing) == 0 {
+			continue
+		}
+		result[index].GroupPricing = make(map[string]model.GroupPricing, len(item.GroupPricing))
+		for group, groupPricing := range item.GroupPricing {
+			effectiveRatio, ok := groupRatios[group]
+			if ok {
+				groupPricing.EffectiveGroupRatio = effectiveRatio
+				groupPricing.HasUserGroupRatio = specialGroups[group]
+			}
+			if groupPricing.ModelPrice != nil {
+				effectivePrice := *groupPricing.ModelPrice * groupPricing.EffectiveGroupRatio
+				groupPricing.EffectiveModelPrice = &effectivePrice
+			}
+			if groupPricing.ModelRatio != nil {
+				effectiveRatio := *groupPricing.ModelRatio * groupPricing.EffectiveGroupRatio
+				groupPricing.EffectiveModelRatio = &effectiveRatio
+				baseInputUSD := *groupPricing.ModelRatio * 2
+				groupPricing.BaseInputUSD = &baseInputUSD
+				if groupPricing.CompletionRatio != nil {
+					baseOutputUSD := baseInputUSD * *groupPricing.CompletionRatio
+					effectiveInputUSD := baseInputUSD * groupPricing.EffectiveGroupRatio
+					effectiveOutputUSD := baseOutputUSD * groupPricing.EffectiveGroupRatio
+					groupPricing.BaseOutputUSD = &baseOutputUSD
+					groupPricing.EffectiveInputUSD = &effectiveInputUSD
+					groupPricing.EffectiveOutputUSD = &effectiveOutputUSD
+				}
+			}
+			result[index].GroupPricing[group] = groupPricing
+		}
+	}
+	return result
+}
+
+func applyActualInputCostVisibility(
+	pricing []model.Pricing,
+	visibility service.SmartRouteActualInputCostVisibility,
+) []model.Pricing {
+	result := make([]model.Pricing, len(pricing))
+	for index, item := range pricing {
+		result[index] = item
+		if len(item.GroupPricing) == 0 {
+			continue
+		}
+		result[index].GroupPricing = make(map[string]model.GroupPricing, len(item.GroupPricing))
+		for group, groupPricing := range item.GroupPricing {
+			if groups, exists := visibility.ModelGroups[item.ModelName]; exists {
+				if summary, available := groups[group]; available {
+					cacheRate := summary.CacheReadRatePPM
+					groupPricing.ActualInputCostBasis = summary.Basis
+					groupPricing.ActualInputCostEndpoint = summary.Endpoint
+					groupPricing.RecentCacheRatePPM = &cacheRate
+					if summary.EstimatedUSDPerM != nil {
+						estimatedUSD := *summary.EstimatedUSDPerM
+						groupPricing.EstimatedInputUSD = &estimatedUSD
+					}
+					groupPricing.ActualCostSamples = summary.Samples
+					groupPricing.SampledRouteCount = summary.SampledRoutes
+					groupPricing.ActualCostObservedMS = summary.LastObservedAtMS
+				}
+			}
+			result[index].GroupPricing[group] = groupPricing
+		}
+	}
+	return result
+}
+
+func GetPricing(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Vary", "Cookie, Authorization, New-Api-User")
+	pricing := model.GetPricing()
+	userId, exists := c.Get("id")
+	usableGroup := map[string]string{}
+	groupRatio := map[string]float64{}
+	specialGroups := map[string]bool{}
+	for s, f := range ratio_setting.GetGroupRatioCopy() {
+		groupRatio[s] = f
+	}
+	var group string
+	if exists {
+		user, err := model.GetUserCache(userId.(int))
+		if err == nil {
+			group = user.Group
+			for g := range groupRatio {
+				ratio, ok := ratio_setting.GetGroupGroupRatio(group, g)
+				if ok {
+					groupRatio[g] = ratio
+					specialGroups[g] = true
+				}
+			}
+		}
+	}
+
+	usableGroup = service.GetUserUsableGroups(group)
+	pricing = filterPricingByUsableGroups(pricing, usableGroup)
+	pricing = applyEffectiveGroupPricing(pricing, groupRatio, specialGroups)
+	pricing = applyPublicParameterPricing(pricing)
+	if smartroutersetting.GetSmartRouterSettingSnapshot().Enabled {
+		if engine, err := service.GetDefaultSmartRouterEngine(); err == nil {
+			pricing = applyActualInputCostVisibility(
+				pricing,
+				engine.ActualInputCostVisibility(c.Request.Context(), group),
+			)
+		}
+	}
+	// check groupRatio contains usableGroup
+	for group := range ratio_setting.GetGroupRatioCopy() {
+		if _, ok := usableGroup[group]; !ok {
+			delete(groupRatio, group)
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"success":                      true,
+		"data":                         pricing,
+		"vendors":                      model.GetVendors(),
+		"capability_contracts":         publicPricingCapabilities(pricing, usableGroup),
+		"group_ratio":                  groupRatio,
+		"usable_group":                 usableGroup,
+		"supported_endpoint":           model.GetSupportedEndpointMap(),
+		"auto_groups":                  service.GetUserAutoGroup(group),
+		"pricing_version":              "a42d372ccf0b5dd13ecf71203521f9d2",
+		"group_ratio_revision":         ratio_setting.GetGroupRatioContentRevision(),
+		"group_model_pricing_revision": billing_setting.GetGroupModelPricingContract().Revision,
+		"parameter_pricing_revision":   billing_setting.GetParameterPricingContract().Revision,
+	})
+}
+
+func ResetModelRatio(c *gin.Context) {
+	defaultStr := ratio_setting.DefaultModelRatio2JSONString()
+	err := model.UpdateOption("ModelRatio", defaultStr)
+	if err != nil {
+		c.JSON(200, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	err = ratio_setting.UpdateModelRatioByJSONString(defaultStr)
+	if err != nil {
+		c.JSON(200, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	c.JSON(200, gin.H{
+		"success": true,
+		"message": "重置模型倍率成功",
+	})
+}

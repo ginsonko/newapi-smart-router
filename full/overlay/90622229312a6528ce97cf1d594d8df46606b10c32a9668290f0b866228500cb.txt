@@ -1,0 +1,1447 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AxiosError } from 'axios'
+import {
+  Activity,
+  ChevronDown,
+  CircleAlert,
+  Gauge,
+  LoaderCircle,
+  RefreshCw,
+  Settings2,
+  ShieldCheck,
+  Stethoscope,
+} from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { useForm, useWatch, type SubmitErrorHandler } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
+import { Input } from '@/components/ui/input'
+import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  getSmartRouterConfig,
+  getSmartRouterHealth,
+  canonicalHealthState,
+  refreshSmartRouterCatalog,
+  updateSmartRouterConfig,
+  type SmartRouterCatalogReport,
+  type SmartRouterConfigResponse,
+  type SmartRouterSetting,
+  type SmartRouterHealthRoute,
+} from '@/features/smart-routing'
+
+import {
+  SettingsForm,
+  SettingsSwitchContent,
+  SettingsSwitchItem,
+} from '../components/settings-form-layout'
+import {
+  SettingsPageFormActions,
+  SettingsPageTitleStatusPortal,
+} from '../components/settings-page-context'
+import { SettingsSection } from '../components/settings-section'
+import { safeNumberFieldProps } from '../utils/numeric-field'
+import { SmartRoutingBlocks } from './smart-routing-blocks'
+import {
+  createEmptySmartRouterFormValues,
+  smartRouterFormSchema,
+  smartRouterFormToSetting,
+  smartRouterSettingToForm,
+  type SmartRouterFormValues,
+} from './smart-routing-form'
+import { SmartRoutingHealth } from './smart-routing-health'
+
+const SMART_ROUTER_CONFIG_QUERY_KEY = ['smart-router-config'] as const
+
+function getServerErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof AxiosError) {
+    const response = error.response?.data as
+      | { message?: string; error?: { message?: string } }
+      | undefined
+    return response?.message || response?.error?.message || error.message
+  }
+  if (error instanceof Error) return error.message
+  return fallback
+}
+
+type CatalogSummaryProps = {
+  ready: boolean
+  version?: string
+  report?: SmartRouterCatalogReport
+  error?: string
+  refreshing: boolean
+  onRefresh: () => void
+}
+
+function CatalogSummary(props: CatalogSummaryProps) {
+  const { t } = useTranslation()
+  const report = props.report
+  const stats = [
+    {
+      label: t('Discovered models'),
+      value: report?.discovered_models ?? 0,
+    },
+    {
+      label: t('Discovered routes'),
+      value: report?.discovered_routes ?? report?.published_routes ?? 0,
+    },
+    {
+      label: t('Discovered groups'),
+      value: report?.discovered_groups ?? 0,
+    },
+    {
+      label: t('Excluded routes'),
+      value: report?.blacklisted_routes ?? 0,
+    },
+    {
+      label: t('Missing price'),
+      value: report?.missing_ratio_routes ?? 0,
+    },
+    {
+      label: t('Incompatible endpoints'),
+      value: report?.incompatible_endpoint_routes ?? 0,
+    },
+  ]
+  const rejections = report?.rejections ?? []
+
+  return (
+    <div className='min-w-0 space-y-3'>
+      <Alert
+        className={
+          props.ready
+            ? 'border-emerald-500/30 bg-emerald-500/5'
+            : 'border-amber-500/30 bg-amber-500/5'
+        }
+      >
+        {props.ready ? <Activity /> : <CircleAlert />}
+        <AlertTitle>
+          {props.ready
+            ? t('Automatic catalog ready')
+            : t('Automatic catalog is preparing')}
+        </AlertTitle>
+        <AlertDescription>
+          {props.ready
+            ? t(
+                'Eligible text, image, and video routes are discovered from enabled channels and their current model abilities. No per-model publishing is required.'
+              )
+            : t(
+                'Enable at least one compatible channel with a valid group, endpoint, model ability, and price, then refresh the catalog.'
+              )}
+          {props.version ? (
+            <span className='mt-1 block font-mono text-xs break-all'>
+              {t('Catalog version')}: {props.version}
+            </span>
+          ) : null}
+        </AlertDescription>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          className='mt-2 w-fit'
+          disabled={props.refreshing}
+          onClick={props.onRefresh}
+        >
+          <RefreshCw
+            data-icon='inline-start'
+            className={props.refreshing ? 'animate-spin' : undefined}
+          />
+          {t('Refresh discovery')}
+        </Button>
+      </Alert>
+
+      {props.error ? (
+        <Alert variant='destructive'>
+          <CircleAlert />
+          <AlertTitle>{t('Catalog refresh error')}</AlertTitle>
+          <AlertDescription className='break-words'>
+            {props.error}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      <div className='grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6'>
+        {stats.map((stat) => (
+          <div
+            key={stat.label}
+            className='bg-muted/20 min-w-0 rounded-lg border px-3 py-2.5'
+          >
+            <p className='text-muted-foreground truncate text-xs'>
+              {stat.label}
+            </p>
+            <p className='mt-1 text-lg font-semibold tabular-nums'>
+              {stat.value}
+            </p>
+          </div>
+        ))}
+      </div>
+
+      {rejections.length > 0 ? (
+        <details className='rounded-lg border'>
+          <summary className='hover:bg-muted/30 cursor-pointer px-3 py-2.5 text-sm font-medium'>
+            {t('{{count}} routes need attention', {
+              count: rejections.length,
+            })}
+          </summary>
+          <div className='max-h-72 divide-y overflow-y-auto border-t'>
+            {rejections.slice(0, 50).map((rejection) => (
+              <div
+                key={JSON.stringify(rejection)}
+                className='grid min-w-0 gap-1 px-3 py-2.5 text-xs sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)]'
+              >
+                <span className='truncate font-mono'>
+                  {[
+                    rejection.group,
+                    rejection.model,
+                    rejection.channel_id
+                      ? `#${rejection.channel_id}`
+                      : undefined,
+                  ]
+                    .filter(Boolean)
+                    .join(' / ') || t('Catalog route')}
+                </span>
+                <span className='text-muted-foreground break-words'>
+                  {rejection.reason}
+                </span>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  )
+}
+
+export function SmartRoutingSection() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [activeTab, setActiveTab] = useState(() => {
+    if (typeof window === 'undefined') return 'overview'
+    const requested = new URLSearchParams(window.location.search).get('tab')
+    if (requested && ['overview', 'blocks', 'health'].includes(requested)) {
+      return requested
+    }
+    return 'overview'
+  })
+  const loadedSettingRef = useRef<SmartRouterSetting | null>(null)
+  const configQuery = useQuery({
+    queryKey: SMART_ROUTER_CONFIG_QUERY_KEY,
+    queryFn: getSmartRouterConfig,
+    staleTime: 15_000,
+  })
+  const healthCountQuery = useQuery({
+    queryKey: ['smart-router-health'],
+    queryFn: getSmartRouterHealth,
+    staleTime: 10_000,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+  })
+  const healthCountData = healthCountQuery.data?.data
+  const healthCountItems: SmartRouterHealthRoute[] = Array.isArray(
+    healthCountData
+  )
+    ? healthCountData
+    : (healthCountData?.items ?? [])
+  const attentionCount = healthCountItems.filter((route) => {
+    const state = canonicalHealthState(route)
+    return route.requires_admin_review === true || state === 'needs_review'
+  }).length
+  const form = useForm<SmartRouterFormValues>({
+    resolver: zodResolver(smartRouterFormSchema),
+    defaultValues: createEmptySmartRouterFormValues(),
+  })
+  const config = configQuery.data?.success ? configQuery.data.data : undefined
+
+  useEffect(() => {
+    if (!config?.setting) return
+    if (loadedSettingRef.current === config.setting || form.formState.isDirty) {
+      return
+    }
+    loadedSettingRef.current = config.setting
+    form.reset(smartRouterSettingToForm(config.setting))
+  }, [config, form, form.formState.isDirty])
+
+  const saveMutation = useMutation({
+    mutationFn: updateSmartRouterConfig,
+    onSuccess: async (response) => {
+      if (!response.success) {
+        toast.error(response.message || t('Failed to update smart routing'))
+        return
+      }
+      toast.success(t('Smart routing configuration updated'))
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: SMART_ROUTER_CONFIG_QUERY_KEY,
+        }),
+        queryClient.invalidateQueries({ queryKey: ['smart-router-options'] }),
+      ])
+      const refreshed = queryClient.getQueryData<SmartRouterConfigResponse>(
+        SMART_ROUTER_CONFIG_QUERY_KEY
+      )
+      const refreshedSetting =
+        refreshed?.data?.setting ?? response.data?.setting
+      if (refreshedSetting) {
+        loadedSettingRef.current = refreshedSetting
+        form.reset(smartRouterSettingToForm(refreshedSetting))
+      }
+    },
+    onError: (error) => {
+      toast.error(
+        getServerErrorMessage(error, t('Failed to update smart routing'))
+      )
+    },
+  })
+  const refreshMutation = useMutation({
+    mutationFn: refreshSmartRouterCatalog,
+    onSuccess: async (response) => {
+      if (!response.success) {
+        toast.error(response.message || t('Catalog refresh failed'))
+        return
+      }
+      toast.success(t('Automatic catalog refreshed'))
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: SMART_ROUTER_CONFIG_QUERY_KEY,
+        }),
+        queryClient.invalidateQueries({ queryKey: ['smart-router-options'] }),
+      ])
+    },
+    onError: () => toast.error(t('Catalog refresh failed')),
+  })
+
+  const enabled = useWatch({ control: form.control, name: 'enabled' })
+  const attemptLimitEnabled = useWatch({
+    control: form.control,
+    name: 'attempt_limit_enabled',
+  })
+  const onSubmit = async (values: SmartRouterFormValues) => {
+    await saveMutation.mutateAsync(smartRouterFormToSetting(values))
+  }
+  const onInvalid: SubmitErrorHandler<SmartRouterFormValues> = () => {
+    toast.error(t('Please fix the highlighted fields before saving'))
+  }
+  const resetForm = () => {
+    if (!config?.setting) return
+    form.reset(smartRouterSettingToForm(config.setting))
+  }
+
+  if (configQuery.isLoading) {
+    return (
+      <div className='text-muted-foreground flex min-h-48 items-center justify-center gap-2 text-sm'>
+        <LoaderCircle className='size-4 animate-spin' />
+        {t('Loading smart routing configuration...')}
+      </div>
+    )
+  }
+
+  if (configQuery.isError || !config) {
+    const message = configQuery.isError
+      ? getServerErrorMessage(
+          configQuery.error,
+          t('Unable to load smart routing configuration')
+        )
+      : configQuery.data?.message ||
+        t('Unable to load smart routing configuration')
+    return (
+      <Alert variant='destructive'>
+        <CircleAlert />
+        <AlertTitle>{t('Smart routing configuration unavailable')}</AlertTitle>
+        <AlertDescription>{message}</AlertDescription>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          className='mt-2 w-fit'
+          onClick={() => configQuery.refetch()}
+        >
+          <RefreshCw data-icon='inline-start' />
+          {t('Try again')}
+        </Button>
+      </Alert>
+    )
+  }
+
+  return (
+    <SettingsSection title={t('Smart Routing')}>
+      <SettingsPageTitleStatusPortal>
+        <Badge variant={config.catalog_ready ? 'default' : 'secondary'}>
+          {config.catalog_ready ? t('Catalog ready') : t('Catalog pending')}
+        </Badge>
+      </SettingsPageTitleStatusPortal>
+
+      <Form {...form}>
+        <SettingsForm onSubmit={form.handleSubmit(onSubmit, onInvalid)}>
+          <SettingsPageFormActions
+            onSave={form.handleSubmit(onSubmit, onInvalid)}
+            onReset={resetForm}
+            isSaving={saveMutation.isPending}
+            isSaveDisabled={!form.formState.isDirty}
+            isResetDisabled={!form.formState.isDirty}
+          />
+
+          <Tabs
+            value={activeTab}
+            onValueChange={(value) => {
+              setActiveTab(value)
+              if (typeof window === 'undefined') return
+              const url = new URL(window.location.href)
+              if (value === 'overview') url.searchParams.delete('tab')
+              else url.searchParams.set('tab', value)
+              window.history.replaceState(window.history.state, '', url)
+            }}
+            className='min-w-0 gap-5'
+          >
+            <TabsList className='max-w-full justify-start overflow-x-auto'>
+              <TabsTrigger value='overview'>
+                {t('Overview and limits')}
+              </TabsTrigger>
+              <TabsTrigger value='blocks'>{t('Exclusions')}</TabsTrigger>
+              <TabsTrigger value='health'>
+                {t('Health and recovery')}
+                {attentionCount > 0 ? (
+                  <Badge variant='destructive' className='ml-1'>
+                    {attentionCount}
+                  </Badge>
+                ) : null}
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent
+              value='overview'
+              className='flex min-w-0 flex-col gap-5'
+            >
+              <CatalogSummary
+                ready={config.catalog_ready}
+                version={config.catalog_version}
+                report={config.catalog_report}
+                error={config.catalog_error}
+                refreshing={refreshMutation.isPending}
+                onRefresh={() => refreshMutation.mutate()}
+              />
+
+              <Separator />
+
+              <div className='flex min-w-0 flex-col gap-4'>
+                <div>
+                  <div className='flex items-center gap-2'>
+                    <ShieldCheck className='text-muted-foreground size-4' />
+                    <h4 className='text-sm font-medium'>{t('Availability')}</h4>
+                  </div>
+                  <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>
+                    {t(
+                      'The system discovers eligible text, image, and video routes from existing channels. These switches do not change fixed-group keys or any existing key policy.'
+                    )}
+                  </p>
+                </div>
+                <div className='grid min-w-0 gap-3 lg:grid-cols-2'>
+                  <FormField
+                    control={form.control}
+                    name='enabled'
+                    render={({ field }) => (
+                      <SettingsSwitchItem className='bg-muted/20 rounded-lg border px-3'>
+                        <SettingsSwitchContent>
+                          <FormLabel>{t('Enable smart routing')}</FormLabel>
+                          <FormDescription>
+                            {t(
+                              'Allow smart keys to use the automatic route catalog'
+                            )}
+                          </FormDescription>
+                        </SettingsSwitchContent>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={(checked) => {
+                              field.onChange(checked)
+                              if (!checked) {
+                                form.setValue('default_for_new_keys', false, {
+                                  shouldDirty: true,
+                                })
+                              }
+                            }}
+                          />
+                        </FormControl>
+                      </SettingsSwitchItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name='default_for_new_keys'
+                    render={({ field }) => (
+                      <SettingsSwitchItem className='bg-muted/20 rounded-lg border px-3'>
+                        <SettingsSwitchContent>
+                          <FormLabel>
+                            {t('New keys start with smart routing')}
+                          </FormLabel>
+                          <FormDescription>
+                            {t(
+                              'New create forms start with every discovered group selected; users can still change each key.'
+                            )}
+                          </FormDescription>
+                        </SettingsSwitchContent>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                            disabled={!enabled}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </SettingsSwitchItem>
+                    )}
+                  />
+                </div>
+              </div>
+
+              <Separator />
+
+              <div className='flex min-w-0 flex-col gap-4'>
+                <div>
+                  <div className='flex items-center gap-2'>
+                    <Gauge className='text-muted-foreground size-4' />
+                    <h4 className='text-sm font-medium'>
+                      {t('Group ratio guardrails')}
+                    </h4>
+                  </div>
+                  <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>
+                    {t(
+                      'These are hard safety boundaries. Users choose their own groups and preference inside them for each key.'
+                    )}
+                  </p>
+                </div>
+                <div className='grid min-w-0 gap-4 sm:grid-cols-2'>
+                  <FormField
+                    control={form.control}
+                    name='default_max_effective_ratio'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          {t('Default group ratio ceiling')}
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={0.000001}
+                            step={0.01}
+                            {...safeNumberFieldProps(field)}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t('Inherited by a key whose ratio cap is 0')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name='absolute_max_effective_ratio'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          {t('Absolute group ratio ceiling')}
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={0.000001}
+                            step={0.01}
+                            {...safeNumberFieldProps(field)}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t('No user key can raise its cap above this value')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+                <FormField
+                  control={form.control}
+                  name='actual_input_cost_ranking'
+                  render={({ field }) => (
+                    <SettingsSwitchItem className='bg-muted/20 rounded-lg border px-3'>
+                      <SettingsSwitchContent>
+                        <FormLabel>
+                          {t('Sort by recent actual input cost')}
+                        </FormLabel>
+                        <FormDescription>
+                          {t(
+                            'Use the shared recent cache/input-cost snapshot for ordering. Without reliable samples, static price ordering is used; billing is unchanged.'
+                          )}
+                        </FormDescription>
+                      </SettingsSwitchContent>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                          disabled={!enabled}
+                          aria-label={t('Sort by recent actual input cost')}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </SettingsSwitchItem>
+                  )}
+                />
+              </div>
+
+              <Collapsible
+                open={advancedOpen}
+                onOpenChange={setAdvancedOpen}
+                className='rounded-lg border'
+              >
+                <CollapsibleTrigger
+                  render={
+                    <button
+                      type='button'
+                      className='hover:bg-muted/30 flex w-full min-w-0 items-center justify-between gap-3 rounded-lg px-4 py-3 text-left transition-colors'
+                    />
+                  }
+                >
+                  <span className='flex min-w-0 items-start gap-3'>
+                    <Settings2 className='text-muted-foreground mt-0.5 size-4 shrink-0' />
+                    <span className='min-w-0'>
+                      <span className='block text-sm font-medium'>
+                        {t('Smart routing advanced settings')}
+                      </span>
+                      <span className='text-muted-foreground mt-0.5 block text-xs leading-relaxed'>
+                        {t('The defaults are suitable for most users.')}
+                      </span>
+                    </span>
+                  </span>
+                  <ChevronDown
+                    className={`text-muted-foreground size-4 shrink-0 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
+                  />
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <div className='flex min-w-0 flex-col gap-5 border-t p-4'>
+                    <FormField
+                      control={form.control}
+                      name='recovery_fallback_enabled'
+                      render={({ field }) => (
+                        <SettingsSwitchItem className='bg-muted/20 rounded-lg border px-3'>
+                          <SettingsSwitchContent>
+                            <FormLabel>{t('Automatic recovery fallback')}</FormLabel>
+                          </SettingsSwitchContent>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                              disabled={!enabled}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </SettingsSwitchItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='attempt_limit_enabled'
+                      render={({ field }) => (
+                        <SettingsSwitchItem className='bg-muted/20 rounded-lg border px-3'>
+                          <SettingsSwitchContent>
+                            <FormLabel>
+                              {t('Limit upstream attempts')}
+                            </FormLabel>
+                            <FormDescription>
+                              {t(
+                                'Off by default. Replay-safe text requests try every eligible channel in the key group scope, one at a time.'
+                              )}
+                            </FormDescription>
+                          </SettingsSwitchContent>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                              disabled={!enabled}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </SettingsSwitchItem>
+                      )}
+                    />
+                    <div className='grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
+                      <FormField
+                        control={form.control}
+                        name='site_max_attempts'
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t('Maximum attempts per request')}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={1}
+                                max={8}
+                                step={1}
+                                disabled={!attemptLimitEnabled}
+                                {...safeNumberFieldProps(field)}
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {attemptLimitEnabled
+                                ? t(
+                                    'Each key can choose a value up to this limit'
+                                  )
+                                : t(
+                                    'Inactive while automatic all-channel attempts are enabled'
+                                  )}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name='max_failure_threshold'
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t('Maximum failure threshold')}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={1}
+                                max={100}
+                                step={1}
+                                {...safeNumberFieldProps(field)}
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {t('Upper bound for per-key failure tolerance')}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name='hard_failure_window_seconds'
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t('Consecutive failure window (seconds)')}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={60}
+                                max={86400}
+                                step={1}
+                                {...safeNumberFieldProps(field)}
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {t(
+                                'Failures outside this window begin a new episode'
+                              )}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name='max_queue_wait_ms'
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t('Maximum short queue wait (ms)')}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={0}
+                                max={60000}
+                                step={1}
+                                {...safeNumberFieldProps(field)}
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {t(
+                                'Hard limit when a key allows short capacity waiting'
+                              )}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name='catalog_refresh_seconds'
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t('Catalog refresh (seconds)')}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={10}
+                                max={3600}
+                                step={1}
+                                {...safeNumberFieldProps(field)}
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {t(
+                                'Also refreshes after channel and ratio changes'
+                              )}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    </div>
+
+                    <Separator />
+
+                    <div className='flex min-w-0 flex-col gap-4'>
+                      <div>
+                        <div className='flex items-center gap-2'>
+                          <Stethoscope className='text-muted-foreground size-4' />
+                          <h4 className='text-sm font-medium'>
+                            {t('Recovery sampling budget')}
+                          </h4>
+                        </div>
+                        <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>
+                          {t(
+                            'Recovery checks run beside user traffic. Users continue on the best healthy route while the worker verifies cheaper routes in the background.'
+                          )}
+                        </p>
+                      </div>
+                      <FormField
+                        control={form.control}
+                        name='background_probe_enabled'
+                        render={({ field }) => (
+                          <SettingsSwitchItem className='bg-muted/20 rounded-lg border px-3'>
+                            <SettingsSwitchContent>
+                              <FormLabel>
+                                {t('Enable background recovery probes')}
+                              </FormLabel>
+                              <FormDescription>
+                                {t(
+                                  'Recovery checks never wait in the user request path'
+                                )}
+                              </FormDescription>
+                            </SettingsSwitchContent>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                                disabled={!enabled}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </SettingsSwitchItem>
+                        )}
+                      />
+                      <div className='grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
+                        <FormField
+                          control={form.control}
+                          name='probe_timeout_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('First-token probe timeout (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Recommended 30–60 seconds; 45 seconds fits the current route distribution'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_completion_grace_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Probe completion grace (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Time allowed to verify a clean terminal event after first content'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_budget_per_minute'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Probe budget per minute')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={10000}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Shared ceiling for background recovery work'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_max_concurrency'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Maximum probe concurrency')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={100}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_scan_interval_ms'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Worker scan interval (ms)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={100}
+                                  max={60000}
+                                  step={100}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_queue_capacity'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Recovery queue capacity')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={100000}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Duplicate route hints are merged automatically'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_initial_backoff_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Initial recovery backoff (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={3600}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_max_backoff_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Maximum recovery backoff (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={86400}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_sweep_interval_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Recovery catalog scan (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={5}
+                                  max={3600}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Rebuilds missing recovery work even when no user is calling the model'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_fast_interval_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Fast recovery interval (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={86400}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_fast_window_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Fast recovery window (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={86400}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'After this continuous outage, checks move to the slower bounded schedule'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_canary_initial_traffic_percent'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Initial recovery canary (%)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={0.0001}
+                                  max={100}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Share of new requests used to verify a route after its probe succeeds'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_canary_healthy_samples'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('New-route canary successes')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={100}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Real successes required when a route has too little trustworthy history'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_canary_fast_history_samples'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Fast-return history samples')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={100000}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_canary_fast_reliability_percent'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Fast-return reliability (%)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={0}
+                                  max={100}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Routes with enough good history return after one successful real canary'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='recovery_backup_evidence_ttl_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Backup evidence lifetime (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={60}
+                                  max={604800}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='probe_lease_ttl_seconds'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                {t('Probe lease TTL (seconds)')}
+                              </FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  min={1}
+                                  max={172815}
+                                  step={1}
+                                  {...safeNumberFieldProps(field)}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t(
+                                  'Lets another worker safely resume a task after a worker stops'
+                                )}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                      <div className='border-border/70 space-y-3 border-t pt-4'>
+                        <div>
+                          <h5 className='text-sm font-medium'>
+                            {t('First-use route discovery')}
+                          </h5>
+                          <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>
+                            {t(
+                              'When every eligible text route is still unknown, the worker checks ordered batches and wakes the waiting request as soon as one succeeds.'
+                            )}
+                          </p>
+                        </div>
+                        <div className='grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-5'>
+                          <FormField
+                            control={form.control}
+                            name='cold_start_wave_batch_size'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>
+                                  {t('Cold-start discovery batch size')}
+                                </FormLabel>
+                                <FormControl>
+                                  <Input
+                                    type='number'
+                                    min={1}
+                                    max={100}
+                                    step={1}
+                                    {...safeNumberFieldProps(field)}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  {t(
+                                    'Unknown physical routes admitted in each ordered wave'
+                                  )}
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name='cold_start_wave_max_concurrency'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>
+                                  {t('Cold-start discovery concurrency')}
+                                </FormLabel>
+                                <FormControl>
+                                  <Input
+                                    type='number'
+                                    min={1}
+                                    max={100}
+                                    step={1}
+                                    {...safeNumberFieldProps(field)}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  {t(
+                                    'Maximum checks running at once in one wave'
+                                  )}
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name='cold_start_probe_budget_per_minute'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>
+                                  {t('Cold-start discovery budget per minute')}
+                                </FormLabel>
+                                <FormControl>
+                                  <Input
+                                    type='number'
+                                    min={1}
+                                    max={10000}
+                                    step={1}
+                                    {...safeNumberFieldProps(field)}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  {t(
+                                    'Independent budget for first-use discovery; routine recovery keeps its own lower limit'
+                                  )}
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name='cold_start_wait_ms'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>
+                                  {t('Cold-start wait window (ms)')}
+                                </FormLabel>
+                                <FormControl>
+                                  <Input
+                                    type='number'
+                                    min={1}
+                                    max={300000}
+                                    step={1000}
+                                    {...safeNumberFieldProps(field)}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  {t(
+                                    'Maximum time the first request waits for route discovery'
+                                  )}
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name='cold_start_poll_interval_ms'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>
+                                  {t('Cold-start state poll interval (ms)')}
+                                </FormLabel>
+                                <FormControl>
+                                  <Input
+                                    type='number'
+                                    min={10}
+                                    max={5000}
+                                    step={10}
+                                    {...safeNumberFieldProps(field)}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  {t(
+                                    'How often waiting requests re-check shared route health'
+                                  )}
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
+            </TabsContent>
+
+            <TabsContent value='blocks'>
+              <SmartRoutingBlocks />
+            </TabsContent>
+            <TabsContent value='health'>
+              <SmartRoutingHealth />
+            </TabsContent>
+          </Tabs>
+        </SettingsForm>
+      </Form>
+    </SettingsSection>
+  )
+}

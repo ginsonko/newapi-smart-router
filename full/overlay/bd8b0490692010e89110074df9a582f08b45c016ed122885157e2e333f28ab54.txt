@@ -1,0 +1,68 @@
+package controller
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+)
+
+// The HTTP contract intentionally contains only logical slot/profile
+// references. Raw keys, secrets, token IDs, provider URLs and physical route
+// candidates are not accepted from the client.
+type tenantCostBatchProvisionRequest struct {
+	RequestID         string                                `json:"request_id"`
+	OwnerUserID       int                                   `json:"owner_user_id"`
+	ExpectedItemCount int                                   `json:"expected_item_count"`
+	Items             []tenantCostBatchProvisionItemRequest `json:"items"`
+}
+
+type tenantCostBatchProvisionItemRequest struct {
+	SlotID         int64  `json:"slot_id"`
+	ProfileID      string `json:"profile_id"`
+	Name           string `json:"name"`
+	Group          string `json:"group"`
+	RoutingPolicy  string `json:"routing_policy"`
+	RemainQuota    int    `json:"remain_quota"`
+	UnlimitedQuota bool   `json:"unlimited_quota"`
+	ExpiredTime    int64  `json:"expired_time"`
+	BindingStatus  string `json:"binding_status"`
+}
+
+func AdminProvisionTenantCostBatch(c *gin.Context) {
+	setTenantCostNoStore(c)
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	var request tenantCostBatchProvisionRequest
+	if err := decodeTenantCostAdminJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	items := make([]model.TenantCostBatchProvisionItemSpec, len(request.Items))
+	for i, item := range request.Items {
+		items[i] = model.TenantCostBatchProvisionItemSpec{
+			SlotID: item.SlotID, ProfileID: strings.TrimSpace(item.ProfileID), Name: strings.TrimSpace(item.Name),
+			Group: strings.TrimSpace(item.Group), RoutingPolicy: strings.TrimSpace(item.RoutingPolicy),
+			RemainQuota: item.RemainQuota, UnlimitedQuota: item.UnlimitedQuota, ExpiredTime: item.ExpiredTime,
+			BindingStatus: strings.TrimSpace(item.BindingStatus),
+		}
+	}
+	result, err := model.ProvisionTenantCostBatch(model.TenantCostBatchProvisionSpec{
+		RequestID: request.RequestID, TenantID: tenantID, OwnerUserID: request.OwnerUserID,
+		ExpectedItemCount: request.ExpectedItemCount, Items: items,
+	}, c.GetInt("id"))
+	if err != nil {
+		tenantCostAdminError(c, err, "批量创建租户服务 Key 失败")
+		return
+	}
+	markAuditLogged(c)
+	status := http.StatusOK
+	if result.Status == model.TenantCostBatchProvisionPartial || result.Status == model.TenantCostBatchProvisionFailed {
+		status = http.StatusMultiStatus
+	}
+	c.JSON(status, gin.H{"success": result.Status != model.TenantCostBatchProvisionFailed, "data": result})
+}

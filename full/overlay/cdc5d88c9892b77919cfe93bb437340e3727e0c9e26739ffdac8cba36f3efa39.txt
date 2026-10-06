@@ -1,0 +1,61 @@
+package service
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMediaTimeoutKeepsChargeAndPollsOriginalUntilVerifiedFailure(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	configureTaskTimeout(t, 1)
+	seedUser(t, 53, 800)
+	seedTaskPollingReservation(t, "direct:reconcile", "reconcile", 53, 200, 200, model.QuotaReservationStatusSettled)
+	task := &model.Task{TaskID: "original-video", Platform: constant.TaskPlatform("sora"), UserId: 53,
+		Quota: 200, BillingReservationID: "direct:reconcile", Status: model.TaskStatusInProgress, Progress: "50%",
+		SubmitTime:  time.Now().Add(-2 * time.Minute).Unix(),
+		Properties:  model.Properties{MediaMode: "videos"},
+		PrivateData: model.TaskPrivateData{BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: "reconcile"}}
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 53).Updates(map[string]any{"used_quota": 200, "request_count": 1}).Error)
+	reservationID := "direct:reconcile"
+	require.NoError(t, model.DB.Create(&model.TaskBillingReceipt{
+		TaskRowID: task.ID, ReservationID: &reservationID, RequestID: "reconcile", UserID: 53,
+		FundingSource: model.QuotaReservationFundingWallet, SubmissionQuota: 200, PreConsumedQuota: 200,
+		AppliedQuota: 200, UsageAppliedQuota: 200, TargetQuota: 200, RequestCountApplied: true,
+		State: model.TaskBillingReceiptTracking, Version: 1,
+	}).Error)
+	sweepTimedOutTasks(context.Background())
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusInProgress, reloaded.Status)
+	assert.Positive(t, reloaded.ReconcileSince)
+	assert.Equal(t, 800, getUserQuota(t, 53))
+	deferMediaTaskReconciliation(reloaded)
+	due, err := listTimedOutOrdinaryTasks(time.Now().Unix())
+	require.NoError(t, err)
+	assert.Empty(t, due, "already marked tasks must leave room for new timeouts")
+	for _, due := range model.GetAllUnFinishSyncTasks(100) {
+		assert.NotEqual(t, task.ID, due.ID)
+	}
+	// An older in-flight progress update cannot erase the reconciliation marker.
+	task.Progress = "75%"
+	won, err := task.UpdateWithStatus(model.TaskStatusInProgress)
+	require.NoError(t, err)
+	require.True(t, won)
+	reloaded, _, err = model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	assert.Positive(t, reloaded.ReconcileSince)
+	assert.Greater(t, reloaded.NextPollAt, time.Now().Unix())
+	for attempt := 0; attempt < 2; attempt++ {
+		require.NoError(t, failTaskWithBilling(context.Background(), reloaded, "上游确认失败"))
+		assert.Equal(t, 1_000, getUserQuota(t, 53))
+	}
+}

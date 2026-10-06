@@ -1,0 +1,557 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { formatCurrencyFromUSD } from '@/lib/currency'
+
+import { QUOTA_TYPE_VALUES, TOKEN_UNIT_DIVISORS } from '../constants'
+import type { GroupPricing, PricingModel, TokenUnit, PriceType } from '../types'
+
+// ----------------------------------------------------------------------------
+// Price Calculation Utilities
+// ----------------------------------------------------------------------------
+
+/**
+ * Strip trailing zeros from formatted price string while preserving currency symbols
+ */
+export function stripTrailingZeros(formatted: string): string {
+  // Match currency symbol at start, number, and potential 'k' suffix
+  const match = formatted.match(/^([^\d-]*)([-\d,]+\.?\d*)(k?)$/)
+  if (!match) return formatted
+
+  const [, symbol, number, suffix] = match
+
+  // Remove commas for processing
+  const cleanNumber = number.replaceAll(',', '')
+
+  // Convert to number and back to remove trailing zeros
+  const parsed = Number.parseFloat(cleanNumber)
+  if (Number.isNaN(parsed)) return formatted
+
+  // Convert to string, which automatically removes trailing zeros
+  let result = parsed.toString()
+
+  // If the result is in scientific notation, format it properly
+  if (result.includes('e')) {
+    result = parsed.toFixed(20).replace(/\.?0+$/, '')
+  }
+
+  return `${symbol}${result}${suffix}`
+}
+
+export type ResolvedModelGroupPricing = {
+  group: string
+  model: PricingModel
+  groupRatio: number
+  billingUnit: string
+  fixedDurationSeconds: number
+  scope: string
+  contractRevision?: string
+  usesGroupContract: boolean
+}
+
+export type ModelDisplayPricing = {
+  pricing: ResolvedModelGroupPricing
+  /** True when no single group price vector is cheaper than every other row. */
+  variesByGroup: boolean
+}
+
+function finiteRatio(value: unknown, fallback: number): number {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback
+}
+
+function projectGroupContract(
+  model: PricingModel,
+  group: string,
+  contract: GroupPricing
+): ResolvedModelGroupPricing {
+  const ratio = finiteRatio(contract.effective_group_ratio, 1)
+  const projected: PricingModel = {
+    ...model,
+    quota_type: contract.quota_type,
+    model_price: contract.model_price ?? undefined,
+    model_ratio: contract.model_ratio ?? 0,
+    completion_ratio: contract.completion_ratio ?? 1,
+    cache_ratio: contract.cache_ratio,
+    create_cache_ratio: contract.cache_creation_ratio,
+    image_ratio: contract.image_ratio,
+    audio_ratio: contract.audio_ratio,
+    audio_completion_ratio: contract.audio_completion_ratio,
+    billing_mode: contract.billing_mode,
+    billing_expr: contract.billing_expr,
+    enable_groups: [group],
+    group_ratio: { [group]: ratio },
+  }
+
+  return {
+    group,
+    model: projected,
+    groupRatio: ratio,
+    billingUnit:
+      contract.billing_unit ||
+      (contract.quota_type === QUOTA_TYPE_VALUES.TOKEN
+        ? 'per_million_tokens'
+        : 'per_request'),
+    fixedDurationSeconds: contract.fixed_duration_seconds ?? 0,
+    scope: contract.scope,
+    contractRevision: contract.contract_revision,
+    usesGroupContract: true,
+  }
+}
+
+/**
+ * Resolve one complete price row. A group contract replaces every pricing
+ * field as a unit; legacy top-level fields are used only when that row is
+ * absent (including against older NewAPI servers).
+ */
+export function resolveModelGroupPricing(
+  model: PricingModel,
+  group: string,
+  groupRatios: Record<string, number> = model.group_ratio || {}
+): ResolvedModelGroupPricing {
+  const contract = model.group_pricing?.[group]
+  if (contract) return projectGroupContract(model, group, contract)
+
+  const ratio = finiteRatio(groupRatios[group], 1)
+  return {
+    group,
+    model: {
+      ...model,
+      enable_groups: [group],
+      group_ratio: { [group]: ratio },
+    },
+    groupRatio: ratio,
+    billingUnit:
+      model.quota_type === QUOTA_TYPE_VALUES.TOKEN
+        ? 'per_million_tokens'
+        : 'per_request',
+    fixedDurationSeconds: 0,
+    scope: 'global',
+    usesGroupContract: false,
+  }
+}
+
+function comparablePriceVector(
+  pricing: ResolvedModelGroupPricing
+): Map<PriceType | 'fixed', number> | null {
+  const model = pricing.model
+  if (
+    model.billing_mode === 'tiered_expr' ||
+    model.billing_mode === 'parameter_price' ||
+    pricing.billingUnit === 'parameter'
+  ) {
+    return null
+  }
+
+  if (model.quota_type === QUOTA_TYPE_VALUES.REQUEST) {
+    if (!hasFixedPrice(model.model_price)) return null
+    return new Map([['fixed', model.model_price * pricing.groupRatio]])
+  }
+
+  const vector = new Map<PriceType, number>()
+  for (const type of [
+    'input',
+    'output',
+    'cache',
+    'create_cache',
+    'image',
+    'audio_input',
+    'audio_output',
+  ] as const) {
+    const value = calculateTokenPrice(model, type, pricing.groupRatio)
+    if (Number.isFinite(value)) vector.set(type, value)
+  }
+  return vector
+}
+
+export function getModelPricingGroups(model: PricingModel): string[] {
+  const groups = new Set(model.enable_groups || [])
+  for (const group of Object.keys(model.group_pricing || {})) groups.add(group)
+  return [...groups]
+}
+
+/**
+ * Pick one coherent row for a summary. With group-specific contracts, a row
+ * is selected only when its whole price vector dominates all other rows with
+ * the same unit and dimensions. Incomparable rows are reported as varying.
+ */
+export function resolveModelDisplayPricing(
+  model: PricingModel,
+  selectedGroup = 'all',
+  groupRatios: Record<string, number> = model.group_ratio || {}
+): ModelDisplayPricing {
+  if (selectedGroup && selectedGroup !== 'all') {
+    return {
+      pricing: resolveModelGroupPricing(model, selectedGroup, groupRatios),
+      variesByGroup: false,
+    }
+  }
+
+  const groups = getModelPricingGroups(model)
+  const fallbackGroup = groups[0] || '_base'
+  if (groups.length === 0) {
+    return {
+      pricing: resolveModelGroupPricing(model, fallbackGroup, groupRatios),
+      variesByGroup: false,
+    }
+  }
+
+  if (!model.group_pricing || Object.keys(model.group_pricing).length === 0) {
+    const cheapest = groups.reduce((best, group) => {
+      const bestRatio = finiteRatio(groupRatios[best], 1)
+      const ratio = finiteRatio(groupRatios[group], 1)
+      return ratio < bestRatio ? group : best
+    }, fallbackGroup)
+    return {
+      pricing: resolveModelGroupPricing(model, cheapest, groupRatios),
+      variesByGroup: false,
+    }
+  }
+
+  const rows = groups.map((group) =>
+    resolveModelGroupPricing(model, group, groupRatios)
+  )
+  const vectors = rows.map(comparablePriceVector)
+  const candidateIndex = rows.findIndex((candidate, index) => {
+    const vector = vectors[index]
+    if (!vector) return false
+    return rows.every((other, otherIndex) => {
+      const otherVector = vectors[otherIndex]
+      if (
+        !otherVector ||
+        candidate.billingUnit !== other.billingUnit ||
+        candidate.fixedDurationSeconds !== other.fixedDurationSeconds ||
+        candidate.model.quota_type !== other.model.quota_type ||
+        vector.size !== otherVector.size
+      ) {
+        return false
+      }
+      for (const [field, value] of vector) {
+        const compared = otherVector.get(field)
+        if (compared === undefined || value > compared) return false
+      }
+      return true
+    })
+  })
+
+  return {
+    pricing: rows[candidateIndex >= 0 ? candidateIndex : 0],
+    variesByGroup: candidateIndex < 0,
+  }
+}
+
+/**
+ * Calculate token price in USD.
+ *
+ * Returns NaN when the required ratio field is missing/null so callers can
+ * skip rendering that price type.
+ */
+function calculateTokenPrice(
+  model: PricingModel,
+  type: PriceType,
+  ratio: number
+): number {
+  const base = model.model_ratio * 2 * ratio
+
+  switch (type) {
+    case 'input':
+      return base
+    case 'output':
+      return base * model.completion_ratio
+    case 'cache':
+      return hasRatio(model.cache_ratio)
+        ? base * Number(model.cache_ratio)
+        : Number.NaN
+    case 'create_cache':
+      return hasRatio(model.create_cache_ratio)
+        ? base * Number(model.create_cache_ratio)
+        : Number.NaN
+    case 'image':
+      return hasRatio(model.image_ratio)
+        ? base * Number(model.image_ratio)
+        : Number.NaN
+    case 'audio_input':
+      return hasRatio(model.audio_ratio)
+        ? base * Number(model.audio_ratio)
+        : Number.NaN
+    case 'audio_output':
+      return hasRatio(model.audio_ratio) &&
+        hasRatio(model.audio_completion_ratio)
+        ? base *
+            Number(model.audio_ratio) *
+            Number(model.audio_completion_ratio)
+        : Number.NaN
+  }
+}
+
+function hasRatio(value: number | null | undefined): boolean {
+  return value !== undefined && value !== null && Number.isFinite(Number(value))
+}
+
+export function hasFixedPrice(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+/**
+ * Apply recharge rate to price
+ *
+ * priceRate represents how much users need to recharge (in the display currency)
+ * to get 1 USD credit. usdExchangeRate is the real exchange rate.
+ *
+ * The returned value will be formatted by formatCurrencyFromUSD, which will
+ * multiply by the display currency's exchange rate.
+ *
+ * Examples:
+ *
+ * 1. Display currency = USD:
+ *    - Model: 1 USD
+ *    - priceRate = 0.5 (recharge $0.5 to get $1 credit)
+ *    - usdExchangeRate = 1
+ *    - Return: 1 × 0.5 / 1 = 0.5
+ *    - formatCurrencyFromUSD(0.5) → $0.5 ✓
+ *
+ * 2. Display currency = CNY:
+ *    - Model: 1 USD
+ *    - priceRate = 4 (recharge ¥4 to get $1 credit)
+ *    - usdExchangeRate = 7 (real rate: 1 USD = ¥7)
+ *    - Return: 1 × 4 / 7 = 0.571
+ *    - formatCurrencyFromUSD(0.571) → 0.571 × 7 = ¥4 ✓
+ *    - Normal price: ¥7, Recharge price: ¥4 (cheaper!)
+ */
+function applyRechargeRate(
+  price: number,
+  showWithRecharge: boolean,
+  priceRate: number,
+  usdExchangeRate: number
+): number {
+  if (!showWithRecharge) return price
+  return (price * priceRate) / usdExchangeRate
+}
+
+export function formatEstimatedInputPrice(
+  usdPerMillion: number,
+  tokenUnit: TokenUnit,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1
+): string {
+  if (!Number.isFinite(usdPerMillion) || usdPerMillion < 0) return ''
+  const unitDivisor = TOKEN_UNIT_DIVISORS[tokenUnit]
+  const priceInUSD = applyRechargeRate(
+    usdPerMillion / unitDivisor,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+  return formatCurrencyFromUSD(priceInUSD, {
+    digitsLarge: 4,
+    digitsSmall: 6,
+    abbreviate: false,
+  })
+}
+
+/**
+ * Format token-based price for display
+ */
+export function formatPrice(
+  model: PricingModel,
+  type: PriceType,
+  tokenUnit: TokenUnit,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1,
+  selectedGroup = 'all'
+): string {
+  const display = resolveModelDisplayPricing(
+    model,
+    selectedGroup,
+    model.group_ratio || {}
+  )
+  if (display.variesByGroup) return '-'
+  const resolved = display.pricing
+  if (resolved.model.quota_type === QUOTA_TYPE_VALUES.REQUEST) {
+    return '-'
+  }
+
+  let priceInUSD = calculateTokenPrice(
+    resolved.model,
+    type,
+    resolved.groupRatio
+  )
+  priceInUSD = applyRechargeRate(
+    priceInUSD,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+
+  const price = priceInUSD / TOKEN_UNIT_DIVISORS[tokenUnit]
+  return formatCurrencyFromUSD(price, {
+    digitsLarge: 4,
+    digitsSmall: 6,
+    abbreviate: false,
+  })
+}
+
+/**
+ * Format price for a specific group (token-based)
+ */
+export function formatGroupPrice(
+  model: PricingModel,
+  group: string,
+  type: PriceType,
+  tokenUnit: TokenUnit,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1,
+  groupRatio: Record<string, number>
+): string {
+  const resolved = resolveModelGroupPricing(model, group, groupRatio)
+  return formatResolvedTokenPrice(
+    resolved,
+    type,
+    tokenUnit,
+    true,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+}
+
+/** Format one already-resolved token row without re-resolving its contract. */
+export function formatResolvedTokenPrice(
+  resolved: ResolvedModelGroupPricing,
+  type: PriceType,
+  tokenUnit: TokenUnit,
+  includeGroupRatio: boolean,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1
+): string {
+  if (resolved.model.quota_type === QUOTA_TYPE_VALUES.REQUEST) {
+    return '-'
+  }
+
+  let priceInUSD = calculateTokenPrice(
+    resolved.model,
+    type,
+    includeGroupRatio ? resolved.groupRatio : 1
+  )
+
+  priceInUSD = applyRechargeRate(
+    priceInUSD,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+
+  const price = priceInUSD / TOKEN_UNIT_DIVISORS[tokenUnit]
+  return formatCurrencyFromUSD(price, {
+    digitsLarge: 4,
+    digitsSmall: 6,
+    abbreviate: false,
+  })
+}
+
+/**
+ * Format fixed price for pay-per-request models (with specific group)
+ */
+export function formatFixedPrice(
+  model: PricingModel,
+  group: string,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1,
+  groupRatio: Record<string, number>
+): string {
+  const resolved = resolveModelGroupPricing(model, group, groupRatio)
+  return formatResolvedFixedPrice(
+    resolved,
+    true,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+}
+
+/** Format one already-resolved fixed-price row at base or user-effective price. */
+export function formatResolvedFixedPrice(
+  resolved: ResolvedModelGroupPricing,
+  includeGroupRatio: boolean,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1
+): string {
+  if (
+    resolved.model.quota_type !== QUOTA_TYPE_VALUES.REQUEST ||
+    resolved.model.billing_mode === 'parameter_price' ||
+    resolved.billingUnit === 'parameter' ||
+    !hasFixedPrice(resolved.model.model_price)
+  ) {
+    return '-'
+  }
+
+  let priceInUSD =
+    resolved.model.model_price * (includeGroupRatio ? resolved.groupRatio : 1)
+
+  priceInUSD = applyRechargeRate(
+    priceInUSD,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+
+  if (!hasFixedPrice(priceInUSD)) return '-'
+
+  return formatCurrencyFromUSD(priceInUSD, {
+    digitsLarge: 4,
+    digitsSmall: 4,
+    abbreviate: false,
+  })
+}
+
+/**
+ * Format fixed price for pay-per-request models (minimum price from all groups)
+ */
+export function formatRequestPrice(
+  model: PricingModel,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1,
+  selectedGroup = 'all'
+): string {
+  const display = resolveModelDisplayPricing(
+    model,
+    selectedGroup,
+    model.group_ratio || {}
+  )
+  if (
+    display.variesByGroup ||
+    display.pricing.model.quota_type !== QUOTA_TYPE_VALUES.REQUEST
+  ) {
+    return '-'
+  }
+
+  return formatResolvedFixedPrice(
+    display.pricing,
+    true,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+}

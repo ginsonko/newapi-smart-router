@@ -1,0 +1,99 @@
+package model
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestImageRouteSpoolHoldValidation(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		owner   int
+		state   string
+		expires int64
+		missing bool
+	}{
+		{name: "valid", state: "reserved", expires: time.Now().Add(time.Hour).Unix()},
+		{name: "foreign", owner: 71, state: "reserved", expires: ImageRouteSpoolReservationExpiresAt},
+		{name: "released", state: "released", expires: ImageRouteSpoolReservationExpiresAt},
+		{name: "expired", state: "reserved", expires: time.Now().Add(-time.Hour).Unix()},
+		{name: "missing", missing: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			database := setupImageRouteJobTest(t)
+			require.NoError(t, database.AutoMigrate(&MediaStorageReservation{}))
+			reservation := MediaStorageReservation{Token: "body", UserID: scenario.owner, State: scenario.state, ExpiresAt: scenario.expires, Bytes: 7}
+			if !scenario.missing {
+				require.NoError(t, database.Create(&reservation).Error)
+			}
+			err := database.Transaction(func(tx *gorm.DB) error { return HoldImageRouteSpoolTx(tx, "body") })
+			if scenario.name == "valid" {
+				require.NoError(t, err)
+				require.NoError(t, database.Transaction(func(tx *gorm.DB) error { return HoldImageRouteSpoolTx(tx, "body") }))
+				require.NoError(t, database.First(&reservation, reservation.ID).Error)
+				require.Equal(t, ImageRouteSpoolReservationExpiresAt, reservation.ExpiresAt)
+				require.EqualValues(t, 7, reservation.Bytes)
+			} else {
+				require.ErrorIs(t, err, ErrImageRouteSpoolReservationUnavailable)
+			}
+		})
+	}
+	require.NoError(t, HoldImageRouteSpoolTx(nil, ""))
+	require.ErrorIs(t, HoldImageRouteSpoolTx(nil, "body"), ErrImageRouteSpoolReservationUnavailable)
+}
+
+func TestImageRouteSpoolCreateBindsBodyAtomically(t *testing.T) {
+	for _, scenario := range []string{"success", "root_failure", "missing", "foreign", "expired", "released"} {
+		t.Run(scenario, func(t *testing.T) {
+			database := setupImageRouteJobTest(t)
+			require.NoError(t, database.AutoMigrate(&MediaStorageReservation{}))
+			expiresAt := time.Now().Add(time.Hour).Unix()
+			reservation := MediaStorageReservation{Token: "body", State: "reserved", ExpiresAt: expiresAt, Bytes: 7}
+			switch scenario {
+			case "foreign":
+				reservation.UserID = 71
+			case "expired":
+				reservation.ExpiresAt = time.Now().Add(-time.Hour).Unix()
+			case "released":
+				reservation.State = "released"
+			}
+			if scenario != "missing" {
+				require.NoError(t, database.Create(&reservation).Error)
+			}
+			if scenario == "root_failure" {
+				require.NoError(t, database.Callback().Create().Before("gorm:create").Register("fail_root_create", func(tx *gorm.DB) {
+					if tx.Statement.Table == "tasks" {
+						tx.AddError(errors.New("root create failure"))
+					}
+				}))
+			}
+			job, root := newImageRouteJobTestInput(t)
+			job.BodyReservation = "body"
+			err := CreateImageRouteJob(job, root)
+			if scenario == "success" {
+				require.NoError(t, err)
+				require.Equal(t, "body", reloadImageRouteJobTest(t, job).BodyReservation)
+				require.NoError(t, database.First(&reservation, reservation.ID).Error)
+				require.Equal(t, ImageRouteSpoolReservationExpiresAt, reservation.ExpiresAt)
+				return
+			}
+			require.Error(t, err)
+			require.Zero(t, job.ID)
+			require.Zero(t, root.ID)
+			for _, table := range []any{&ImageRouteJob{}, &Task{}} {
+				var count int64
+				require.NoError(t, database.Model(table).Count(&count).Error)
+				require.Zero(t, count)
+			}
+			if scenario != "missing" {
+				originalExpiry := reservation.ExpiresAt
+				require.NoError(t, database.First(&reservation, reservation.ID).Error)
+				require.Equal(t, originalExpiry, reservation.ExpiresAt)
+			}
+		})
+	}
+}

@@ -1,0 +1,422 @@
+package model
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+)
+
+// SourcePrice is the frozen provider catalog basis, not a paid invoice. It
+// stays unchanged when a downstream sale is refunded or a provider reconciles.
+type TenantSourcePrice struct {
+	SchemaVersion   string            `json:"schema_version"`
+	Unit            string            `json:"unit"`
+	UnitPrice       string            `json:"unit_price"`
+	Quantity        string            `json:"quantity"`
+	EstimatedAmount string            `json:"estimated_amount"`
+	Currency        string            `json:"currency"`
+	RuleRevision    string            `json:"rule_revision"`
+	Parameters      map[string]string `json:"parameters"`
+	Evidence        string            `json:"evidence"`
+}
+
+type TenantProviderCost struct {
+	Amount           *string `json:"amount"`
+	RefundAmount     *string `json:"refund_amount"`
+	Currency         string  `json:"currency,omitempty"`
+	Evidence         string  `json:"evidence"`
+	AmountKind       string  `json:"amount_kind"`
+	ReceiptReference string  `json:"receipt_reference,omitempty"`
+}
+
+func TenantParameterCostBasis(q *types.ParameterPriceSnapshot) (*TenantSourcePrice, *TenantProviderCost) {
+	if q == nil {
+		return nil, nil
+	}
+	provider := &TenantProviderCost{Evidence: TenantCostEvidenceUnknown, AmountKind: "cumulative", Currency: q.Currency}
+	if q.SourceUnitPrice == "" {
+		return nil, provider
+	}
+	params := parameterCostPricingDimensions(q.Parameters)
+	revision := q.SupplyRevision
+	if revision == "" {
+		revision = q.Revision
+	}
+	return &TenantSourcePrice{SchemaVersion: "parameter-source-price.v1", Unit: q.Unit, UnitPrice: q.SourceUnitPrice,
+		Quantity: q.Quantity, EstimatedAmount: q.SourceAmount, Currency: q.SourceCurrency, RuleRevision: revision,
+		Parameters: params, Evidence: "catalog_estimate"}, provider
+}
+
+func validateTenantParameterCosts(s TenantCostEventSpec) error {
+	if s.SourcePrice == nil && s.ProviderCost == nil && s.OperationID == "" {
+		return nil
+	}
+	if !validTenantCostPublicIdentifier(s.OperationID, 192) {
+		return ErrTenantCostInvalidInput
+	}
+	if source := s.SourcePrice; source != nil {
+		if source.SchemaVersion != "parameter-source-price.v1" || source.Evidence != "catalog_estimate" || source.Currency != "USD" || !validTenantCostPublicIdentifier(source.RuleRevision, 512) {
+			return ErrTenantCostInvalidInput
+		}
+		price, err := parseTenantParameterDecimal(source.UnitPrice, 18)
+		if err != nil {
+			return err
+		}
+		quantity, err := parseTenantParameterDecimal(source.Quantity, 18)
+		if err != nil || !quantity.IsPositive() {
+			return ErrTenantCostInvalidInput
+		}
+		amount, err := parseTenantParameterDecimal(source.EstimatedAmount, 36)
+		if err != nil || !amount.Equal(price.Mul(quantity)) {
+			return ErrTenantCostInvalidInput
+		}
+		switch source.Unit {
+		case "per_request", "fixed_duration":
+			if !quantity.Equal(decimal.NewFromInt(1)) {
+				return ErrTenantCostInvalidInput
+			}
+		case "per_image":
+			if !quantity.Equal(quantity.Truncate(0)) || quantity.GreaterThan(decimal.NewFromInt(dto.MaxImageN)) {
+				return ErrTenantCostInvalidInput
+			}
+		case "per_second":
+			if quantity.GreaterThan(decimal.NewFromInt(common.MaxTaskDurationSeconds)) {
+				return ErrTenantCostInvalidInput
+			}
+		default:
+			return ErrTenantCostInvalidInput
+		}
+		if err := validateParameterCostParameters(source.Parameters); err != nil {
+			return err
+		}
+	}
+	if provider := s.ProviderCost; provider != nil {
+		if provider.AmountKind != "cumulative" || (provider.Currency != "" && provider.Currency != "USD") {
+			return ErrTenantCostInvalidInput
+		}
+		if provider.Evidence == TenantCostEvidenceUnknown {
+			if provider.Amount != nil || provider.RefundAmount != nil || provider.ReceiptReference != "" {
+				return ErrTenantCostInvalidInput
+			}
+		} else {
+			if provider.Evidence != TenantCostEvidenceExact && provider.Evidence != TenantCostEvidenceObserved {
+				return ErrTenantCostInvalidInput
+			}
+			if provider.Amount == nil || provider.RefundAmount == nil || provider.Currency != "USD" || !validTenantCostPublicIdentifier(provider.ReceiptReference, 192) {
+				return ErrTenantCostInvalidInput
+			}
+			amount, err := parseTenantParameterDecimal(*provider.Amount, 18)
+			if err != nil {
+				return err
+			}
+			refund, err := parseTenantParameterDecimal(*provider.RefundAmount, 18)
+			if err != nil || refund.GreaterThan(amount) {
+				return ErrTenantCostInvalidInput
+			}
+		}
+	}
+	return nil
+}
+
+func parseTenantParameterDecimal(value string, fractionalLimit int) (decimal.Decimal, error) {
+	if len(value) == 0 || len(value) > 96 || value != strings.TrimSpace(value) {
+		return decimal.Zero, ErrTenantCostInvalidInput
+	}
+	whole, fractional, dot := 0, 0, false
+	for _, c := range value {
+		if c == '.' && !dot {
+			dot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return decimal.Zero, ErrTenantCostInvalidInput
+		}
+		if dot {
+			fractional++
+		} else {
+			whole++
+		}
+	}
+	if whole+fractional == 0 || whole > 36 || fractional > fractionalLimit || (dot && fractional == 0) {
+		return decimal.Zero, ErrTenantCostInvalidInput
+	}
+	return decimal.NewFromString(value)
+}
+
+func validateParameterCostParameters(parameters map[string]string) error {
+	if len(parameters) > 4 {
+		return ErrTenantCostInvalidInput
+	}
+	for key, value := range parameters {
+		if len(value) == 0 || len(value) > 512 {
+			return ErrTenantCostInvalidInput
+		}
+		switch key {
+		case "resolution", "quality", "count", "duration_seconds":
+		default:
+			return ErrTenantCostInvalidInput
+		}
+	}
+	return nil
+}
+
+func parameterQuotaAmount(quota int) (string, error) {
+	if quota < common.MinQuota || quota > common.MaxQuota || common.QuotaPerUnit <= 0 || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) {
+		return "", ErrTenantCostInvalidInput
+	}
+	factor, err := decimal.NewFromString(strconv.FormatFloat(common.QuotaPerUnit, 'f', -1, 64))
+	if err != nil {
+		return "", err
+	}
+	return decimal.NewFromInt(int64(quota)).DivRound(factor, 18).String(), nil
+}
+
+// BuildParameterTaskCostSpec uses only the persisted task and receipt. The
+// operation identity and timestamps survive a process restart unchanged.
+func BuildParameterTaskCostSpec(task *Task, receipt *TaskBillingReceipt) (TenantCostEventSpec, error) {
+	if task == nil || receipt == nil || task.PrivateData.BillingContext == nil {
+		return TenantCostEventSpec{}, ErrTenantCostInvalidInput
+	}
+	if receipt.ParameterTerminalCost != nil {
+		var frozen TenantCostEventSpec
+		if err := common.UnmarshalJsonStr(*receipt.ParameterTerminalCost, &frozen); err != nil {
+			return frozen, err
+		}
+		if task.PrivateData.BillingContext.TenantCost == nil || frozen.TenantID != task.PrivateData.BillingContext.TenantCost.TenantID || frozen.TaskPublicID != task.TaskID {
+			return frozen, ErrTenantCostScope
+		}
+		return frozen.normalize()
+	}
+	bc := task.PrivateData.BillingContext
+	b := bc.TenantCost
+	q := bc.ParameterPricing
+	if b == nil || q == nil {
+		return TenantCostEventSpec{}, ErrTenantCostInvalidInput
+	}
+	kind, evidence := TenantCostEventSettlement, TenantCostEvidenceFallback
+	if receipt.AppliedQuota == 0 {
+		kind, evidence = TenantCostEventObservedZero, TenantCostEvidenceExact
+	}
+	op := fmt.Sprintf("task:%d:receipt:%d:v%d", task.ID, receipt.ID, receipt.Version)
+	digest := sha256.Sum256([]byte(b.TenantID + ":" + op))
+	eventID := "uce_" + hex.EncodeToString(digest[:])
+	amount, err := parameterQuotaAmount(receipt.AppliedQuota)
+	if err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	reservation := ""
+	if receipt.ReservationID != nil {
+		reservation = *receipt.ReservationID
+	}
+	requestID := b.DownstreamRequestId
+	if requestID == "" {
+		requestID = receipt.RequestID
+	}
+	source, provider := TenantParameterCostBasis(q)
+	usage := TenantCostBillingUsage{RequestCount: "1"}
+	if q.Unit == "per_second" {
+		usage.Seconds = q.Quantity
+	}
+	start := task.StartTime
+	if start <= 0 {
+		start = task.CreatedAt
+	}
+	return TenantCostEventSpec{TenantID: b.TenantID, EventID: eventID, EventType: kind, OperationID: op,
+		OccurredAt: time.Unix(start, 0).UTC(), FinalizedAt: time.Unix(receipt.AppliedAt, 0).UTC(),
+		DownstreamRequestId: requestID, GatewayRequestId: receipt.RequestID, ReservationID: reservation, TaskPublicID: task.TaskID,
+		ProductPoolID: b.ProductPoolID, ServiceTier: b.ServiceTier, RouteProfileID: b.RouteProfileID, ProfileRevision: b.ProfileRevision, KeyID: b.KeyID,
+		RequestedModel: q.Model, CanonicalModel: q.Model, MappingRevision: q.MappingRevision,
+		BillingMode: "parameter_price", BillingUnit: q.Unit, Usage: usage, GatewayChargeQuota: int64(receipt.AppliedQuota), GatewayChargeAmount: amount, Currency: q.Currency,
+		ProcurementAmount: &amount, ProcurementCurrency: q.Currency, Evidence: evidence, BasisKind: "gateway_charge_fallback", BasisRevision: q.Revision,
+		Formula: "procurement=gateway_charge (fallback)", Status: TenantCostStatusFinal, SitePriceRevision: q.Revision, Rounding: "half_away_from_zero_after_total",
+		SourcePrice: source, ProviderCost: provider}, nil
+}
+
+func enqueueParameterTaskTerminalTx(tx *gorm.DB, task *Task, receipt *TaskBillingReceipt) error {
+	if task.PrivateData.BillingContext == nil || task.PrivateData.BillingContext.ParameterPricing == nil || task.PrivateData.BillingContext.TenantCost == nil {
+		return nil
+	}
+	spec, err := BuildParameterTaskCostSpec(task, receipt)
+	if err != nil {
+		return err
+	}
+	if receipt.ParameterTerminalCost == nil {
+		raw, err := common.Marshal(spec)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		receipt.ParameterTerminalCost = &value
+		if err := tx.Model(receipt).Update("parameter_terminal_cost", value).Error; err != nil {
+			return err
+		}
+	}
+	return EnqueueTenantCostProjectionTx(tx, spec, nil)
+}
+
+// AppendTenantProviderCostCorrection records a new reconciliation operation.
+// The API and downstream customer charges stay zero for this adjustment.
+func AppendTenantProviderCostCorrection(tenantID, parentID, operationID string, fact TenantProviderCost) (TenantCostAppendResult, error) {
+	var empty TenantCostAppendResult
+	if !validTenantCostPublicIdentifier(operationID, 128) {
+		return empty, ErrTenantCostInvalidInput
+	}
+	if err := validateTenantParameterCosts(TenantCostEventSpec{OperationID: "provider:" + operationID, ProviderCost: &fact}); err != nil {
+		return empty, err
+	}
+	if fact.Amount != nil {
+		value, _ := parseTenantParameterDecimal(*fact.Amount, 18)
+		normalized := value.String()
+		fact.Amount = &normalized
+	}
+	if fact.RefundAmount != nil {
+		value, _ := parseTenantParameterDecimal(*fact.RefundAmount, 18)
+		normalized := value.String()
+		fact.RefundAmount = &normalized
+	}
+	parent, err := GetTenantCostEvent(tenantID, parentID)
+	if err != nil {
+		return empty, err
+	}
+	var original TenantCostEventPayload
+	if err := common.Unmarshal([]byte(parent.Payload), &original); err != nil {
+		return empty, err
+	}
+	if original.ProviderCost == nil || original.OperationID == "" || (parent.EventType != TenantCostEventSettlement && parent.EventType != TenantCostEventObservedZero && parent.EventType != TenantCostEventChargedFailure) {
+		return empty, fmt.Errorf("parent is not a parameter settlement")
+	}
+	digest := sha256.Sum256([]byte(tenantID + ":provider:" + operationID))
+	zero := "0"
+	s := TenantCostEventSpec{TenantID: tenantID, EventID: "uce_" + hex.EncodeToString(digest[:]), OperationID: "provider:" + operationID,
+		EventType: TenantCostEventCorrection, ParentEventID: &parentID, OccurredAt: time.Now().UTC(), FinalizedAt: time.Now().UTC(),
+		DownstreamRequestId: parent.DownstreamRequestId, GatewayRequestId: parent.GatewayRequestId, TaskPublicID: parent.TaskPublicID, ReservationID: parent.ReservationID,
+		ProductPoolID: parent.ProductPoolID, ServiceTier: parent.ServiceTier, RouteProfileID: parent.RouteProfileID, ProfileRevision: parent.ProfileRevision, KeyID: parent.KeyID,
+		RequestedModel: parent.RequestedModel, CanonicalModel: parent.CanonicalModel, MappingRevision: parent.MappingRevision,
+		BillingMode: parent.BillingMode, BillingUnit: parent.BillingUnit, GatewayChargeAmount: zero, Currency: parent.Currency,
+		ProcurementAmount: &zero, ProcurementCurrency: parent.Currency, Evidence: TenantCostEvidenceExact, BasisKind: "gateway_charge_fallback", Formula: "procurement=gateway_charge (fallback)",
+		Status: TenantCostStatusFinal, SourcePrice: original.SourcePrice, ProviderCost: &fact}
+	if strings.TrimSpace(fact.Evidence) == "" {
+		return empty, ErrTenantCostInvalidInput
+	}
+	return AppendTenantCostEvent(s)
+}
+
+// ApplyParameterTaskRefund extends the existing receipt authority with one
+// explicit refund operation. Terminal callbacks still replay the original
+// frozen settlement instead of charging again after a customer adjustment.
+func ApplyParameterTaskRefund(ctx context.Context, tenantID string, userID int, taskRowID int64, operationID string, refundQuota int) (TenantCostAppendResult, error) {
+	var output TenantCostAppendResult
+	if DB == nil || userID <= 0 || taskRowID <= 0 || refundQuota <= 0 || refundQuota > common.MaxQuota || !validTenantCostPublicIdentifier(operationID, 128) {
+		return output, ErrTenantCostInvalidInput
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mutation := quotaReservationCacheMutation{}
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var receipt TaskBillingReceipt
+		if err := lockForUpdate(tx).Where("task_row_id = ?", taskRowID).First(&receipt).Error; err != nil {
+			return err
+		}
+		if receipt.UserID != userID {
+			return ErrTenantCostScope
+		}
+		var task Task
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", taskRowID, userID).First(&task).Error; err != nil {
+			return err
+		}
+		if task.PrivateData.BillingContext == nil || task.PrivateData.BillingContext.TenantCost == nil || task.PrivateData.BillingContext.ParameterPricing == nil || task.PrivateData.BillingContext.TenantCost.TenantID != tenantID {
+			return ErrTenantCostScope
+		}
+		if receipt.State != TaskBillingReceiptApplied {
+			return ErrTaskBillingReceiptConflict
+		}
+		parent, err := BuildParameterTaskCostSpec(&task, &receipt)
+		if err != nil {
+			return err
+		}
+		spec, err := parameterRefundSpec(parent, operationID, refundQuota)
+		if err != nil {
+			return err
+		}
+		if existing, found, err := replayParameterRefundTx(tx, spec); err != nil || found {
+			output = existing
+			return err
+		}
+		if receipt.AppliedQuota < refundQuota {
+			return ErrTaskBillingReceiptConflict
+		}
+		var reservation *QuotaReservation
+		if receipt.ReservationID != nil {
+			reservation = &QuotaReservation{}
+			if err := lockForUpdate(tx).Where("reservation_id = ?", *receipt.ReservationID).First(reservation).Error; err != nil {
+				return err
+			}
+			if err := correctCommissionReservationRefundTx(tx, reservation, spec, refundQuota); err != nil {
+				return err
+			}
+		}
+		if _, err := AppendTenantCostEventTx(tx, parent); err != nil {
+			return err
+		}
+		if receipt.ParameterTerminalCost == nil {
+			raw, err := common.Marshal(parent)
+			if err != nil {
+				return err
+			}
+			value := string(raw)
+			receipt.ParameterTerminalCost = &value
+		}
+		target := receipt.AppliedQuota - refundQuota
+		if err := applyTaskReceiptFundingTx(tx, &receipt, target, &mutation); err != nil {
+			return err
+		}
+		if reservation != nil {
+			// A later refund is a correction, not a new commission event time.
+			if err := tx.Model(reservation).Update("finalized_at", reservation.FinalizedAt).Error; err != nil {
+				return err
+			}
+		}
+		if err := applyTaskReceiptUsageTx(tx, &receipt, target, &mutation); err != nil {
+			return err
+		}
+		receipt.AppliedQuota = target
+		receipt.TargetQuota = target
+		receipt.UsageAppliedQuota = target
+		receipt.Version++
+		receipt.UpdatedAt = common.GetTimestamp()
+		if err := tx.Save(&receipt).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&task).Update("quota", target).Error; err != nil {
+			return err
+		}
+		output, err = AppendTenantCostEventTx(tx, spec)
+		return err
+	})
+	if err == nil && mutation.changed() {
+		invalidateQuotaReservationCaches(mutation)
+	}
+	return output, err
+}
+
+func parameterCostPricingDimensions(parameters map[string]string) map[string]string {
+	params := make(map[string]string, len(parameters))
+	for key, value := range parameters {
+		if key != "size" && key != "requested_resolution" {
+			params[key] = value
+		}
+	}
+	return params
+}

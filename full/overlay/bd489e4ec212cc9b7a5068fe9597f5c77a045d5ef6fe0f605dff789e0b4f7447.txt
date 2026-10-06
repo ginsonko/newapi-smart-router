@@ -1,0 +1,101 @@
+package openai
+
+import (
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/stretchr/testify/require"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+func TestBillingEvidenceEmptyStreamDoesNotEstimate(t *testing.T) {
+	for _, body := range []string{
+		"data: [DONE]\n",
+		"data: {\"choices\":[]}\ndata: [DONE]\n",
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\ndata: [DONE]\n",
+		"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\ndata: {\"choices\":[]}\ndata: [DONE]\n",
+	} {
+		c, w, r, info := newClaudeEntryTestContext(t, "/v1/messages", body)
+		info.SetEstimatePromptTokens(532949)
+		usage, err := OaiStreamHandler(c, info, r)
+		require.Nil(t, usage)
+		require.NotNil(t, err)
+		require.Equal(t, 502, err.StatusCode)
+		require.False(t, c.GetBool(string(constant.ContextKeyLocalCountTokens)))
+		require.Empty(t, w.Body.String(), "empty response must not manufacture a successful message")
+	}
+}
+
+func TestBillingEvidenceRetainsSnapshotBeforeTail(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"id":"r","choices":[{"delta":{"content":"answer"}}]}`,
+		`data: {"id":"r","choices":[{"delta":{}}],"usage":{"prompt_tokens":66718,"completion_tokens":293,"total_tokens":67011,"prompt_tokens_details":{"cached_tokens":66716}}}`,
+		`data: {"id":"r","choices":[{"delta":{}}],"usage":{"prompt_tokens":66718,"completion_tokens":293,"total_tokens":67011,"prompt_tokens_details":{"cached_tokens":66716}}}`,
+		`data: {"id":"r","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`, "",
+	}, "\n")
+	c, _, r, info := newClaudeEntryTestContext(t, "/v1/messages", body)
+	info.SetEstimatePromptTokens(532949)
+	usage, err := OaiStreamHandler(c, info, r)
+	require.Nil(t, err)
+	require.Equal(t, 66718, usage.PromptTokens)
+	require.Equal(t, 293, usage.CompletionTokens)
+	require.Equal(t, 66716, usage.PromptTokensDetails.CachedTokens)
+	require.True(t, usage.CacheUsageReliable)
+	require.False(t, c.GetBool(string(constant.ContextKeyLocalCountTokens)))
+}
+
+func TestBillingEvidenceStreamZeroAndRealUsage(t *testing.T) {
+	for _, test := range []struct {
+		name, delta, usage string
+		input, output      int
+	}{
+		{"explicit zero", `{"content":"answer"}`, `{"prompt_tokens":0,"completion_tokens":0}`, 0, 0},
+		{"zero input real output", `{"content":"answer"}`, `{"prompt_tokens":0,"completion_tokens":7}`, 0, 7},
+		{"thinking", `{"reasoning_content":"think"}`, `{"prompt_tokens":12,"completion_tokens":7}`, 12, 7},
+		{"tool", `{"tool_calls":[{"index":0,"id":"call1","function":{"name":"read","arguments":"{}"}}]}`, `{"prompt_tokens":12,"completion_tokens":7}`, 12, 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := `data: {"id":"r","choices":[{"delta":` + test.delta + "}]}\n" + `data: {"id":"r","choices":[{"delta":{},"finish_reason":"stop"}],"usage":` + test.usage + "}\ndata: [DONE]\n"
+			c, _, r, info := newClaudeEntryTestContext(t, "/v1/messages", body)
+			info.SetEstimatePromptTokens(532949)
+			u, e := OaiStreamHandler(c, info, r)
+			require.Nil(t, e)
+			require.Equal(t, test.input, u.PromptTokens)
+			require.Equal(t, test.output, u.CompletionTokens)
+			require.False(t, c.GetBool(string(constant.ContextKeyLocalCountTokens)))
+		})
+	}
+}
+
+func TestBillingEvidenceNonStreamZeroAndEmpty(t *testing.T) {
+	for _, test := range []struct {
+		name, body    string
+		fail          bool
+		input, output int
+	}{
+		{"empty missing", `{"choices":[]}`, true, 0, 0},
+		{"empty zero", `{"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0}}`, true, 0, 0},
+		{"zero with result", `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0}}`, false, 0, 0},
+		{"zero input", `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":7}}`, false, 0, 7},
+		{"real input no text", `{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":0}}`, false, 12, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, _, _, info := newClaudeEntryTestContext(t, "/v1/messages", "")
+			info.IsStream = false
+			info.SetEstimatePromptTokens(532949)
+			r := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(test.body))}
+			u, e := OpenaiHandler(c, info, r)
+			if test.fail {
+				require.Nil(t, u)
+				require.NotNil(t, e)
+			} else {
+				require.Nil(t, e)
+				require.Equal(t, test.input, u.PromptTokens)
+				require.Equal(t, test.output, u.CompletionTokens)
+			}
+			require.False(t, c.GetBool(string(constant.ContextKeyLocalCountTokens)))
+		})
+	}
+}

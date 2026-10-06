@@ -1,0 +1,53 @@
+package model
+
+import (
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func createTenantCostMarkerFixture(t *testing.T, tokenID int, marker int64, bindingStatus string) (*Token, *TenantCredentialBinding) {
+	t.Helper()
+	db := setupTenantCostTestDB(t)
+	require.NoError(t, db.AutoMigrate(&Token{}))
+	token := &Token{Id: tokenID, UserId: 7, Key: "marker-key-" + strconv.Itoa(tokenID), Status: 1,
+		Name: "marker token", ExpiredTime: -1, UnlimitedQuota: true, TenantCostBindingID: marker}
+	require.NoError(t, db.Create(token).Error)
+	binding := &TenantCredentialBinding{
+		TokenID: tokenID, TenantID: DefaultTenantCostTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "marker-key", KeySuffix: "m123", ProductPoolID: "openai_gpt", ServiceTier: "pro",
+		RouteProfileID: "profile-marker", ProfileRevision: "rev-1", ModelCatalogRevision: "catalog-1",
+		BindingStatus: bindingStatus,
+	}
+	require.NoError(t, db.Create(binding).Error)
+	return token, binding
+}
+
+func TestReconcileTenantCredentialBindingMarkersBackfillsExactMarker(t *testing.T) {
+	token, binding := createTenantCostMarkerFixture(t, 501, 0, TenantBindingEnabled)
+	require.NoError(t, ReconcileTenantCredentialBindingMarkers())
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, binding.ID, stored.TenantCostBindingID)
+	resolved, err := GetTenantCredentialBindingByTokenMarker(token.Id, binding.ID)
+	require.NoError(t, err)
+	assert.Equal(t, binding.ID, resolved.ID)
+}
+
+func TestReconcileTenantCredentialBindingMarkersRejectsConflict(t *testing.T) {
+	_, _ = createTenantCostMarkerFixture(t, 502, 999, TenantBindingEnabled)
+	err := ReconcileTenantCredentialBindingMarkers()
+	assert.ErrorIs(t, err, ErrTenantCostConflict)
+}
+
+func TestReconcileTenantCredentialBindingMarkersRejectsOrphanMarker(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	require.NoError(t, db.AutoMigrate(&Token{}))
+	token := &Token{Id: 503, UserId: 7, Key: "marker-key-orphan", Status: 1, Name: "orphan",
+		ExpiredTime: -1, UnlimitedQuota: true, TenantCostBindingID: 777}
+	require.NoError(t, db.Create(token).Error)
+	err := ReconcileTenantCredentialBindingMarkers()
+	assert.ErrorIs(t, err, ErrTenantCostBindingUnavailable)
+}

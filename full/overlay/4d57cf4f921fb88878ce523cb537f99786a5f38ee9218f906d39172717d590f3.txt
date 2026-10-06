@@ -1,0 +1,45 @@
+package controller
+
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/model"
+	"reflect"
+	"testing"
+)
+
+func TestPricingVisibilityIsolatesGroupsAndCachedContracts(t *testing.T) {
+	source := []model.Pricing{
+		{ModelName: "shared", EnableGroup: []string{"public", "private", "public"}, GroupPricing: map[string]model.GroupPricing{"public": {Group: "public"}, "private": {Group: "private"}, "retired": {Group: "retired"}}},
+		{ModelName: "private-only", EnableGroup: []string{"private"}},
+	}
+	before, _ := json.Marshal(source)
+	ordinary := filterPricingByUsableGroups(source, map[string]string{"public": ""})
+	if len(ordinary) != 1 || !reflect.DeepEqual(ordinary[0].EnableGroup, []string{"public"}) || len(ordinary[0].GroupPricing) != 1 {
+		t.Fatalf("private or retired group leaked: %+v", ordinary)
+	}
+	vip := filterPricingByUsableGroups(source, map[string]string{"public": "", "private": ""})
+	if len(vip) != 2 || len(vip[0].EnableGroup) != 2 || len(vip[0].GroupPricing) != 2 {
+		t.Fatalf("VIP scope lost: %+v", vip)
+	}
+	ordinary[0].EnableGroup[0] = "changed"
+	ordinary[0].GroupPricing["public"] = model.GroupPricing{Group: "changed"}
+	after, _ := json.Marshal(source)
+	if string(before) != string(after) {
+		t.Fatal("per-user filtering mutated shared cache")
+	}
+	again := filterPricingByUsableGroups(source, map[string]string{"public": ""})
+	if again[0].EnableGroup[0] != "public" {
+		t.Fatal("previous request polluted next account")
+	}
+	if len(filterPricingByUsableGroups(source, nil)) != 0 {
+		t.Fatal("empty scope exposed models")
+	}
+}
+
+func TestPricingVisibilityExpandsAllOnlyIntoAllowedGroups(t *testing.T) {
+	source := []model.Pricing{{ModelName: "wildcard", EnableGroup: []string{"all", "hidden"}, GroupPricing: map[string]model.GroupPricing{"a": {Group: "a"}, "b": {Group: "b"}, "hidden": {Group: "hidden"}}}}
+	got := filterPricingByUsableGroups(source, map[string]string{"b": "", "a": ""})
+	if len(got) != 1 || !reflect.DeepEqual(got[0].EnableGroup, []string{"a", "b"}) || len(got[0].GroupPricing) != 2 {
+		t.Fatalf("incorrect wildcard scope: %+v", got)
+	}
+}

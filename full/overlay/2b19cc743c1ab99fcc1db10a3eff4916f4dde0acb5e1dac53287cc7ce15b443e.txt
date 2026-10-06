@@ -1,0 +1,84 @@
+package model
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTenantReportingTokenAdminLifecycleIsHashOnlyAndAudited(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	row, secret, err := CreateTenantReportingTokenWithAudit(DownstreamTenantID, TenantCostReportingPermission, 0, 1)
+	require.NoError(t, err)
+	require.NotEmpty(t, secret)
+	assert.NotContains(t, row.TokenHash, secret)
+	rows, err := ListTenantReportingTokens(100)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Empty(t, rows[0].TokenID == secret)
+
+	replacement, replacementSecret, err := RotateTenantReportingToken(row.TokenID, time.Now().Add(time.Hour).Unix(), 1)
+	require.NoError(t, err)
+	require.NotEmpty(t, replacementSecret)
+	assert.NotEqual(t, row.TokenID, replacement.TokenID)
+	_, err = LookupTenantReportingToken(secret)
+	assert.Error(t, err)
+	got, err := LookupTenantReportingToken(replacementSecret)
+	require.NoError(t, err)
+	assert.Equal(t, replacement.TokenID, got.TokenID)
+	require.NoError(t, RevokeTenantReportingToken(replacement.TokenID, 1))
+	_, err = LookupTenantReportingToken(replacementSecret)
+	assert.Error(t, err)
+	var auditCount int64
+	require.NoError(t, db.Model(&TenantCostAuditEvent{}).Count(&auditCount).Error)
+	assert.Equal(t, int64(3), auditCount)
+}
+
+func TestTenantBindingStatusAndWorkerControlAreBounded(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	profile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "admin-profile", Revision: "rev-admin",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantRouteProfile(profile))
+	binding := &TenantCredentialBinding{TokenID: 701, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "key-admin", KeySuffix: "1234", ProductPoolID: "openai_gpt", ServiceTier: "pro", RouteProfileID: profile.ProfileID,
+		ProfileRevision: profile.Revision, ModelCatalogRevision: "catalog-1", BindingStatus: TenantBindingPending}
+	require.NoError(t, UpsertTenantCredentialBinding(binding))
+	require.NoError(t, SetTenantCredentialBindingStatus(binding.ID, TenantBindingEnabled, 1))
+	require.NoError(t, SetTenantCredentialBindingStatus(binding.ID, TenantBindingDisabled, 1))
+	require.NoError(t, SetTenantCredentialBindingStatus(binding.ID, TenantBindingRevoked, 1))
+	assert.Error(t, SetTenantCredentialBindingStatus(binding.ID, TenantBindingEnabled, 1))
+
+	require.NoError(t, SetTenantCostWorkerPaused(true, 1))
+	paused, err := IsTenantCostWorkerPaused()
+	require.NoError(t, err)
+	assert.True(t, paused)
+	require.NoError(t, SetTenantCostWorkerPaused(false, 1))
+	paused, err = IsTenantCostWorkerPaused()
+	require.NoError(t, err)
+	assert.False(t, paused)
+	var auditCount int64
+	require.NoError(t, db.Model(&TenantCostAuditEvent{}).Count(&auditCount).Error)
+	// Three binding transitions plus pause/resume are the five audited admin
+	// mutations; profile/binding upserts above are provisioning helpers without
+	// an operator actor and therefore do not add an audit row.
+	assert.Equal(t, int64(5), auditCount)
+}
+
+func TestTenantCostOutboxReplayRequiresBoundedSelectorAndPreservesEvent(t *testing.T) {
+	setupTenantCostTestDB(t)
+	result, err := AppendTenantCostEvent(tenantCostTestSpec("admin-replay"))
+	require.NoError(t, err)
+	require.NoError(t, MarkTenantCostOutboxSent(result.Event.EventID, time.Now().UnixNano()))
+	count, err := ReplayTenantCostOutbox(TenantCostOutboxReplaySelector{FromSequence: result.Event.Sequence, ToSequence: result.Event.Sequence, Limit: 1}, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	var outbox TenantCostOutbox
+	require.NoError(t, DB.Where("event_id = ?", result.Event.EventID).First(&outbox).Error)
+	assert.Equal(t, TenantOutboxReady, outbox.State)
+	_, err = ReplayTenantCostOutbox(TenantCostOutboxReplaySelector{Limit: 1}, 1)
+	assert.Error(t, err)
+	_, err = ReplayTenantCostOutbox(TenantCostOutboxReplaySelector{EventIDs: []string{"admin-replay"}, Limit: TenantCostAdminMaxReplay + 1}, 1)
+	assert.Error(t, err)
+}

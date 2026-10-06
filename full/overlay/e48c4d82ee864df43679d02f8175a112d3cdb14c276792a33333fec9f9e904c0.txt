@@ -1,0 +1,231 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"math"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+func GetRouteAnalyticsDimensionByDetailIDV1(
+	ctx context.Context,
+	detailID string,
+) (RouteAnalyticsDimensionV1, error) {
+	if DB == nil {
+		return RouteAnalyticsDimensionV1{}, errors.New("main database is not initialized")
+	}
+	detailID = strings.TrimSpace(detailID)
+	if !validAnalyticsHex(detailID, 32) {
+		return RouteAnalyticsDimensionV1{}, errors.New("route analytics detail id must be 32 hexadecimal characters")
+	}
+	var dimension RouteAnalyticsDimensionV1
+	err := DB.WithContext(ctx).Where("detail_id = ?", detailID).First(&dimension).Error
+	return dimension, err
+}
+
+func ListRouteAnalyticsDimensionsByFingerprintsV1(
+	ctx context.Context,
+	fingerprints []string,
+) ([]RouteAnalyticsDimensionV1, error) {
+	if DB == nil {
+		return nil, errors.New("main database is not initialized")
+	}
+	if len(fingerprints) == 0 {
+		return []RouteAnalyticsDimensionV1{}, nil
+	}
+	unique := make([]string, 0, len(fingerprints))
+	seen := make(map[string]struct{}, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		fingerprint = strings.TrimSpace(fingerprint)
+		if !validAnalyticsHex(fingerprint, 64) {
+			return nil, errors.New("route fingerprint digest must be 64 hexadecimal characters")
+		}
+		if _, exists := seen[fingerprint]; exists {
+			continue
+		}
+		seen[fingerprint] = struct{}{}
+		unique = append(unique, fingerprint)
+	}
+	var dimensions []RouteAnalyticsDimensionV1
+	err := DB.WithContext(ctx).
+		Where("route_fingerprint_digest IN ?", unique).
+		Find(&dimensions).Error
+	return dimensions, err
+}
+
+func ListRouteAnalyticsBucketsV1(
+	ctx context.Context,
+	detailID string,
+	granularity string,
+	startMS int64,
+	endMS int64,
+) ([]RouteAnalyticsBucketV1, error) {
+	if DB == nil {
+		return nil, errors.New("main database is not initialized")
+	}
+	detailID = strings.TrimSpace(detailID)
+	if !validAnalyticsHex(detailID, 32) {
+		return nil, errors.New("route analytics detail id must be 32 hexadecimal characters")
+	}
+	if granularity != RouteAnalyticsGranularity5m && granularity != RouteAnalyticsGranularity1h {
+		return nil, errors.New("unsupported route analytics granularity")
+	}
+	if startMS <= 0 || endMS <= startMS {
+		return nil, errors.New("invalid route analytics bucket range")
+	}
+	var buckets []RouteAnalyticsBucketV1
+	err := DB.WithContext(ctx).
+		Where("detail_id = ? AND granularity = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?",
+			detailID, granularity, startMS, endMS).
+		Order("bucket_start_ms ASC").
+		Find(&buckets).Error
+	return buckets, err
+}
+
+// ListGlobalKeyUsageAnalyticsBucketsV1 returns the privacy-safe logical
+// request projection used by public aggregate views.
+func ListGlobalKeyUsageAnalyticsBucketsV1(
+	ctx context.Context,
+	granularity string,
+	startMS int64,
+	endMS int64,
+) ([]KeyUsageAnalyticsBucketV1, error) {
+	if DB == nil {
+		return nil, errors.New("main database is not initialized")
+	}
+	if granularity != RouteAnalyticsGranularity5m && granularity != RouteAnalyticsGranularity1h {
+		return nil, errors.New("unsupported key analytics granularity")
+	}
+	if startMS <= 0 || endMS <= startMS {
+		return nil, errors.New("invalid key analytics bucket range")
+	}
+	var buckets []KeyUsageAnalyticsBucketV1
+	err := DB.WithContext(ctx).
+		Where("granularity = ? AND bucket_start_ms >= ? AND bucket_start_ms < ? AND logical_requests > 0",
+			granularity, startMS, endMS).
+		Order("bucket_start_ms ASC, model ASC, endpoint ASC").
+		Find(&buckets).Error
+	return buckets, err
+}
+
+func ListKeyUsageAnalyticsBucketsV1(
+	ctx context.Context,
+	userID int,
+	tokenID int,
+	granularity string,
+	startMS int64,
+	endMS int64,
+	modelName string,
+) ([]KeyUsageAnalyticsBucketV1, error) {
+	if DB == nil {
+		return nil, errors.New("main database is not initialized")
+	}
+	if userID <= 0 || tokenID <= 0 {
+		return nil, errors.New("route analytics key owner is invalid")
+	}
+	if granularity != RouteAnalyticsGranularity5m && granularity != RouteAnalyticsGranularity1h {
+		return nil, errors.New("unsupported key analytics granularity")
+	}
+	if startMS <= 0 || endMS <= startMS {
+		return nil, errors.New("invalid key analytics bucket range")
+	}
+	query := DB.WithContext(ctx).
+		Where("user_id = ? AND token_id = ? AND granularity = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?",
+			userID, tokenID, granularity, startMS, endMS)
+	if modelName = strings.TrimSpace(modelName); modelName != "" {
+		query = query.Where("model = ?", modelName)
+	}
+	var buckets []KeyUsageAnalyticsBucketV1
+	err := query.Order("bucket_start_ms ASC, model ASC, endpoint ASC").Find(&buckets).Error
+	return buckets, err
+}
+
+func ListUserKeyUsageAnalyticsBucketsV1(
+	ctx context.Context,
+	userID int,
+	granularity string,
+	startMS int64,
+	endMS int64,
+) ([]KeyUsageAnalyticsBucketV1, error) {
+	if DB == nil {
+		return nil, errors.New("main database is not initialized")
+	}
+	if userID <= 0 {
+		return nil, errors.New("route analytics key owner is invalid")
+	}
+	if granularity != RouteAnalyticsGranularity5m && granularity != RouteAnalyticsGranularity1h {
+		return nil, errors.New("unsupported key analytics granularity")
+	}
+	if startMS <= 0 || endMS <= startMS {
+		return nil, errors.New("invalid key analytics bucket range")
+	}
+	var buckets []KeyUsageAnalyticsBucketV1
+	err := DB.WithContext(ctx).
+		Where("user_id = ? AND granularity = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?",
+			userID, granularity, startMS, endMS).
+		Order("bucket_start_ms ASC, model ASC, endpoint ASC").
+		Find(&buckets).Error
+	return buckets, err
+}
+
+// RouteAnalyticsTTFTPercentilesV1 merges version-one fixed histograms and
+// returns approximate P50/P95 upper bounds. The final open-ended bucket is
+// reported as the last finite boundary (300 seconds) and marked as capped.
+func RouteAnalyticsTTFTPercentilesV1(rawHistograms []string) (
+	p50MS *int64,
+	p95MS *int64,
+	total int64,
+	capped bool,
+	err error,
+) {
+	counts := make([]int64, len(ttftHistogramUpperBoundsMS))
+	for _, raw := range rawHistograms {
+		if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "[]" {
+			continue
+		}
+		current := make([]int64, len(ttftHistogramUpperBoundsMS))
+		if decodeErr := common.UnmarshalJsonStr(raw, &current); decodeErr != nil {
+			return nil, nil, 0, false, decodeErr
+		}
+		if len(current) != len(ttftHistogramUpperBoundsMS) {
+			return nil, nil, 0, false, errors.New("TTFT histogram schema mismatch")
+		}
+		for index, value := range current {
+			if value < 0 || counts[index] > math.MaxInt64-value {
+				return nil, nil, 0, false, errors.New("TTFT histogram contains an invalid count")
+			}
+			counts[index] += value
+			if total > math.MaxInt64-value {
+				return nil, nil, 0, false, errors.New("TTFT histogram total would overflow")
+			}
+			total += value
+		}
+	}
+	if total == 0 {
+		return nil, nil, 0, false, nil
+	}
+	percentile := func(numerator int64, denominator int64) (*int64, bool) {
+		whole := total / denominator
+		remainder := total % denominator
+		target := whole*numerator + (remainder*numerator+denominator-1)/denominator
+		seen := int64(0)
+		for index, count := range counts {
+			seen += count
+			if seen < target {
+				continue
+			}
+			upper := ttftHistogramUpperBoundsMS[index]
+			if upper == math.MaxInt64 {
+				upper = ttftHistogramUpperBoundsMS[len(ttftHistogramUpperBoundsMS)-2]
+				return &upper, true
+			}
+			return &upper, false
+		}
+		return nil, false
+	}
+	p50MS, p50Capped := percentile(50, 100)
+	p95MS, p95Capped := percentile(95, 100)
+	return p50MS, p95MS, total, p50Capped || p95Capped, nil
+}

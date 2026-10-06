@@ -1,0 +1,209 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func recordConfirmedAutomaticRouteFailure(
+	t *testing.T,
+	state SmartRouteStateStore,
+	routeID string,
+) {
+	t.Helper()
+	for index := 1; index <= smartrouter.DefaultSharedOpenFailureThreshold; index++ {
+		require.NoError(t, state.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+			RouteID: routeID, Outcome: smartrouter.OutcomeInfrastructure,
+			ObservationID: fmt.Sprintf("%s-confirmed-failure-%d", routeID, index),
+		}))
+	}
+}
+
+func TestCatalogRecoverySweepReconstructsFailedRouteWithoutForegroundHint(t *testing.T) {
+	worker, state, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	recordConfirmedAutomaticRouteFailure(t, state, "cheap")
+	state.mu.Lock()
+	cheap := state.quality["cheap"]
+	cheap.NextProbeAtMS = 1
+	state.quality["cheap"] = cheap
+	state.mu.Unlock()
+
+	scheduled, err := worker.runCatalogRecoverySweep(context.Background(), *setting)
+	require.NoError(t, err)
+	assert.Equal(t, 1, scheduled)
+	worker.mu.Lock()
+	queued := false
+	for _, job := range worker.pending {
+		queued = queued || job.route.RouteID == "cheap"
+	}
+	pendingCount := len(worker.pending)
+	worker.mu.Unlock()
+	assert.Equal(t, 1, pendingCount)
+	assert.True(t, queued)
+	_ = session
+}
+
+func TestCatalogRecoverySweepDoesNotProbeEveryVirginRoute(t *testing.T) {
+	worker, _, _, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+
+	scheduled, err := worker.runCatalogRecoverySweep(context.Background(), *setting)
+	require.NoError(t, err)
+	assert.Zero(t, scheduled)
+	worker.mu.Lock()
+	assert.Empty(t, worker.pending)
+	worker.mu.Unlock()
+}
+
+func TestScheduleAllAutomaticRecoveriesQueuesOnlyExistingAutomaticFailures(t *testing.T) {
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	session.engine.SetRecoveryHintSink(worker)
+	recordConfirmedAutomaticRouteFailure(t, state, "cheap")
+
+	result, err := session.engine.ScheduleAllAutomaticRecoveries(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Contracts)
+	assert.Equal(t, 1, result.PhysicalRoutes)
+	assert.Equal(t, 1, result.Queued)
+	assert.Zero(t, result.AlreadyQueued)
+	assert.Zero(t, result.QueueFull)
+
+	again, err := session.engine.ScheduleAllAutomaticRecoveries(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, again.Queued)
+	assert.Equal(t, 1, again.AlreadyQueued)
+}
+
+func TestScheduleAllAutomaticRecoveriesDoesNotQueueVirginRoutes(t *testing.T) {
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	session.engine.SetRecoveryHintSink(worker)
+	state.mu.Lock()
+	state.quality["fallback"] = smartrouter.QualityState{
+		Phase: smartrouter.QualityUnknown, Epoch: 1, Revision: 7,
+		LastUpdatedMS: 1, ReliabilityPPM: 500_000,
+	}
+	state.mu.Unlock()
+
+	result, err := session.engine.ScheduleAllAutomaticRecoveries(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, SmartRouteBulkRecoveryResult{}, result)
+	worker.mu.Lock()
+	assert.Empty(t, worker.pending, "unknown stays non-probeable even after normalization changed its revision")
+	worker.mu.Unlock()
+}
+
+func TestScheduleAllAutomaticRecoveriesCountsEveryPhysicalQueueDisposition(t *testing.T) {
+	worker, state, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	setting.ProbeQueueCapacity = 1
+	session.engine.SetRecoveryHintSink(worker)
+	for _, routeID := range []string{"cheap", "fallback"} {
+		recordConfirmedAutomaticRouteFailure(t, state, routeID)
+	}
+
+	result, err := session.engine.ScheduleAllAutomaticRecoveries(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Contracts)
+	assert.Equal(t, 2, result.PhysicalRoutes)
+	assert.Equal(t, 1, result.Queued)
+	assert.Zero(t, result.AlreadyQueued)
+	assert.Equal(t, 1, result.QueueFull)
+}
+
+func TestScheduleAllAutomaticRecoveriesPreservesManualBlacklist(t *testing.T) {
+	setting := smartroutersetting.Normalize(smartCatalogTestSetting(constant.EndpointTypeOpenAI))
+	setting.BackgroundProbeEnabled = true
+	setting.ProbeQueueCapacity = 16
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	chat := contractByEndpoint(t, *catalog, SmartEndpointChat)
+	routes := contractCatalogRoutes(chat)
+	require.Len(t, routes, 2)
+
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	for _, route := range routes {
+		recordConfirmedAutomaticRouteFailure(t, state, route.RouteID)
+	}
+	source.blocks = []model.SmartRouteBlock{{
+		Scope: SmartRouteBlockScopeGroupModel, Group: "economy", ModelPattern: "gpt-*",
+		Source: SmartRouteBlockSourceManual,
+	}}
+	catalogs.Invalidate()
+	_, err = catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+
+	engine, err := NewSmartRouterEngine(
+		catalogs,
+		NewPriceSnapshotManager(catalogs, nil),
+		state,
+		NewMemorySmartRouteAffinityStore(nil, 100),
+		func() smartroutersetting.Setting { return setting },
+	)
+	require.NoError(t, err)
+	worker, err := NewSmartRouteProbeWorker(engine, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	require.NoError(t, err)
+	engine.SetRecoveryHintSink(worker)
+
+	result, err := engine.ScheduleAllAutomaticRecoveries(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Contracts)
+	assert.Equal(t, 1, result.PhysicalRoutes)
+	assert.Equal(t, 1, result.Queued)
+	worker.mu.Lock()
+	require.Len(t, worker.pending, 1)
+	for _, job := range worker.pending {
+		assert.Equal(t, "fallback", job.route.Group)
+	}
+	worker.mu.Unlock()
+}
+
+func TestScheduleAllAutomaticRecoveriesRequiresEnabledWorker(t *testing.T) {
+	_, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	*setting = smartroutersetting.Normalize(smartroutersetting.Setting{Enabled: false})
+	_, err := session.engine.ScheduleAllAutomaticRecoveries(context.Background())
+	require.ErrorIs(t, err, ErrSmartRouterDisabled)
+}

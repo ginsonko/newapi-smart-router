@@ -1,0 +1,52 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSessionOnlyUserAuthUsesSessionWithoutSPAHeaderAndRejectsAccessToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("bot-session-test"))))
+	router.GET("/login", func(c *gin.Context) {
+		session := sessions.Default(c)
+		session.Set("id", 7)
+		session.Set("username", "alice")
+		session.Set("role", common.RoleCommonUser)
+		session.Set("status", common.UserStatusEnabled)
+		session.Set("group", "default")
+		require.NoError(t, session.Save())
+		c.Status(http.StatusNoContent)
+	})
+	router.POST("/confirm", SessionOnlyUserAuth(), func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id")}) })
+
+	loginRecorder := httptest.NewRecorder()
+	router.ServeHTTP(loginRecorder, httptest.NewRequest(http.MethodGet, "/login", nil))
+	require.Equal(t, http.StatusNoContent, loginRecorder.Code)
+	request := httptest.NewRequest(http.MethodPost, "/confirm", nil)
+	for _, value := range loginRecorder.Result().Cookies() {
+		request.AddCookie(value)
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"id":7`)
+
+	request = httptest.NewRequest(http.MethodPost, "/confirm", nil)
+	request.Header.Set("Authorization", "secret")
+	for _, value := range loginRecorder.Result().Cookies() {
+		request.AddCookie(value)
+	}
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+}

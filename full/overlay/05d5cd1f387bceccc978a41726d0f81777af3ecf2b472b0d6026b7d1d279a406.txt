@@ -1,0 +1,331 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import { createInstance } from 'i18next'
+import type { ReactElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { I18nextProvider } from 'react-i18next'
+
+import { DEFAULT_CURRENCY_CONFIG } from '@/stores/system-config-store'
+
+import { ModelGroupPrices } from '../components/model-group-prices'
+import { ParameterPriceTable } from '../components/parameter-price-table'
+import type { ParameterPrice, PricingModel } from '../types'
+import { filterBySearch, filterByGroup, sortModels } from './filters'
+import {
+  distinctParameterPrices,
+  parameterDisplayAmount,
+} from './parameter-price-display'
+import {
+  formatFixedPrice,
+  formatRequestPrice,
+  resolveModelDisplayPricing,
+  resolveModelGroupPricing,
+} from './price'
+
+const offer: ParameterPrice = {
+  model: 'generic-media',
+  group: 'parameter',
+  revision: 'v1',
+  unit: 'per_second',
+  currency: 'USD',
+  unit_price: '0.83',
+  conditions: { resolution: '720p' },
+}
+const usd = { ...DEFAULT_CURRENCY_CONFIG }
+const cny = { ...usd, quotaDisplayType: 'CNY' as const, usdExchangeRate: 7 }
+const i18n = createInstance()
+await i18n.init({
+  lng: 'en',
+  fallbackLng: 'en',
+  resources: { en: { translation: {} } },
+  initAsync: false,
+})
+function html(element: ReactElement) {
+  return renderToStaticMarkup(
+    <I18nextProvider i18n={i18n}>{element}</I18nextProvider>
+  )
+}
+function contracts(source: PricingModel) {
+  assert.ok(source.group_pricing)
+  return source.group_pricing
+}
+function model(): PricingModel {
+  return {
+    id: 1,
+    model_name: offer.model,
+    quota_type: 0,
+    model_price: 0,
+    model_ratio: 37.5,
+    completion_ratio: 1,
+    enable_groups: ['parameter', 'fixed'],
+    group_ratio: { parameter: 50, fixed: 9 },
+    group_pricing: {
+      parameter: {
+        group: 'parameter',
+        scope: 'group_model',
+        billing_mode: 'parameter_price',
+        billing_unit: 'parameter',
+        quota_type: 1,
+        base_group_ratio: 50,
+        effective_group_ratio: 50,
+        parameter_prices: [offer],
+      },
+      fixed: {
+        group: 'fixed',
+        scope: 'group_model',
+        billing_mode: 'fixed_price',
+        billing_unit: 'per_image',
+        quota_type: 1,
+        model_price: 0.8,
+        base_group_ratio: 0.0125,
+        effective_group_ratio: 0.0125,
+      },
+    },
+  }
+}
+
+describe('parameter gallery prices', () => {
+  test('final decimal contract prices honor standard and recharge currency without group multiplication', () => {
+    assert.equal(parameterDisplayAmount(offer)?.text, 'USD 0.83')
+    assert.equal(
+      parameterDisplayAmount(offer, { currency: usd })?.text,
+      '$0.83'
+    )
+    assert.equal(
+      parameterDisplayAmount(offer, { currency: cny })?.text,
+      '¥5.81'
+    )
+    assert.equal(
+      parameterDisplayAmount(offer, {
+        currency: cny,
+        showRechargePrice: true,
+        priceRate: 4,
+        usdExchangeRate: 7,
+      })?.text,
+      '¥3.32'
+    )
+    assert.equal(
+      parameterDisplayAmount(offer, {
+        currency: {
+          ...usd,
+          quotaDisplayType: 'CUSTOM',
+          customCurrencySymbol: 'credits',
+          customCurrencyExchangeRate: 2,
+        },
+      })?.text,
+      'credits 1.66'
+    )
+    assert.equal(
+      parameterDisplayAmount(offer, {
+        currency: { ...usd, quotaDisplayType: 'TOKENS' },
+      })?.text,
+      '$0.83'
+    )
+    assert.equal(
+      parameterDisplayAmount(
+        { ...offer, currency: 'EUR' },
+        { currency: cny, showRechargePrice: true }
+      )?.text,
+      'EUR 0.83'
+    )
+    assert.equal(
+      parameterDisplayAmount({ ...offer, currency: 'EUR' }, { currency: cny })
+        ?.originalCurrency,
+      true
+    )
+  })
+
+  test('zero, tiny, missing and invalid values remain distinct', () => {
+    assert.equal(
+      parameterDisplayAmount({ ...offer, unit_price: '0' }, { currency: cny })
+        ?.text,
+      '¥0'
+    )
+    assert.equal(
+      parameterDisplayAmount(offer, {
+        currency: cny,
+        showRechargePrice: true,
+        priceRate: 0,
+        usdExchangeRate: 7,
+      })?.text,
+      '¥0'
+    )
+    assert.equal(
+      parameterDisplayAmount(
+        { ...offer, unit_price: '0.000000000000000001' },
+        { currency: usd }
+      )?.text,
+      '$0.000000000000000001'
+    )
+    assert.equal(
+      parameterDisplayAmount(
+        { ...offer, unit_price: '0.000000000000000001' },
+        { currency: usd, showRechargePrice: true, priceRate: 0.5 }
+      )?.text,
+      '<$0.000000000000000001'
+    )
+    for (const value of [
+      '',
+      '-1',
+      'NaN',
+      'Infinity',
+      '0.0000000000000000001',
+      undefined,
+    ]) {
+      assert.equal(
+        parameterDisplayAmount({ ...offer, unit_price: value as string }),
+        undefined
+      )
+    }
+    for (const rate of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.equal(
+        parameterDisplayAmount(offer, {
+          currency: { ...cny, usdExchangeRate: rate },
+        }),
+        undefined
+      )
+    }
+    assert.equal(
+      parameterDisplayAmount({ ...offer, unit: 'fixed_duration' }),
+      undefined
+    )
+  })
+
+  test('compact view preserves every resolution and quality row, currency and unit', () => {
+    const prices = ['480p', '720p', '1080p', '2160p'].map((resolution) => ({
+      ...offer,
+      conditions: { resolution, quality: 'high' },
+    }))
+    prices.push({
+      ...offer,
+      currency: 'EUR',
+      unit: 'per_image',
+      conditions: { resolution: '480p', quality: 'standard' },
+    })
+    const output = html(
+      <ParameterPriceTable prices={prices} compact useDisplayCurrency />
+    )
+    for (const resolution of ['480p', '720p', '1080p', '2160p']) {
+      assert.match(output, new RegExp(resolution))
+    }
+    assert.match(output, /Quality: high/)
+    assert.match(output, /Quality: standard/)
+    assert.match(output, /EUR 0.83/)
+    assert.match(output, /\/ image/)
+    assert.match(output, /\/ second/)
+    assert.match(
+      html(
+        <ParameterPriceTable
+          prices={[
+            { ...offer, unit: 'fixed_duration', fixed_duration_seconds: 8 },
+          ]}
+        />
+      ),
+      /Fixed 8 seconds/
+    )
+  })
+
+  test('only duplicate public facts collapse; distinct conditions, currencies and groups survive', () => {
+    const prices = [
+      offer,
+      { ...offer, revision: 'v2', schedule_id: 'other' },
+      { ...offer, currency: 'EUR' },
+      { ...offer, group: 'other' },
+      { ...offer, conditions: { quality: 'high' } },
+    ]
+    assert.equal(distinctParameterPrices(prices).length, 4)
+  })
+
+  test('mixed group summary retains fixed rows and uses final parameter prices with one group multiplier for legacy rows', () => {
+    const output = html(<ModelGroupPrices model={model()} />)
+    assert.match(output, /data-price-group="parameter"/)
+    assert.match(output, /data-price-group="fixed"/)
+    assert.match(output, /\$0.83/)
+    assert.match(output, /\$0.01/)
+    assert.doesNotMatch(output, /\$41.5/)
+    assert.doesNotMatch(output, /\$0 \/ request/)
+    const selected = html(
+      <ModelGroupPrices model={model()} selectedGroup='fixed' />
+    )
+    assert.match(selected, /\$0.01/)
+    assert.doesNotMatch(selected, /data-price-group="parameter"/)
+    const parameterOnly = html(
+      <ModelGroupPrices model={model()} selectedGroup='parameter' />
+    )
+    assert.doesNotMatch(parameterOnly, /data-price-group="fixed"/)
+    assert.match(parameterOnly, /\$0.83/)
+  })
+
+  test('empty parameter contract is explicitly unavailable with the group retained', () => {
+    const source = model()
+    contracts(source).parameter.parameter_prices = []
+    const output = html(
+      <ModelGroupPrices model={source} selectedGroup='parameter' />
+    )
+    assert.match(output, /Parameter pricing is temporarily unavailable/)
+    assert.match(output, />parameter<\/span>/)
+    assert.doesNotMatch(output, /\$0/)
+  })
+
+  test('legacy fixed formatters never reinterpret parameter schedules or absent values as zero', () => {
+    const source = model()
+    assert.equal(
+      resolveModelGroupPricing(source, 'parameter').model.model_price,
+      undefined
+    )
+    assert.equal(formatFixedPrice(source, 'parameter', false, 1, 1, {}), '-')
+    assert.equal(formatRequestPrice(source, false, 1, 1, 'parameter'), '-')
+    for (const value of [
+      undefined,
+      null,
+      Number.NaN,
+      -1,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      contracts(source).fixed.model_price = value
+      assert.equal(formatFixedPrice(source, 'fixed', false, 1, 1, {}), '-')
+    }
+    contracts(source).fixed.model_price = 0
+    assert.equal(formatFixedPrice(source, 'fixed', false, 1, 1, {}), '$0')
+  })
+
+  test('filters keep nested contracts and sorting does not pretend parameter prices are zero', () => {
+    const source = model()
+    const filtered = filterByGroup(
+      filterBySearch([source], 'generic'),
+      'parameter'
+    )
+    assert.equal(
+      filtered[0].group_pricing?.parameter.parameter_prices?.[0],
+      offer
+    )
+    const fixed = {
+      ...source,
+      id: 2,
+      enable_groups: ['fixed'],
+      group_pricing: { fixed: contracts(source).fixed },
+    }
+    assert.equal(resolveModelDisplayPricing(source).variesByGroup, true)
+    assert.equal(sortModels([source, fixed], 'price-low')[0].id, 2)
+    assert.equal(sortModels([source, fixed], 'price-high')[0].id, 2)
+  })
+})

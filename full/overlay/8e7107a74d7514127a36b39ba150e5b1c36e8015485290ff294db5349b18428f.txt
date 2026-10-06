@@ -1,0 +1,30 @@
+package sora
+
+import (
+	"testing"
+
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestManagedProviderPayloadUsesDeclaredFieldsAndResolvedReferences(t *testing.T) {
+	capability := mediaservice.Capability{RuntimeEnforced: true, ReferenceFields: map[string]string{"image": "configured_images", "video": "configured_videos", "audio": "configured_audios"}}
+	req := relaycommon.TaskSubmitReq{Duration: 4, Seconds: "4", Resolution: "480p", References: []relaycommon.MediaReference{
+		{Type: "image", FileID: "private-image-id", ResolvedURL: "https://media.example/image"},
+		{Type: "video", FileID: "private-video-id", ResolvedURL: "https://media.example/video"},
+		{Type: "audio", FileID: "private-audio-id", ResolvedURL: "https://media.example/audio"},
+	}}
+	body := map[string]interface{}{"model": "upstream-model", "references": "private-input", "input_reference": "https://media.example/image"}
+	require.NoError(t, applyManagedCapabilityPayload(body, req, capability))
+	assert.Equal(t, []string{"https://media.example/image"}, body["configured_images"])
+	assert.Equal(t, []string{"https://media.example/video"}, body["configured_videos"])
+	assert.Equal(t, []string{"https://media.example/audio"}, body["configured_audios"])
+	assert.Equal(t, "4", body["seconds"])
+	assert.Equal(t, "480p", body["resolution"])
+	assert.NotContains(t, body, "references")
+	assert.NotContains(t, body, "input_reference")
+	assert.ErrorContains(t, applyManagedCapabilityPayload(map[string]interface{}{"configured_images": []string{"unvalidated"}}, req, capability), "use references")
+	assert.ErrorContains(t, applyManagedCapabilityPayload(map[string]interface{}{"image": "https://media.example/unlisted"}, req, capability), "conflicts")
+}

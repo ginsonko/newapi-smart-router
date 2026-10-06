@@ -1,0 +1,2333 @@
+package controller
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+type mediaFileResponse struct {
+	ID        string `json:"id"`
+	Object    string `json:"object"`
+	Bytes     int64  `json:"bytes"`
+	CreatedAt int64  `json:"created_at"`
+	Filename  string `json:"filename"`
+	Purpose   string `json:"purpose"`
+	Status    string `json:"status"`
+	MimeType  string `json:"mime_type,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+}
+
+type mediaFileListResponse struct {
+	Object  string              `json:"object"`
+	Data    []mediaFileResponse `json:"data"`
+	HasMore bool                `json:"has_more"`
+	FirstID string              `json:"first_id,omitempty"`
+	LastID  string              `json:"last_id,omitempty"`
+}
+
+type mediaModeContract struct {
+	Path         string
+	Endpoint     string
+	EndpointType constant.EndpointType
+}
+
+type mediaCapabilityCatalogEntry struct {
+	Group  string   `json:"group"`
+	Models []string `json:"models"`
+}
+
+type mediaRouteSummary struct {
+	ChannelID      int      `json:"channel_id"`
+	ChannelName    string   `json:"channel_name"`
+	Group          string   `json:"group"`
+	Model          string   `json:"model"`
+	BillingMode    string   `json:"billing_mode"`
+	PriceUnit      string   `json:"price_unit,omitempty"`
+	ActualPrice    *float64 `json:"actual_price,omitempty"`
+	EffectiveRatio *float64 `json:"effective_ratio,omitempty"`
+	PriceKnown     bool     `json:"price_known"`
+}
+
+const (
+	mediaStudioOperationHeader     = "X-Media-Studio-Operation-ID"
+	mediaStudioOperationContextKey = "media_studio_operation_id"
+	mediaStudioOperationPrefix     = "studio_"
+	mediaStudioFallbackGroupsQuery = "fallback_groups"
+	mediaStudioMaxBatchCount       = relaycommon.MaxStudioBatchCount
+)
+
+func validateMediaStudioOperationID(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(value, mediaStudioOperationPrefix) {
+		return "", errors.New("invalid media studio operation id")
+	}
+	raw := strings.TrimPrefix(value, mediaStudioOperationPrefix)
+	parsed, err := uuid.Parse(raw)
+	if err != nil || parsed.String() != raw {
+		return "", errors.New("invalid media studio operation id")
+	}
+	return value, nil
+}
+
+func setMediaStudioOperationID(c *gin.Context, mode string) error {
+	if mode != "images" && mode != "image-edits" && mode != "videos" {
+		return nil
+	}
+	operationID, err := validateMediaStudioOperationID(c.GetHeader(mediaStudioOperationHeader))
+	if err != nil {
+		return err
+	}
+	if operationID != "" {
+		c.Set(mediaStudioOperationContextKey, operationID)
+	}
+	return nil
+}
+
+func validateMediaStudioBatchCount(count int) error {
+	if count < 1 || count > mediaStudioMaxBatchCount {
+		return fmt.Errorf("count must be an integer between 1 and %d", mediaStudioMaxBatchCount)
+	}
+	return nil
+}
+
+// resolveMediaStudioFallbackGroups validates the browser's saved group order
+// against the session user's current permissions. The smart-route planner is
+// still authoritative for model, endpoint and capability eligibility; this
+// function only prevents a session request from widening its group scope.
+func resolveMediaStudioFallbackGroups(raw, requestedGroup string, usableGroups map[string]string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var requested []string
+	if err := json.Unmarshal([]byte(raw), &requested); err != nil {
+		return nil, errors.New("invalid media studio fallback group order")
+	}
+	groups := make([]string, 0, len(requested)+1)
+	seen := make(map[string]struct{}, len(requested)+1)
+	appendGroup := func(group string) error {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			return nil
+		}
+		if _, exists := seen[group]; exists {
+			return nil
+		}
+		if _, allowed := usableGroups[group]; !allowed {
+			return fmt.Errorf("group %q is not available to this user", group)
+		}
+		seen[group] = struct{}{}
+		groups = append(groups, group)
+		return nil
+	}
+	for _, group := range requested {
+		if err := appendGroup(group); err != nil {
+			return nil, err
+		}
+	}
+	if err := appendGroup(requestedGroup); err != nil {
+		return nil, err
+	}
+	if len(groups) == 0 {
+		return nil, errors.New("at least one media studio fallback group is required")
+	}
+	return groups, nil
+}
+
+// mediaStudioRoutingPolicy creates a request-scoped v4 policy. It reuses the
+// production smart-media dispatcher, so only an explicit pre-acceptance
+// rejection may open the next group; timeouts and result-unknown outcomes stop
+// without a second paid generation.
+func mediaStudioRoutingPolicy(groups []string) (smartrouter.Policy, error) {
+	setting := smartroutersetting.Normalize(smartroutersetting.GetSmartRouterSettingSnapshot())
+	policy := smartrouter.NormalizePolicy(setting.DefaultPolicy)
+	policy.Version = smartrouter.PolicyVersion
+	policy.PolicyID = "media-studio-manual-v1"
+	policy.Enabled = true
+	policy.Strategy = smartrouter.StrategyManual
+	policy.OrderMode = smartrouter.OrderManual
+	policy.PoolPolicy = ""
+	policy.ManualGroupOrder = append([]string(nil), groups...)
+	policy.AllowFutureGroups = false
+	policy.AllowFutureCertifiedRoutes = false
+	policy.ContractOverrides = map[string]smartrouter.ContractOverride{}
+	policy.HealthGuard = true
+	policy.AffinityEnabled = false
+	policy.AffinityMode = ""
+	policy.AffinityMaxPremiumPercent = 0
+	policy.ActualInputCostRanking = nil
+	policy.QueuePolicy = smartrouter.QueuePolicy{Mode: smartrouter.QueueModeNoQueue}
+	if setting.AbsoluteMaxEffectiveRatioPPM > 0 {
+		policy.MaxEffectiveRatioPPM = setting.AbsoluteMaxEffectiveRatioPPM
+	}
+	policy = smartrouter.NormalizePolicy(policy)
+	if err := policy.Validate(); err != nil {
+		return policy, err
+	}
+	return policy, nil
+}
+
+func mediaContractForMode(mode string) (mediaModeContract, bool) {
+	switch strings.TrimSpace(mode) {
+	case "images":
+		return mediaModeContract{
+			Path: "/v1/images/generations", Endpoint: service.SmartEndpointImages,
+			EndpointType: constant.EndpointTypeImageGeneration,
+		}, true
+	case "image-edits":
+		return mediaModeContract{
+			Path: "/v1/images/edits", Endpoint: service.SmartEndpointImageEdits,
+			EndpointType: constant.EndpointTypeImageGeneration,
+		}, true
+	case "videos":
+		return mediaModeContract{
+			Path: "/v1/videos", Endpoint: service.SmartEndpointVideos,
+			EndpointType: constant.EndpointTypeOpenAIVideo,
+		}, true
+	case "speech":
+		return mediaModeContract{
+			Path: "/v1/audio/speech", Endpoint: service.SmartEndpointAudioSpeech,
+			EndpointType: constant.EndpointTypeAudioSpeech,
+		}, true
+	case "transcriptions":
+		return mediaModeContract{
+			Path: "/v1/audio/transcriptions", Endpoint: service.SmartEndpointAudioTranscription,
+			EndpointType: constant.EndpointTypeAudioTranscription,
+		}, true
+	case "translations":
+		return mediaModeContract{
+			Path: "/v1/audio/translations", Endpoint: service.SmartEndpointAudioTranslation,
+			EndpointType: constant.EndpointTypeAudioTranslation,
+		}, true
+	default:
+		return mediaModeContract{}, false
+	}
+}
+
+func normalizeMediaStudioResponseFormat(c *gin.Context, mode string) error {
+	responseFormat := ""
+	switch mode {
+	case "image-edits":
+		responseFormat = "url"
+	case "transcriptions", "translations":
+		responseFormat = "json"
+	default:
+		return nil
+	}
+	if !strings.Contains(strings.ToLower(c.GetHeader("Content-Type")), "multipart/form-data") {
+		return nil
+	}
+	form := c.Request.MultipartForm
+	if form == nil {
+		parsed, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			return err
+		}
+		form = parsed
+	}
+	if form.Value == nil {
+		form.Value = make(map[string][]string)
+	}
+	form.Value["response_format"] = []string{responseFormat}
+	c.Request.MultipartForm = form
+	c.Request.PostForm = url.Values(form.Value)
+	return nil
+}
+
+func resolveRequestedMediaGroup(userGroup, requestedGroup string, usableGroups map[string]string) (string, error) {
+	group := strings.TrimSpace(requestedGroup)
+	if group == "" {
+		group = strings.TrimSpace(userGroup)
+	}
+	if group == "" {
+		return "", errors.New("a media group is required")
+	}
+	if _, allowed := usableGroups[group]; !allowed {
+		return "", fmt.Errorf("group %q is not available to this user", group)
+	}
+	return group, nil
+}
+
+func MediaUploadFile(c *gin.Context) {
+	mediaUploadFile(c, false)
+}
+
+func MediaUploadOpenAIFile(c *gin.Context) {
+	mediaUploadFile(c, true)
+}
+
+func mediaUploadFile(c *gin.Context, openAIContract bool) {
+	userID := c.GetInt("id")
+	if userID <= 0 {
+		mediaContractError(c, openAIContract, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	releaseUpload, err := prepareMediaUploadRequest(c)
+	if err != nil {
+		mediaContractErrorFromStorage(c, openAIContract, err)
+		return
+	}
+	defer releaseUpload()
+	header, err := c.FormFile("file")
+	if err != nil {
+		if common.IsRequestBodyTooLargeError(err) {
+			mediaContractError(c, openAIContract, http.StatusRequestEntityTooLarge, "media request exceeds the configured size limit")
+		} else {
+			mediaContractError(c, openAIContract, http.StatusBadRequest, "file is required")
+		}
+		return
+	}
+	file, err := header.Open()
+	if err != nil {
+		mediaContractError(c, openAIContract, http.StatusBadRequest, "unable to open uploaded file")
+		return
+	}
+	defer file.Close()
+	username := c.GetString("username")
+	if username == "" {
+		if user, queryErr := model.GetUserById(userID, false); queryErr == nil && user != nil {
+			username = user.Username
+		}
+	}
+	blob, err := mediaservice.SaveUpload(c.Request.Context(), mediaservice.UploadInput{
+		UserID: userID, Username: username, Filename: header.Filename,
+		Purpose: c.DefaultPostForm("purpose", "user_data"), Role: "reference",
+		SizeHint: header.Size, Reader: file,
+	})
+	if err != nil {
+		mediaContractErrorFromStorage(c, openAIContract, err)
+		return
+	}
+	response := mediaFileResponseFromBlob(blob)
+	if openAIContract {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	common.ApiSuccess(c, response)
+}
+
+func MediaListFiles(c *gin.Context) {
+	mediaListFiles(c, false)
+}
+
+func MediaListOpenAIFiles(c *gin.Context) {
+	mediaListFiles(c, true)
+}
+
+func mediaListFiles(c *gin.Context, openAIContract bool) {
+	page := common.GetPageQuery(c)
+	blobs, total, err := model.ListMediaBlobs(page.GetStartIdx(), page.GetPageSize(), model.MediaListFilter{
+		UserID: c.GetInt("id"), Purpose: c.Query("purpose"), MediaType: c.Query("type"),
+	})
+	if err != nil {
+		mediaContractError(c, openAIContract, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items := make([]mediaFileResponse, 0, len(blobs))
+	for index := range blobs {
+		items = append(items, mediaFileResponseFromBlob(&blobs[index]))
+	}
+	if openAIContract {
+		response := mediaFileListResponse{Object: "list", Data: items, HasMore: int64(page.GetStartIdx()+len(items)) < total}
+		if len(items) > 0 {
+			response.FirstID = items[0].ID
+			response.LastID = items[len(items)-1].ID
+		}
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	page.SetTotal(int(total))
+	page.SetItems(items)
+	common.ApiSuccess(c, page)
+}
+
+func MediaGetFile(c *gin.Context) {
+	mediaGetFile(c, false)
+}
+
+func MediaGetOpenAIFile(c *gin.Context) {
+	mediaGetFile(c, true)
+}
+
+func mediaGetFile(c *gin.Context, openAIContract bool) {
+	blob, err := model.GetMediaBlobForUser(c.GetInt("id"), c.Param("file_id"))
+	if err != nil {
+		mediaContractErrorFromStorage(c, openAIContract, err)
+		return
+	}
+	response := mediaFileResponseFromBlob(blob)
+	if openAIContract {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	common.ApiSuccess(c, response)
+}
+
+func MediaDeleteFile(c *gin.Context) {
+	mediaDeleteFile(c, false)
+}
+
+func MediaDeleteOpenAIFile(c *gin.Context) {
+	mediaDeleteFile(c, true)
+}
+
+func mediaDeleteFile(c *gin.Context, openAIContract bool) {
+	userID := c.GetInt("id")
+	blob, err := model.GetMediaBlobForUser(userID, c.Param("file_id"))
+	if err != nil {
+		mediaContractErrorFromStorage(c, openAIContract, err)
+		return
+	}
+	if blob.AdminHold {
+		mediaContractError(c, openAIContract, http.StatusConflict, "this asset is retained for an administrator review")
+		return
+	}
+	if err := mediaservice.DeleteBlob(blob.PublicID, fmt.Sprintf("user-%d", userID), false); err != nil {
+		mediaContractErrorFromStorage(c, openAIContract, err)
+		return
+	}
+	response := gin.H{"id": blob.PublicID, "object": "file", "deleted": true}
+	if openAIContract {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	common.ApiSuccess(c, response)
+}
+
+func MediaFileContent(c *gin.Context) {
+	blob, _, err := resolveMediaBlobForRequest(c)
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	serveMediaBlob(c, blob)
+}
+
+func MediaListAssets(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	channelID, _ := strconv.Atoi(c.Query("channel_id"))
+	filter := model.MediaListFilter{
+		MediaType: c.Query("type"), Status: c.Query("status"),
+		ModerationStatus: c.Query("moderation_status"), Search: c.Query("q"),
+		Username: c.Query("username"), TaskPublicID: c.Query("task_id"),
+		ChannelID: channelID, Model: c.Query("model"), Group: c.Query("group"),
+		StorageBackend: c.Query("storage_backend"), MaterializeStatus: c.Query("materialize_status"),
+		IncludeDeleted: c.Query("include_deleted") == "true",
+	}
+	if c.GetBool("media_admin") == false {
+		filter.UserID = c.GetInt("id")
+	}
+	blobs, total, err := model.ListMediaBlobs(page.GetStartIdx(), page.GetPageSize(), filter)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	prompts, promptErr := model.ListMediaAssetPrompts(blobs)
+	if promptErr != nil {
+		common.SysLog("media asset prompt projection failed: " + promptErr.Error())
+	}
+	items := make([]gin.H, 0, len(blobs))
+	for index := range blobs {
+		item := mediaBlobPublicMapWithPrompt(&blobs[index], c.GetBool("media_admin"), prompts[blobs[index].ID])
+		items = append(items, item)
+	}
+	page.SetTotal(int(total))
+	page.SetItems(items)
+	common.ApiSuccess(c, page)
+}
+
+func MediaGetAsset(c *gin.Context) {
+	blob, artifact, err := resolveMediaBlobForRequest(c)
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	prompts, promptErr := model.ListMediaAssetPrompts([]model.MediaBlob{*blob})
+	if promptErr != nil {
+		common.SysLog("media asset prompt projection failed: " + promptErr.Error())
+	}
+	item := mediaBlobPublicMapWithPrompt(blob, c.GetBool("media_admin"), prompts[blob.ID])
+	if artifact != nil {
+		item["asset"] = mediaservice.PublicArtifactFromModel(*artifact, c.GetBool("media_admin"))
+	}
+	common.ApiSuccess(c, item)
+}
+
+func MediaDeleteAsset(c *gin.Context) {
+	userID := c.GetInt("id")
+	blob, _, err := model.GetMediaBlobByAssetID(userID, c.Param("asset_id"), false)
+	if err != nil {
+		blob, err = model.GetMediaBlobForUser(userID, c.Param("asset_id"))
+	}
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	if blob.AdminHold {
+		mediaError(c, http.StatusConflict, "this asset is retained for an administrator review")
+		return
+	}
+	if err := mediaservice.DeleteBlob(blob.PublicID, fmt.Sprintf("user-%d", userID), false); err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"id": c.Param("asset_id"), "deleted": true})
+}
+
+type mediaArchiveRequest struct {
+	AssetIDs []string `json:"asset_ids"`
+}
+
+type mediaArchiveSpoolWriter struct {
+	destination io.Writer
+	reservation *mediaservice.RequestSpoolReservation
+	written     int64
+}
+
+func (writer *mediaArchiveSpoolWriter) Write(data []byte) (int, error) {
+	if writer == nil || writer.destination == nil || writer.reservation == nil {
+		return 0, errors.New("media archive spool writer is unavailable")
+	}
+	if err := writer.reservation.GrowTo(writer.written + int64(len(data))); err != nil {
+		return 0, err
+	}
+	written, err := writer.destination.Write(data)
+	writer.written += int64(written)
+	return written, err
+}
+
+func MediaDownloadAssetArchive(c *gin.Context) {
+	request := mediaArchiveRequest{}
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		mediaError(c, http.StatusBadRequest, "invalid archive request")
+		return
+	}
+	assetIDs := make([]string, 0, len(request.AssetIDs))
+	seen := make(map[string]struct{}, len(request.AssetIDs))
+	for _, assetID := range request.AssetIDs {
+		assetID = strings.TrimSpace(assetID)
+		if assetID == "" {
+			continue
+		}
+		if _, exists := seen[assetID]; exists {
+			continue
+		}
+		seen[assetID] = struct{}{}
+		assetIDs = append(assetIDs, assetID)
+	}
+	if len(assetIDs) == 0 || len(assetIDs) > 100 {
+		mediaError(c, http.StatusBadRequest, "select between 1 and 100 assets")
+		return
+	}
+
+	userID := c.GetInt("id")
+	release, _, err := mediaservice.AcquireDownload(c.Request.Context(), userID)
+	if err != nil {
+		mediaError(c, http.StatusServiceUnavailable, "media delivery is busy, please retry")
+		return
+	}
+	defer release()
+	temporaryDirectory, err := mediaservice.RequestSpoolDirectory()
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	setting := mediasetting.Get()
+	archiveReservation, err := mediaservice.BeginRequestSpoolReservation(setting.MaxRequestBytes, 0)
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	defer archiveReservation.Release()
+	archiveFile, err := os.CreateTemp(temporaryDirectory, "media-download-*.zip")
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	archivePath := archiveFile.Name()
+	defer os.Remove(archivePath)
+	archive := zip.NewWriter(&mediaArchiveSpoolWriter{
+		destination: archiveFile, reservation: archiveReservation,
+	})
+	usedNames := map[string]int{"下载说明.txt": 1}
+	failures := make([]string, 0)
+	successCount := 0
+	totalBytes := int64(0)
+	for _, assetID := range assetIDs {
+		if err := c.Request.Context().Err(); err != nil {
+			failures = append(failures, fmt.Sprintf("资产 %s：下载已取消", assetID))
+			break
+		}
+		blob, _, lookupErr := model.GetMediaBlobByAssetID(userID, assetID, false)
+		if lookupErr != nil {
+			blob, lookupErr = model.GetMediaBlobForUser(userID, assetID)
+		}
+		if lookupErr != nil || blob.Status != model.MediaBlobStatusReady || blob.DeletedAt != 0 ||
+			blob.ModerationStatus == model.MediaModerationViolation {
+			failures = append(failures, fmt.Sprintf("资产 %s：不存在、无权访问或当前不可用", assetID))
+			continue
+		}
+		if err := model.AcquireMediaAccessLease(blob.ID); err != nil {
+			failures = append(failures, fmt.Sprintf("资产 %s：暂时无法锁定文件", assetID))
+			continue
+		}
+		remaining := setting.MaxRequestBytes - totalBytes
+		sourcePath, sourceSize, releaseSource, sourceErr := prepareMediaArchiveSource(
+			c.Request.Context(), blob, temporaryDirectory, remaining,
+		)
+		if sourceErr != nil {
+			model.ReleaseMediaAccessLease(blob.ID)
+			failures = append(failures, fmt.Sprintf("资产 %s：%s", assetID, sourceErr.Error()))
+			continue
+		}
+		filename := uniqueMediaArchiveFilename(blob.Filename, assetID, usedNames)
+		header := &zip.FileHeader{Name: filename, Method: zip.Store}
+		header.SetModTime(time.Unix(blob.CreatedAt, 0))
+		entry, createErr := archive.CreateHeader(header)
+		if createErr == nil {
+			var source *os.File
+			source, createErr = os.Open(sourcePath)
+			if createErr == nil {
+				_, createErr = copyMediaArchiveWithContext(c.Request.Context(), entry, source)
+				_ = source.Close()
+			}
+		}
+		releaseSource()
+		model.ReleaseMediaAccessLease(blob.ID)
+		if createErr != nil {
+			failures = append(failures, fmt.Sprintf("资产 %s：读取文件失败", assetID))
+			continue
+		}
+		model.UpdateMediaAccess(blob.ID)
+		totalBytes += sourceSize
+		successCount++
+	}
+
+	if successCount == 0 {
+		_ = archive.Close()
+		_ = archiveFile.Close()
+		mediaError(c, http.StatusBadRequest, "selected assets are unavailable")
+		return
+	}
+	if len(failures) > 0 {
+		manifest, createErr := archive.CreateHeader(&zip.FileHeader{
+			Name: "下载说明.txt", Method: zip.Store,
+		})
+		if createErr != nil {
+			_ = archive.Close()
+			_ = archiveFile.Close()
+			mediaErrorFromStorage(c, createErr)
+			return
+		}
+		_, _ = io.WriteString(manifest, "以下资产未加入压缩包：\n"+strings.Join(failures, "\n")+"\n")
+	}
+	if err := archive.Close(); err != nil {
+		_ = archiveFile.Close()
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
+		_ = archiveFile.Close()
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	stat, err := archiveFile.Stat()
+	if err != nil {
+		_ = archiveFile.Close()
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	defer archiveFile.Close()
+	failedCount := len(assetIDs) - successCount
+	c.Header("Content-Type", "application/zip")
+	c.Header("Content-Disposition", fmt.Sprintf(
+		`attachment; filename="media-assets.zip"; filename*=UTF-8''%s`,
+		url.PathEscape("创作资产-"+time.Now().Format("20060102-150405")+".zip"),
+	))
+	c.Header("X-Media-Archive-Success-Count", strconv.Itoa(successCount))
+	c.Header("X-Media-Archive-Failure-Count", strconv.Itoa(failedCount))
+	http.ServeContent(mediaDownloadWriter(c), c.Request, "media-assets.zip", stat.ModTime(), archiveFile)
+}
+
+func prepareMediaArchiveSource(
+	ctx context.Context,
+	blob *model.MediaBlob,
+	temporaryDirectory string,
+	remaining int64,
+) (string, int64, func(), error) {
+	if remaining <= 0 {
+		return "", 0, nil, errors.New("所选文件超过单次打包容量上限")
+	}
+	if blob.StorageBackend == model.MediaStorageBackendLocal {
+		objectPath, err := mediaservice.ResolveObjectPath(blob.ObjectKey)
+		if err != nil {
+			return "", 0, nil, errors.New("本地文件路径无效")
+		}
+		stat, err := os.Stat(objectPath)
+		if err != nil || !stat.Mode().IsRegular() {
+			return "", 0, nil, errors.New("本地文件不存在")
+		}
+		if stat.Size() > remaining {
+			return "", 0, nil, errors.New("所选文件超过单次打包容量上限")
+		}
+		return objectPath, stat.Size(), func() {}, nil
+	}
+	if strings.HasPrefix(blob.PrivateSource, "task://") {
+		return "", 0, nil, errors.New("远程任务文件尚未归档，请稍后重试")
+	}
+	var reader io.ReadCloser
+	remoteSource := false
+	if strings.HasPrefix(blob.PrivateSource, "data:") {
+		parts := strings.SplitN(blob.PrivateSource, ",", 2)
+		if len(parts) != 2 || !strings.Contains(parts[0], ";base64") {
+			return "", 0, nil, errors.New("内联文件格式无效")
+		}
+		encoding := base64.StdEncoding
+		if len(parts[1])%4 != 0 {
+			encoding = base64.RawStdEncoding
+		}
+		reader = io.NopCloser(base64.NewDecoder(encoding, strings.NewReader(parts[1])))
+	} else {
+		remoteSource = true
+		if err := service.ValidateSSRFProtectedFetchURL(blob.PrivateSource); err != nil {
+			return "", 0, nil, errors.New("远程文件来源被阻止")
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, blob.PrivateSource, nil)
+		if err != nil {
+			return "", 0, nil, errors.New("远程文件地址无效")
+		}
+		matched, authorizationErr := service.ApplyTaskContentAuthorization(request, blob.ID)
+		if authorizationErr != nil && matched {
+			return "", 0, nil, errors.New("远程任务授权不可用")
+		}
+		baseClient := service.GetSSRFProtectedHTTPClient()
+		client := &http.Client{Transport: baseClient.Transport, CheckRedirect: baseClient.CheckRedirect}
+		response, err := client.Do(request)
+		if err != nil {
+			return "", 0, nil, errors.New("读取远程文件失败")
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			return "", 0, nil, fmt.Errorf("远程文件返回 %d", response.StatusCode)
+		}
+		reader = response.Body
+	}
+	defer reader.Close()
+	var source io.Reader = reader
+	if remoteSource {
+		source = mediaservice.WrapUpstreamArchiveReader(ctx, reader)
+	}
+	sourceReservation, err := mediaservice.BeginRequestSpoolReservation(remaining, 0)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	temporary, err := os.CreateTemp(temporaryDirectory, "media-archive-source-*")
+	if err != nil {
+		sourceReservation.Release()
+		return "", 0, nil, errors.New("无法创建下载临时文件")
+	}
+	temporaryPath := temporary.Name()
+	written, copyErr := copyMediaArchiveWithContext(
+		ctx,
+		&mediaArchiveSpoolWriter{destination: temporary, reservation: sourceReservation},
+		io.LimitReader(source, remaining+1),
+	)
+	closeErr := temporary.Close()
+	if copyErr != nil || closeErr != nil || written > remaining {
+		_ = os.Remove(temporaryPath)
+		sourceReservation.Release()
+		if written > remaining {
+			return "", 0, nil, errors.New("所选文件超过单次打包容量上限")
+		}
+		return "", 0, nil, errors.New("读取远程文件失败")
+	}
+	return temporaryPath, written, func() {
+		_ = os.Remove(temporaryPath)
+		sourceReservation.Release()
+	}, nil
+}
+
+func copyMediaArchiveWithContext(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	buffer := make([]byte, 64*1024)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		count, readErr := source.Read(buffer)
+		if count > 0 {
+			copied, writeErr := destination.Write(buffer[:count])
+			written += int64(copied)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if copied != count {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
+}
+
+func uniqueMediaArchiveFilename(filename, fallback string, used map[string]int) string {
+	filename = path.Base(strings.ReplaceAll(strings.TrimSpace(filename), "\\", "/"))
+	filename = strings.Map(func(value rune) rune {
+		if unicode.IsControl(value) || strings.ContainsRune(`<>:"/\\|?*`, value) {
+			return '_'
+		}
+		return value
+	}, filename)
+	filename = strings.Trim(filename, " .")
+	if filename == "" || filename == "." {
+		filename = "asset-" + fallback
+	}
+	if used[filename] == 0 {
+		used[filename] = 1
+		return filename
+	}
+	extension := path.Ext(filename)
+	base := strings.TrimSuffix(filename, extension)
+	for suffix := used[filename] + 1; ; suffix++ {
+		candidate := fmt.Sprintf("%s (%d)%s", base, suffix, extension)
+		if used[candidate] == 0 {
+			used[filename] = suffix
+			used[candidate] = 1
+			return candidate
+		}
+	}
+}
+
+func MediaListTaskArtifacts(c *gin.Context) {
+	taskID := c.Param("task_id")
+	if taskID == "" {
+		mediaError(c, http.StatusBadRequest, "task_id is required")
+		return
+	}
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), taskID)
+	if err != nil || !exists {
+		mediaError(c, http.StatusNotFound, "task not found")
+		return
+	}
+	artifacts, err := mediaservice.ListDeliverableTaskArtifacts(c.GetInt("id"), taskID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if task.Platform == "smart_image" {
+		common.ApiSuccess(c, mediaTaskPublicMap(task, artifacts)["artifacts"])
+		return
+	}
+	common.ApiSuccess(c, mediaservice.PublicArtifacts(artifacts, false))
+}
+
+func MediaGetTask(c *gin.Context) {
+	userID := c.GetInt("id")
+	task, exists, err := model.GetByTaskId(userID, c.Param("task_id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !exists || task == nil {
+		mediaError(c, http.StatusNotFound, "task not found")
+		return
+	}
+	if task.Platform != "smart_image" && task.Status == model.TaskStatusSuccess && !(task.PrivateData.ImageTask != nil && task.PrivateData.ImageTask.NoRetention) {
+		if _, artifactErr := mediaservice.EnsureTaskArtifacts(task); artifactErr != nil {
+			common.SysLog("media task compensation archive failed: " + artifactErr.Error())
+		}
+	}
+	artifacts, artifactErr := mediaservice.ListDeliverableTaskArtifacts(userID, task.TaskID)
+	if artifactErr != nil {
+		common.ApiError(c, artifactErr)
+		return
+	}
+	common.ApiSuccess(c, mediaTaskPublicMap(task, artifacts))
+}
+
+func MediaListTasks(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	if page.PageSize < 1 {
+		page.PageSize = 20
+	}
+	if page.PageSize > 50 {
+		page.PageSize = 50
+	}
+	timeline, total, err := model.ListUserMediaTaskTimeline(c.GetInt("id"), page.GetStartIdx(), page.GetPageSize())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	taskIDs := make([]string, 0, len(timeline))
+	studioBlobs := make([]model.MediaBlob, 0)
+	for index := range timeline {
+		if timeline[index].Task != nil {
+			taskIDs = append(taskIDs, timeline[index].Task.TaskID)
+		} else {
+			studioBlobs = append(studioBlobs, timeline[index].Blobs...)
+		}
+	}
+	artifactsByTask, err := mediaservice.ListDeliverableTaskArtifactsForTasks(c.GetInt("id"), taskIDs)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	prompts, _ := model.ListMediaAssetPrompts(studioBlobs)
+	items := make([]gin.H, 0, len(timeline))
+	for index := range timeline {
+		entry := timeline[index]
+		if entry.Task != nil {
+			items = append(items, mediaTaskPublicMap(entry.Task, artifactsByTask[entry.Task.TaskID]))
+			continue
+		}
+		if len(entry.Blobs) == 0 {
+			continue
+		}
+		artifacts := make([]model.TaskArtifact, 0, len(entry.Blobs))
+		for position := range entry.Blobs {
+			blob := entry.Blobs[position]
+			artifacts = append(artifacts, model.TaskArtifact{
+				PublicAssetID: blob.PublicID, MediaBlobID: blob.ID, UserID: blob.UserID,
+				TaskPublicID: entry.PublicID, Type: blob.MediaType, Role: blob.Role,
+				Position: position, Status: "ready", MimeType: blob.MimeType,
+				Filename: blob.Filename, SizeBytes: blob.SizeBytes,
+				DurationSeconds: blob.DurationSeconds, Width: blob.Width, Height: blob.Height,
+				HasAudio: blob.HasAudio,
+			})
+		}
+		first := entry.Blobs[0]
+		prompt := prompts[first.ID].Prompt
+		synthetic := &model.Task{
+			TaskID: entry.PublicID, UserId: c.GetInt("id"), Group: first.Group,
+			Status: model.TaskStatusSuccess, Progress: "100%", SubmitTime: entry.CreatedAt,
+			CreatedAt: entry.CreatedAt, UpdatedAt: entry.Blobs[len(entry.Blobs)-1].UpdatedAt,
+			Properties: model.Properties{Input: prompt, MediaMode: "images", OriginModelName: first.Model},
+		}
+		items = append(items, mediaTaskPublicMap(synthetic, artifacts))
+	}
+	page.SetTotal(int(total))
+	page.SetItems(items)
+	common.ApiSuccess(c, page)
+}
+
+func MediaAdminListAssets(c *gin.Context) {
+	c.Set("media_admin", true)
+	MediaListAssets(c)
+}
+
+func MediaAdminGetAsset(c *gin.Context) {
+	c.Set("media_admin", true)
+	MediaGetAsset(c)
+}
+
+func MediaAdminOverview(c *gin.Context) {
+	if err := mediaservice.ReconcileStorageStateIfStale(30 * time.Second); err != nil {
+		common.SysLog("media storage overview refresh failed: " + err.Error())
+	}
+	overview, err := model.GetMediaStorageOverview()
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	setting := mediasetting.Get()
+	common.ApiSuccess(c, gin.H{
+		"storage": overview, "global_max_bytes": setting.GlobalMaxBytes,
+		"per_user_max_bytes":     setting.PerUserMaxBytes,
+		"high_watermark_percent": setting.HighWatermarkPercent,
+		"low_watermark_percent":  setting.LowWatermarkPercent,
+		"reserved_free_bytes":    setting.ReservedFreeBytes,
+	})
+}
+
+func MediaAdminCleanupRuns(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	runs, total, err := model.ListMediaCleanupRuns(page.GetStartIdx(), page.GetPageSize())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	page.SetTotal(int(total))
+	page.SetItems(runs)
+	common.ApiSuccess(c, page)
+}
+
+func MediaAdminModerationEvents(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	userID, _ := strconv.Atoi(c.Query("user_id"))
+	events, total, err := model.ListMediaModerationEvents(page.GetStartIdx(), page.GetPageSize(), userID, c.Query("action"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	page.SetTotal(int(total))
+	page.SetItems(events)
+	common.ApiSuccess(c, page)
+}
+
+type mediaModerationRequest struct {
+	Action    string `json:"action" binding:"required"`
+	Reason    string `json:"reason"`
+	AdminHold *bool  `json:"admin_hold"`
+	BanUser   bool   `json:"ban_user"`
+}
+
+func MediaAdminModerateAsset(c *gin.Context) {
+	assetID := c.Param("asset_id")
+	blob, artifact, err := model.GetMediaBlobByAssetID(0, assetID, true)
+	if err != nil {
+		// Uploads use their file ID as the asset ID and have no artifact row.
+		blob, err = model.GetMediaBlob(assetID)
+		if err != nil {
+			mediaErrorFromStorage(c, err)
+			return
+		}
+	}
+	_ = artifact
+	var request mediaModerationRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		mediaError(c, http.StatusBadRequest, "invalid moderation request")
+		return
+	}
+	nextStatus := model.MediaModerationApproved
+	action := request.Action
+	adminHold := false
+	switch request.Action {
+	case "approve", "release":
+		nextStatus = model.MediaModerationApproved
+	case "violation", "mark_violation":
+		nextStatus = model.MediaModerationViolation
+		adminHold = true
+	case "hold":
+		nextStatus = blob.ModerationStatus
+		adminHold = true
+	case "unhold":
+		nextStatus = blob.ModerationStatus
+	default:
+		mediaError(c, http.StatusBadRequest, "unsupported moderation action")
+		return
+	}
+	if request.AdminHold != nil {
+		adminHold = *request.AdminHold
+	}
+	if request.BanUser && nextStatus != model.MediaModerationViolation {
+		mediaError(c, http.StatusBadRequest, "a user can be disabled only when an asset is marked as a violation")
+		return
+	}
+	if err := model.ModerateMediaBlobWithDecision(
+		blob.PublicID, c.GetInt("id"), action, request.Reason, nextStatus, adminHold, request.BanUser,
+	); err != nil {
+		switch {
+		case errors.Is(err, model.ErrMediaModerationReasonRequired):
+			mediaError(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, model.ErrMediaModerationForbidden):
+			mediaError(c, http.StatusForbidden, err.Error())
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			mediaError(c, http.StatusNotFound, "media asset or user not found")
+		default:
+			common.ApiError(c, err)
+		}
+		return
+	}
+	common.ApiSuccess(c, gin.H{"id": blob.PublicID, "moderation_status": nextStatus, "admin_hold": adminHold})
+}
+
+func MediaAdminDeleteAsset(c *gin.Context) {
+	blob, _, err := model.GetMediaBlobByAssetID(0, c.Param("asset_id"), true)
+	if err != nil {
+		blob, err = model.GetMediaBlob(c.Param("asset_id"))
+	}
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	audit, err := model.BeginMediaBlobDeletion(blob.PublicID, c.Param("asset_id"), c.GetInt("id"), c.Query("reason"))
+	if err != nil {
+		switch {
+		case errors.Is(err, model.ErrMediaModerationReasonRequired):
+			mediaError(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, model.ErrMediaModerationForbidden):
+			mediaError(c, http.StatusForbidden, err.Error())
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			mediaError(c, http.StatusNotFound, "media asset or user not found")
+		default:
+			common.ApiError(c, err)
+		}
+		return
+	}
+	if err := mediaservice.DeleteBlob(blob.PublicID, fmt.Sprintf("admin-%d", c.GetInt("id")), true); err != nil {
+		if auditErr := model.CompleteMediaBlobDeletionAudit(audit.ID, false); auditErr != nil {
+			common.SysLog("failed to record media deletion failure: " + auditErr.Error())
+		}
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	if err := model.CompleteMediaBlobDeletionAudit(audit.ID, true); err != nil {
+		common.SysLog("failed to finalize media deletion audit: " + err.Error())
+	}
+	common.ApiSuccess(c, gin.H{"id": c.Param("asset_id"), "deleted": true})
+}
+
+func MediaAdminCleanup(c *gin.Context) {
+	aggressive := c.DefaultQuery("mode", "expired") == "all"
+	summary, err := mediaservice.RunCleanup(c.Request.Context(), "manual", c.GetInt("id"), aggressive)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, summary)
+}
+
+// MediaAdminHistoryRepair is intentionally dry-run by default. Applying a
+// repair changes only media availability/materializer projection; it never
+// submits a provider task or modifies billing. The route is Root-only in the
+// router and additionally requires an explicit confirmation phrase.
+func MediaAdminHistoryRepair(c *gin.Context) {
+	var request struct {
+		Apply        bool   `json:"apply"`
+		Confirmation string `json:"confirmation"`
+		Limit        int    `json:"limit"`
+	}
+	if c.Request.Body != nil {
+		if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+			mediaError(c, http.StatusBadRequest, "invalid history repair request")
+			return
+		}
+	}
+	if request.Apply && strings.TrimSpace(request.Confirmation) != "REPAIR MEDIA HISTORY" {
+		mediaError(c, http.StatusBadRequest, "apply requires confirmation: REPAIR MEDIA HISTORY")
+		return
+	}
+	report, err := service.RepairMediaHistory(c.Request.Context(), service.MediaHistoryRepairOptions{Limit: request.Limit, Apply: request.Apply})
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAudit(c, "media.history_repair", map[string]interface{}{
+		"apply": request.Apply, "scanned": report.Scanned,
+		"local_restored": report.LocalRestored, "remote_requeued": report.RemoteRequeued,
+		"marked_permanently_unavailable": report.MarkedPermanent,
+	})
+	common.ApiSuccess(c, report)
+}
+
+func MediaGetConfig(c *gin.Context) {
+	common.ApiSuccess(c, mediasetting.Get())
+}
+
+func MediaUpdateConfig(c *gin.Context) {
+	var next mediasetting.Setting
+	if err := common.DecodeJson(c.Request.Body, &next); err != nil {
+		mediaError(c, http.StatusBadRequest, "invalid media configuration")
+		return
+	}
+	next = mediasetting.Normalize(next)
+	if err := next.Validate(); err != nil {
+		mediaError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := common.Marshal(next)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if err := model.UpdateOptionsBulk(map[string]string{"media_setting.config": string(data)}); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, mediasetting.Get())
+}
+
+func MediaGetCapabilities(c *gin.Context) {
+	modelName := c.Query("model")
+	group := c.Query("group")
+	mode := c.DefaultQuery("mode", "videos")
+	contract, ok := mediaContractForMode(mode)
+	if !ok {
+		mediaError(c, http.StatusBadRequest, "unsupported media creation mode")
+		return
+	}
+	user, err := model.GetUserCache(c.GetInt("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	usableGroups := service.GetUserUsableGroups(user.Group)
+	if group != "" {
+		if _, allowed := usableGroups[group]; !allowed {
+			mediaError(c, http.StatusForbidden, "group is not available to this user")
+			return
+		}
+	}
+	// Refresh the model metadata snapshot before catalog construction so an
+	// administrator's explicit endpoint declaration is immediately authoritative.
+	_ = model.GetPricing()
+	abilities, err := model.GetAllEnableAbilityWithChannels()
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	routes := make([]mediaservice.Capability, 0)
+	routeSummaries := make([]mediaRouteSummary, 0)
+	parameterChannels := []int{}
+	catalogSets := make(map[string]map[string]struct{})
+	for _, ability := range abilities {
+		if ability.ChannelStatus != common.ChannelStatusEnabled {
+			continue
+		}
+		if _, allowed := usableGroups[ability.Group]; !allowed {
+			continue
+		}
+		if !channelSupportsMediaContract(ability, contract) {
+			continue
+		}
+		models := catalogSets[ability.Group]
+		if models == nil {
+			models = make(map[string]struct{})
+			catalogSets[ability.Group] = models
+		}
+		models[ability.Model] = struct{}{}
+		if (modelName == "" || ability.Model == modelName) && (group == "" || ability.Group == group) {
+			baseURL := ""
+			upstreamModel := ability.Model
+			if channel, channelErr := model.CacheGetChannel(ability.ChannelId); channelErr == nil && channel != nil {
+				baseURL = channel.GetBaseURL()
+				if channel.ModelMapping != nil {
+					var mappings map[string]string
+					if common.Unmarshal([]byte(*channel.ModelMapping), &mappings) == nil {
+						if mapped := mappings[ability.Model]; mapped != "" {
+							upstreamModel = mapped
+						}
+					}
+				}
+			}
+			capability, capabilityErr := mediaservice.ResolveCapabilityForRequest(
+				ability.ChannelId, ability.ChannelType, ability.Model, upstreamModel, ability.Group, contract.Endpoint, baseURL,
+			)
+			if capabilityErr != nil {
+				continue
+			}
+			pricing := billing_setting.ResolveModelPricing(ability.Model, ability.Group)
+			capability.PricingRevision = pricing.ContractRevision
+			if pricing.HasTaskProfile && !billing_setting.HasParameterPricing(ability.Model, ability.Group) {
+				capability.BillingUnit = pricing.TaskProfile.Unit
+				if pricing.TaskProfile.Unit == billing_setting.TaskBillingUnitFixedDuration {
+					capability.Duration = mediaservice.DurationCapability{
+						Mode: "fixed", Fixed: pricing.TaskProfile.FixedDurationSeconds,
+						Default: pricing.TaskProfile.FixedDurationSeconds,
+					}
+				}
+			}
+			routes = append(routes, capability)
+			parameterChannels = append(parameterChannels, ability.ChannelId)
+			if modelName != "" && group != "" {
+				channelName := fmt.Sprintf("Channel #%d", ability.ChannelId)
+				if channel, channelErr := model.CacheGetChannel(ability.ChannelId); channelErr == nil && channel != nil && strings.TrimSpace(channel.Name) != "" {
+					channelName = strings.TrimSpace(channel.Name)
+				}
+				summary := mediaRouteSummary{
+					ChannelID: ability.ChannelId, ChannelName: channelName,
+					Group: ability.Group, Model: ability.Model,
+					BillingMode: pricing.BillingMode, PriceKnown: false,
+				}
+				if pricing.HasTaskProfile {
+					summary.PriceUnit = pricing.TaskProfile.Unit
+				} else if pricing.BillingMode == billing_setting.BillingModeFixedPrice {
+					summary.PriceUnit = billing_setting.TaskBillingUnitPerRequest
+				}
+				effectiveRatio := service.GetUserGroupRatio(user.Group, ability.Group)
+				if pricing.UsePrice && pricing.ModelPrice >= 0 && effectiveRatio >= 0 {
+					value := pricing.ModelPrice * effectiveRatio
+					summary.ActualPrice = &value
+					summary.PriceKnown = true
+				} else if pricing.HasModelRatio && pricing.ModelRatio >= 0 && effectiveRatio >= 0 {
+					value := pricing.ModelRatio * effectiveRatio
+					summary.EffectiveRatio = &value
+					summary.PriceUnit = "ratio"
+					summary.PriceKnown = true
+				}
+				if billing_setting.HasParameterPricing(ability.Model, ability.Group) {
+					summary.BillingMode = "parameter_price"
+					summary.PriceUnit = "parameter"
+					summary.ActualPrice = nil
+					summary.EffectiveRatio = nil
+					summary.PriceKnown = false
+				}
+				routeSummaries = append(routeSummaries, summary)
+			}
+		}
+	}
+	groups := make([]string, 0, len(catalogSets))
+	catalog := make([]mediaCapabilityCatalogEntry, 0, len(catalogSets))
+	modelSet := make(map[string]struct{})
+	for groupName, models := range catalogSets {
+		groups = append(groups, groupName)
+		modelNames := make([]string, 0, len(models))
+		for name := range models {
+			modelNames = append(modelNames, name)
+			if group == "" || group == groupName {
+				modelSet[name] = struct{}{}
+			}
+		}
+		sort.Strings(modelNames)
+		catalog = append(catalog, mediaCapabilityCatalogEntry{Group: groupName, Models: modelNames})
+	}
+	sort.Strings(groups)
+	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Group < catalog[j].Group })
+	models := make([]string, 0, len(modelSet))
+	for name := range modelSet {
+		models = append(models, name)
+	}
+	sort.Strings(models)
+	available := mergeMediaCapabilities(routes, false)
+	guaranteed := mergeMediaCapabilities(routes, true)
+	routeCapabilities := anonymousMediaRouteCapabilities(routes)
+	common.ApiSuccess(c, gin.H{
+		"model": modelName, "group": group, "mode": mode,
+		"path": contract.Path, "endpoint": contract.Endpoint,
+		"contract_version": "media-v1", "route_count": len(routes),
+		"groups": groups, "models": models, "catalog": catalog,
+		"available": available, "guaranteed": guaranteed, "route_capabilities": routeCapabilities,
+		"routes":           routeSummaries,
+		"parameter_prices": model.PublicParameterPrices(modelName, group, parameterChannels),
+		"sources": gin.H{
+			"image": []string{"multipart", "file_id", "url", "data_url"},
+			"video": []string{"multipart", "file_id", "url"},
+			"audio": []string{"multipart", "file_id", "url"},
+		},
+		"strict": true,
+	})
+}
+
+func anonymousMediaRouteCapabilities(routes []mediaservice.Capability) []mediaservice.Capability {
+	unique := make(map[string]mediaservice.Capability, len(routes))
+	for _, route := range routes {
+		encoded, _ := common.Marshal(route)
+		key := string(encoded)
+		unique[key] = route
+	}
+	keys := make([]string, 0, len(unique))
+	for key := range unique {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]mediaservice.Capability, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, unique[key])
+	}
+	return result
+}
+
+func channelSupportsMediaContract(ability model.AbilityWithChannel, contract mediaModeContract) bool {
+	if ability.ChannelType == constant.ChannelTypeAdvancedCustom {
+		channel, err := model.CacheGetChannel(ability.ChannelId)
+		if err != nil || channel == nil || channel.Status != common.ChannelStatusEnabled {
+			return false
+		}
+		config := channel.GetOtherSettings().AdvancedCustom
+		return config != nil && config.SupportsPath(contract.Path)
+	}
+	if model.ModelSupportsEndpoint(ability.ChannelType, ability.Model, contract.EndpointType) {
+		return true
+	}
+	return mediaservice.HasCapabilityOverride(ability.ChannelId, ability.Model, contract.Endpoint)
+}
+
+func mergeMediaCapabilities(routes []mediaservice.Capability, intersection bool) mediaservice.Capability {
+	if len(routes) == 0 {
+		return mediaservice.Capability{}
+	}
+	result := routes[0]
+	result.ResolutionAliases = mergeMediaResolutionAliases(routes, intersection)
+	result.SizeAspectRatios = mediaservice.MergeSizeAspectRatios(routes, result.ResolutionAliases, intersection)
+	for _, route := range routes[1:] {
+		if intersection {
+			result.ReferenceImage = result.ReferenceImage && route.ReferenceImage
+			result.ReferenceVideo = result.ReferenceVideo && route.ReferenceVideo
+			result.ReferenceAudio = result.ReferenceAudio && route.ReferenceAudio
+			result.ImageRoles = intersectStrings(result.ImageRoles, route.ImageRoles)
+			result.VideoRoles = intersectStrings(result.VideoRoles, route.VideoRoles)
+			result.AudioRoles = intersectStrings(result.AudioRoles, route.AudioRoles)
+			result.MaxImages = minPositive(result.MaxImages, route.MaxImages)
+			result.MaxVideos = minPositive(result.MaxVideos, route.MaxVideos)
+			result.MaxAudios = minPositive(result.MaxAudios, route.MaxAudios)
+			result.MaxTotalReferences = minPositive(result.MaxTotalReferences, route.MaxTotalReferences)
+			result.AspectRatios = intersectStrings(result.AspectRatios, route.AspectRatios)
+			result.Resolutions = intersectStrings(result.Resolutions, route.Resolutions)
+			if result.Duration != route.Duration {
+				result.Duration = mediaservice.DurationCapability{}
+			}
+			if result.OutputCount != route.OutputCount {
+				result.OutputCount = mediaservice.OutputCountCapability{Min: 1, Max: 1, Default: 1}
+			}
+			if result.ProviderContract != route.ProviderContract {
+				result.ProviderContract = ""
+			}
+			if result.BillingUnit != route.BillingUnit || result.PricingRevision != route.PricingRevision {
+				result.BillingUnit = ""
+				result.PricingRevision = ""
+			}
+			continue
+		}
+		resultSupportsReferences := result.ReferenceImage || result.ReferenceVideo || result.ReferenceAudio
+		routeSupportsReferences := route.ReferenceImage || route.ReferenceVideo || route.ReferenceAudio
+		result.ReferenceImage, result.ImageRoles, result.MaxImages = mergeAvailableReferenceCapability(
+			result.ReferenceImage, result.ImageRoles, result.MaxImages,
+			route.ReferenceImage, route.ImageRoles, route.MaxImages,
+		)
+		result.ReferenceVideo, result.VideoRoles, result.MaxVideos = mergeAvailableReferenceCapability(
+			result.ReferenceVideo, result.VideoRoles, result.MaxVideos,
+			route.ReferenceVideo, route.VideoRoles, route.MaxVideos,
+		)
+		result.ReferenceAudio, result.AudioRoles, result.MaxAudios = mergeAvailableReferenceCapability(
+			result.ReferenceAudio, result.AudioRoles, result.MaxAudios,
+			route.ReferenceAudio, route.AudioRoles, route.MaxAudios,
+		)
+		if routeSupportsReferences {
+			if !resultSupportsReferences {
+				result.MaxTotalReferences = route.MaxTotalReferences
+			} else if result.MaxTotalReferences == 0 || route.MaxTotalReferences == 0 {
+				result.MaxTotalReferences = 0
+			} else if route.MaxTotalReferences > result.MaxTotalReferences {
+				result.MaxTotalReferences = route.MaxTotalReferences
+			}
+		}
+		result.AspectRatios = mergeAvailableOptionalValues(result.AspectRatios, route.AspectRatios)
+		result.Resolutions = mergeAvailableOptionalValues(result.Resolutions, route.Resolutions)
+		if result.Duration != route.Duration {
+			result.Duration = mediaservice.DurationCapability{}
+		}
+		if result.OutputCount != route.OutputCount {
+			result.OutputCount = mediaservice.OutputCountCapability{}
+		}
+		if result.ProviderContract != route.ProviderContract {
+			result.ProviderContract = ""
+		}
+		if result.BillingUnit != route.BillingUnit || result.PricingRevision != route.PricingRevision {
+			result.BillingUnit = ""
+			result.PricingRevision = ""
+		}
+	}
+	return result
+}
+
+func mergeAvailableReferenceCapability(
+	enabled bool,
+	roles []string,
+	limit int,
+	routeEnabled bool,
+	routeRoles []string,
+	routeLimit int,
+) (bool, []string, int) {
+	if !routeEnabled {
+		return enabled, roles, limit
+	}
+	if !enabled {
+		return true, append([]string(nil), routeRoles...), routeLimit
+	}
+	if len(roles) == 0 || len(routeRoles) == 0 {
+		roles = nil
+	} else {
+		roles = unionStrings(roles, routeRoles)
+	}
+	if limit == 0 || routeLimit == 0 {
+		limit = 0
+	} else if routeLimit > limit {
+		limit = routeLimit
+	}
+	return true, roles, limit
+}
+
+func mergeAvailableOptionalValues(left, right []string) []string {
+	if len(left) == 0 || len(right) == 0 {
+		return nil
+	}
+	return unionStrings(left, right)
+}
+
+func unionStrings(left, right []string) []string {
+	seen := make(map[string]struct{}, len(left)+len(right))
+	result := make([]string, 0, len(left)+len(right))
+	for _, values := range [][]string{left, right} {
+		for _, value := range values {
+			if _, exists := seen[value]; exists {
+				continue
+			}
+			seen[value] = struct{}{}
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func intersectStrings(left, right []string) []string {
+	rightSet := make(map[string]struct{}, len(right))
+	for _, value := range right {
+		rightSet[value] = struct{}{}
+	}
+	result := make([]string, 0)
+	for _, value := range left {
+		if _, exists := rightSet[value]; exists {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func minPositive(left, right int) int {
+	if left <= 0 {
+		return right
+	}
+	if right <= 0 || left < right {
+		return left
+	}
+	return right
+}
+
+func MediaTaskEvents(c *gin.Context) {
+	taskID := c.Param("task_id")
+	userID := c.GetInt("id")
+	task, exists, err := model.GetByTaskId(userID, taskID)
+	if err != nil || !exists {
+		mediaError(c, http.StatusNotFound, "task not found")
+		return
+	}
+	setting := mediasetting.Get()
+	if !mediaTaskEventConnections.acquire(userID, setting.MaxEventStreamConnections, setting.MaxEventStreamConnectionsPerUser) {
+		c.Header("Retry-After", "5")
+		mediaError(c, http.StatusTooManyRequests, "too many active media task event streams")
+		return
+	}
+	defer mediaTaskEventConnections.release(userID)
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	lastEvent := ""
+	lastWriteAt := time.Now()
+	deadline := time.NewTimer(time.Duration(setting.EventStreamMaxLifetimeMinutes) * time.Minute)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Duration(setting.EventStreamPollMilliseconds) * time.Millisecond)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(time.Duration(setting.EventStreamHeartbeatSeconds) * time.Second)
+	defer heartbeat.Stop()
+	write := func(current *model.Task) bool {
+		eventID := fmt.Sprintf("%d-%s-%s", current.UpdatedAt, current.Status, current.Progress)
+		if eventID == lastEvent {
+			return true
+		}
+		lastEvent = eventID
+		status := mediaTaskPublicStatus(current.Status)
+		payload := gin.H{"id": current.TaskID, "status": status, "progress": current.Progress, "updated_at": current.UpdatedAt}
+		if artifacts, artifactErr := mediaservice.ListDeliverableTaskArtifacts(userID, current.TaskID); artifactErr == nil {
+			payload["artifacts"] = mediaservice.PublicArtifacts(artifacts, false)
+			if current.Platform == "smart_image" {
+				public := mediaTaskPublicMap(current, artifacts)
+				payload["artifacts"], payload["data"] = public["artifacts"], public["data"]
+			}
+		}
+		data, marshalErr := common.Marshal(payload)
+		if marshalErr != nil {
+			return false
+		}
+		if _, writeErr := fmt.Fprintf(c.Writer, "id: %s\nevent: progress\ndata: %s\n\n", eventID, data); writeErr != nil {
+			return false
+		}
+		if flusher, ok := c.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		lastWriteAt = time.Now()
+		return true
+	}
+	fmt.Fprintf(c.Writer, "retry: %d\n\n", setting.EventStreamPollMilliseconds)
+	if !write(task) || task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return
+	}
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-deadline.C:
+			return
+		case <-heartbeat.C:
+			if time.Since(lastWriteAt) >= time.Duration(setting.EventStreamHeartbeatSeconds)*time.Second {
+				if _, writeErr := fmt.Fprint(c.Writer, ": keep-alive\n\n"); writeErr != nil {
+					return
+				}
+				if flusher, ok := c.Writer.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				lastWriteAt = time.Now()
+			}
+		case <-ticker.C:
+			current, found, queryErr := model.GetByTaskId(userID, taskID)
+			if queryErr != nil || !found {
+				return
+			}
+			if !write(current) {
+				return
+			}
+			if current.Status == model.TaskStatusSuccess || current.Status == model.TaskStatusFailure {
+				return
+			}
+		}
+	}
+}
+
+type mediaEventConnectionGate struct {
+	mu     sync.Mutex
+	total  int
+	byUser map[int]int
+}
+
+var mediaTaskEventConnections mediaEventConnectionGate
+
+func (gate *mediaEventConnectionGate) acquire(userID, globalLimit, userLimit int) bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.total >= globalLimit {
+		return false
+	}
+	if gate.byUser == nil {
+		gate.byUser = make(map[int]int)
+	}
+	if gate.byUser[userID] >= userLimit {
+		return false
+	}
+	gate.total++
+	gate.byUser[userID]++
+	return true
+}
+
+func (gate *mediaEventConnectionGate) release(userID int) {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.byUser[userID] <= 0 {
+		return
+	}
+	gate.total--
+	gate.byUser[userID]--
+	if gate.byUser[userID] == 0 {
+		delete(gate.byUser, userID)
+	}
+}
+
+func MediaUploadAndGenerate(c *gin.Context) {
+	// The browser workbench uses the same authenticated session as the console.
+	// We normalize the URL to an existing relay contract, then reuse billing and
+	// channel selection instead of introducing a second billing path.
+	originalPath := c.Request.URL.Path
+	defer func() { c.Request.URL.Path = originalPath }()
+	mode := c.Param("mode")
+	contract, ok := mediaContractForMode(mode)
+	if !ok {
+		mediaError(c, http.StatusBadRequest, "unsupported media creation mode")
+		return
+	}
+	if err := setMediaStudioOperationID(c, mode); err != nil {
+		mediaError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.Set(relaycommon.TaskMediaModeContextKey, mode)
+	c.Request.URL.Path = contract.Path
+	releaseUpload, err := prepareMediaUploadRequest(c)
+	if err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	defer releaseUpload()
+	if err := verifyMediaParameterQuote(c, mode); err != nil {
+		mediaError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	preparePlaygroundMedia(c)
+	if c.IsAborted() {
+		return
+	}
+	if (mode == "images" || mode == "image-edits") && respondExistingStudioImageResponse(c) {
+		return
+	}
+	if err := normalizeMediaStudioResponseFormat(c, mode); err != nil {
+		mediaError(c, http.StatusBadRequest, "unable to normalize media response format")
+		return
+	}
+	switch mode {
+	case "images":
+		Relay(c, types.RelayFormatOpenAIImage)
+	case "image-edits":
+		Relay(c, types.RelayFormatOpenAIImage)
+	case "videos":
+		RelayTask(c)
+	case "speech":
+		Relay(c, types.RelayFormatOpenAIAudio)
+	case "transcriptions":
+		Relay(c, types.RelayFormatOpenAIAudio)
+	case "translations":
+		Relay(c, types.RelayFormatOpenAIAudio)
+	}
+}
+
+// respondExistingStudioImageResponse closes the synchronous image idempotency
+// gap. The browser may lose the response after the provider and archive have
+// completed; a retry carrying the same operation ID must read the durable
+// assets before route selection, billing, or another upstream dispatch.
+func respondExistingStudioImageResponse(c *gin.Context) bool {
+	mode := ""
+	if c != nil {
+		mode = c.GetString(relaycommon.TaskMediaModeContextKey)
+	}
+	if c == nil || !c.GetBool("is_playground") || (mode != "images" && mode != "image-edits") {
+		return false
+	}
+	value, ok := c.Get(mediaStudioOperationContextKey)
+	operationID, valid := value.(string)
+	if !ok || !valid || strings.TrimSpace(operationID) == "" {
+		return false
+	}
+	if task, found, err := model.GetByTaskId(c.GetInt("id"), operationID); err == nil && found && task.PrivateData.ImageTask != nil {
+		c.JSON(http.StatusAccepted, gin.H{"id": task.TaskID, "task_id": task.TaskID, "object": "image", "status": task.Status.ToVideoStatus()})
+		return true
+	}
+	blobs, _, err := model.ListMediaBlobs(0, mediaStudioMaxBatchCount, model.MediaListFilter{
+		UserID: c.GetInt("id"), TaskPublicID: operationID, MediaType: "image",
+		Status: model.MediaBlobStatusReady,
+	})
+	if err != nil || len(blobs) == 0 {
+		return false
+	}
+	data := make([]gin.H, 0, len(blobs))
+	artifacts := make([]gin.H, 0, len(blobs))
+	for index := range blobs {
+		public := mediaBlobPublicMap(&blobs[index], false)
+		artifacts = append(artifacts, public)
+		item := gin.H{"asset_id": blobs[index].PublicID}
+		if url, ok := public["download_url"].(string); ok && url != "" {
+			item["url"] = url
+		}
+		data = append(data, item)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"created":      blobs[0].CreatedAt,
+		"data":         data,
+		"artifacts":    artifacts,
+		"operation_id": operationID,
+	})
+	return true
+}
+
+func mediaTaskPublicMap(task *model.Task, artifacts []model.TaskArtifact) gin.H {
+	mode := task.Properties.MediaMode
+	if mode == "" {
+		mode = "videos"
+	}
+	modelName := task.Properties.OriginModelName
+	if modelName == "" {
+		modelName = task.Properties.UpstreamModelName
+	}
+	progress := strings.TrimSpace(task.Progress)
+	if numeric, err := strconv.ParseFloat(strings.TrimSuffix(progress, "%"), 64); err != nil || numeric <= 0 || numeric > 100 {
+		progress = ""
+	}
+	createdAt := task.CreatedAt
+	if createdAt == 0 {
+		createdAt = task.SubmitTime
+	}
+	failureReason := task.FailReason
+	if mediaservice.IsFailedVideoTask(task) {
+		failureReason = mediaservice.PublicVideoFailure(task).Message
+	}
+	result := gin.H{
+		"id": task.TaskID, "status": mediaTaskPublicStatus(task.Status), "progress": progress,
+		"mode": mode, "model": modelName, "group": task.Group,
+		"prompt": task.Properties.Input, "size": task.Properties.MediaSize,
+		"duration":        task.Properties.MediaDuration,
+		"reference_count": task.Properties.MediaReferenceCount,
+		"created_at":      createdAt, "updated_at": task.UpdatedAt, "completed_at": task.FinishTime,
+		"error": failureReason, "artifacts": mediaservice.PublicArtifacts(artifacts, false),
+	}
+	if task.Platform == "smart_image" {
+		for key, value := range mediaImageRouteResult(task, artifacts) {
+			result[key] = value
+		}
+	} else if task.PrivateData.ImageTask != nil && task.PrivateData.ImageTask.NoRetention {
+		result["artifacts"] = service.ImageTaskURLArtifacts(task)
+	}
+	return result
+}
+
+func mediaImageRouteResult(task *model.Task, artifacts []model.TaskArtifact) gin.H {
+	result := gin.H{"artifacts": []any{}, "data": []dto.ImageData{}}
+	if task.Status != model.TaskStatusSuccess {
+		return result
+	}
+	job, found, err := model.GetImageRouteJob(task.TaskID, task.UserId)
+	if err != nil || !found || job.State != model.ImageRouteJobSucceeded {
+		return result
+	}
+	noRetention := job.NoRetention || (task.PrivateData.ImageTask != nil && task.PrivateData.ImageTask.NoRetention)
+	output := *task
+	artifactTaskID := task.TaskID
+	if job.CurrentTaskID != "" {
+		child, exists, childErr := model.GetByTaskId(task.UserId, job.CurrentTaskID)
+		if childErr != nil || !exists || child.Platform != constant.TaskPlatformOpenAIImage || child.Status != model.TaskStatusSuccess {
+			return result
+		}
+		output.Data, output.PrivateData = child.Data, child.PrivateData
+		artifactTaskID = child.TaskID
+		noRetention = noRetention || (child.PrivateData.ImageTask != nil && child.PrivateData.ImageTask.NoRetention)
+		artifacts = nil
+		if !noRetention {
+			artifacts, err = mediaservice.ListDeliverableTaskArtifacts(task.UserId, child.TaskID)
+			if err != nil {
+				return result
+			}
+		}
+	}
+	if !noRetention && len(artifacts) > 0 {
+		public := mediaservice.PublicArtifacts(artifacts, false)
+		data := make([]dto.ImageData, 0, len(public))
+		for _, artifact := range public {
+			data = append(data, dto.ImageData{Url: artifact.DownloadURL})
+		}
+		result["artifacts"], result["data"] = public, data
+		return result
+	}
+	if !noRetention {
+		archived, archiveErr := model.ListTaskArtifacts(task.UserId, artifactTaskID)
+		if archiveErr != nil || len(archived) > 0 {
+			return result
+		}
+	}
+	if job.CurrentTaskID == "" {
+		output.Data, err = imageRouteJobResponse(job)
+		if err != nil {
+			return result
+		}
+	}
+	public := service.ImageTaskURLArtifacts(&output)
+	data := make([]dto.ImageData, 0, len(public))
+	for _, artifact := range public {
+		data = append(data, dto.ImageData{Url: artifact["content_url"].(string)})
+	}
+	if job.CurrentTaskID == "" {
+		var response dto.ImageResponse
+		if common.Unmarshal(output.Data, &response) == nil {
+			for index, item := range response.Data {
+				if item.B64Json == "" {
+					continue
+				}
+				decoded, decodeErr := base64.StdEncoding.DecodeString(item.B64Json)
+				mimeType := http.DetectContentType(decoded)
+				if decodeErr != nil || !strings.HasPrefix(mimeType, "image/") {
+					continue
+				}
+				imageURL := "data:" + mimeType + ";base64," + item.B64Json
+				public = append(public, map[string]any{
+					"id": fmt.Sprintf("%s-inline-%d", task.TaskID, index), "type": "image", "role": "result", "status": "ready",
+					"content_url": imageURL, "download_url": imageURL, "mime_type": mimeType, "filename": "图片",
+				})
+				data = append(data, dto.ImageData{B64Json: item.B64Json})
+			}
+		}
+	}
+	result["artifacts"], result["data"] = public, data
+	return result
+}
+
+func mediaTaskPublicStatus(status model.TaskStatus) string {
+	if status == model.TaskStatusFinalizing {
+		return "resolving_artifacts"
+	}
+	return status.ToVideoStatus()
+}
+
+type mediaRequestSpoolBody struct {
+	io.ReadCloser
+	reservation *mediaservice.RequestSpoolReservation
+	readBytes   int64
+	maxBytes    int64
+}
+
+func (body *mediaRequestSpoolBody) Read(buffer []byte) (int, error) {
+	if len(buffer) > 0 {
+		nextBytes := body.readBytes + int64(len(buffer))
+		if nextBytes > body.maxBytes {
+			nextBytes = body.maxBytes
+		}
+		if err := body.reservation.GrowTo(nextBytes); err != nil {
+			return 0, err
+		}
+	}
+	count, err := body.ReadCloser.Read(buffer)
+	body.readBytes += int64(count)
+	return count, err
+}
+
+func prepareMediaUploadRequest(c *gin.Context) (func(), error) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return nil, fmt.Errorf("invalid media request")
+	}
+	setting := mediasetting.Get()
+	if !setting.Enabled {
+		return nil, mediaservice.ErrMediaDisabled
+	}
+	if setting.MaxRequestBytes <= 0 {
+		return nil, mediaservice.ErrMediaFileTooLarge
+	}
+	if c.Request.ContentLength > setting.MaxRequestBytes {
+		return nil, mediaservice.ErrMediaFileTooLarge
+	}
+	userID := c.GetInt("id")
+	requestContext, release, _, err := mediaservice.AcquireUpload(c.Request.Context(), userID)
+	if err != nil {
+		return nil, err
+	}
+	requestContext, requestBody := mediaservice.WrapClientUploadBody(requestContext, c.Request.Body)
+	c.Request = c.Request.WithContext(requestContext)
+	c.Request.Body = requestBody
+	c.Set(common.KeyRequestBodyMaxBytes, setting.MaxRequestBytes)
+	contentType := strings.ToLower(c.GetHeader("Content-Type"))
+	spoolToDisk := strings.Contains(contentType, "multipart/") || c.Request.ContentLength < 0 ||
+		c.Request.ContentLength >= common.GetDiskCacheThresholdBytes()
+	releaseSpool := func() {}
+	if spoolToDisk {
+		initialBytes := c.Request.ContentLength
+		if initialBytes < 0 {
+			initialBytes = 0
+		}
+		spoolReservation, reservationErr := mediaservice.BeginRequestSpoolReservation(
+			setting.MaxRequestBytes, initialBytes,
+		)
+		err = reservationErr
+		if err != nil {
+			release()
+			return nil, err
+		}
+		releaseSpool = spoolReservation.Release
+		spoolDirectory, spoolErr := mediaservice.RequestSpoolDirectory()
+		if spoolErr != nil {
+			releaseSpool()
+			release()
+			return nil, spoolErr
+		}
+		c.Set(common.KeyRequestBodySpoolDirectory, spoolDirectory)
+		c.Request.Body = &mediaRequestSpoolBody{
+			ReadCloser: c.Request.Body, reservation: spoolReservation, maxBytes: setting.MaxRequestBytes,
+		}
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, setting.MaxRequestBytes)
+	return func() {
+		releaseSpool()
+		release()
+	}, nil
+}
+
+func preparePlaygroundMedia(c *gin.Context) {
+	userID := c.GetInt("id")
+	userCache, err := model.GetUserCache(userID)
+	if err != nil {
+		mediaError(c, http.StatusInternalServerError, "unable to load user")
+		return
+	}
+	userCache.WriteContext(c)
+	requestedGroup := strings.TrimSpace(c.Query("group"))
+	if requestedGroup == "" {
+		requestedGroup = strings.TrimSpace(c.PostForm("group"))
+	}
+	usableGroups := service.GetUserUsableGroups(userCache.Group)
+	usingGroup, err := resolveRequestedMediaGroup(userCache.Group, requestedGroup, usableGroups)
+	if err != nil {
+		mediaError(c, http.StatusForbidden, err.Error())
+		return
+	}
+	tempToken := &model.Token{UserId: userID, Name: "media-studio", Group: usingGroup}
+	fallbackGroups, err := resolveMediaStudioFallbackGroups(
+		c.Query(mediaStudioFallbackGroupsQuery), usingGroup, usableGroups,
+	)
+	if err != nil {
+		mediaError(c, http.StatusForbidden, err.Error())
+		return
+	}
+	if len(fallbackGroups) > 0 {
+		policy, policyErr := mediaStudioRoutingPolicy(fallbackGroups)
+		if policyErr != nil {
+			mediaError(c, http.StatusInternalServerError, policyErr.Error())
+			return
+		}
+		encoded, marshalErr := common.Marshal(policy)
+		if marshalErr != nil {
+			mediaError(c, http.StatusInternalServerError, "unable to prepare media studio routing")
+			return
+		}
+		tempToken.Group = "auto"
+		tempToken.RoutingPolicy = string(encoded)
+		usingGroup = "auto"
+	}
+	if err := middleware.SetupContextForToken(c, tempToken); err != nil {
+		mediaError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, usingGroup)
+	c.Set("is_playground", true)
+	// Session users do not pass through TokenAuth/Distribute. Invoke the same
+	// distributor once after the request has been normalized to a known path.
+	middleware.Distribute()(c)
+}
+
+func resolveMediaBlobForRequest(c *gin.Context) (*model.MediaBlob, *model.TaskArtifact, error) {
+	assetID := c.Param("asset_id")
+	if assetID == "" {
+		assetID = c.Param("file_id")
+	}
+	if assetID == "" {
+		assetID = c.Param("id")
+	}
+	signed := c.GetBool("media_signed")
+	adminAudience := c.GetString("media_signature_audience") == "admin"
+	if signed {
+		if adminAudience {
+			if blob, artifact, err := model.GetMediaBlobByAssetID(0, assetID, true); err == nil {
+				return blob, artifact, nil
+			}
+			blob, err := model.GetMediaBlob(assetID)
+			return blob, nil, err
+		}
+		// The signature binds the random asset ID; ownership is still checked for
+		// bearer/session requests, while signed browser URLs are intentionally
+		// usable without a cookie.
+		if blob, artifact, err := model.GetMediaBlobByAssetID(0, assetID, true); err == nil {
+			return blob, artifact, nil
+		}
+		blob, err := model.GetMediaBlob(assetID)
+		return blob, nil, err
+	}
+	userID := c.GetInt("id")
+	admin := c.GetBool("media_admin")
+	if artifactBlob, artifact, err := model.GetMediaBlobByAssetID(userID, assetID, admin); err == nil {
+		return artifactBlob, artifact, nil
+	}
+	if admin {
+		blob, err := model.GetMediaBlob(assetID)
+		return blob, nil, err
+	}
+	blob, err := model.GetMediaBlobForUser(userID, assetID)
+	return blob, nil, err
+}
+
+func serveMediaBlob(c *gin.Context, blob *model.MediaBlob) {
+	if blob == nil || blob.Status != model.MediaBlobStatusReady || blob.DeletedAt != 0 {
+		mediaError(c, http.StatusNotFound, "asset is not available")
+		return
+	}
+	if blob.ModerationStatus == model.MediaModerationViolation && c.GetString("media_signature_audience") != "admin" && !c.GetBool("media_admin") {
+		mediaError(c, http.StatusForbidden, "asset is unavailable")
+		return
+	}
+	if err := model.AcquireMediaAccessLease(blob.ID); err != nil {
+		mediaErrorFromStorage(c, err)
+		return
+	}
+	defer model.ReleaseMediaAccessLease(blob.ID)
+	model.UpdateMediaAccess(blob.ID)
+	if blob.StorageBackend == model.MediaStorageBackendLocal {
+		releaseDownload, _, err := mediaservice.AcquireDownload(c.Request.Context(), mediaTransferUserID(c, blob.UserID))
+		if err != nil {
+			mediaError(c, http.StatusServiceUnavailable, "media delivery is busy, please retry")
+			return
+		}
+		defer releaseDownload()
+		path, err := mediaservice.ResolveObjectPath(blob.ObjectKey)
+		if err != nil {
+			mediaErrorFromStorage(c, err)
+			return
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			mediaErrorFromStorage(c, err)
+			return
+		}
+		defer file.Close()
+		stat, err := file.Stat()
+		if err != nil {
+			mediaErrorFromStorage(c, err)
+			return
+		}
+		c.Header("Accept-Ranges", "bytes")
+		c.Header("ETag", fmt.Sprintf("\"%s\"", blob.ContentHash))
+		c.Header("Content-Disposition", `inline; filename="`+strings.ReplaceAll(blob.Filename, `"`, "")+`"`)
+		http.ServeContent(mediaDownloadWriter(c), c.Request, blob.Filename, stat.ModTime(), file)
+		return
+	}
+	if strings.HasPrefix(blob.PrivateSource, "task://") {
+		if taskID := strings.TrimPrefix(blob.PrivateSource, "task://"); taskID != "" {
+			c.Params = append(c.Params, gin.Param{Key: "task_id", Value: taskID})
+			c.Set("id", blob.UserID)
+			VideoProxy(c)
+			return
+		}
+	}
+	releaseDownload, _, err := mediaservice.AcquireDownload(c.Request.Context(), mediaTransferUserID(c, blob.UserID))
+	if err != nil {
+		mediaError(c, http.StatusServiceUnavailable, "media delivery is busy, please retry")
+		return
+	}
+	defer releaseDownload()
+	if strings.HasPrefix(blob.PrivateSource, "data:") {
+		serveDataURL(c, blob.PrivateSource, blob.Filename)
+		return
+	}
+	proxyRemoteMedia(c, blob)
+}
+
+func proxyRemoteMedia(c *gin.Context, blob *model.MediaBlob) {
+	if blob.PrivateSource == "" {
+		mediaError(c, http.StatusBadGateway, "asset source is unavailable")
+		return
+	}
+	if err := service.ValidateSSRFProtectedFetchURL(blob.PrivateSource); err != nil {
+		mediaError(c, http.StatusForbidden, "asset source blocked")
+		return
+	}
+	request, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, blob.PrivateSource, nil)
+	if err != nil {
+		mediaError(c, http.StatusBadGateway, "invalid asset source")
+		return
+	}
+	matchedTaskContent, credentialErr := service.ApplyTaskContentAuthorization(request, blob.ID)
+	if credentialErr != nil {
+		if matchedTaskContent {
+			mediaError(c, http.StatusBadGateway, "task content authorization is unavailable")
+			return
+		}
+	}
+	for _, header := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		if value := c.GetHeader(header); value != "" {
+			request.Header.Set(header, value)
+		}
+	}
+	baseClient := service.GetSSRFProtectedHTTPClient()
+	client := &http.Client{Transport: baseClient.Transport, CheckRedirect: baseClient.CheckRedirect}
+	response, err := client.Do(request)
+	if err != nil {
+		mediaError(c, http.StatusBadGateway, "failed to fetch asset")
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusNotModified {
+		mediaError(c, http.StatusBadGateway, fmt.Sprintf("asset source returned %d", response.StatusCode))
+		return
+	}
+	for _, header := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+		if value := response.Header.Get(header); value != "" {
+			c.Header(header, value)
+		}
+	}
+	c.Status(response.StatusCode)
+	if c.Request.Method != http.MethodHead {
+		_, _ = io.Copy(mediaservice.WrapClientDownloadWriter(c.Request.Context(), c.Writer), response.Body)
+	}
+}
+
+func serveDataURL(c *gin.Context, dataURL, filename string) {
+	parts := strings.SplitN(dataURL, ",", 2)
+	if len(parts) != 2 || !strings.Contains(parts[0], ";base64") {
+		mediaError(c, http.StatusBadGateway, "invalid inline asset")
+		return
+	}
+	encoding := base64.StdEncoding
+	if len(parts[1])%4 != 0 {
+		encoding = base64.RawStdEncoding
+	}
+	mimeType := strings.TrimPrefix(strings.SplitN(parts[0], ";", 2)[0], "data:")
+	c.Header("Content-Type", mimeType)
+	c.Header("Content-Length", strconv.Itoa(encoding.DecodedLen(len(parts[1]))))
+	c.Header("Content-Disposition", `inline; filename="`+strings.ReplaceAll(filename, `"`, "")+`"`)
+	c.Status(http.StatusOK)
+	if c.Request.Method != http.MethodHead {
+		if _, err := io.Copy(mediaservice.WrapClientDownloadWriter(c.Request.Context(), c.Writer), base64.NewDecoder(encoding, strings.NewReader(parts[1]))); err != nil {
+			common.SysLog("failed to stream inline media asset: " + err.Error())
+		}
+	}
+}
+
+type mediaRateLimitedResponseWriter struct {
+	gin.ResponseWriter
+	ctx context.Context
+}
+
+func (writer *mediaRateLimitedResponseWriter) Write(data []byte) (int, error) {
+	return mediaservice.WrapClientDownloadWriter(writer.ctx, writer.ResponseWriter).Write(data)
+}
+
+func (writer *mediaRateLimitedResponseWriter) WriteString(value string) (int, error) {
+	return writer.Write([]byte(value))
+}
+
+func mediaDownloadWriter(c *gin.Context) http.ResponseWriter {
+	return &mediaRateLimitedResponseWriter{ResponseWriter: c.Writer, ctx: c.Request.Context()}
+}
+
+func mediaTransferUserID(c *gin.Context, ownerID int) int {
+	if c != nil {
+		if userID := c.GetInt("id"); userID > 0 {
+			return userID
+		}
+	}
+	return ownerID
+}
+
+func mediaFileResponseFromBlob(blob *model.MediaBlob) mediaFileResponse {
+	status := "processed"
+	if blob.Status != model.MediaBlobStatusReady {
+		status = "error"
+	}
+	return mediaFileResponse{ID: blob.PublicID, Object: "file", Bytes: blob.SizeBytes, CreatedAt: blob.CreatedAt,
+		Filename: blob.Filename, Purpose: blob.Purpose, Status: status, MimeType: blob.MimeType, ExpiresAt: blob.ExpiresAt}
+}
+
+func mediaBlobPublicMap(blob *model.MediaBlob, admin bool) gin.H {
+	return mediaBlobPublicMapWithPrompt(blob, admin, model.MediaAssetPrompt{})
+}
+
+func mediaBlobPublicMapWithPrompt(blob *model.MediaBlob, admin bool, prompt model.MediaAssetPrompt) gin.H {
+	availability := mediaservice.InspectMediaAvailability(blob)
+	content, signed := "", ""
+	if availability.Status == mediaservice.MediaAvailabilityAvailable {
+		content, signed = mediaservice.PublicMediaURLs(blob.PublicID, admin)
+	}
+	result := gin.H{
+		"id": blob.PublicID, "type": blob.MediaType, "role": blob.Role, "filename": blob.Filename,
+		"mime_type": blob.MimeType, "size_bytes": blob.SizeBytes, "duration_seconds": blob.DurationSeconds,
+		"width": blob.Width, "height": blob.Height, "has_audio": blob.HasAudio, "status": blob.Status,
+		"moderation_status": blob.ModerationStatus, "task_id": blob.TaskPublicID, "model": blob.Model,
+		"created_at": blob.CreatedAt, "expires_at": blob.ExpiresAt, "content_url": content, "download_url": signed,
+		"availability_status": availability.Status, "availability_reason": availability.Reason,
+	}
+	if prompt.Prompt != "" {
+		result["prompt"] = prompt.Prompt
+		result["prompt_truncated"] = prompt.Truncated
+	}
+	if admin {
+		result["moderation_reason"] = blob.ModerationReason
+		result["admin_hold"] = blob.AdminHold
+		result["user_id"] = blob.UserID
+		result["username"] = blob.UsernameSnapshot
+		result["channel_id"] = blob.ChannelID
+		result["group"] = blob.Group
+		result["source_kind"] = blob.SourceKind
+		result["content_hash"] = blob.ContentHash
+		result["last_accessed_at"] = blob.LastAccessedAt
+		result["storage_backend"] = blob.StorageBackend
+		result["materialize_status"] = blob.MaterializeStatus
+		result["materialize_attempts"] = blob.MaterializeAttempts
+		result["materialize_next_retry_at"] = blob.MaterializeNextRetryAt
+		result["materialize_last_error"] = blob.MaterializeLastError
+		result["materialized_at"] = blob.MaterializedAt
+	}
+	return result
+}
+
+func mediaError(c *gin.Context, status int, message string) {
+	c.AbortWithStatusJSON(status, gin.H{"success": false, "message": message})
+}
+
+func mediaErrorFromStorage(c *gin.Context, err error) {
+	mediaContractErrorFromStorage(c, false, err)
+}
+
+func mediaContractErrorFromStorage(c *gin.Context, openAIContract bool, err error) {
+	status := http.StatusInternalServerError
+	message := err.Error()
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, os.ErrNotExist):
+		status, message = http.StatusNotFound, "media asset not found"
+	case errors.Is(err, mediaservice.ErrMediaCapacity), errors.Is(err, mediaservice.ErrUserMediaCapacity):
+		status = http.StatusInsufficientStorage
+	case errors.Is(err, mediaservice.ErrMediaFileTooLarge):
+		status = http.StatusRequestEntityTooLarge
+	case errors.Is(err, mediaservice.ErrMediaDisabled):
+		status, message = http.StatusServiceUnavailable, "media storage is unavailable"
+	case errors.Is(err, mediaservice.ErrUnsupportedMedia):
+		status = http.StatusUnsupportedMediaType
+	}
+	mediaContractError(c, openAIContract, status, message)
+}
+
+func mediaContractError(c *gin.Context, openAIContract bool, status int, message string) {
+	if !openAIContract {
+		mediaError(c, status, message)
+		return
+	}
+	errorType := "server_error"
+	if status >= 400 && status < 500 {
+		errorType = "invalid_request_error"
+	}
+	c.JSON(status, gin.H{"error": gin.H{"message": message, "type": errorType}})
+}
+
+func mergeMediaResolutionAliases(routes []mediaservice.Capability, intersection bool) map[string]string {
+	aliases := make(map[string]string)
+	conflicts := make(map[string]bool)
+	for _, route := range routes {
+		for size, resolution := range route.ResolutionAliases {
+			if previous, ok := aliases[size]; ok && previous != resolution {
+				conflicts[size] = true
+			}
+			aliases[size] = resolution
+		}
+	}
+	for size, resolution := range aliases {
+		if conflicts[size] {
+			delete(aliases, size)
+			continue
+		}
+		if intersection {
+			for _, route := range routes {
+				if route.ResolutionAliases[size] != resolution {
+					delete(aliases, size)
+					break
+				}
+			}
+		}
+	}
+	return aliases
+}

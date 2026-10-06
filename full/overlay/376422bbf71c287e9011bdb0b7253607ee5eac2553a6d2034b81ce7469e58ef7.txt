@@ -1,0 +1,853 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  FileAudioIcon,
+  ImageIcon,
+  ImagesIcon,
+  Loader2Icon,
+  Mic2Icon,
+  SendIcon,
+  SubtitlesIcon,
+  VideoIcon,
+} from 'lucide-react'
+import { useWatch, type UseFormReturn } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+
+import { ModelGroupSelector } from '@/components/model-group-selector'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Field, FieldError, FieldLabel } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { Textarea } from '@/components/ui/textarea'
+import { cn } from '@/lib/utils'
+
+import type { GroupOption, ModelOption } from '../../playground/types'
+import { ParameterPriceTable } from '../../pricing/components/parameter-price-table'
+import { estimateParameterPrice } from '../../pricing/lib/parameter-price'
+import { isImage2ModelName, STUDIO_BATCH_MAX_COUNT } from '../lib'
+import {
+  managedCapabilityIssues,
+  studioDurationHintCopy,
+  studioDurationOptions,
+} from '../parameter-capability'
+import type { StudioSchemaValue } from '../studio-schema'
+import type { MediaCapabilities, StudioMode, StudioReference } from '../types'
+import { MediaQueryError } from './query-error'
+import { ReferenceInput } from './reference-input'
+
+type StudioControlsProps = {
+  form: UseFormReturn<StudioSchemaValue>
+  groups: GroupOption[]
+  fallbackGroupOptions: GroupOption[]
+  fallbackPrices: Record<string, number | undefined>
+  fallbackPriceUnits: Record<string, string | undefined>
+  models: ModelOption[]
+  loadingModels: boolean
+  checkingRoute: boolean
+  catalogError: boolean
+  capabilities?: MediaCapabilities
+  references: StudioReference[]
+  inputFile?: File
+  generating: boolean
+  onAddReferences: (files: File[]) => void
+  onRemoveReference: (id: string) => void
+  onReferenceRoleChange: (id: string, role: string) => void
+  onInsertReference: (token: string) => void
+  onInputFileChange: (file?: File) => void
+  onRetryCatalog: () => void
+  onSubmit: (value: StudioSchemaValue) => void
+  fallbackEnabled: boolean
+  fallbackGroups: string[]
+  image2PriceAscending: boolean
+  onFallbackEnabledChange: (enabled: boolean) => void
+  onFallbackGroupsChange: (groups: string[]) => void
+  onImage2PriceAscendingChange: (enabled: boolean) => void
+}
+
+const MODES: Array<{
+  value: StudioMode
+  label: string
+  icon: typeof ImageIcon
+}> = [
+  { value: 'images', label: 'Image', icon: ImageIcon },
+  { value: 'image-edits', label: 'Edit', icon: ImagesIcon },
+  { value: 'videos', label: 'Video', icon: VideoIcon },
+  { value: 'speech', label: 'Speech', icon: Mic2Icon },
+  { value: 'transcriptions', label: 'Transcribe', icon: SubtitlesIcon },
+  { value: 'translations', label: 'Translate', icon: FileAudioIcon },
+]
+
+function billingUnitLabel(unit?: string) {
+  if (unit === 'fixed_duration') return 'Fixed price'
+  if (unit === 'per_second') return 'Billed per second'
+  if (unit === 'per_image') return 'Per image'
+  return 'Per request'
+}
+
+function referenceLimitBadge(
+  t: (key: string, options?: { count: number }) => string,
+  enabled: boolean | undefined,
+  max: number | undefined,
+  supportedKey: string
+) {
+  if (enabled === false) return t('Not supported')
+  if (max) return t(supportedKey, { count: max })
+  return `${t('Unlimited')}`
+}
+
+export function StudioControls(props: StudioControlsProps) {
+  const { t } = useTranslation()
+  const mode = useWatch({ control: props.form.control, name: 'mode' })
+  const group = useWatch({ control: props.form.control, name: 'group' })
+  const model = useWatch({ control: props.form.control, name: 'model' })
+  const aspectRatio = useWatch({
+    control: props.form.control,
+    name: 'aspectRatio',
+  })
+  const resolution = useWatch({
+    control: props.form.control,
+    name: 'resolution',
+  })
+  const prompt = useWatch({ control: props.form.control, name: 'prompt' })
+  const seconds = useWatch({ control: props.form.control, name: 'duration' })
+  const count = useWatch({ control: props.form.control, name: 'count' })
+  const size = useWatch({ control: props.form.control, name: 'size' })
+  const quality = useWatch({ control: props.form.control, name: 'quality' })
+  const responseFormat = useWatch({
+    control: props.form.control,
+    name: 'responseFormat',
+  })
+  const requiresFile = mode === 'transcriptions' || mode === 'translations'
+  const supportsReferences = mode === 'videos' || mode === 'image-edits'
+  const promptLabel = mode === 'speech' ? t('Text') : t('Prompt')
+  const promptPlaceholder =
+    mode === 'speech'
+      ? t('Enter the text to turn into speech')
+      : t('Describe what you want to create')
+  const capability = props.capabilities?.available
+  const parameterPrices = props.capabilities?.parameter_prices ?? []
+  const parameterMode =
+    parameterPrices.length > 0 ||
+    Boolean(
+      props.capabilities?.routes?.some(
+        (route) => route.billing_mode === 'parameter_price'
+      )
+    )
+  const parameterResolutions = [
+    ...new Set(
+      parameterPrices.flatMap((price) =>
+        price.conditions.resolution ? [price.conditions.resolution] : []
+      )
+    ),
+  ]
+  const parameterQualities = [
+    ...new Set(
+      parameterPrices.flatMap((price) =>
+        price.conditions.quality ? [price.conditions.quality] : []
+      )
+    ),
+  ]
+  const estimate = parameterMode
+    ? estimateParameterPrice(parameterPrices, {
+        model,
+        group,
+        resolution,
+        quality,
+        duration: seconds,
+        count,
+        size: mode === 'videos' ? undefined : size,
+        resolutionAliases: capability?.resolution_aliases,
+      })
+    : undefined
+  const contractIssues = managedCapabilityIssues(
+    capability,
+    { mode, duration: seconds, resolution, aspectRatio, prompt },
+    props.references
+  )
+  let aspectRatios = capability?.aspect_ratios ?? []
+  if (!aspectRatios.length && !capability?.runtime_enforced) {
+    aspectRatios = ['16:9', '9:16', '1:1', '4:3', '3:4']
+  }
+  let resolutions = capability?.resolutions ?? []
+  if (!resolutions.length) resolutions = parameterResolutions
+  if (!resolutions.length && !capability?.runtime_enforced) {
+    resolutions = ['720p']
+  }
+  const duration = capability?.duration
+  const durationOptions = studioDurationOptions(duration)
+  const durationHintCopy = studioDurationHintCopy(duration)
+  const outputCount = capability?.output_count
+
+  return (
+    <form
+      className='flex h-full min-h-0 flex-col'
+      onSubmit={props.form.handleSubmit(props.onSubmit)}
+    >
+      <div className='hover-scrollbar min-h-0 flex-1 space-y-5 overflow-y-auto p-4'>
+        <div className='bg-muted/30 grid grid-cols-3 gap-1 rounded-lg border p-1'>
+          {MODES.map((item) => {
+            const Icon = item.icon
+            return (
+              <button
+                aria-pressed={mode === item.value}
+                className={cn(
+                  'flex min-w-0 items-center justify-center gap-1.5 rounded-md px-2 py-2 text-xs font-medium transition-colors',
+                  mode === item.value
+                    ? 'bg-background text-foreground shadow-xs'
+                    : 'text-muted-foreground hover:text-foreground'
+                )}
+                key={item.value}
+                onClick={() => {
+                  props.form.setValue('mode', item.value)
+                  props.form.clearErrors()
+                }}
+                type='button'
+              >
+                <Icon aria-hidden='true' className='size-3.5 shrink-0' />
+                <span className='truncate'>{t(item.label)}</span>
+              </button>
+            )
+          })}
+        </div>
+
+        <Field>
+          <FieldLabel>{t('Model and group')}</FieldLabel>
+          <ModelGroupSelector
+            disabled={
+              props.loadingModels || props.generating || props.catalogError
+            }
+            groups={props.groups}
+            models={props.models}
+            onGroupChange={(value) =>
+              props.form.setValue('group', value, { shouldValidate: true })
+            }
+            onModelChange={(value) =>
+              props.form.setValue('model', value, { shouldValidate: true })
+            }
+            selectedGroup={group}
+            selectedModel={model}
+          />
+          <FieldError
+            errors={[
+              props.form.formState.errors.group,
+              props.form.formState.errors.model,
+            ]}
+          />
+          {props.catalogError && (
+            <MediaQueryError compact onRetry={props.onRetryCatalog} />
+          )}
+        </Field>
+
+        {!requiresFile && (
+          <Field data-invalid={Boolean(props.form.formState.errors.prompt)}>
+            <FieldLabel htmlFor='media-studio-prompt'>{promptLabel}</FieldLabel>
+            <Textarea
+              className='min-h-28 resize-y'
+              id='media-studio-prompt'
+              placeholder={promptPlaceholder}
+              {...props.form.register('prompt')}
+            />
+            <FieldError errors={[props.form.formState.errors.prompt]} />
+          </Field>
+        )}
+
+        {requiresFile && (
+          <Field>
+            <FieldLabel htmlFor='media-studio-audio'>
+              {t('Audio file')}
+            </FieldLabel>
+            <Input
+              accept='audio/*,video/*'
+              id='media-studio-audio'
+              onChange={(event) =>
+                props.onInputFileChange(event.target.files?.[0])
+              }
+              type='file'
+            />
+            {props.inputFile && (
+              <p className='text-muted-foreground truncate text-xs'>
+                {props.inputFile.name}
+              </p>
+            )}
+          </Field>
+        )}
+
+        {supportsReferences && (
+          <ReferenceInput
+            capabilities={props.capabilities}
+            mode={mode}
+            onAdd={props.onAddReferences}
+            onRemove={props.onRemoveReference}
+            onInsert={props.onInsertReference}
+            onRoleChange={props.onReferenceRoleChange}
+            references={props.references}
+          />
+        )}
+
+        {!props.checkingRoute &&
+          !props.catalogError &&
+          group &&
+          model &&
+          props.capabilities?.route_count === 0 && (
+            <Alert variant='destructive'>
+              <AlertTitle>{t('No compatible route')}</AlertTitle>
+              <AlertDescription>
+                {t('Choose another model or group for this creation mode.')}
+              </AlertDescription>
+            </Alert>
+          )}
+
+        {mode === 'videos' && capability && (
+          <div className='flex flex-wrap gap-1.5 text-xs'>
+            <Badge variant='secondary'>
+              {t(
+                parameterMode
+                  ? 'Parameter pricing'
+                  : billingUnitLabel(capability.billing_unit)
+              )}
+            </Badge>
+            <Badge variant='outline'>
+              {`${t('Images')}: ${referenceLimitBadge(
+                t,
+                capability.reference_image,
+                capability.max_images,
+                '{{count}} images'
+              )}`}
+            </Badge>
+            <Badge variant='outline'>
+              {`${t('Videos')}: ${referenceLimitBadge(
+                t,
+                capability.reference_video,
+                capability.max_videos,
+                '{{count}} videos'
+              )}`}
+            </Badge>
+            <Badge variant='outline'>
+              {`${t('Audio')}: ${referenceLimitBadge(
+                t,
+                capability.reference_audio,
+                capability.max_audios,
+                '{{count}} audio files'
+              )}`}
+            </Badge>
+          </div>
+        )}
+
+        {(mode === 'images' || mode === 'image-edits' || mode === 'videos') &&
+          (props.capabilities?.routes?.length ?? 0) > 0 && (
+            <div className='space-y-2 rounded-lg border p-3'>
+              <div className='flex items-center justify-between gap-2'>
+                <span className='text-sm font-medium'>
+                  {t('Available channels')}
+                </span>
+                <span className='text-muted-foreground text-xs'>
+                  {t('{{count}} routes', {
+                    count: props.capabilities?.routes?.length ?? 0,
+                  })}
+                </span>
+              </div>
+              <div className='space-y-1.5'>
+                {(props.capabilities?.routes ?? []).map((route) => {
+                  let price = t('Price unavailable')
+                  if (route.billing_mode === 'parameter_price') {
+                    price = t('Price depends on selected parameters')
+                  } else if (route.price_known) {
+                    if (route.actual_price !== undefined) {
+                      price = `$${route.actual_price.toFixed(4)} · ${t(
+                        billingUnitLabel(route.price_unit)
+                      )}`
+                    } else if (route.effective_ratio !== undefined) {
+                      price = `${route.effective_ratio.toFixed(4)}×`
+                    } else {
+                      price = t('Price available')
+                    }
+                  }
+                  return (
+                    <div
+                      className='bg-muted/20 flex min-w-0 items-center justify-between gap-3 rounded-md px-2 py-1.5 text-xs'
+                      key={`${route.channel_id}-${route.group}-${route.model}`}
+                    >
+                      <span className='min-w-0 font-medium break-words'>
+                        {route.channel_name}
+                      </span>
+                      <span className='text-muted-foreground shrink-0'>
+                        {price}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+        {(mode === 'images' || mode === 'image-edits') && (
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'When using backup channels, verify that the selected groups support the requested 2K/4K size.'
+            )}
+          </p>
+        )}
+
+        {(mode === 'images' || mode === 'image-edits' || mode === 'videos') &&
+          props.fallbackGroupOptions.length > 1 && (
+            <div className='space-y-2 rounded-lg border p-3'>
+              <label className='flex items-start gap-2 text-sm'>
+                <Checkbox
+                  checked={props.fallbackEnabled}
+                  onCheckedChange={(checked) =>
+                    props.onFallbackEnabledChange(checked === true)
+                  }
+                />
+                <span>
+                  <span className='font-medium'>
+                    {t('Try backup channels on failure')}
+                  </span>
+                  <span className='text-muted-foreground mt-0.5 block text-xs'>
+                    {t(
+                      'Only safe, not-yet-submitted requests continue to the next group.'
+                    )}
+                  </span>
+                </span>
+              </label>
+              {props.fallbackEnabled && (
+                <>
+                  <div className='space-y-1'>
+                    <span className='text-muted-foreground text-xs'>
+                      {t('Fallback order')}
+                    </span>
+                    {props.fallbackGroups.map((groupValue, index) => {
+                      const groupOption = props.fallbackGroupOptions.find(
+                        (item) => item.value === groupValue
+                      )
+                      let fallbackPrice = t('Final price unavailable')
+                      if (parameterMode) {
+                        fallbackPrice = t(
+                          'Price depends on selected parameters'
+                        )
+                      } else if (
+                        props.fallbackPrices[groupValue] !== undefined
+                      ) {
+                        fallbackPrice = `$${props.fallbackPrices[groupValue]?.toFixed(4)} · ${t(billingUnitLabel(props.fallbackPriceUnits[groupValue]))}`
+                      }
+                      return (
+                        <div
+                          className='bg-muted/20 flex items-center gap-2 rounded-md px-2 py-1.5 text-xs'
+                          key={groupValue}
+                        >
+                          <span className='min-w-0 flex-1'>
+                            <span className='block font-medium break-words'>
+                              {groupOption?.label ?? groupValue}
+                            </span>
+                            <span className='text-muted-foreground block text-[11px]'>
+                              {fallbackPrice}
+                            </span>
+                          </span>
+                          <Button
+                            aria-label={t('Move up')}
+                            disabled={index === 0}
+                            onClick={() => {
+                              const next = [...props.fallbackGroups]
+                              ;[next[index - 1], next[index]] = [
+                                next[index],
+                                next[index - 1],
+                              ]
+                              props.onFallbackGroupsChange(next)
+                            }}
+                            size='icon-sm'
+                            type='button'
+                            variant='ghost'
+                          >
+                            <ArrowUpIcon aria-hidden='true' />
+                          </Button>
+                          <Button
+                            aria-label={t('Move down')}
+                            disabled={index === props.fallbackGroups.length - 1}
+                            onClick={() => {
+                              const next = [...props.fallbackGroups]
+                              ;[next[index], next[index + 1]] = [
+                                next[index + 1],
+                                next[index],
+                              ]
+                              props.onFallbackGroupsChange(next)
+                            }}
+                            size='icon-sm'
+                            type='button'
+                            variant='ghost'
+                          >
+                            <ArrowDownIcon aria-hidden='true' />
+                          </Button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {isImage2ModelName(model) && (
+                    <label className='text-muted-foreground flex items-center gap-2 text-xs'>
+                      <Checkbox
+                        checked={props.image2PriceAscending}
+                        onCheckedChange={(checked) =>
+                          props.onImage2PriceAscendingChange(checked === true)
+                        }
+                      />
+                      {t('Sort image2 backup channels by final price')}
+                    </label>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+        {(mode === 'images' || mode === 'image-edits') && (
+          <div className='grid grid-cols-2 gap-3'>
+            <Field>
+              <FieldLabel htmlFor='media-studio-size'>{t('Size')}</FieldLabel>
+              <Input id='media-studio-size' {...props.form.register('size')} />
+            </Field>
+            <Field key='image-count'>
+              <FieldLabel htmlFor='media-studio-count'>{t('Count')}</FieldLabel>
+              <Input
+                id='media-studio-count'
+                max={STUDIO_BATCH_MAX_COUNT}
+                min={1}
+                type='number'
+                {...props.form.register('count', { valueAsNumber: true })}
+              />
+            </Field>
+          </div>
+        )}
+
+        {(mode === 'images' || mode === 'image-edits') &&
+          parameterMode &&
+          parameterResolutions.length > 0 && (
+            <Field>
+              <FieldLabel htmlFor='media-studio-image-resolution'>
+                {t('Resolution')}
+              </FieldLabel>
+              <NativeSelect
+                id='media-studio-image-resolution'
+                value={resolution}
+                onChange={(event) =>
+                  props.form.setValue('resolution', event.target.value)
+                }
+              >
+                {!parameterResolutions.includes(resolution) && (
+                  <NativeSelectOption value={resolution}>
+                    {resolution || t('Select resolution')}
+                  </NativeSelectOption>
+                )}
+                {parameterResolutions.map((value) => (
+                  <NativeSelectOption key={value} value={value}>
+                    {value}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+          )}
+        {mode === 'videos' && (
+          <div className='grid grid-cols-2 gap-3'>
+            <Field>
+              <FieldLabel htmlFor='media-studio-aspect-ratio'>
+                {t('Aspect ratio')}
+              </FieldLabel>
+              {aspectRatios.length ? (
+                <NativeSelect
+                  className='w-full'
+                  id='media-studio-aspect-ratio'
+                  onChange={(event) =>
+                    props.form.setValue('aspectRatio', event.target.value, {
+                      shouldValidate: true,
+                    })
+                  }
+                  value={aspectRatio}
+                >
+                  {!aspectRatios.includes(aspectRatio) && (
+                    <NativeSelectOption value={aspectRatio}>
+                      {aspectRatio}
+                    </NativeSelectOption>
+                  )}
+                  {aspectRatios.map((ratio) => (
+                    <NativeSelectOption key={ratio} value={ratio}>
+                      {ratio}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              ) : (
+                <Input
+                  id='media-studio-aspect-ratio'
+                  {...props.form.register('aspectRatio')}
+                />
+              )}
+              <FieldError errors={[props.form.formState.errors.aspectRatio]} />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor='media-studio-resolution'>
+                {t('Resolution')}
+              </FieldLabel>
+              {resolutions.length ? (
+                <NativeSelect
+                  className='w-full'
+                  disabled={
+                    resolutions.length === 1 && resolutions.includes(resolution)
+                  }
+                  id='media-studio-resolution'
+                  onChange={(event) =>
+                    props.form.setValue('resolution', event.target.value)
+                  }
+                  value={resolution}
+                >
+                  {!resolutions.includes(resolution) && (
+                    <NativeSelectOption value={resolution}>
+                      {resolution || t('Select resolution')}
+                    </NativeSelectOption>
+                  )}
+                  {resolutions.map((resolution) => (
+                    <NativeSelectOption key={resolution} value={resolution}>
+                      {resolution.toUpperCase()}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              ) : (
+                <Input
+                  id='media-studio-resolution'
+                  {...props.form.register('resolution')}
+                />
+              )}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor='media-studio-duration'>
+                {t('Seconds')}
+              </FieldLabel>
+              {durationOptions.length ? (
+                <NativeSelect
+                  className='w-full'
+                  disabled={durationOptions.length === 1}
+                  id='media-studio-duration'
+                  onChange={(event) =>
+                    props.form.setValue(
+                      'duration',
+                      Number(event.target.value),
+                      { shouldValidate: true }
+                    )
+                  }
+                  value={String(seconds)}
+                >
+                  {!durationOptions.includes(seconds) && (
+                    <NativeSelectOption value={String(seconds)}>
+                      {seconds}
+                    </NativeSelectOption>
+                  )}
+                  {durationOptions.map((option) => (
+                    <NativeSelectOption key={option} value={String(option)}>
+                      {option}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              ) : (
+                <Input
+                  disabled={
+                    duration?.mode === 'fixed' && seconds === duration.fixed
+                  }
+                  id='media-studio-duration'
+                  max={duration?.fixed ?? duration?.max ?? 3600}
+                  min={duration?.fixed ?? duration?.min ?? 1}
+                  step={
+                    duration?.step ?? (capability?.runtime_enforced ? 'any' : 1)
+                  }
+                  type='number'
+                  {...props.form.register('duration', { valueAsNumber: true })}
+                />
+              )}
+              {durationHintCopy ? (
+                <p className='text-muted-foreground text-xs'>
+                  {t(durationHintCopy.key, durationHintCopy.values)}
+                </p>
+              ) : null}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor='media-studio-video-count'>
+                {t('Count')}
+              </FieldLabel>
+              <Input
+                id='media-studio-video-count'
+                max={Math.min(
+                  outputCount?.max ?? STUDIO_BATCH_MAX_COUNT,
+                  STUDIO_BATCH_MAX_COUNT
+                )}
+                min={Math.max(1, outputCount?.min ?? 1)}
+                type='number'
+                {...props.form.register('count', { valueAsNumber: true })}
+              />
+            </Field>
+          </div>
+        )}
+
+        {(mode === 'images' ||
+          (parameterQualities.length > 0 &&
+            (mode === 'image-edits' || mode === 'videos'))) && (
+          <Field>
+            <FieldLabel>{t('Quality')}</FieldLabel>
+            <NativeSelect
+              className='w-full'
+              onChange={(event) =>
+                props.form.setValue('quality', event.target.value)
+              }
+              value={quality}
+            >
+              {parameterQualities.length ? (
+                <>
+                  {!parameterQualities.includes(quality) && (
+                    <NativeSelectOption value={quality}>
+                      {quality || t('Select quality')}
+                    </NativeSelectOption>
+                  )}
+                  {parameterQualities.map((value) => (
+                    <NativeSelectOption key={value} value={value}>
+                      {value}
+                    </NativeSelectOption>
+                  ))}
+                </>
+              ) : (
+                <>
+                  <NativeSelectOption value='standard'>
+                    {t('Standard')}
+                  </NativeSelectOption>
+                  <NativeSelectOption value='hd'>
+                    {t('High')}
+                  </NativeSelectOption>
+                </>
+              )}
+            </NativeSelect>
+          </Field>
+        )}
+
+        {mode === 'speech' && (
+          <div className='grid grid-cols-2 gap-3'>
+            <Field>
+              <FieldLabel>{t('Voice')}</FieldLabel>
+              <Input {...props.form.register('voice')} />
+            </Field>
+            <Field>
+              <FieldLabel>{t('Format')}</FieldLabel>
+              <NativeSelect
+                className='w-full'
+                onChange={(event) =>
+                  props.form.setValue('responseFormat', event.target.value)
+                }
+                value={responseFormat}
+              >
+                {['mp3', 'wav', 'opus', 'aac', 'flac'].map((format) => (
+                  <NativeSelectOption key={format} value={format}>
+                    {format.toUpperCase()}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+          </div>
+        )}
+      </div>
+
+      {capability?.runtime_enforced && (
+        <div className='space-y-2 border-t p-4 text-xs'>
+          <p className='font-medium'>{t('Model capability contract')}</p>
+          {capability.native_human_images === true && (
+            <p>{t('Native human image references supported')}</p>
+          )}
+          {!!capability.min_visual && (
+            <p>{t('Add at least one image or video reference before creating')}</p>
+          )}
+          {capability.max_total_references !== undefined && (
+            <p>
+              {t('Up to {{count}} reference files in total', {
+                count: capability.max_total_references,
+              })}
+            </p>
+          )}
+          {capability.reference_video === false && (
+            <p>{t('This model does not accept video references')}</p>
+          )}
+          {capability.reference_audio === false && (
+            <p>{t('This model does not accept audio references')}</p>
+          )}
+          {durationHintCopy && (
+            <p>{t(durationHintCopy.key, durationHintCopy.values)}</p>
+          )}
+          {contractIssues.map((issue) => (
+            <p key={issue} role='alert' className='text-destructive'>
+              {t(issue)}
+            </p>
+          ))}
+        </div>
+      )}
+      {parameterMode && (
+        <div className='space-y-2 border-t p-4'>
+          <p className='text-sm font-medium'>
+            {t('Estimated total')}:{' '}
+            {estimate
+              ? `${estimate.offer.currency} ${estimate.total}`
+              : t('No price matches the selected parameters')}
+          </p>
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'The estimate includes all creations. The exact quote is checked before each request is sent.'
+            )}
+          </p>
+          <details>
+            <summary className='cursor-pointer text-xs'>
+              {t('View parameter prices')}
+            </summary>
+            <div className='mt-2'>
+              <ParameterPriceTable prices={parameterPrices} />
+            </div>
+          </details>
+        </div>
+      )}
+      <div className='bg-background border-t p-4'>
+        <Button
+          className='w-full'
+          disabled={
+            props.generating ||
+            contractIssues.length > 0 ||
+            (parameterMode && !estimate) ||
+            props.loadingModels ||
+            props.checkingRoute ||
+            props.catalogError ||
+            !group ||
+            !model ||
+            !props.capabilities ||
+            props.capabilities.route_count === 0 ||
+            (requiresFile && !props.inputFile) ||
+            (mode === 'image-edits' && props.references.length === 0)
+          }
+          type='submit'
+        >
+          {props.generating ? (
+            <Loader2Icon aria-hidden='true' className='animate-spin' />
+          ) : (
+            <SendIcon aria-hidden='true' />
+          )}
+          {props.generating ? t('Submitting') : t('Create')}
+        </Button>
+      </div>
+    </form>
+  )
+}

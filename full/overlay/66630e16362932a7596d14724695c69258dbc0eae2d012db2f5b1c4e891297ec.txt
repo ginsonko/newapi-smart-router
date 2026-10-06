@@ -1,0 +1,148 @@
+package service
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestImageTaskParserRequiresDeliverableTerminal(t *testing.T) {
+	for _, tc := range []struct{ name, raw, status string }{
+		{"accepted", `{"task_id":"provider-1","status":"pending","data":[]}`, string(model.TaskStatusQueued)},
+		{"completed", `{"status":"completed","data":[{"url":"https://images.example/image.png"}]}`, string(model.TaskStatusSuccess)},
+		{"empty completion", `{"status":"completed","data":[]}`, ""},
+		{"poll error", `{"error":{"message":"temporary failure"}}`, ""},
+		{"explicit failure", `{"status":"failed","error":{"message":"图片审核未通过"}}`, string(model.TaskStatusFailure)},
+		{"unknown", `{"status":"new-provider-state"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := (&ImageTaskAdaptor{}).ParseTaskResult([]byte(tc.raw))
+			if tc.status == "" {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.status, result.Status)
+		})
+	}
+}
+
+func imageTaskFixture(t *testing.T, baseURL string) *model.Task {
+	t.Helper()
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	seedUser(t, 961, 850)
+	seedTaskPollingReservation(t, "direct:async-image", "async-image", 961, 150, 0, model.QuotaReservationStatusActive)
+	task := &model.Task{
+		TaskID: "task_public_image", Platform: constant.TaskPlatformOpenAIImage, UserId: 961, ChannelId: 1,
+		Status: model.TaskStatusSubmitted, Progress: "5%", Quota: 150, SubmitTime: time.Now().Unix(),
+		BillingReservationID: "direct:async-image", Properties: model.Properties{MediaMode: "images", OriginModelName: "image-model"},
+		PrivateData: model.TaskPrivateData{Key: "test-private-key", UpstreamTaskID: "provider-1", BillingSource: "wallet", BillingRequestID: "async-image",
+			ImageTask:      &model.ImageTaskContext{Count: 1, NoRetention: true, ResponseFormat: "url"},
+			BillingContext: &model.TaskBillingContext{UsePrice: true, PerCallBilling: true, OriginModelName: "image-model"}},
+	}
+	require.NoError(t, model.InsertTaskWithMediaInputsAndSnapshot(task, nil, &model.TaskDeliverySnapshot{ChannelID: 1, ChannelType: constant.ChannelTypeOpenAI, UpstreamBaseURL: baseURL, CredentialRef: "task.private_data.key", UpstreamTaskID: "provider-1"}))
+	return task
+}
+
+func TestImageTaskPollingRecoversSameTaskAndSettlesOnceWithoutAssets(t *testing.T) {
+	requests := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/images/generations/provider-1", r.URL.Path)
+		assert.Equal(t, "Bearer test-private-key", r.Header.Get("Authorization"))
+		if requests == 1 {
+			w.WriteHeader(502)
+			return
+		}
+		_, _ = w.Write([]byte(`{"task_id":"provider-1","status":"completed","data":[{"url":"https://images.example/final.png","revised_prompt":"must not retain"}],"prompt":"must not retain","poll_url":"https://untrusted.example/secret"}`))
+	}))
+	defer provider.Close()
+	previous := httpClient
+	InitHttpClient()
+	t.Cleanup(func() { httpClient = previous })
+	task := imageTaskFixture(t, provider.URL)
+	_, err := model.ApplyTaskBillingSubmission(task.ID)
+	require.NoError(t, err)
+	require.Error(t, PollImageTask(context.Background(), task))
+	assert.EqualValues(t, model.TaskStatusSubmitted, task.Status)
+	assert.Equal(t, 850, getUserQuota(t, 961))
+	// A fresh task loaded from storage models a new process resuming delivery.
+	restored, found, err := model.GetByTaskId(961, task.TaskID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t, PollImageTask(context.Background(), restored))
+	assert.EqualValues(t, model.TaskStatusSuccess, restored.Status)
+	require.NoError(t, PollImageTask(context.Background(), restored))
+	assert.Equal(t, 2, requests)
+	assert.Equal(t, 850, getUserQuota(t, 961))
+	var user model.User
+	require.NoError(t, model.DB.First(&user, 961).Error)
+	assert.Equal(t, 150, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	var assets int64
+	require.NoError(t, model.DB.Model(&model.MediaBlob{}).Count(&assets).Error)
+	assert.Zero(t, assets)
+	response, err := ImageTaskResponse(restored)
+	require.NoError(t, err)
+	assert.Contains(t, string(response), "final.png")
+	for _, forbidden := range []string{"provider-1", "private-key", "must not retain", "untrusted.example"} {
+		assert.NotContains(t, string(restored.Data), forbidden)
+	}
+	assert.Len(t, ImageTaskURLArtifacts(restored), 1)
+}
+
+func TestImageTaskFailureRefundsOnceAndEmptyCompletionDoesNotSettle(t *testing.T) {
+	task := imageTaskFixture(t, "https://provider.example")
+	_, err := model.ApplyTaskBillingSubmission(task.ID)
+	require.NoError(t, err)
+	require.Error(t, ApplyImageTaskResult(context.Background(), task, []byte(`{"status":"completed","data":[]}`)))
+	assert.Equal(t, 850, getUserQuota(t, 961))
+	raw := []byte(`{"status":"failed","error":{"message":"图片审核未通过"}}`)
+	require.NoError(t, ApplyImageTaskResult(context.Background(), task, raw))
+	require.NoError(t, ApplyImageTaskResult(context.Background(), task, raw))
+	assert.EqualValues(t, model.TaskStatusFailure, task.Status)
+	assert.Contains(t, task.FailReason, "审核")
+	assert.Equal(t, 1000, getUserQuota(t, 961))
+}
+
+func TestImageTaskNeverPollsUnknownPublicIDOrFollowsProviderRedirect(t *testing.T) {
+	task := imageTaskFixture(t, "https://provider.example")
+	task.PrivateData.UpstreamTaskID = ""
+	require.NoError(t, PollImageTask(context.Background(), task))
+	requests := 0
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests++ }))
+	defer destination.Close()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, destination.URL, 302) }))
+	defer provider.Close()
+	previous := httpClient
+	InitHttpClient()
+	t.Cleanup(func() { httpClient = previous })
+	resp, err := (&ImageTaskAdaptor{}).FetchTask(provider.URL, "private-key", map[string]any{"task_id": "provider-1"}, "")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, 302, resp.StatusCode)
+	assert.Zero(t, requests)
+}
+
+func TestImageTaskDuplicateOperationIsRejectedBeforeAnotherSubmission(t *testing.T) {
+	task := imageTaskFixture(t, "https://provider.example")
+	copy := *task
+	copy.ID = 0
+	copy.BillingReservationID = ""
+	err := model.InsertTaskWithMediaInputsAndSnapshot(&copy, nil, nil)
+	require.ErrorIs(t, err, model.ErrImageTaskExists)
+	var tasks int64
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("user_id = ? AND task_id = ?", task.UserId, task.TaskID).Count(&tasks).Error)
+	assert.EqualValues(t, 1, tasks)
+	assert.False(t, strings.Contains(task.TaskID, task.PrivateData.Key))
+}

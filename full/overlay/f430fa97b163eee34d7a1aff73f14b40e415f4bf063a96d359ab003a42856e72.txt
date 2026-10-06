@@ -1,0 +1,443 @@
+package controller
+
+import (
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+)
+
+// TenantParameterProviderCorrectionRequest defines the HTTP payload for
+// recording an actual supplier provider cost correction on a parent settlement.
+type TenantParameterProviderCorrectionRequest struct {
+	OperationID      string  `json:"operation_id"`
+	ParentEventID    string  `json:"parent_event_id,omitempty"`
+	TenantID         string  `json:"tenant_id,omitempty"`
+	Amount           *string `json:"amount"`
+	RefundAmount     *string `json:"refund_amount,omitempty"`
+	Currency         string  `json:"currency,omitempty"`
+	Evidence         string  `json:"evidence,omitempty"`
+	ReceiptReference string  `json:"receipt_reference,omitempty"`
+	Reason           string  `json:"reason,omitempty"`
+}
+
+// TenantParameterRefundRequest defines the HTTP payload for executing a
+// manual customer parameter refund against a settled task or reservation.
+type TenantParameterRefundRequest struct {
+	OperationID   string `json:"operation_id"`
+	ParentEventID string `json:"parent_event_id,omitempty"`
+	TenantID      string `json:"tenant_id,omitempty"`
+	UserID        int    `json:"user_id,omitempty"`
+	RefundQuota   int    `json:"refund_quota,omitempty"`
+	RefundAmount  string `json:"refund_amount,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+func formatTenantCostAppendResult(result model.TenantCostAppendResult) (gin.H, error) {
+	var rawPayload map[string]interface{}
+	if len(result.Event.Payload) > 0 {
+		if err := common.Unmarshal([]byte(result.Event.Payload), &rawPayload); err != nil {
+			return nil, err
+		}
+	} else {
+		b, err := common.Marshal(result.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if err := common.Unmarshal(b, &rawPayload); err != nil {
+			return nil, err
+		}
+	}
+	redacted := redactTenantCostValue(rawPayload)
+	return gin.H{
+		"event_id":   result.Event.EventID,
+		"tenant_id":  result.Event.TenantID,
+		"sequence":   result.Event.Sequence,
+		"event_type": result.Event.EventType,
+		"replayed":   result.Replayed,
+		"payload":    redacted,
+	}, nil
+}
+
+// AdminAppendTenantProviderCostCorrection handles root-only manual provider cost
+// corrections for parameter settlements. The authentic tenant is resolved from
+// the database parent event, preventing tenant-spoofing or cross-tenant drift.
+func AdminAppendTenantProviderCostCorrection(c *gin.Context) {
+	setTenantCostNoStore(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var request TenantParameterProviderCorrectionRequest
+	if err := decodeTenantCostAdminJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效: " + err.Error()})
+		return
+	}
+
+	parentID := strings.TrimSpace(c.Param("event_id"))
+	if parentID != "" && strings.TrimSpace(request.ParentEventID) != "" && parentID != strings.TrimSpace(request.ParentEventID) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "路径与请求正文的父事件不一致"})
+		return
+	}
+	if parentID == "" {
+		parentID = strings.TrimSpace(request.ParentEventID)
+	}
+	if parentID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 parent_event_id"})
+		return
+	}
+
+	if model.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "数据库未初始化"})
+		return
+	}
+
+	var parent model.TenantCostEvent
+	if err := model.DB.Where("event_id = ?", parentID).First(&parent).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "父成本事件不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "查询父成本事件失败"})
+		return
+	}
+
+	realTenantID := parent.TenantID
+	if _, err := model.RequireRegisteredTenantCostDownstream(realTenantID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户不存在或不可访问"})
+		return
+	}
+
+	explicitSelections := tenantCostExplicitSelections(c)
+	for _, sel := range explicitSelections {
+		if sel != realTenantID {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户选择冲突：父事件租户与请求租户不一致"})
+			return
+		}
+	}
+	if request.TenantID != "" && strings.TrimSpace(request.TenantID) != realTenantID {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户选择冲突：父事件租户与请求租户不一致"})
+		return
+	}
+
+	if parent.BillingMode != "parameter_price" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "该事件不是参数计价事件，不支持实扣更正"})
+		return
+	}
+	if parent.EventType != model.TenantCostEventSettlement &&
+		parent.EventType != model.TenantCostEventObservedZero &&
+		parent.EventType != model.TenantCostEventChargedFailure {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "仅支持对结算类参数事件进行供应商实扣更正"})
+		return
+	}
+
+	opID := strings.TrimSpace(request.OperationID)
+	if opID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 operation_id"})
+		return
+	}
+
+	evidence := strings.TrimSpace(request.Evidence)
+	if evidence == "" {
+		if request.Amount != nil {
+			evidence = model.TenantCostEvidenceExact
+		} else {
+			evidence = model.TenantCostEvidenceUnknown
+		}
+	}
+	if evidence == model.TenantCostEvidenceUnknown && request.Amount != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "成本未知时不能指定金额（未知不能写零或赋值）"})
+		return
+	}
+
+	currency := strings.TrimSpace(request.Currency)
+	if currency == "" {
+		currency = "USD"
+	}
+
+	var refundAmount *string
+	if request.RefundAmount != nil {
+		ref := strings.TrimSpace(*request.RefundAmount)
+		refundAmount = &ref
+	} else if request.Amount != nil && evidence != model.TenantCostEvidenceUnknown {
+		zero := "0"
+		refundAmount = &zero
+	}
+	receiptRef := strings.TrimSpace(request.ReceiptReference)
+
+	fact := model.TenantProviderCost{
+		AmountKind:       "cumulative",
+		Currency:         currency,
+		Evidence:         evidence,
+		ReceiptReference: receiptRef,
+		Amount:           request.Amount,
+		RefundAmount:     refundAmount,
+	}
+
+	result, err := model.AppendTenantProviderCostCorrection(realTenantID, parentID, opID, fact)
+	if err != nil {
+		if errors.Is(err, model.ErrTenantCostConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "该 operation_id 已存在但更正事实冲突"})
+			return
+		}
+		if errors.Is(err, model.ErrTenantCostScope) {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "租户范围不匹配或跨租户拒绝"})
+			return
+		}
+		if errors.Is(err, model.ErrTenantCostInvalidInput) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "更正参数无效（请检查金额、凭据标识及币种）"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+
+	markAuditLogged(c)
+	if model.LOG_DB != nil {
+		recordManageAudit(c, "tenant_cost_provider_correction", map[string]interface{}{
+			"tenant_id":       realTenantID,
+			"parent_event_id": parentID,
+			"operation_id":    opID,
+			"evidence":        evidence,
+			"receipt_ref":     receiptRef,
+		})
+	}
+
+	formatted, formatErr := formatTenantCostAppendResult(result)
+	if formatErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "序列化脱敏响应失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":  true,
+		"data":     formatted,
+		"replayed": result.Replayed,
+	})
+}
+
+// AdminApplyTenantParameterRefund executes an authorized manual parameter refund
+// for root operators. Real tenant, customer/owner, task and reservation entities
+// are looked up from the durable database state, forbidding untrusted caller user IDs.
+func AdminApplyTenantParameterRefund(c *gin.Context) {
+	setTenantCostNoStore(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var request TenantParameterRefundRequest
+	if err := decodeTenantCostAdminJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求格式无效: " + err.Error()})
+		return
+	}
+
+	parentID := strings.TrimSpace(c.Param("event_id"))
+	if parentID != "" && strings.TrimSpace(request.ParentEventID) != "" && parentID != strings.TrimSpace(request.ParentEventID) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "路径与请求正文的父事件不一致"})
+		return
+	}
+	if parentID == "" {
+		parentID = strings.TrimSpace(request.ParentEventID)
+	}
+	if parentID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 parent_event_id"})
+		return
+	}
+
+	if model.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "数据库未初始化"})
+		return
+	}
+
+	var parent model.TenantCostEvent
+	if err := model.DB.Where("event_id = ?", parentID).First(&parent).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "父成本事件不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "查询父成本事件失败"})
+		return
+	}
+
+	realTenantID := parent.TenantID
+	if _, err := model.RequireRegisteredTenantCostDownstream(realTenantID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户不存在或不可访问"})
+		return
+	}
+
+	explicitSelections := tenantCostExplicitSelections(c)
+	for _, sel := range explicitSelections {
+		if sel != realTenantID {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户选择冲突：父事件租户与请求租户不一致"})
+			return
+		}
+	}
+	if request.TenantID != "" && strings.TrimSpace(request.TenantID) != realTenantID {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户选择冲突：父事件租户与请求租户不一致"})
+		return
+	}
+
+	if parent.BillingMode != "parameter_price" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "该事件不是参数计价事件，不支持用户退款"})
+		return
+	}
+	if parent.EventType != model.TenantCostEventSettlement &&
+		parent.EventType != model.TenantCostEventObservedZero &&
+		parent.EventType != model.TenantCostEventChargedFailure {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "仅支持对结算类参数事件进行退款"})
+		return
+	}
+
+	opID := strings.TrimSpace(request.OperationID)
+	if opID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "必须提供 operation_id"})
+		return
+	}
+
+	refundQuota, amountErr := parseTenantParameterRefundQuota(request.RefundQuota, request.RefundAmount)
+	if amountErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": amountErr.Error()})
+		return
+	}
+
+	var (
+		result    model.TenantCostAppendResult
+		refundErr error
+	)
+
+	if parent.TaskPublicID != "" {
+		var task model.Task
+		if err := model.DB.Where("task_id = ?", parent.TaskPublicID).First(&task).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "未找到父事件关联的任务记录"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "查询关联任务失败"})
+			return
+		}
+
+		if request.UserID > 0 && request.UserID != task.UserId {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "用户归属冲突：不可指定与数据库不一致的被退款用户"})
+			return
+		}
+
+		if task.PrivateData.BillingContext == nil ||
+			task.PrivateData.BillingContext.TenantCost == nil ||
+			task.PrivateData.BillingContext.TenantCost.TenantID != realTenantID {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "任务租户归属与父事件不一致"})
+			return
+		}
+
+		result, refundErr = model.ApplyParameterTaskRefund(c.Request.Context(), realTenantID, task.UserId, task.ID, opID, refundQuota)
+	} else if parent.ReservationID != "" {
+		var reservation model.QuotaReservation
+		if err := model.DB.Where("reservation_id = ?", parent.ReservationID).First(&reservation).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "未找到父事件关联的预扣记录"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "查询关联预扣记录失败"})
+			return
+		}
+
+		if request.UserID > 0 && request.UserID != reservation.UserId {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "用户归属冲突：不可指定与数据库不一致的被退款用户"})
+			return
+		}
+
+		result, refundErr = model.ApplyParameterReservationRefund(c.Request.Context(), realTenantID, reservation.UserId, reservation.ReservationId, opID, refundQuota)
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "父事件缺少关联的任务或预扣记录标识，无法执行退款"})
+		return
+	}
+
+	if refundErr != nil {
+		if errors.Is(refundErr, model.ErrTenantCostConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "该 operation_id 已存在但退款参数冲突"})
+			return
+		}
+		if errors.Is(refundErr, model.ErrTaskBillingReceiptConflict) ||
+			errors.Is(refundErr, model.ErrQuotaReservationSettlementConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "退款额度超过当前已扣额度或状态冲突（超额退款拒绝）"})
+			return
+		}
+		if errors.Is(refundErr, model.ErrTenantCostScope) {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "租户范围不匹配或跨租户拒绝"})
+			return
+		}
+		if errors.Is(refundErr, model.ErrTenantCostInvalidInput) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "退款参数无效"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": refundErr.Error()})
+		return
+	}
+
+	markAuditLogged(c)
+	if model.LOG_DB != nil {
+		recordManageAudit(c, "tenant_cost_parameter_refund", map[string]interface{}{
+			"tenant_id":       realTenantID,
+			"parent_event_id": parentID,
+			"operation_id":    opID,
+			"refund_quota":    refundQuota,
+		})
+	}
+
+	formatted, formatErr := formatTenantCostAppendResult(result)
+	if formatErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "序列化脱敏响应失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":  true,
+		"data":     formatted,
+		"replayed": result.Replayed,
+	})
+}
+
+// Administrative money inputs obey the same bounded decimal and final quota
+// rounding boundary as parameter prices. Conflicting units are never ignored.
+func parseTenantParameterRefundQuota(quota int, amount string) (int, error) {
+	invalid := errors.New("退款金额无效、超出范围或与退款额度不一致")
+	if quota < 0 || quota > common.MaxQuota {
+		return 0, invalid
+	}
+	amount = strings.TrimSpace(amount)
+	if amount != "" {
+		if len(amount) > 64 {
+			return 0, invalid
+		}
+		parts := strings.Split(amount, ".")
+		if len(parts) > 2 || len(parts[0]) == 0 || len(parts[0]) > 18 {
+			return 0, invalid
+		}
+		for _, part := range parts {
+			if part == "" || len(part) > 18 {
+				return 0, invalid
+			}
+			for _, char := range part {
+				if char < '0' || char > '9' {
+					return 0, invalid
+				}
+			}
+		}
+		value, err := decimal.NewFromString(amount)
+		if err != nil || !value.IsPositive() {
+			return 0, invalid
+		}
+		factor, err := decimal.NewFromString(strconv.FormatFloat(common.QuotaPerUnit, 'f', -1, 64))
+		if err != nil || !factor.IsPositive() {
+			return 0, invalid
+		}
+		converted, clamp := common.QuotaFromDecimalChecked(value.Mul(factor))
+		if clamp != nil || converted <= 0 || (quota > 0 && converted != quota) {
+			return 0, invalid
+		}
+		quota = converted
+	}
+	if quota <= 0 || quota > common.MaxQuota {
+		return 0, invalid
+	}
+	return quota, nil
+}

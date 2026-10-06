@@ -1,0 +1,165 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sync/atomic"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestReconcileImageRouteJobAmbiguousHTTPNeverResubmits(test *testing.T) {
+	for _, statusCode := range []int{http.StatusRequestTimeout, http.StatusConflict, http.StatusInternalServerError,
+		http.StatusNotImplemented, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 599} {
+		test.Run(fmt.Sprintf("http_%d", statusCode), func(test *testing.T) {
+			var posts, otherRequests atomic.Int64
+			fixture, _, guard := newImageRouteLocalUpstreamFixture(test, func(*imageRouteReconcileFixture) http.Handler {
+				return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					if request.Method != http.MethodPost || request.URL.Path != "/v1/images/generations" {
+						otherRequests.Add(1)
+						writer.WriteHeader(http.StatusNotFound)
+						return
+					}
+					posts.Add(1)
+					assert.Equal(test, "Bearer local-channel-a", request.Header.Get("Authorization"))
+					writer.Header().Set("Content-Type", "application/json")
+					writer.WriteHeader(statusCode)
+					_, _ = writer.Write([]byte(`{"error":{"message":"local intake result is not confirmed","type":"upstream_error"}}`))
+				})
+			})
+			transitions := fixture.observeJobTransitions(test)
+			executeImageRouteJob(context.Background(), fixture.job)
+			waiting := fixture.loadJob(test)
+			require.Equal(test, model.ImageRouteJobWaiting, waiting.State, waiting.LastError)
+			require.NotEmpty(test, waiting.CurrentTaskID)
+			require.Equal(test, "[703]", waiting.AttemptedChannelsJSON)
+			require.EqualValues(test, 1, posts.Load())
+			child, found, err := model.GetByTaskId(waiting.UserID, waiting.CurrentTaskID)
+			require.NoError(test, err)
+			require.True(test, found)
+			require.EqualValues(test, model.TaskStatusUnknown, child.Status)
+			require.Empty(test, child.PrivateData.UpstreamTaskID)
+			require.NotNil(test, child.PrivateData.ImageTask)
+			require.False(test, child.PrivateData.ImageTask.RetryableFailure)
+			require.Equal(test, waiting.ID, child.PrivateData.ImageTask.RouteJobID)
+			receipt, err := model.GetTaskBillingReceipt(child.ID)
+			require.NoError(test, err)
+			require.Equal(test, model.TaskBillingReceiptSubmissionPending, receipt.State)
+			require.Empty(test, receipt.TerminalTargetStatus)
+			before := fixture.accounting(test)
+			require.Len(test, before.Receipts, 1)
+			require.Len(test, before.Reservations, 1)
+			assert.Equal(test, 900, before.User.Quota)
+			assert.Equal(test, 900, before.Token.RemainQuota)
+			assert.Equal(test, 100, before.Reservations[0].ReservedQuota)
+			assert.Equal(test, model.QuotaReservationStatusActive, before.Reservations[0].Status)
+			assert.Zero(test, before.User.UsedQuota)
+			assert.Zero(test, before.User.RequestCount)
+			assert.Empty(test, before.Logs)
+			root := fixture.loadRoot(test)
+			assert.Equal(test, fixture.job.PublicTaskID, root.TaskID)
+			assert.EqualValues(test, model.TaskStatusSubmitted, root.Status)
+			assert.Zero(test, root.Quota)
+			for replay := 0; replay < 3; replay++ {
+				reconcileImageRouteJob(context.Background(), waiting)
+				reconcileImageRouteJob(context.Background(), fixture.loadJob(test))
+				executeImageRouteJob(context.Background(), fixture.job)
+				executeImageRouteJob(context.Background(), fixture.loadJob(test))
+				require.NoError(test, service.PollImageTask(context.Background(), child))
+			}
+			assert.Equal(test, []string{model.ImageRouteJobDispatching, model.ImageRouteJobWaiting}, *transitions)
+			assert.Equal(test, waiting, fixture.loadJob(test))
+			assert.Equal(test, root, fixture.loadRoot(test))
+			assert.Equal(test, before, fixture.accounting(test))
+			assert.EqualValues(test, 1, posts.Load())
+			assert.Zero(test, otherRequests.Load())
+			assert.Zero(test, guard.blocked.Load())
+			assert.FileExists(test, waiting.BodyPath)
+			var taskCount int64
+			require.NoError(test, fixture.database.Model(&model.Task{}).Count(&taskCount).Error)
+			assert.EqualValues(test, 2, taskCount)
+		})
+	}
+}
+
+func TestReconcileImageRouteJobRevokedAuthorizationPreventsFallbackPOST(test *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		changes map[string]interface{}
+	}{
+		{name: "disabled_token", changes: map[string]interface{}{"status": common.TokenStatusDisabled}},
+		{name: "expired_token", changes: map[string]interface{}{"expired_time": 1}},
+		{name: "revoked_client_ip", changes: map[string]interface{}{"allow_ips": "192.0.2.0/24"}},
+		{name: "routing_disabled", changes: map[string]interface{}{"routing_policy": `{"version":4,"enabled":false}`}},
+		{name: "current_group_scope_removed_fallback"},
+	} {
+		test.Run(testCase.name, func(test *testing.T) {
+			var posts, polls atomic.Int64
+			fixture, _, guard := newImageRouteLocalUpstreamFixture(test, func(*imageRouteReconcileFixture) http.Handler {
+				return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					writer.Header().Set("Content-Type", "application/json")
+					switch request.Method + " " + request.URL.Path {
+					case "POST /v1/images/generations":
+						posts.Add(1)
+						assert.Equal(test, "Bearer local-channel-a", request.Header.Get("Authorization"))
+						writer.WriteHeader(http.StatusAccepted)
+						_, _ = writer.Write([]byte(`{"task_id":"provider-a","status":"pending","data":[]}`))
+					case "GET /v1/images/generations/provider-a":
+						polls.Add(1)
+						_, _ = writer.Write([]byte(`{"task_id":"provider-a","status":"failed","message":"local failure"}`))
+					default:
+						test.Errorf("unexpected local upstream request %s %s", request.Method, request.URL.Path)
+						writer.WriteHeader(http.StatusNotFound)
+					}
+				})
+			})
+			executeImageRouteJob(context.Background(), fixture.job)
+			waiting := fixture.loadJob(test)
+			require.Equal(test, model.ImageRouteJobWaiting, waiting.State, waiting.LastError)
+			child, found, err := model.GetByTaskId(waiting.UserID, waiting.CurrentTaskID)
+			require.NoError(test, err)
+			require.True(test, found)
+			require.NoError(test, service.PollImageTask(context.Background(), child))
+			receipt, err := model.GetTaskBillingReceipt(child.ID)
+			require.NoError(test, err)
+			require.Equal(test, model.TaskBillingReceiptApplied, receipt.State)
+			require.Zero(test, receipt.AppliedQuota)
+			require.Equal(test, 1000, fixture.accounting(test).User.Quota)
+			changes := testCase.changes
+			if changes == nil {
+				var current smartrouter.Policy
+				require.NoError(test, common.UnmarshalJsonStr(waiting.PolicyJSON, &current))
+				current.AllowFutureGroups, current.AllowFutureCertifiedRoutes = false, false
+				current.ManualGroupOrder = []string{"cheap"}
+				encoded, err := common.Marshal(current)
+				require.NoError(test, err)
+				changes = map[string]interface{}{"routing_policy": string(encoded)}
+			}
+			require.NoError(test, fixture.database.Model(&model.Token{}).Where("id = ?", waiting.TokenID).Updates(changes).Error)
+			before := fixture.accounting(test)
+			reconcileImageRouteJob(context.Background(), waiting)
+			ready := fixture.loadJob(test)
+			require.Equal(test, model.ImageRouteJobReady, ready.State)
+			executeImageRouteJob(context.Background(), ready)
+			completed := fixture.loadJob(test)
+			require.Equal(test, model.ImageRouteJobFailed, completed.State, completed.LastError)
+			assert.Equal(test, "[703]", completed.AttemptedChannelsJSON)
+			assert.Empty(test, completed.CurrentTaskID)
+			assert.EqualValues(test, model.TaskStatusFailure, fixture.loadRoot(test).Status)
+			reconcileImageRouteJob(context.Background(), waiting)
+			executeImageRouteJob(context.Background(), ready)
+			assert.Equal(test, completed, fixture.loadJob(test))
+			assert.Equal(test, before, fixture.accounting(test))
+			assert.EqualValues(test, 1, posts.Load())
+			assert.EqualValues(test, 1, polls.Load())
+			assert.Zero(test, guard.blocked.Load())
+		})
+	}
+}

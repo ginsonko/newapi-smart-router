@@ -1,0 +1,40 @@
+package common
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestManagedMediaRejectsPassthroughReferenceBypasses(t *testing.T) {
+	capability := mediaservice.Capability{RuntimeEnforced: true, ReferenceImage: true, ImageRoles: []string{"reference"}, ForbiddenRoles: []string{"first_frame", "last_frame"}, ForbiddenModes: []string{"first_last_frame"}, ReferenceFields: map[string]string{"image": "declared_image_urls"}}
+	for _, fields := range []map[string]interface{}{
+		{"first_frame_url": "https://example.test/frame.png"},
+		{"last_frame_image": []string{"https://example.test/frame.png"}},
+		{"mode": "first_last_frame"},
+		{"declared_image_urls": []string{"https://example.test/frame.png"}},
+	} {
+		assert.Error(t, ValidateTaskMediaPayloadFields(capability, fields))
+	}
+	require.NoError(t, ValidateTaskMediaPayloadFields(capability, map[string]interface{}{"first_frame_url": "", "future_scalar": "unchanged"}))
+	capability.RuntimeEnforced = false
+	require.NoError(t, ValidateTaskMediaPayloadFields(capability, map[string]interface{}{"last_frame_url": "https://example.test/legacy.png"}))
+}
+
+func TestManagedReferenceNormalizationDoesNotInventFrameRoles(t *testing.T) {
+	for _, role := range []string{"reference", "first_frame", "last_frame"} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		req := TaskSubmitReq{References: []MediaReference{{Type: "image", Role: role, URL: "https://example.test/image.png"}}}
+		require.NoError(t, NormalizeTaskMediaReferences(c, &RelayInfo{}, &req))
+		if role == "reference" {
+			assert.NotContains(t, req.Metadata, "first_frame_url")
+			assert.NotContains(t, req.Metadata, "last_frame_url")
+		} else {
+			assert.Equal(t, "https://example.test/image.png", req.Metadata[role+"_url"])
+		}
+	}
+}

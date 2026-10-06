@@ -1,0 +1,84 @@
+package service
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	media "github.com/QuantumNous/new-api/setting/media_setting"
+	ratio "github.com/QuantumNous/new-api/setting/ratio_setting"
+	settings "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/require"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestReadonlySnapshotVideoCatalog(t *testing.T) {
+	file := os.Getenv("GENERIC_READONLY_CATALOG_SNAPSHOT")
+	if file == "" {
+		t.Skip("optional readonly snapshot diagnostic")
+	}
+	data, e := os.ReadFile(file)
+	require.NoError(t, e)
+	var s struct {
+		Abilities []model.Ability `json:"abilities"`
+		Channels  []model.Channel `json:"channels"`
+		Options   []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"options"`
+		Policy smartrouter.Policy `json:"policy"`
+	}
+	require.NoError(t, common.Unmarshal(data, &s))
+	var cfg settings.Setting
+	for _, o := range s.Options {
+		switch o.Key {
+		case "smart_router_setting.config":
+			require.NoError(t, common.UnmarshalJsonStr(o.Value, &cfg))
+		case "UserUsableGroups":
+			require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(o.Value))
+		case "GroupRatio":
+			require.NoError(t, ratio.UpdateGroupRatioByJSONString(o.Value))
+		case "GroupGroupRatio":
+			require.NoError(t, ratio.UpdateGroupGroupRatioByJSONString(o.Value))
+		case "media_setting.config":
+			var m media.Setting
+			require.NoError(t, common.UnmarshalJsonStr(o.Value, &m))
+			require.NoError(t, media.Replace(m))
+		}
+	}
+	src := &staticCatalogSource{abilities: s.Abilities, channels: s.Channels}
+	cm := NewCatalogManager(src, func() settings.Setting { return cfg })
+	defer cm.Close()
+	c, e := cm.Refresh(context.Background())
+	require.NoError(t, e)
+	report, _ := cm.LastReport()
+	for _, r := range report.Rejections {
+		if r.ChannelID == 109 {
+			t.Logf("rejected109=%+v", r)
+		}
+	}
+	pm := NewPriceSnapshotManager(cm, NewAPIRouteRatioSource{})
+	defer pm.Close()
+	prices, e := pm.GetOrRefresh(context.Background(), "default")
+	require.NoError(t, e)
+	groups := map[string]struct{}{}
+	for g := range GetUserUsableGroups("default") {
+		groups[g] = struct{}{}
+	}
+	for id, c := range c.Contracts {
+		if strings.Contains(strings.ToLower(c.Contract.CanonicalModel), "seedance") {
+			for pool, p := range c.Pools {
+				for _, r := range p.Candidates {
+					t.Logf("model=%s endpoint=%s pool=%s channel=%d group=%s ratio=%d allow=%v", c.Contract.CanonicalModel, c.Contract.Endpoint, pool, r.ChannelID, r.Group, prices.RatiosPPM[r.RouteID], smartRoutePolicyAllowsCandidate(r, id, s.Policy, *prices, groups, nil))
+				}
+			}
+		}
+	}
+	engine := &SmartRouterEngine{Catalogs: cm, Prices: pm, Settings: func() settings.Setting { return cfg }}
+	names, e := engine.EligibleModelsForEndpoints(context.Background(), "default", s.Policy, SmartEndpointVideos)
+	require.NoError(t, e)
+	t.Logf("video_models=%v", names)
+}

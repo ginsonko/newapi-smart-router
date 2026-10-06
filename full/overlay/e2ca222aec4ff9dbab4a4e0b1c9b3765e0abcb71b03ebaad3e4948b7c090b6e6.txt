@@ -1,0 +1,48 @@
+package service
+
+import "strings"
+
+// smartRouteModelCatalogMetadataV1 is the single display taxonomy used by the
+// leaderboard selector. Unknown names remain searchable and fall into
+// "other"; this metadata never changes routing eligibility or protocol use.
+func smartRouteModelCatalogMetadataV1(modelName string, endpoint string) (
+	displayName string,
+	family string,
+	modality string,
+	aliases []string,
+) {
+	modelName = strings.TrimSpace(modelName)
+	endpoint = strings.TrimSpace(endpoint)
+	displayName = modelName
+	lowerModel := strings.ToLower(modelName)
+	switch {
+	case strings.HasPrefix(lowerModel, "gpt-") || strings.Contains(lowerModel, "openai"):
+		family = "openai"
+	case strings.HasPrefix(lowerModel, "claude-"):
+		family = "anthropic"
+	case strings.HasPrefix(lowerModel, "gemini-"):
+		family = "google"
+	case strings.HasPrefix(lowerModel, "grok-"):
+		family = "xai"
+	default:
+		family = "other"
+	}
+	switch endpoint {
+	case SmartEndpointImages, SmartEndpointImageEdits:
+		modality = "image"
+	case SmartEndpointVideos, SmartEndpointVideoTasks:
+		modality = "video"
+	case SmartEndpointAudioSpeech, SmartEndpointAudioTranscription, SmartEndpointAudioTranslation:
+		modality = "audio"
+	default:
+		modality = "text"
+	}
+	aliases = []string{modelName}
+	if endpoint != "" {
+		aliases = append(aliases, endpoint)
+	}
+	if displayName != modelName {
+		aliases = append(aliases, displayName)
+	}
+	return displayName, family, modality, aliases
+}

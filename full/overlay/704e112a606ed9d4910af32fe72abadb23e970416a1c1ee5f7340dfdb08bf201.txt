@@ -1,0 +1,263 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const RouteAnalyticsWorkerStateGlobalID = "global"
+
+var ErrRouteAnalyticsWorkerLeaseLost = errors.New("route analytics worker lease lost")
+
+type RouteAnalyticsLogBatchV1 struct {
+	Logs               []*Log
+	CompleteThroughSec int64
+	HasMore            bool
+}
+
+// GetRouteAnalyticsLogBatchV1 returns whole event-time seconds. Completing the
+// boundary second prevents a high-volume second from splitting one logical
+// request across durable checkpoints, while observation digests make overlap
+// replay harmless. ClickHouse log IDs are intentionally not used as cursors.
+func GetRouteAnalyticsLogBatchV1(
+	ctx context.Context,
+	startSec int64,
+	endSec int64,
+	batchLimit int,
+	boundaryLimit int,
+) (RouteAnalyticsLogBatchV1, error) {
+	if LOG_DB == nil {
+		return RouteAnalyticsLogBatchV1{}, errors.New("log database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if startSec <= 0 || endSec < startSec {
+		return RouteAnalyticsLogBatchV1{}, errors.New("invalid route analytics log window")
+	}
+	if batchLimit <= 0 || batchLimit > 2_000 {
+		batchLimit = 500
+	}
+	if boundaryLimit < batchLimit || boundaryLimit > 10_000 {
+		boundaryLimit = 5_000
+	}
+	query := func(untilSec int64, limit int) ([]*Log, error) {
+		logs := make([]*Log, 0, min(limit, batchLimit+1))
+		err := LOG_DB.WithContext(ctx).
+			Select(
+				"id", "user_id", "created_at", "type", "model_name", "quota", "prompt_tokens", "completion_tokens",
+				"use_time", "is_stream", "channel_id", "token_id", "group", "request_id", "other",
+			).
+			Where("type IN ? AND created_at >= ? AND created_at <= ?", []int{LogTypeConsume, LogTypeError, LogTypeRefund}, startSec, untilSec).
+			Order("created_at ASC, request_id ASC, type ASC, id ASC").
+			Limit(limit).
+			Find(&logs).Error
+		return logs, err
+	}
+
+	logs, err := query(endSec, batchLimit+1)
+	if err != nil {
+		return RouteAnalyticsLogBatchV1{}, err
+	}
+	if len(logs) <= batchLimit {
+		return RouteAnalyticsLogBatchV1{Logs: logs, CompleteThroughSec: endSec}, nil
+	}
+	boundarySec := logs[batchLimit-1].CreatedAt
+	wholeBoundary, err := query(boundarySec, boundaryLimit+1)
+	if err != nil {
+		return RouteAnalyticsLogBatchV1{}, err
+	}
+	if len(wholeBoundary) > boundaryLimit {
+		return RouteAnalyticsLogBatchV1{}, fmt.Errorf(
+			"route analytics event-time boundary %d exceeds the bounded %d-row budget",
+			boundarySec,
+			boundaryLimit,
+		)
+	}
+	return RouteAnalyticsLogBatchV1{Logs: wholeBoundary, CompleteThroughSec: boundarySec, HasMore: true}, nil
+}
+
+func AcquireRouteAnalyticsWorkerLeaseV1(
+	ctx context.Context,
+	owner string,
+	nowMS int64,
+	leaseUntilMS int64,
+) (RouteAnalyticsWorkerStateV1, bool, error) {
+	if DB == nil {
+		return RouteAnalyticsWorkerStateV1{}, false, errors.New("main database is not initialized")
+	}
+	owner = strings.TrimSpace(owner)
+	if owner == "" || nowMS <= 0 || leaseUntilMS <= nowMS {
+		return RouteAnalyticsWorkerStateV1{}, false, errors.New("invalid route analytics worker lease")
+	}
+	seed := RouteAnalyticsWorkerStateV1{ID: RouteAnalyticsWorkerStateGlobalID, UpdatedAtMS: nowMS}
+	if err := DB.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&seed).Error; err != nil {
+		return RouteAnalyticsWorkerStateV1{}, false, err
+	}
+	result := DB.WithContext(ctx).Model(&RouteAnalyticsWorkerStateV1{}).
+		Where("id = ? AND (lease_until_ms < ? OR lease_owner = ?)", RouteAnalyticsWorkerStateGlobalID, nowMS, owner).
+		Updates(map[string]any{"lease_owner": owner, "lease_until_ms": leaseUntilMS, "updated_at_ms": nowMS})
+	if result.Error != nil {
+		return RouteAnalyticsWorkerStateV1{}, false, result.Error
+	}
+	var state RouteAnalyticsWorkerStateV1
+	if err := DB.WithContext(ctx).Where("id = ?", RouteAnalyticsWorkerStateGlobalID).First(&state).Error; err != nil {
+		return RouteAnalyticsWorkerStateV1{}, false, err
+	}
+	return state, result.RowsAffected == 1 && state.LeaseOwner == owner, nil
+}
+
+func UpdateRouteAnalyticsWorkerStateV1(
+	ctx context.Context,
+	owner string,
+	nowMS int64,
+	leaseUntilMS int64,
+	updates map[string]any,
+) error {
+	if DB == nil {
+		return errors.New("main database is not initialized")
+	}
+	owner = strings.TrimSpace(owner)
+	if owner == "" || nowMS <= 0 || leaseUntilMS <= nowMS {
+		return errors.New("invalid route analytics worker state update")
+	}
+	copyUpdates := make(map[string]any, len(updates)+3)
+	for key, value := range updates {
+		switch key {
+		case "id", "lease_owner", "lease_until_ms":
+			return fmt.Errorf("route analytics worker state field %q is lease-managed", key)
+		default:
+			copyUpdates[key] = value
+		}
+	}
+	copyUpdates["lease_owner"] = owner
+	copyUpdates["lease_until_ms"] = leaseUntilMS
+	copyUpdates["updated_at_ms"] = nowMS
+	result := DB.WithContext(ctx).Model(&RouteAnalyticsWorkerStateV1{}).
+		Where("id = ? AND lease_owner = ? AND lease_until_ms >= ?", RouteAnalyticsWorkerStateGlobalID, owner, nowMS).
+		Updates(copyUpdates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrRouteAnalyticsWorkerLeaseLost
+	}
+	return nil
+}
+
+func ReleaseRouteAnalyticsWorkerLeaseV1(ctx context.Context, owner string, nowMS int64) error {
+	if DB == nil {
+		return errors.New("main database is not initialized")
+	}
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return errors.New("route analytics worker lease owner is empty")
+	}
+	return DB.WithContext(ctx).Model(&RouteAnalyticsWorkerStateV1{}).
+		Where("id = ? AND lease_owner = ?", RouteAnalyticsWorkerStateGlobalID, owner).
+		Updates(map[string]any{"lease_owner": "", "lease_until_ms": int64(0), "updated_at_ms": nowMS}).Error
+}
+
+func GetRouteAnalyticsWorkerStateV1(ctx context.Context) (RouteAnalyticsWorkerStateV1, error) {
+	if DB == nil {
+		return RouteAnalyticsWorkerStateV1{}, errors.New("main database is not initialized")
+	}
+	var state RouteAnalyticsWorkerStateV1
+	err := DB.WithContext(ctx).Where("id = ?", RouteAnalyticsWorkerStateGlobalID).First(&state).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return RouteAnalyticsWorkerStateV1{ID: RouteAnalyticsWorkerStateGlobalID}, nil
+	}
+	return state, err
+}
+
+type RouteAnalyticsRetentionResultV1 struct {
+	Observations int64
+	RouteBuckets int64
+	KeyBuckets   int64
+	Dimensions   int64
+}
+
+func CleanupRouteAnalyticsRetentionV1(ctx context.Context, now time.Time, batchLimit int) (RouteAnalyticsRetentionResultV1, error) {
+	if DB == nil {
+		return RouteAnalyticsRetentionResultV1{}, errors.New("main database is not initialized")
+	}
+	if batchLimit <= 0 || batchLimit > 1_000 {
+		batchLimit = 250
+	}
+	result := RouteAnalyticsRetentionResultV1{}
+	deleteByKeys := func(target any, keyColumn string, where string, args []any, keys any) (int64, error) {
+		query := DB.WithContext(ctx).Model(target).Select(keyColumn).Where(where, args...).Order(keyColumn + " ASC").Limit(batchLimit)
+		if err := query.Find(keys).Error; err != nil {
+			return 0, err
+		}
+		var values []string
+		switch typed := keys.(type) {
+		case *[]string:
+			values = *typed
+		default:
+			return 0, errors.New("unsupported route analytics retention key target")
+		}
+		if len(values) == 0 {
+			return 0, nil
+		}
+		deleted := DB.WithContext(ctx).Where(keyColumn+" IN ?", values).Delete(target)
+		return deleted.RowsAffected, deleted.Error
+	}
+
+	var observationKeys []string
+	count, err := deleteByKeys(
+		&RouteAnalyticsObservationV1{}, "observation_digest", "ingested_at_ms < ?",
+		[]any{now.Add(-10 * 24 * time.Hour).UnixMilli()}, &observationKeys,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.Observations = count
+
+	var routeBucketKeys []string
+	count, err = deleteByKeys(
+		&RouteAnalyticsBucketV1{}, "bucket_key",
+		"(granularity = ? AND bucket_start_ms < ?) OR (granularity = ? AND bucket_start_ms < ?)",
+		[]any{
+			RouteAnalyticsGranularity5m, now.Add(-26 * time.Hour).UnixMilli(),
+			RouteAnalyticsGranularity1h, now.Add(-4 * 24 * time.Hour).UnixMilli(),
+		},
+		&routeBucketKeys,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.RouteBuckets = count
+
+	var keyBucketKeys []string
+	count, err = deleteByKeys(
+		&KeyUsageAnalyticsBucketV1{}, "bucket_key",
+		"(granularity = ? AND bucket_start_ms < ?) OR (granularity = ? AND bucket_start_ms < ?)",
+		[]any{
+			RouteAnalyticsGranularity5m, now.Add(-26 * time.Hour).UnixMilli(),
+			RouteAnalyticsGranularity1h, now.Add(-8 * 24 * time.Hour).UnixMilli(),
+		},
+		&keyBucketKeys,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.KeyBuckets = count
+
+	var dimensionKeys []string
+	count, err = deleteByKeys(
+		&RouteAnalyticsDimensionV1{}, "detail_id", "retired_at_ms > 0 AND retired_at_ms < ?",
+		[]any{now.Add(-4 * 24 * time.Hour).UnixMilli()}, &dimensionKeys,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.Dimensions = count
+	return result, nil
+}

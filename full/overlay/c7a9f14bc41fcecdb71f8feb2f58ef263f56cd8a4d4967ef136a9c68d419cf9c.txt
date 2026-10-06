@@ -1,0 +1,46 @@
+package common
+
+// ImageDimensionPreset records a provider preset's nominal ratio and pixels.
+// Rounded 21:9 presets intentionally do not reduce to an exact 21:9 fraction.
+type ImageDimensionPreset struct {
+	Size        string
+	Resolution  string
+	AspectRatio string
+}
+
+// Image2DimensionPresets returns fresh values so callers cannot mutate defaults.
+// Explicit channel/model capability overrides may narrow or replace the preset.
+func Image2DimensionPresets() []ImageDimensionPreset {
+	return []ImageDimensionPreset{
+		{Size: "1024x1024", Resolution: "1k", AspectRatio: "1:1"},
+		{Size: "2048x2048", Resolution: "2k", AspectRatio: "1:1"},
+		{Size: "2880x2880", Resolution: "4k", AspectRatio: "1:1"},
+		{Size: "1536x1024", Resolution: "1k", AspectRatio: "3:2"},
+		{Size: "2160x1440", Resolution: "2k", AspectRatio: "3:2"},
+		{Size: "3456x2304", Resolution: "4k", AspectRatio: "3:2"},
+		{Size: "1280x720", Resolution: "1k", AspectRatio: "16:9"},
+		{Size: "2560x1440", Resolution: "2k", AspectRatio: "16:9"},
+		{Size: "3840x2160", Resolution: "4k", AspectRatio: "16:9"},
+		{Size: "720x1280", Resolution: "1k", AspectRatio: "9:16"},
+		{Size: "1440x2560", Resolution: "2k", AspectRatio: "9:16"},
+		{Size: "2160x3840", Resolution: "4k", AspectRatio: "9:16"},
+		{Size: "1024x768", Resolution: "1k", AspectRatio: "4:3"},
+		{Size: "2048x1536", Resolution: "2k", AspectRatio: "4:3"},
+		{Size: "3200x2400", Resolution: "4k", AspectRatio: "4:3"},
+		{Size: "768x1024", Resolution: "1k", AspectRatio: "3:4"},
+		{Size: "1536x2048", Resolution: "2k", AspectRatio: "3:4"},
+		{Size: "2400x3200", Resolution: "4k", AspectRatio: "3:4"},
+		{Size: "1280x544", Resolution: "1k", AspectRatio: "21:9"},
+		{Size: "2560x1088", Resolution: "2k", AspectRatio: "21:9"},
+		{Size: "3840x1600", Resolution: "4k", AspectRatio: "21:9"},
+	}
+}
+
+func Image2PresetResolution(size string) (string, bool) {
+	for _, preset := range Image2DimensionPresets() {
+		if preset.Size == size {
+			return preset.Resolution, true
+		}
+	}
+	return "", false
+}

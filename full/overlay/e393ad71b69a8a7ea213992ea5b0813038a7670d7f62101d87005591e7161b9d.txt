@@ -1,0 +1,59 @@
+package model
+
+import (
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// RecoverTaskProxyArtifact preserves the original asset/blob IDs. The caller
+// must resolve source against the frozen task delivery contract first. This
+// repairs only the never-attempted compatibility placeholder; real failures,
+// active readers/workers, deleted media, and completed files retain their state.
+func RecoverTaskProxyArtifact(task *Task, source, identity string) (bool, error) {
+	if task == nil || task.ID <= 0 || task.UserId <= 0 || source == "" || identity == "" {
+		return false, errors.New("invalid task media recovery")
+	}
+	if task.Status != TaskStatusFinalizing && task.Status != TaskStatusSuccess {
+		return false, nil
+	}
+	var blobs []MediaBlob
+	err := DB.Table("media_blobs").Select("media_blobs.*").
+		Joins("JOIN task_artifacts ON task_artifacts.media_blob_id = media_blobs.id").
+		Where("task_artifacts.task_row_id = ? AND task_artifacts.user_id = ? AND task_artifacts.type = ?", task.ID, task.UserId, "video").
+		Where("media_blobs.user_id = ? AND media_blobs.deleted_at = 0 AND media_blobs.status = ?", task.UserId, MediaBlobStatusReady).
+		Where("(media_blobs.private_source IN ? OR task_artifacts.provider_output_identity = ?)", []string{"task://" + task.TaskID, source}, identity).
+		Order("media_blobs.id ASC").Find(&blobs).Error
+	if err != nil || len(blobs) == 0 {
+		return false, err
+	}
+	for _, blob := range blobs {
+		if blob.PrivateSource == source || blob.StorageBackend == MediaStorageBackendLocal {
+			return true, nil
+		}
+	}
+	now := time.Now().Unix()
+	// Conditional update is the same fence used by materializer leases. Once
+	// rebound, subsequent polls cannot reset attempts or reacquire its lease.
+	blob := blobs[0]
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		update := tx.Model(&MediaBlob{}).
+			Where("id = ? AND private_source = ? AND storage_backend = ? AND deleted_at = 0 AND status = ?", blob.ID, "task://"+task.TaskID, MediaStorageBackendRemote, MediaBlobStatusReady).
+			Where("access_lease_until <= ?", now).
+			Where("size_bytes = 0 AND materialize_attempts = 0 AND materialize_lease_until <= ? AND materialize_status IN ?", now, []string{MediaMaterializeDisabled, MediaMaterializePending, ""}).
+			Updates(map[string]any{
+				"private_source": source, "materialize_status": MediaMaterializePending,
+				"materialize_next_retry_at": now, "materialize_last_error": "",
+				"materialize_lease_owner": "", "materialize_lease_until": 0,
+			})
+		if update.Error != nil || update.RowsAffected == 0 {
+			return update.Error
+		}
+		// Bind the selected provider output identity too, so a later poll after
+		// materialization clears private_source reuses this same artifact.
+		return tx.Model(&TaskArtifact{}).Where("task_row_id = ? AND media_blob_id = ?", task.ID, blob.ID).
+			Update("provider_output_identity", identity).Error
+	})
+	return true, err
+}

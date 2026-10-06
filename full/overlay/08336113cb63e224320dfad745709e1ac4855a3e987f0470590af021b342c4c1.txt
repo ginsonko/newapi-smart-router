@@ -1,0 +1,309 @@
+package model
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupTenantCostTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previousDB := DB
+	previousMain := common.MainDatabaseType()
+	dsn := fmt.Sprintf("file:tenant-cost-%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		DB = previousDB
+		common.SetMainDatabaseType(previousMain)
+	})
+	require.NoError(t, db.AutoMigrate(
+		&TenantCostDownstream{}, &TenantCostProductSlot{}, &TenantCostSlotProvisionReceipt{}, &TenantCostKeyRotationReceipt{},
+		&TenantCredentialBinding{}, &TenantRouteProfile{}, &TenantCostSequence{},
+		&TenantCostEvent{}, &TenantCostOutbox{}, &TenantReportingToken{}, &TenantCostAuditEvent{}, &TenantCostProjectionRetry{},
+		&TenantCostWorkerControl{},
+	))
+	require.NoError(t, EnsureDefaultTenantCostDownstream())
+	return db
+}
+
+func tenantCostTestSpec(eventID string) TenantCostEventSpec {
+	amount := "0.01230000"
+	return TenantCostEventSpec{
+		TenantID: DownstreamTenantID, EventID: eventID, EventType: TenantCostEventSettlement,
+		OccurredAt: time.Unix(1_700_000_000, 0).UTC(), FinalizedAt: time.Unix(1_700_000_001, 0).UTC(),
+		DownstreamRequestId: "tvreq_test", GatewayRequestId: "req_test", ProductPoolID: "openai_gpt",
+		ServiceTier: "pro", RouteProfileID: "profile-test", ProfileRevision: "rev-1", KeyID: "key-test",
+		RequestedModel: "gpt-test", CanonicalModel: "gpt-test", UpstreamModel: "gpt-test",
+		BillingMode: "token", BillingUnit: "token", GatewayChargeQuota: 12300,
+		GatewayChargeAmount: amount, Currency: "USD", ProcurementAmount: &amount,
+		ProcurementCurrency: "USD", Evidence: TenantCostEvidenceFallback,
+		BasisKind: "gateway_charge_fallback", BasisRevision: "price-1", Formula: "fallback",
+		Status: TenantCostStatusFinal,
+	}
+}
+
+func TestTenantCostPublicIdentifierDistinguishesOrdinaryIDsFromSecrets(t *testing.T) {
+	assert.True(t, validTenantCostPublicIdentifier("task-123", 128))
+	assert.True(t, validTenantCostPublicIdentifier("mask-key", 128))
+	assert.False(t, validTenantCostPublicIdentifier("sk-secret", 128))
+	assert.False(t, validTenantCostPublicIdentifier("key:sk-secret", 128))
+}
+
+func TestTenantCostEventMissingTenantFailsClosed(t *testing.T) {
+	setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("uce_missing_tenant")
+	spec.TenantID = ""
+	_, err := AppendTenantCostEvent(spec)
+	assert.ErrorIs(t, err, ErrTenantCostScope)
+	var count int64
+	require.NoError(t, DB.Model(&TenantCostEvent{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestTenantCostEventAppendIsImmutableAndIdempotent(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("uce_same")
+	first, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	require.False(t, first.Replayed)
+	second, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	assert.True(t, second.Replayed)
+	assert.Equal(t, first.Event.Sequence, second.Event.Sequence)
+	var eventCount, outboxCount int64
+	require.NoError(t, db.Model(&TenantCostEvent{}).Count(&eventCount).Error)
+	require.NoError(t, db.Model(&TenantCostOutbox{}).Count(&outboxCount).Error)
+	assert.EqualValues(t, 1, eventCount)
+	assert.EqualValues(t, 1, outboxCount)
+
+	conflict := spec
+	conflict.GatewayChargeQuota++
+	_, err = AppendTenantCostEvent(conflict)
+	assert.ErrorIs(t, err, ErrTenantCostConflict)
+}
+
+func TestTenantCostEventReplayIgnoresReconstructedTerminalTimes(t *testing.T) {
+	setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("uce_time_replay")
+	first, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+
+	// A worker restart can rebuild the same terminal fact with new wall-clock
+	// timestamps.  The durable event ID and all financial/correlation fields
+	// still identify one fact, so this must replay the original row rather than
+	// create a conflict or a second outbox item.
+	retry := spec
+	retry.OccurredAt = spec.OccurredAt.Add(17 * time.Minute)
+	retry.FinalizedAt = spec.FinalizedAt.Add(19 * time.Minute)
+	second, err := AppendTenantCostEvent(retry)
+	require.NoError(t, err)
+	assert.True(t, second.Replayed)
+	assert.Equal(t, first.Event.Sequence, second.Event.Sequence)
+
+	conflict := retry
+	conflict.GatewayChargeQuota++
+	_, err = AppendTenantCostEvent(conflict)
+	assert.ErrorIs(t, err, ErrTenantCostConflict)
+}
+
+func TestTenantCostUnknownAndObservedZeroSemantics(t *testing.T) {
+	setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("uce_unknown")
+	spec.EventType = TenantCostEventSettlement
+	spec.Evidence = TenantCostEvidenceUnknown
+	spec.ProcurementAmount = nil
+	spec.UnknownReason = "missing_upstream_receipt"
+	result, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	assert.Contains(t, result.Event.Payload, `"amount":null`)
+
+	zero := tenantCostTestSpec("uce_zero")
+	zero.DownstreamRequestId = "tvreq_zero"
+	zero.GatewayRequestId = "req_zero"
+	zero.EventType = TenantCostEventObservedZero
+	zero.GatewayChargeQuota = 0
+	zero.GatewayChargeAmount = "0.00000000"
+	zero.ProcurementAmount = stringPtr("0.00000000")
+	zero.Evidence = TenantCostEvidenceExact
+	result, err = AppendTenantCostEvent(zero)
+	require.NoError(t, err)
+	assert.Contains(t, result.Event.Payload, `"amount":"0.00000000"`)
+}
+
+func TestTenantCostOutboxClaimRetryAndSent(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	_, err := AppendTenantCostEvent(tenantCostTestSpec("uce_outbox"))
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	rows, err := ClaimTenantCostOutbox(10, now.UnixNano())
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, TenantOutboxPending, rows[0].State)
+	require.NoError(t, MarkTenantCostOutboxFailed(rows[0].EventID, fmt.Errorf("temporary"), now.UnixNano()))
+	var failed TenantCostOutbox
+	require.NoError(t, db.Where("event_id = ?", rows[0].EventID).First(&failed).Error)
+	assert.Equal(t, TenantOutboxFailed, failed.State)
+	// A failed row is not immediately eligible; forcing its due time models a
+	// worker restart after the bounded backoff.
+	require.NoError(t, db.Model(&TenantCostOutbox{}).Where("id = ?", failed.ID).Updates(map[string]interface{}{
+		"next_attempt_at": now.Add(-time.Second).UnixNano(),
+	}).Error)
+	rows, err = ClaimTenantCostOutbox(10, now.Add(time.Second).UnixNano())
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.NoError(t, MarkTenantCostOutboxSent(rows[0].EventID, now.Add(2*time.Second).UnixNano()))
+	var sent TenantCostOutbox
+	require.NoError(t, db.Where("event_id = ?", rows[0].EventID).First(&sent).Error)
+	assert.Equal(t, TenantOutboxSent, sent.State)
+}
+
+func TestTenantCostProjectionRetryQueueIsBoundedAndIdempotent(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("uce_projection_retry")
+	require.NoError(t, EnqueueTenantCostProjection(spec, fmt.Errorf("temporary database error")))
+	// Re-enqueueing the same redacted spec must not create a second row.
+	require.NoError(t, EnqueueTenantCostProjection(spec, fmt.Errorf("same transient error")))
+	var count int64
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+	rows, err := ClaimTenantCostProjectionRetries(10, time.Now().UTC().UnixNano())
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	decoded, err := DecodeTenantCostProjectionRetry(rows[0])
+	require.NoError(t, err)
+	assert.Equal(t, spec.EventID, decoded.EventID)
+	require.NoError(t, MarkTenantCostProjectionRetrySent(spec.EventID, time.Now().UTC().UnixNano()))
+	var row TenantCostProjectionRetry
+	require.NoError(t, db.Where("event_id = ?", spec.EventID).First(&row).Error)
+	assert.Equal(t, TenantCostProjectionSent, row.State)
+
+	conflict := spec
+	conflict.GatewayChargeQuota++
+	assert.ErrorIs(t, EnqueueTenantCostProjection(conflict, nil), ErrTenantCostConflict)
+}
+
+func TestTenantCostProjectionRetryStatusUpdatesStayTenantScoped(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	second := &TenantCostDownstream{TenantID: "retry-tenant", DisplayName: "Retry Tenant", ConfigKey: "retry_tenant", Status: TenantCostDownstreamActive}
+	require.NoError(t, UpsertTenantCostDownstream(second))
+	spec := tenantCostTestSpec("retry-tenant-event")
+	spec.TenantID = second.TenantID
+	require.NoError(t, EnqueueTenantCostProjection(spec, fmt.Errorf("temporary")))
+	rows, err := ClaimTenantCostProjectionRetries(10, time.Now().UTC().UnixNano())
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+
+	assert.ErrorIs(t, MarkTenantCostProjectionRetrySent(spec.EventID, time.Now().UTC().UnixNano()), gorm.ErrRecordNotFound)
+	require.NoError(t, MarkTenantCostProjectionRetrySentForTenant(second.TenantID, spec.EventID, time.Now().UTC().UnixNano()))
+	var row TenantCostProjectionRetry
+	require.NoError(t, db.Where("tenant_id = ? AND event_id = ?", second.TenantID, spec.EventID).First(&row).Error)
+	assert.Equal(t, TenantCostProjectionSent, row.State)
+}
+
+func TestDecodeTenantCostProjectionRetryRejectsCrossTenantPayload(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	second := &TenantCostDownstream{TenantID: "retry-payload-tenant", DisplayName: "Retry Payload Tenant", ConfigKey: "retry_payload_tenant", Status: TenantCostDownstreamActive}
+	require.NoError(t, UpsertTenantCostDownstream(second))
+
+	rowSpec := tenantCostTestSpec("cross-tenant-payload")
+	require.NoError(t, EnqueueTenantCostProjection(rowSpec, fmt.Errorf("temporary")))
+	var row TenantCostProjectionRetry
+	require.NoError(t, db.Where("tenant_id = ? AND event_id = ?", DownstreamTenantID, rowSpec.EventID).First(&row).Error)
+
+	// Simulate a tampered durable row whose payload and hash are internally
+	// consistent for another registered tenant.  The row namespace must still
+	// win and fail closed before any append/replay decision is made.
+	forged := rowSpec
+	forged.TenantID = second.TenantID
+	normalized, err := forged.normalize()
+	require.NoError(t, err)
+	forgedPayload := tenantCostSemanticPayload(normalized)
+	forgedHash, _, err := tenantCostPayloadHash(forgedPayload)
+	require.NoError(t, err)
+	forgedJSON, err := common.Marshal(normalized)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Where("id = ?", row.ID).Updates(map[string]interface{}{
+		"spec_json": string(forgedJSON), "spec_hash": forgedHash,
+	}).Error)
+
+	row.SpecJSON = string(forgedJSON)
+	row.SpecHash = forgedHash
+	_, err = DecodeTenantCostProjectionRetry(row)
+	assert.ErrorIs(t, err, ErrTenantCostScope)
+	var events int64
+	require.NoError(t, db.Model(&TenantCostEvent{}).Count(&events).Error)
+	assert.Zero(t, events)
+}
+
+func TestTenantCostTerminalCorrelationConflictPreventsDoubleProjection(t *testing.T) {
+	setupTenantCostTestDB(t)
+	zero := tenantCostTestSpec("uce_zero_fence")
+	zero.EventType = TenantCostEventObservedZero
+	zero.GatewayChargeQuota = 0
+	zero.GatewayChargeAmount = "0.00000000"
+	zero.ProcurementAmount = stringPtr("0.00000000")
+	zero.Evidence = TenantCostEvidenceExact
+	_, err := AppendTenantCostEvent(zero)
+	require.NoError(t, err)
+
+	positive := tenantCostTestSpec("uce_late_settlement")
+	_, err = AppendTenantCostEvent(positive)
+	assert.ErrorIs(t, err, ErrTenantCostConflict)
+}
+
+func TestTenantCostUsageRetainsAudioEvidence(t *testing.T) {
+	setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("uce_audio")
+	spec.Usage.AudioInputTokens = "17"
+	spec.Usage.AudioOutputTokens = "23"
+	result, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	assert.Contains(t, result.Event.Payload, `"audio_input_tokens":"17"`)
+	assert.Contains(t, result.Event.Payload, `"audio_output_tokens":"23"`)
+}
+
+func TestTenantCostCursorSupportsOverlapAndStableSequence(t *testing.T) {
+	setupTenantCostTestDB(t)
+	for _, id := range []string{"uce_cursor_1", "uce_cursor_2", "uce_cursor_3"} {
+		_, err := AppendTenantCostEvent(tenantCostTestSpec(id))
+		require.NoError(t, err)
+	}
+	first, err := ListTenantCostEvents(DownstreamTenantID, 0, 2)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	overlap, err := ListTenantCostEvents(DownstreamTenantID, first[0].Sequence, 2)
+	require.NoError(t, err)
+	require.Len(t, overlap, 2)
+	assert.Equal(t, first[1].Sequence, overlap[0].Sequence)
+	assert.Greater(t, overlap[1].Sequence, overlap[0].Sequence)
+}
+
+func TestTenantReportingTokenExpiryAndRevocation(t *testing.T) {
+	setupTenantCostTestDB(t)
+	now := common.GetTimestamp()
+	row, secret, err := CreateTenantReportingToken(DownstreamTenantID, TenantCostReportingPermission, now+60)
+	require.NoError(t, err)
+	got, err := LookupTenantReportingToken(secret)
+	require.NoError(t, err)
+	assert.Equal(t, row.TokenID, got.TokenID)
+	// Expiry and revocation are checked against persisted state, not a client
+	// supplied tenant header.
+	require.NoError(t, DB.Model(&TenantReportingToken{}).Where("id = ?", row.ID).Updates(map[string]interface{}{"expires_at": now - 1}).Error)
+	_, err = LookupTenantReportingToken(secret)
+	assert.ErrorIs(t, err, ErrTenantCostReportingToken)
+	require.NoError(t, DB.Model(&TenantReportingToken{}).Where("id = ?", row.ID).Updates(map[string]interface{}{"expires_at": now + 60, "revoked_at": now}).Error)
+	_, err = LookupTenantReportingToken(secret)
+	assert.ErrorIs(t, err, ErrTenantCostReportingToken)
+}
+
+func stringPtr(value string) *string { return &value }

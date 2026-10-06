@@ -1,0 +1,179 @@
+package service
+
+// Bounded retry worker for cost projection writes.  It is separate from the
+// partner outbox worker: the former makes the local immutable fact durable,
+// while the latter publishes an already-durable event to Downstream.
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+)
+
+const (
+	tenantCostProjectionWorkerDefaultInterval = 45 * time.Second
+	tenantCostProjectionWorkerDefaultBatch    = 20
+)
+
+type TenantCostProjectionRetryWorker struct {
+	interval  time.Duration
+	batch     int
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	startOnce sync.Once
+	started   atomic.Bool
+}
+
+type TenantCostProjectionRetryStats struct {
+	Claimed int
+	Sent    int
+	Failed  int
+	Review  int
+}
+
+func NewTenantCostProjectionRetryWorker(interval time.Duration, batch int) *TenantCostProjectionRetryWorker {
+	if interval <= 0 {
+		interval = tenantCostProjectionWorkerDefaultInterval
+	}
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+	if interval > 10*time.Minute {
+		interval = 10 * time.Minute
+	}
+	if batch <= 0 || batch > 100 {
+		batch = tenantCostProjectionWorkerDefaultBatch
+	}
+	return &TenantCostProjectionRetryWorker{interval: interval, batch: batch, stop: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (worker *TenantCostProjectionRetryWorker) Start() {
+	if worker == nil {
+		return
+	}
+	worker.startOnce.Do(func() {
+		worker.started.Store(true)
+		go worker.loop()
+	})
+}
+
+func (worker *TenantCostProjectionRetryWorker) loop() {
+	defer close(worker.done)
+	worker.runAndLog(context.Background())
+	ticker := time.NewTicker(worker.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			worker.runAndLog(context.Background())
+		case <-worker.stop:
+			return
+		}
+	}
+}
+
+func (worker *TenantCostProjectionRetryWorker) runAndLog(ctx context.Context) {
+	stats, err := worker.RunOnce(ctx, time.Now().UTC())
+	if err != nil {
+		common.SysLog("tenant cost projection retry pass failed: " + err.Error())
+		return
+	}
+	if stats.Failed > 0 || stats.Review > 0 {
+		common.SysLog("tenant cost projection retry pass: claimed=" + strconv.Itoa(stats.Claimed) +
+			" sent=" + strconv.Itoa(stats.Sent) + " failed=" + strconv.Itoa(stats.Failed) +
+			" review=" + strconv.Itoa(stats.Review))
+	}
+}
+
+func (worker *TenantCostProjectionRetryWorker) RunOnce(ctx context.Context, now time.Time) (TenantCostProjectionRetryStats, error) {
+	var stats TenantCostProjectionRetryStats
+	if worker == nil {
+		return stats, errors.New("tenant cost projection retry worker is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := model.ClaimTenantCostProjectionRetries(worker.batch, now.UnixNano())
+	if err != nil {
+		return stats, err
+	}
+	stats.Claimed = len(rows)
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		spec, decodeErr := model.DecodeTenantCostProjectionRetry(row)
+		if decodeErr != nil {
+			stats.Review++
+			_ = model.MarkTenantCostProjectionRetryReviewForTenant(row.TenantID, row.EventID, decodeErr, now.UnixNano())
+			continue
+		}
+		_, appendErr := model.AppendTenantCostEvent(spec)
+		if appendErr == nil {
+			if markErr := model.MarkTenantCostProjectionRetrySentForTenant(row.TenantID, row.EventID, now.UnixNano()); markErr != nil {
+				stats.Failed++
+				_ = model.MarkTenantCostProjectionRetryFailedForTenant(row.TenantID, row.EventID, markErr, now.UnixNano())
+				continue
+			}
+			stats.Sent++
+			continue
+		}
+		if errors.Is(appendErr, model.ErrTenantCostConflict) || errors.Is(appendErr, model.ErrTenantCostInvalidInput) || errors.Is(appendErr, model.ErrTenantCostScope) {
+			stats.Review++
+			_ = model.MarkTenantCostProjectionRetryReviewForTenant(row.TenantID, row.EventID, appendErr, now.UnixNano())
+			continue
+		}
+		stats.Failed++
+		_ = model.MarkTenantCostProjectionRetryFailedForTenant(row.TenantID, row.EventID, appendErr, now.UnixNano())
+	}
+	return stats, nil
+}
+
+func (worker *TenantCostProjectionRetryWorker) Close() {
+	if worker == nil {
+		return
+	}
+	worker.closeOnce.Do(func() {
+		if !worker.started.Load() {
+			return
+		}
+		close(worker.stop)
+		<-worker.done
+	})
+}
+
+// StartTenantCostProjectionRetryWorkerFromEnv is opt-out only when explicitly
+// disabled.  It never makes startup fail: a missing cost table or a temporary
+// database fault is reported and the normal API remains available.
+func StartTenantCostProjectionRetryWorkerFromEnv() (func(), error) {
+	if raw := os.Getenv("TENANT_COST_PROJECTION_RETRY_ENABLED"); raw != "" {
+		enabled, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err == nil && !enabled {
+			return func() {}, nil
+		}
+	}
+	interval := tenantCostProjectionWorkerDefaultInterval
+	if raw := strings.TrimSpace(os.Getenv("TENANT_COST_PROJECTION_RETRY_INTERVAL_SECONDS")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil {
+			interval = time.Duration(seconds) * time.Second
+		}
+	}
+	batch := tenantCostProjectionWorkerDefaultBatch
+	if raw := strings.TrimSpace(os.Getenv("TENANT_COST_PROJECTION_RETRY_BATCH")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			batch = parsed
+		}
+	}
+	worker := NewTenantCostProjectionRetryWorker(interval, batch)
+	worker.Start()
+	return worker.Close, nil
+}

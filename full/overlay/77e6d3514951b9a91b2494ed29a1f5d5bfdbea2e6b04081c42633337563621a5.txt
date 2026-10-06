@@ -1,0 +1,509 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import { api } from '@/lib/api'
+
+import { estimateParameterPrice } from '../pricing/lib/parameter-price'
+import type { ParameterPrice } from '../pricing/types'
+import { createStudioMedia, type StudioBatchResponse } from './api'
+import {
+  containsPromptToken,
+  managedCapabilityIssues,
+  promptReferenceTokens,
+  rebindPromptReferences,
+} from './parameter-capability'
+import {
+  parameterQuoteHeaders,
+  parameterQuoteIntent,
+  ParameterQuotePreflightError,
+} from './parameter-quote'
+import type {
+  MediaCapabilityContract,
+  StudioFormValue,
+  StudioReference,
+} from './types'
+
+const offer: ParameterPrice = {
+  revision: 'v1',
+  model: 'model-a',
+  group: 'group-a',
+  unit: 'per_second',
+  currency: 'USD',
+  unit_price: '0.996',
+  conditions: { resolution: '720p' },
+}
+
+test('server scope precedence is independent for each public price schedule', () => {
+  const input = { model: 'model-a', group: 'group-a', resolution: '720p', quality: 'hd', duration: 10, count: 1 }
+  const schedules: ParameterPrice[] = [
+    { ...offer, schedule_id: 'a', priority: 6, unit_price: '0.6', conditions: {} },
+    { ...offer, schedule_id: 'a', priority: 2, unit_price: '0.1', conditions: { resolution: '720p', quality: 'hd' } },
+    { ...offer, schedule_id: 'b', priority: 10, unit_price: '0.9' },
+  ]
+  assert.equal(estimateParameterPrice(schedules, input)?.amount, '6')
+})
+const value: StudioFormValue = {
+  mode: 'images',
+  group: 'group-a',
+  model: 'model-a',
+  prompt: 'A landscape',
+  size: '1024x1024',
+  aspectRatio: '1:1',
+  resolution: '720p',
+  duration: 10,
+  count: 1,
+  quality: 'standard',
+  voice: '',
+  responseFormat: 'url',
+  references: [],
+  parameterPricing: true,
+  parameterExpectedAmount: '1',
+  parameterExpectedCurrency: 'USD',
+}
+const capability: MediaCapabilityContract = {
+  runtime_enforced: true,
+  reference_image: true,
+  reference_video: true,
+  reference_audio: true,
+  resolutions: ['720p'],
+  duration: { mode: 'range', min: 4, max: 30 },
+  prompt_reference: {
+    required: true,
+    templates: {
+      image: '@image{index}',
+      video: '@video{index}',
+      audio: '@audio{index}',
+    },
+    index_scope: 'per_type',
+    index_base: 1,
+  },
+}
+const references: StudioReference[] = [
+  { id: 'a', type: 'image', role: 'reference', name: 'a' },
+  { id: 'b', type: 'video', role: 'reference', name: 'b' },
+  { id: 'c', type: 'image', role: 'reference', name: 'c' },
+]
+
+describe('consumer parameter pricing', () => {
+  test('per-second estimates retain decimal precision and apply batch exactly once', () => {
+    const estimate = estimateParameterPrice([offer], { ...value, count: 3 })
+    assert.equal(estimate?.amount, '9.96')
+    assert.equal(estimate?.total, '29.88')
+    assert.equal(estimate?.quantity, 10)
+    assert.equal(
+      estimateParameterPrice([offer], { ...value, duration: 7200 })?.amount,
+      '7171.2'
+    )
+    for (const unit of ['per_request', 'per_image'] as const) {
+      assert.equal(
+        estimateParameterPrice([{ ...offer, unit, unit_price: '0.036' }], {
+          ...value,
+          count: 3,
+        })?.total,
+        '0.108'
+      )
+    }
+  })
+
+  test('changing resolution, quality, model or group cannot inherit an unrelated cheap price', () => {
+    for (const changed of [
+      { resolution: '1080p' },
+      { model: 'model-b' },
+      { group: 'group-b' },
+    ]) {
+      assert.equal(
+        estimateParameterPrice([offer], { ...value, ...changed }),
+        undefined
+      )
+    }
+    assert.equal(
+      estimateParameterPrice(
+        [{ ...offer, conditions: { resolution: '720p', quality: 'high' } }],
+        value
+      ),
+      undefined
+    )
+    assert.equal(
+      estimateParameterPrice([offer], {
+        ...value,
+        size: '1920x1080',
+        resolutionAliases: { '1920x1080': '1080p' },
+      }),
+      undefined
+    )
+    assert.equal(
+      estimateParameterPrice(
+        [{ ...offer, unit: 'fixed_duration', fixed_duration_seconds: 5 }],
+        value
+      ),
+      undefined
+    )
+    assert.equal(
+      estimateParameterPrice([offer], { ...value, duration: Number.NaN }),
+      undefined
+    )
+  })
+
+  test('multipart quote contains only file descriptions and preserves repeated string fields', () => {
+    const payload = new FormData()
+    payload.append('model', 'model-a')
+    payload.append('n', '1')
+    payload.append('tag', 'first')
+    payload.append('tag', 'second')
+    payload.append(
+      'image',
+      new File(['private-pixels'], 'a.png', { type: 'image/png' })
+    )
+    const intent = parameterQuoteIntent('image-edits', 'group-a', payload)
+    assert.deepEqual(intent.fields, {
+      model: 'model-a',
+      n: '1',
+      tag: ['first', 'second'],
+    })
+    assert.deepEqual(intent.files, [
+      { field: 'image', name: 'a.png', size: 14, type: 'image/png' },
+    ])
+    assert.equal(JSON.stringify(intent).includes('private-pixels'), false)
+    const untyped = new FormData()
+    untyped.append('image', new File(['opaque'], 'opaque.bin'))
+    assert.equal(
+      parameterQuoteIntent('image-edits', 'group-a', untyped).files?.[0].type,
+      'application/octet-stream'
+    )
+    assert.equal(
+      parameterQuoteIntent('images', 'group-a', { n: 1 }).fields.n,
+      1
+    )
+  })
+
+  test('missing or expired quotes fail before dispatch while unsupported legacy pricing continues', () => {
+    assert.deepEqual(parameterQuoteHeaders({ supported: false }), {})
+    assert.throws(
+      () =>
+        parameterQuoteHeaders(
+          {
+            supported: true,
+            expires_at: 200,
+            offer: { amount: '1', currency: 'USD' },
+          },
+          100_000,
+          { amount: '1', currency: 'USD' }
+        ),
+      /incomplete/
+    )
+    assert.throws(
+      () =>
+        parameterQuoteHeaders(
+          {
+            supported: true,
+            quote_id: 'q',
+            expires_at: 100,
+            offer: { amount: '1', currency: 'USD' },
+          },
+          100_000,
+          { amount: '1', currency: 'USD' }
+        ),
+      /expired/
+    )
+    assert.deepEqual(
+      parameterQuoteHeaders(
+        {
+          supported: true,
+          quote_id: 'q',
+          expires_at: 101,
+          offer: { amount: '1', currency: 'USD' },
+        },
+        100_000,
+        { amount: '1', currency: 'USD' }
+      ),
+      { 'X-Parameter-Quote': 'q' }
+    )
+    assert.throws(() =>
+      parameterQuoteHeaders(
+        {
+          supported: true,
+          quote_id: 'q',
+          expires_at: 101,
+          offer: { amount: '1', currency: 'USD' },
+        },
+        100_000
+      )
+    )
+    assert.throws(() =>
+      parameterQuoteHeaders(
+        {
+          supported: true,
+          quote_id: 'q',
+          expires_at: 101,
+          offer: { amount: '1.01', currency: 'USD' },
+        },
+        100_000,
+        { amount: '1', currency: 'USD' }
+      )
+    )
+    assert.deepEqual(
+      parameterQuoteHeaders(
+        {
+          supported: true,
+          quote_id: 'q',
+          expires_at: 101,
+          offer: { amount: '0.99', currency: 'USD' },
+        },
+        100_000,
+        { amount: '1', currency: 'USD' }
+      ),
+      { 'X-Parameter-Quote': 'q' }
+    )
+  })
+
+  test('batch children each quote once and retain operation identity and server-owned fallback scope', async () => {
+    const original = api.defaults.adapter
+    const submitted: Array<{
+      path: string
+      data: Record<string, unknown>
+      quote?: string
+      operation?: string
+      params: unknown
+    }> = []
+    let quotes = 0
+    api.defaults.adapter = async (config) => {
+      const data = JSON.parse(String(config.data)) as Record<string, unknown>
+      submitted.push({
+        path: config.url ?? '',
+        data,
+        quote: config.headers.get('X-Parameter-Quote') as string | undefined,
+        operation: config.headers.get('X-Media-Studio-Operation-ID') as
+          | string
+          | undefined,
+        params: config.params,
+      })
+      const response =
+        config.url === '/api/media/parameter-quote'
+          ? {
+              success: true,
+              data: {
+                supported: true,
+                quote_id: `q${++quotes}`,
+                expires_at: Math.floor(Date.now() / 1000) + 60,
+                offer: { amount: '1', currency: 'USD' },
+              },
+            }
+          : { data: [] }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: response,
+      }
+    }
+    try {
+      const result = (await createStudioMedia(
+        {
+          ...value,
+          count: 2,
+          fallbackEnabled: true,
+          fallbackGroups: ['group-b', 'group-a'],
+        },
+        { operationIds: ['op-1', 'op-2'] }
+      )) as StudioBatchResponse
+      assert.equal(
+        result.items.every((item) => item.ok),
+        true
+      )
+      assert.equal(quotes, 2)
+      const requests = submitted.filter(
+        (item) => item.path === '/api/media/studio/images'
+      )
+      assert.equal(requests.length, 2)
+      assert.deepEqual(requests.map((item) => item.operation).sort(), [
+        'op-1',
+        'op-2',
+      ])
+      assert.equal(new Set(requests.map((item) => item.quote)).size, 2)
+      assert.equal(
+        requests.every((item) => item.data.n === 1),
+        true
+      )
+      assert.equal(
+        requests.every((item) => item.data.resolution === undefined),
+        true
+      )
+      assert.equal(
+        submitted
+          .filter((item) => item.path === '/api/media/parameter-quote')
+          .every((item) => item.data.group === 'group-b'),
+        true
+      )
+      assert.deepEqual(requests[0].params, {
+        group: 'group-b',
+        fallback_groups: '["group-b","group-a"]',
+      })
+    } finally {
+      api.defaults.adapter = original
+    }
+  })
+
+  test('quote failure sends no generation request and does not start ambiguous-result confirmation', async () => {
+    const original = api.defaults.adapter
+    const paths: string[] = []
+    api.defaults.adapter = async (config) => {
+      paths.push(config.url ?? '')
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: { success: false, message: 'Quote unavailable' },
+      }
+    }
+    try {
+      await assert.rejects(
+        () => createStudioMedia(value),
+        ParameterQuotePreflightError
+      )
+      const batch = (await createStudioMedia(
+        { ...value, count: 2 },
+        { operationIds: ['op-1', 'op-2'] }
+      )) as StudioBatchResponse
+      assert.equal(
+        batch.items.every((item) => !item.ok && !item.dispatched),
+        true
+      )
+      assert.equal(
+        paths.every((path) => path === '/api/media/parameter-quote'),
+        true
+      )
+    } finally {
+      api.defaults.adapter = original
+    }
+  })
+
+  test('configured reference tokens preserve asset identity when another reference is removed', () => {
+    assert.deepEqual(
+      promptReferenceTokens(capability, references).map((entry) => entry.token),
+      ['@image1', '@video1', '@image2']
+    )
+    assert.equal(containsPromptToken('@image10', '@image1'), false)
+    assert.equal(
+      rebindPromptReferences(
+        'Use @image1 and @image2 beside @video1',
+        references,
+        references.slice(1),
+        capability
+      ),
+      'Use  and @image1 beside @video1'
+    )
+    const unknown = {
+      ...capability,
+      prompt_reference: {
+        required: true,
+        index_scope: 'per_type' as const,
+        index_base: 1,
+      },
+    }
+    assert.equal(
+      managedCapabilityIssues(unknown, value, references).includes(
+        'Reference syntax is not configured for this model'
+      ),
+      true
+    )
+    assert.equal(
+      managedCapabilityIssues(
+        capability,
+        { ...value, prompt: '@image1 @image2 @video1' },
+        references
+      ).length,
+      0
+    )
+  })
+
+  test('video batches reuse one uploaded reference and quote the actual file ID without invented pixel size', async () => {
+    const original = api.defaults.adapter
+    let uploads = 0
+    let quotes = 0
+    let generations = 0
+    api.defaults.adapter = async (config) => {
+      let response: unknown
+      if (config.url === '/api/media/files') {
+        uploads++
+        response = { success: true, data: { id: 'file-shared' } }
+      } else {
+        const data = JSON.parse(String(config.data)) as Record<string, unknown>
+        const fields =
+          config.url === '/api/media/parameter-quote'
+            ? (data.fields as Record<string, unknown>)
+            : data
+        assert.deepEqual(fields.references, [
+          { type: 'image', role: 'reference', file_id: 'file-shared' },
+        ])
+        assert.equal(fields.size, undefined)
+        if (config.url === '/api/media/parameter-quote') {
+          quotes++
+          response = {
+            success: true,
+            data: {
+              supported: true,
+              quote_id: `video-q${quotes}`,
+              expires_at: Math.floor(Date.now() / 1000) + 60,
+              offer: { amount: '1', currency: 'USD' },
+            },
+          }
+        } else {
+          generations++
+          response = { id: `task-${generations}` }
+        }
+      }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: response,
+      }
+    }
+    try {
+      await createStudioMedia(
+        {
+          ...value,
+          mode: 'videos',
+          runtimeEnforced: true,
+          count: 2,
+          references: [
+            {
+              id: 'ref',
+              type: 'image',
+              role: 'reference',
+              name: 'a.png',
+              file: new File(['pixels'], 'a.png', { type: 'image/png' }),
+            },
+          ],
+        },
+        { operationIds: ['video-1', 'video-2'] }
+      )
+      assert.equal(uploads, 1)
+      assert.equal(quotes, 2)
+      assert.equal(generations, 2)
+    } finally {
+      api.defaults.adapter = original
+    }
+  })
+})

@@ -1,0 +1,30 @@
+package sora
+
+import (
+	"encoding/json"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestLaoliUpdateReferenceDuration(t *testing.T) {
+	var reference relaycommon.MediaReference
+	require.NoError(t, json.Unmarshal([]byte(`{"type":"video","url":"https://example.com/video.mp4","duration_seconds":3.5}`), &reference))
+	require.False(t, reference.MetadataTrusted)
+	refs := []relaycommon.MediaReference{reference, reference}
+	payload := providerReferencePayloadWithDuration(refs, "source", "duration_seconds")
+	require.Len(t, payload, 2)
+	require.Equal(t, 3.5, payload[0]["duration_seconds"])
+	require.Equal(t, payload[0], payload[1])
+	legacy := providerReferencePayload(refs, "source")
+	require.NotContains(t, legacy[0], "duration_seconds")
+	body := map[string]interface{}{"model": "test", "prompt": "unchanged"}
+	request := relaycommon.TaskSubmitReq{Seconds: "4", References: refs}
+	capability := mediaservice.Capability{RuntimeEnforced: true, ReferenceURLField: "source", ReferenceDurationField: "duration_seconds"}
+	capability.GenerationFields = map[string]string{"seconds": "seconds"}
+	require.NoError(t, applyManagedCapabilityPayload(body, request, capability))
+	require.Equal(t, 4, body["seconds"])
+	require.Equal(t, "unchanged", body["prompt"])
+	require.Equal(t, payload, body["references"])
+}

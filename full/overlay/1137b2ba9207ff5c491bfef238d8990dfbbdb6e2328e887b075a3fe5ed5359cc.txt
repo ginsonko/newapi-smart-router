@@ -1,0 +1,188 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import * as z from 'zod'
+
+import type { SmartRouterPolicy, SmartRouterStrategy } from './types'
+
+export const SMART_ROUTER_RATIO_SCALE = 1_000_000
+export const MAX_SMART_ROUTER_EFFECTIVE_RATIO = Math.floor(
+  Number.MAX_SAFE_INTEGER / SMART_ROUTER_RATIO_SCALE
+)
+export const MAX_SMART_ROUTER_TTFT_MS = 600_000
+export const MAX_SMART_ROUTER_TTFT_SAMPLES = 100_000
+
+const smartRouterPolicySchema = z
+  .object({
+    version: z.number().int(),
+    enabled: z.boolean().default(true),
+    strategy: z
+      .enum([
+        'price',
+        'stability',
+        'latency',
+        'balanced',
+        'custom_weighted',
+        'manual',
+      ])
+      .optional(),
+    order_mode: z.enum(['auto_price', 'manual']).optional(),
+    manual_group_order: z.array(z.string()).nullish(),
+    max_effective_ratio_ppm: z
+      .number()
+      .finite()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER),
+    recovery_profile: z.enum(['fast', 'balanced', 'stable']).optional(),
+    excluded_groups: z.array(z.string()).nullish(),
+    allow_future_groups: z.boolean().optional(),
+    allow_future_certified_routes: z.boolean().optional(),
+    max_attempts: z.number().int().min(1).max(100).optional(),
+    failure_threshold: z.number().int().min(1).max(100).optional(),
+    health_guard: z.boolean().default(true),
+    actual_input_cost_ranking: z.boolean().optional(),
+    affinity_enabled: z.boolean().optional(),
+    affinity_mode: z.enum(['fixed_premium', 'economic_break_even']).optional(),
+    affinity_max_premium_percent: z.number().int().min(0).max(100).optional(),
+    affinity_ttl_seconds: z.number().int().min(0).optional(),
+    compression_thresholds: z
+      .array(
+        z.object({
+          model: z.string(),
+          tokens: z.number().int().positive().max(100_000_000),
+        })
+      )
+      .nullish(),
+    ttft_policy: z
+      .object({
+        enabled: z.boolean().default(false),
+        target_ms: z
+          .number()
+          .finite()
+          .int()
+          .min(0)
+          .max(MAX_SMART_ROUTER_TTFT_MS),
+        hard_max_ms: z
+          .number()
+          .finite()
+          .int()
+          .min(0)
+          .max(MAX_SMART_ROUTER_TTFT_MS),
+        min_samples: z
+          .number()
+          .finite()
+          .int()
+          .min(0)
+          .max(MAX_SMART_ROUTER_TTFT_SAMPLES),
+      })
+      .passthrough(),
+    queue_policy: z
+      .object({
+        mode: z.enum(['no_queue', 'short_wait']),
+        max_wait_ms: z.number().int().nonnegative(),
+        min_saving_percent: z.number().int().min(0).max(100),
+      })
+      .passthrough(),
+    balanced_weights: z
+      .object({
+        stability: z.number().int().min(0).max(100),
+        price: z.number().int().min(0).max(100),
+        ttft: z.number().int().min(0).max(100),
+      })
+      .nullish(),
+    custom_weights: z
+      .object({
+        cache: z.number().int().min(0).max(100),
+        cost: z.number().int().min(0).max(100),
+        ttft: z.number().int().min(0).max(100),
+        stability: z.number().int().min(0).max(100),
+      })
+      .nullish(),
+  })
+  .passthrough()
+
+function normalizeStrategy(value: {
+  strategy?: SmartRouterStrategy
+  order_mode?: 'auto_price' | 'manual'
+}) {
+  if (value.strategy) return value.strategy
+  return value.order_mode === 'manual' ? 'manual' : 'price'
+}
+
+export function parseSmartRouterPolicy(raw: string | null | undefined) {
+  if (!raw?.trim()) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    const result = smartRouterPolicySchema.safeParse(parsed)
+    if (!result.success) return null
+    const policy = result.data
+    return {
+      ...policy,
+      version: policy.version,
+      enabled: policy.enabled,
+      strategy: normalizeStrategy(policy),
+      excluded_groups: policy.excluded_groups ?? [],
+      allow_future_groups:
+        policy.allow_future_groups ??
+        policy.allow_future_certified_routes ??
+        true,
+      manual_group_order: policy.manual_group_order ?? [],
+      max_attempts: policy.max_attempts ?? 3,
+      failure_threshold: policy.failure_threshold ?? 3,
+      max_effective_ratio_ppm: policy.max_effective_ratio_ppm,
+      recovery_profile: policy.recovery_profile ?? 'balanced',
+      health_guard: policy.health_guard,
+      actual_input_cost_ranking: policy.actual_input_cost_ranking ?? true,
+      affinity_enabled: policy.affinity_enabled ?? true,
+      // A missing field belongs to a pre-V4.7 key and must preserve the old
+      // fixed-premium contract. New-key defaults set the economic mode
+      // explicitly in the form layer.
+      affinity_mode: policy.affinity_mode ?? 'fixed_premium',
+      affinity_max_premium_percent: policy.affinity_max_premium_percent ?? 10,
+      affinity_ttl_seconds: policy.affinity_ttl_seconds ?? 1800,
+      compression_thresholds: policy.compression_thresholds ?? [],
+      ttft_policy: {
+        ...policy.ttft_policy,
+        enabled: policy.ttft_policy.enabled,
+        target_ms: policy.ttft_policy.target_ms,
+        hard_max_ms: policy.ttft_policy.hard_max_ms,
+        min_samples: policy.ttft_policy.min_samples,
+      },
+      queue_policy: {
+        ...policy.queue_policy,
+        mode: policy.queue_policy.mode,
+        max_wait_ms: policy.queue_policy.max_wait_ms,
+        min_saving_percent: policy.queue_policy.min_saving_percent,
+      },
+      balanced_weights: policy.balanced_weights ?? {
+        stability: 45,
+        price: 40,
+        ttft: 15,
+      },
+      custom_weights: policy.custom_weights ?? {
+        cache: 25,
+        cost: 25,
+        ttft: 25,
+        stability: 25,
+      },
+    } as SmartRouterPolicy
+  } catch {
+    return null
+  }
+}

@@ -1,0 +1,88 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
+	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/require"
+)
+
+func TestEmailSecurityConcurrentMailboxAndCooldown(t *testing.T) {
+	server := miniredis.RunT(t)
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	common.RedisEnabled = true
+	t.Cleanup(func() { common.RDB.Close(); common.RDB, common.RedisEnabled = previousClient, previousEnabled })
+	router := gin.New()
+	router.GET("/mail", EmailVerificationRateLimit(), func(ctx *gin.Context) { ctx.Status(204) })
+	request := func(email, remote string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		input := httptest.NewRequest("GET", "/mail?email="+url.QueryEscape(email), nil)
+		input.RemoteAddr = remote
+		router.ServeHTTP(recorder, input)
+		return recorder
+	}
+	var successful atomic.Int32
+	var workers sync.WaitGroup
+	for index := 0; index < 24; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if request(" Test@Example.com ", "192.0.2.1:1").Code == 204 {
+				successful.Add(1)
+			}
+		}()
+	}
+	workers.Wait()
+	require.EqualValues(t, 1, successful.Load())
+	require.Equal(t, 429, request("test@example.com", "192.0.2.2:1").Code)
+	server.FastForward(15 * time.Second)
+	blocked := request("test@example.com", "192.0.2.2:1")
+	require.Equal(t, "15", blocked.Header().Get("Retry-After"))
+	server.FastForward(15 * time.Second)
+	require.Equal(t, 204, request("test@example.com", "192.0.2.2:1").Code)
+	require.Equal(t, 204, request("other@example.com", "192.0.2.2:1").Code)
+	require.Equal(t, 429, request("third@example.com", "192.0.2.2:1").Code)
+	require.Equal(t, 204, request("third@example.com", "192.0.2.3:1").Code)
+	server.Close()
+	require.Equal(t, 503, request("fourth@example.com", "192.0.2.4:1").Code)
+}
+
+func TestEmailSecurityMemoryAndInvalidInput(t *testing.T) {
+	previousEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousEnabled })
+	router := gin.New()
+	router.GET("/mail", EmailVerificationRateLimit(), func(ctx *gin.Context) { ctx.Status(204) })
+	for index, email := range []string{"bad", "memory@example.com", "MEMORY@example.com"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest("GET", "/mail?email="+email, nil)
+		request.RemoteAddr = "192.0.2.50:1"
+		router.ServeHTTP(recorder, request)
+		require.Equal(t, []int{400, 204, 429}[index], recorder.Code)
+	}
+}
+
+func TestTokenSecurityMissingOrForgedIdentity(t *testing.T) {
+	router := gin.New()
+	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("isolated-security-test"))))
+	router.PUT("/api/token/", UserAuth(), func(ctx *gin.Context) { t.Error("unauthenticated mutation reached handler") })
+	for _, identity := range []string{"", "12", "1"} {
+		request := httptest.NewRequest(http.MethodPut, "/api/token/", nil)
+		request.Header.Set("New-Api-User", identity)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusUnauthorized, recorder.Code)
+	}
+}

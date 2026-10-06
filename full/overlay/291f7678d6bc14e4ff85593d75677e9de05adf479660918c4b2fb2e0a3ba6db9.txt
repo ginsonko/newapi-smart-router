@@ -1,0 +1,1181 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayhelper "github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+func TestSmartRouteAttemptCommittedIgnoresOnlyCurrentAttemptKeepalive(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	writtenBefore := c.Writer.Written()
+	sizeBefore := c.Writer.Size()
+	require.NoError(t, relayhelper.PingData(c))
+	assert.False(t, smartRouteAttemptCommitted(c, writtenBefore, sizeBefore), "SSE comments alone remain replaceable")
+
+	// A new attempt begins after the prior keepalive. Gin's Writer remains in a
+	// written state, so the decision must use only this attempt's byte delta.
+	common.SetContextKey(c, constant.ContextKeySmartStreamPingBytes, 0)
+	writtenBefore = c.Writer.Written()
+	sizeBefore = c.Writer.Size()
+	assert.False(t, smartRouteAttemptCommitted(c, writtenBefore, sizeBefore), "a prior route's keepalive must not leak into the next attempt")
+
+	require.NoError(t, relayhelper.ObjectData(c, gin.H{"id": "payload"}))
+	assert.True(t, smartRouteAttemptCommitted(c, writtenBefore, sizeBefore), "any protocol payload is committed")
+}
+
+func TestSmartRouteAttemptCommittedTreatsHeaderOnlyFlushAsCommitted(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	writtenBefore := c.Writer.Written()
+	sizeBefore := c.Writer.Size()
+
+	c.Writer.Flush()
+
+	assert.True(t, smartRouteAttemptCommitted(c, writtenBefore, sizeBefore))
+}
+
+func TestResetSmartChannelContextClearsPriorRouteIdentity(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	common.SetContextKey(c, constant.ContextKeyChannelId, 99)
+	common.SetContextKey(c, constant.ContextKeyChannelName, "api-b")
+	common.SetContextKey(c, constant.ContextKeyChannelType, 7)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://internal.example")
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 3)
+
+	resetSmartChannelContext(c)
+
+	assert.Zero(t, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+	assert.Empty(t, common.GetContextKeyString(c, constant.ContextKeyChannelName))
+	assert.Zero(t, common.GetContextKeyInt(c, constant.ContextKeyChannelType))
+	assert.Empty(t, common.GetContextKeyString(c, constant.ContextKeyChannelBaseUrl))
+	assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey))
+	assert.Zero(t, common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex))
+}
+
+const (
+	smartRelayTestModel        = "gpt-5.6-sol"
+	smartRelayTestUserID       = 7101
+	smartRelayTestTokenID      = 8101
+	smartRelayTestCheapChannel = 9101
+	smartRelayTestPlusChannel  = 9102
+)
+
+type smartRelayTestHarness struct {
+	db      *gorm.DB
+	engine  *service.SmartRouterEngine
+	state   *service.MemorySmartRouteStateStore
+	setting smartroutersetting.Setting
+	quota   int
+}
+
+func TestRelaySmartFaultInjection(t *testing.T) {
+	// model's quoted column names are initialized by InitDB in production. The
+	// controller test package owns this one-time test initialization helper.
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+
+	t.Run("one transient failure retries the same physical route and never marks it red", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "same-route-confirmation-success")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			if len(channels) == 1 {
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		require.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel}, channels)
+		reservation := h.reservation(t, "same-route-confirmation-success")
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+		assert.Equal(t, 2, reservation.AttemptCount)
+
+		contractID, _, err := service.BuildSmartContractIdentity(smartRelayTestModel, service.SmartEndpointChat)
+		require.NoError(t, err)
+		route := catalogRouteByContractGroup(t, h.catalog(t), contractID, "cheap")
+		snapshot, err := h.state.Snapshot(context.Background(), service.SmartRouteStateSnapshotRequest{
+			Routes: []service.SmartRouteStateRoute{{
+				RouteID: route.RouteID, CapacityDomain: route.CapacityDomain,
+				CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			}},
+		})
+		require.NoError(t, err)
+		quality := snapshot.Quality.Routes[route.RouteID]
+		assert.Equal(t, smartrouter.QualityHealthy, quality.Phase)
+		assert.Zero(t, quality.RealHardFailures)
+		assert.Zero(t, quality.ConsecutiveHardFailures)
+	})
+
+	t.Run("generic upstream 400 keeps evidence and fails over before semantic commit", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "provider-400-failover")
+		var channels []int
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				return types.WithOpenAIError(types.OpenAIError{
+					Message: "provider temporarily rejected this request", Type: "provider_error", Code: "vendor_busy",
+				}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+		require.Nil(t, resultErr)
+		require.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		assert.NotContains(t, ctx.Errors.String(), "具体字段或参数")
+		reservation := h.reservation(t, "provider-400-failover")
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+		assert.Equal(t, 3, reservation.AttemptCount)
+	})
+
+	for _, disconnected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("upstream cancellation downstream disconnected %v", disconnected), func(t *testing.T) {
+			h := newSmartRelayTestHarness(t, 1_000)
+			ctx, _, routeRequest := h.newRequest(t, fmt.Sprintf("cancel-live-%v", disconnected))
+			original, cancel := context.WithCancel(ctx.Request.Context())
+			defer cancel()
+			ctx.Request = ctx.Request.WithContext(original)
+			var channels []int
+			resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+				id := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+				channels = append(channels, id)
+				if disconnected {
+					cancel()
+				}
+				if id == smartRelayTestCheapChannel {
+					return types.NewErrorWithStatusCode(fmt.Errorf("upstream: %w", context.Canceled), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+				}
+				require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+				return nil
+			})
+			if disconnected {
+				require.NotNil(t, resultErr)
+				require.Equal(t, []int{smartRelayTestCheapChannel}, channels)
+			} else {
+				require.Nil(t, resultErr)
+				require.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+			}
+		})
+	}
+
+	t.Run("explicit upstream field 400 exhausts every eligible route before returning", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "provider-field-400-exhausted")
+		var channels []int
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+			channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			return types.WithOpenAIError(types.OpenAIError{
+				Message: "Invalid 'input[0].type': expected message", Type: "invalid_request_error", Code: "invalid_request",
+			}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+		})
+		require.NotNil(t, resultErr)
+		require.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel, smartRelayTestPlusChannel}, channels)
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "发起 4 次上游尝试")
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "覆盖 2 个")
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "Invalid 'input[0].type'")
+		assert.Equal(t, http.StatusBadRequest, resultErr.GetOriginalStatusCode())
+		assert.True(t, resultErr.HasUpstreamResponse())
+	})
+
+	t.Run("cheap 503 falls back to plus and settles the final group quote", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, recorder, routeRequest := h.newRequest(t, "cheap-503-plus-success")
+		var channels []int
+		var ratios []float64
+
+		dispatch := func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			ratios = append(ratios, info.PriceData.GroupRatioInfo.GroupRatio)
+			if channelID == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			if err := info.Billing.Settle(info.PriceData.QuotaToPreConsume); err != nil {
+				return types.NewError(err, types.ErrorCodeUpdateDataError)
+			}
+			return nil
+		}
+
+		resultErr := h.relay(ctx, routeRequest, dispatch)
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		require.Len(t, ratios, 3)
+		assert.InDelta(t, 0.02, ratios[0], 0.000001)
+		assert.InDelta(t, 0.02, ratios[1], 0.000001)
+		assert.InDelta(t, 0.05, ratios[2], 0.000001)
+		assert.False(t, recorder.Flushed)
+
+		reservation := h.reservation(t, "cheap-503-plus-success")
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, smartRelayTestPlusChannel, reservation.ChannelId)
+		assert.Equal(t, "plus", reservation.Group)
+		assert.Equal(t, int64(50_000), reservation.RatioPPM)
+		assert.Equal(t, reservation.QuotedQuota, reservation.FinalQuota)
+		assert.Equal(t, 3, reservation.AttemptCount)
+		assert.Greater(t, reservation.FinalQuota, 0)
+		assert.Equal(t, h.quota-reservation.FinalQuota, h.userQuota(t))
+	})
+
+	t.Run("all eligible safe text routes fail confirmation and return a bounded exhaustion summary", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "all-eligible-exhaustion-refund")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			return smartRelayTestError(http.StatusTooManyRequests, types.ErrorCodeBadResponseStatusCode, 0)
+		})
+
+		require.NotNil(t, resultErr)
+		assert.Equal(t, http.StatusTooManyRequests, resultErr.GetOriginalStatusCode())
+		assert.True(t, types.IsSkipRetryError(resultErr))
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "发起 4 次上游尝试")
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "覆盖 2 个可用候选")
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "繁忙")
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel, smartRelayTestPlusChannel}, channels)
+		reservation := h.reservation(t, "all-eligible-exhaustion-refund")
+		assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Zero(t, reservation.FinalQuota)
+		assert.Equal(t, 4, reservation.AttemptCount)
+		assert.Equal(t, h.quota, h.userQuota(t))
+	})
+
+	t.Run("one eligible capacity route returns a bounded exhaustion summary", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		// The cheap route is 0.02 and the plus route is 0.05. Keep the
+		// administrator price guard below plus so this request has exactly one
+		// eligible physical route without weakening the catalog contract.
+		h.setting.DefaultPolicy.MaxEffectiveRatioPPM = 30_000
+		ctx, _, routeRequest := h.newRequest(t, "single-eligible-exhaustion")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+			channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			return smartRelayTestError(http.StatusTooManyRequests, types.ErrorCodeBadResponseStatusCode, 0)
+		})
+
+		require.NotNil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel}, channels)
+		assert.True(t, types.IsSkipRetryError(resultErr))
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "发起 2 次上游尝试")
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "覆盖 1 个可用候选")
+		assert.Contains(t, resultErr.ToOpenAIError().Message, "繁忙")
+		reservation := h.reservation(t, "single-eligible-exhaustion")
+		assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+		assert.Equal(t, h.quota, h.userQuota(t))
+	})
+
+	t.Run("zero key ratio cap inherits the site guardrail", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		h.setting.DefaultPolicy.MaxEffectiveRatioPPM = 0
+		ctx, _, routeRequest := h.newRequest(t, "zero-cap-inherits-site-default")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel}, channels)
+		reservation := h.reservation(t, "zero-cap-inherits-site-default")
+		assert.Equal(t, int64(20_000), reservation.RatioPPM)
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	})
+
+	t.Run("model 404 cools only the failed route and falls back", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "model-404-tombstone")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusNotFound, types.ErrorCodeModelNotFound, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		catalog := h.catalog(t)
+		cheap := catalogRouteByContractGroup(t, catalog, routeRequest.ContractID, "cheap")
+		plus := catalogRouteByContractGroup(t, catalog, routeRequest.ContractID, "plus")
+		snapshot, err := h.state.Snapshot(context.Background(), service.SmartRouteStateSnapshotRequest{
+			Routes: catalogStateRoutes(catalog),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, smartrouter.QualityOpen, snapshot.Quality.Routes[cheap.RouteID].Phase)
+		assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes[plus.RouteID].Phase)
+		assert.Equal(t, int64(2000), snapshot.Quality.Routes[cheap.RouteID].NextProbeAtMS-snapshot.Quality.Routes[cheap.RouteID].LastFailureMS,
+			"one failure starts a short demand cooldown, not a synthetic probe")
+	})
+
+	t.Run("429 Retry-After blocks cheap capacity and releases its lease", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "rate-limit-retry-after")
+		before := time.Now()
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			if common.GetContextKeyInt(c, constant.ContextKeyChannelId) == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusTooManyRequests, types.ErrorCodeBadResponseStatusCode, 2*time.Second)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		catalog := h.catalog(t)
+		cheap := catalogRouteByContractGroup(t, catalog, routeRequest.ContractID, "cheap")
+		snapshot, err := h.state.Snapshot(context.Background(), service.SmartRouteStateSnapshotRequest{
+			Routes: catalogStateRoutes(catalog),
+		})
+		require.NoError(t, err)
+		capacity := snapshot.Capacity.Domains[cheap.CapacityDomain]
+		assert.Zero(t, capacity.Inflight, "the failed attempt must release its exact capacity lease")
+		assert.GreaterOrEqual(t, capacity.BlockedUntilMS, before.Add(1900*time.Millisecond).UnixMilli())
+	})
+
+	t.Run("credential failure disables only the selected multi-key credential", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		configureCheapMultiKeyChannel(t, h, true)
+		ctx, _, routeRequest := h.newRequest(t, "multi-key-invalid-credential")
+		var selectedKeys []string
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			selectedKey := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+			selectedKeys = append(selectedKeys, selectedKey)
+			if channelID == smartRelayTestCheapChannel && selectedKey == "cheap-invalid-key" {
+				return smartRelayTestError(http.StatusUnauthorized, types.ErrorCodeChannelInvalidKey, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		require.Len(t, selectedKeys, 2)
+		assert.Equal(t, "cheap-invalid-key", selectedKeys[0])
+		assert.Equal(t, "cheap-valid-key", selectedKeys[1])
+
+		var updated model.Channel
+		require.Eventually(t, func() bool {
+			if err := h.db.First(&updated, smartRelayTestCheapChannel).Error; err != nil {
+				return false
+			}
+			return updated.ChannelInfo.MultiKeyStatusList[0] == common.ChannelStatusAutoDisabled
+		}, 2*time.Second, 10*time.Millisecond)
+		assert.Equal(t, common.ChannelStatusEnabled, updated.Status, "one bad key must not disable the physical channel")
+		assert.NotEqual(t, common.ChannelStatusAutoDisabled, updated.ChannelInfo.MultiKeyStatusList[1])
+
+		nextKey, nextIndex, keyErr := updated.GetNextEnabledKey()
+		require.Nil(t, keyErr)
+		assert.Equal(t, "cheap-valid-key", nextKey)
+		assert.Equal(t, 1, nextIndex)
+	})
+
+	t.Run("non-credential failure never disables a multi-key credential", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		configureCheapMultiKeyChannel(t, h, true)
+		ctx, _, routeRequest := h.newRequest(t, "multi-key-infrastructure-failure")
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			if common.GetContextKeyInt(c, constant.ContextKeyChannelId) == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		var updated model.Channel
+		require.NoError(t, h.db.First(&updated, smartRelayTestCheapChannel).Error)
+		assert.Empty(t, updated.ChannelInfo.MultiKeyStatusList)
+		assert.Equal(t, common.ChannelStatusEnabled, updated.Status)
+	})
+
+	t.Run("foreground recovery admission never inherits the probe deadline", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "recovery-timeout")
+		routeRequest.DeadlineMS = time.Now().Add(120 * time.Millisecond).UnixMilli()
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				_, hasInternalDeadline := c.Request.Context().Deadline()
+				assert.False(t, hasInternalDeadline)
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		assert.NoError(t, ctx.Request.Context().Err())
+	})
+
+	t.Run("failure before the first downstream byte can fall back", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, recorder, routeRequest := h.newRequest(t, "pre-commit-fallback")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				assert.False(t, c.Writer.Written())
+				return smartRelayTestError(http.StatusBadGateway, types.ErrorCodeReadResponseBodyFailed, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		assert.Empty(t, recorder.Body.String(), "the fallback path itself does not need to write a synthetic body")
+	})
+
+	t.Run("pre-dispatch conversion contract failure falls back and settles once", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "convert-contract-fallback")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				return types.NewError(errors.New("adapter conversion is not implemented"), types.ErrorCodeConvertRequestFailed)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		reservation := h.reservation(t, "convert-contract-fallback")
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, 3, reservation.AttemptCount)
+		assert.Equal(t, smartRelayTestPlusChannel, reservation.ChannelId)
+		assert.Equal(t, h.quota-reservation.FinalQuota, h.userQuota(t))
+	})
+
+	t.Run("upstream account balance exhaustion falls back and settles only the successful route", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "upstream-account-balance-fallback")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			if channelID == smartRelayTestCheapChannel {
+				return types.NewErrorWithStatusCode(
+					errors.New("Insufficient account balance"),
+					types.ErrorCodeBadResponseStatusCode,
+					http.StatusForbidden,
+				)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		reservation := h.reservation(t, "upstream-account-balance-fallback")
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, 3, reservation.AttemptCount)
+		assert.Equal(t, smartRelayTestPlusChannel, reservation.ChannelId)
+		assert.Equal(t, h.quota-reservation.FinalQuota, h.userQuota(t))
+	})
+
+	t.Run("HTTP 200 Responses semantic capacity failure falls back before commit", func(t *testing.T) {
+		oldStreamingTimeout := constant.StreamingTimeout
+		constant.StreamingTimeout = 30
+		t.Cleanup(func() { constant.StreamingTimeout = oldStreamingTimeout })
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, recorder, routeRequest := h.newRequest(t, "semantic-200-capacity-fallback")
+		common.SetContextKey(ctx, constant.ContextKeyTokenRoutingPolicy, h.setting.DefaultPolicy)
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			info.IsStream = true
+			restoreSemanticWindow := openaichannel.BeginSmartResponsesSemanticWindow(c, info)
+			defer restoreSemanticWindow()
+			c.Set("event_stream_headers_set", true)
+			body := strings.Join([]string{
+				`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+				`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","summary":[]}}`,
+				`data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
+				`data: {"type":"response.failed","error":{"message":"Selected model is at capacity. Please try a different model.","type":"invalid_request_error"}}`,
+				`data: [DONE]`,
+			}, "\n")
+			if channelID == smartRelayTestPlusChannel {
+				body = strings.Join([]string{
+					`data: {"type":"response.created","response":{"id":"resp_2","model":"gpt-5.6-sol","status":"in_progress"}}`,
+					`data: {"type":"response.output_text.delta","delta":"healthy fallback"}`,
+					`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`,
+					`data: [DONE]`,
+				}, "\n")
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+			_, apiErr := openaichannel.OaiResponsesStreamHandler(c, info, resp)
+			if apiErr != nil {
+				return apiErr
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		assert.NotContains(t, recorder.Body.String(), "at capacity")
+		assert.Contains(t, recorder.Body.String(), "healthy fallback")
+		assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+		assert.Equal(t, "no", recorder.Header().Get("X-Accel-Buffering"))
+		reservation := h.reservation(t, "semantic-200-capacity-fallback")
+		assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+		assert.Equal(t, 3, reservation.AttemptCount)
+		assert.False(t, reservation.SettlementPending)
+	})
+
+	for _, testCase := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "generic parser failure"},
+		{name: "model not found after ambiguity", suffix: `data: {"type":"response.failed","error":{"code":"model_not_found","message":"model not found"}}` + "\n\n"},
+		{name: "unsupported parameter after ambiguity", suffix: `data: {"type":"response.failed","error":{"code":"unsupported_parameter","message":"unsupported parameter response_format"}}` + "\n\n"},
+	} {
+		t.Run("malformed Responses prelude retries every safe route: "+testCase.name, func(t *testing.T) {
+			oldStreamingTimeout := constant.StreamingTimeout
+			constant.StreamingTimeout = 30
+			t.Cleanup(func() { constant.StreamingTimeout = oldStreamingTimeout })
+			h := newSmartRelayTestHarness(t, 1_000)
+			requestID := "semantic-200-malformed-single-route-" + strings.ReplaceAll(testCase.name, " ", "-")
+			ctx, recorder, routeRequest := h.newRequest(t, requestID)
+			common.SetContextKey(ctx, constant.ContextKeyTokenRoutingPolicy, h.setting.DefaultPolicy)
+			var channels []int
+
+			resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+				channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+				info.IsStream = true
+				restoreSemanticWindow := openaichannel.BeginSmartResponsesSemanticWindow(c, info)
+				defer restoreSemanticWindow()
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader("data: {malformed-json}\n\n" + testCase.suffix)),
+				}
+				_, apiErr := openaichannel.OaiResponsesStreamHandler(c, info, resp)
+				if apiErr != nil {
+					return apiErr
+				}
+				require.NotNil(t, info.StreamStatus)
+				streamErr := info.StreamStatus.EndError
+				if streamErr == nil {
+					streamErr = fmt.Errorf("upstream stream ended abnormally: %s", info.StreamStatus.Summary())
+				}
+				return openaichannel.PreserveSmartResponsesSingleRouteError(c, types.NewErrorWithStatusCode(
+					streamErr,
+					types.ErrorCodeReadResponseBodyFailed,
+					http.StatusBadGateway,
+				))
+			})
+
+			require.NotNil(t, resultErr)
+			// Once both certified physical routes are exhausted, the final
+			// upstream error is intentionally marked skip-retry for the client;
+			// the server has already completed its route traversal.
+			assert.True(t, types.IsSkipRetryError(resultErr))
+			assert.Equal(t, types.ErrorCodeBadResponseBody, resultErr.GetErrorCode())
+			assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel, smartRelayTestPlusChannel}, channels)
+			assert.Empty(t, recorder.Body.String())
+			reservation := h.reservation(t, requestID)
+			assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+			assert.False(t, reservation.SettlementPending)
+			assert.Equal(t, h.quota, h.userQuota(t))
+		})
+	}
+
+	t.Run("side effecting semantic failure dispatches exactly one route", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, recorder, routeRequest := h.newRequest(t, "semantic-200-side-effecting-single-dispatch")
+		common.SetContextKey(ctx, constant.ContextKeyTokenRoutingPolicy, h.setting.DefaultPolicy)
+		routeRequest.ReplayClass = smartrouter.ReplaySideEffecting
+		calls := 0
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			calls++
+			common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, true)
+			common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, http.StatusOK)
+			body := strings.Join([]string{
+				`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+				`data: {"type":"response.failed","error":{"code":"server_is_overloaded","message":"high demand"}}`,
+				`data: [DONE]`,
+			}, "\n")
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+			_, apiErr := openaichannel.OaiResponsesStreamHandler(c, info, resp)
+			return apiErr
+		})
+
+		require.NotNil(t, resultErr)
+		assert.Equal(t, 1, calls)
+		assert.Empty(t, recorder.Body.String())
+		reservation := h.reservation(t, "semantic-200-side-effecting-single-dispatch")
+		assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, h.quota, h.userQuota(t))
+	})
+
+	t.Run("side effecting request dispatches once and never changes route after failure", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "side-effecting-single-dispatch-failure")
+		routeRequest.ReplayClass = smartrouter.ReplaySideEffecting
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+			channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+		})
+
+		require.NotNil(t, resultErr)
+		assert.Equal(t, types.ErrorCodeBadResponseStatusCode, resultErr.GetErrorCode())
+		assert.Equal(t, []int{smartRelayTestCheapChannel}, channels)
+		reservation := h.reservation(t, "side-effecting-single-dispatch-failure")
+		assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, h.quota, h.userQuota(t))
+	})
+
+	t.Run("side effecting conversion contract failure still attempts one route", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "side-effecting-convert-single-dispatch")
+		routeRequest.ReplayClass = smartrouter.ReplaySideEffecting
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+			channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			return types.NewError(errors.New("adapter conversion is not implemented"), types.ErrorCodeConvertRequestFailed)
+		})
+
+		require.NotNil(t, resultErr)
+		assert.Equal(t, types.ErrorCodeConvertRequestFailed, resultErr.GetErrorCode())
+		assert.Equal(t, []int{smartRelayTestCheapChannel}, channels)
+		reservation := h.reservation(t, "side-effecting-convert-single-dispatch")
+		assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, h.quota, h.userQuota(t))
+	})
+
+	t.Run("side effecting request can complete its initial route", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "side-effecting-single-dispatch-success")
+		routeRequest.ReplayClass = smartrouter.ReplaySideEffecting
+		calls := 0
+
+		resultErr := h.relay(ctx, routeRequest, func(_ *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			calls++
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, 1, calls)
+		assert.Equal(t, model.QuotaReservationStatusSettled, h.reservation(t, "side-effecting-single-dispatch-success").Status)
+	})
+
+	for _, testCase := range []struct {
+		name   string
+		commit func(*gin.Context)
+	}{
+		{
+			name: "body byte",
+			commit: func(c *gin.Context) {
+				_, _ = c.Writer.Write([]byte("partial"))
+			},
+		},
+		{
+			name: "flush",
+			commit: func(c *gin.Context) {
+				c.Writer.Flush()
+			},
+		},
+	} {
+		t.Run("post-commit failure never dispatches a fallback and is refunded after "+testCase.name, func(t *testing.T) {
+			h := newSmartRelayTestHarness(t, 1_000)
+			previousErrorLog := constant.ErrorLogEnabled
+			constant.ErrorLogEnabled = true
+			t.Cleanup(func() { constant.ErrorLogEnabled = previousErrorLog })
+			requestID := "post-commit-" + strings.ReplaceAll(testCase.name, " ", "-")
+			ctx, recorder, routeRequest := h.newRequest(t, requestID)
+			calls := 0
+
+			resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+				calls++
+				testCase.commit(c)
+				return smartRelayTestError(http.StatusBadGateway, types.ErrorCodeReadResponseBodyFailed, 0)
+			})
+
+			require.Nil(t, resultErr, "a committed streaming response cannot be replaced with a second JSON error")
+			assert.Equal(t, 1, calls)
+			assert.True(t, ctx.Writer.Written())
+			if testCase.name == "flush" {
+				assert.True(t, recorder.Flushed)
+			} else {
+				assert.Equal(t, "partial", recorder.Body.String())
+			}
+
+			reservation := h.reservation(t, requestID)
+			assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+			assert.False(t, reservation.SettlementPending)
+			assert.False(t, reservation.SettlementQuotaKnown)
+			assert.Zero(t, reservation.FinalQuota)
+			assert.Greater(t, reservation.ReservedQuota, 0, "reserved_quota preserves the audited peak; refunded status means no active hold")
+			assert.Zero(t, h.activeReservedQuota(t, requestID), "a refunded reservation must leave no active hold")
+			assert.Equal(t, h.quota, h.userQuota(t), "an unsuccessful committed response must not charge the user")
+			assert.Zero(t, h.positiveConsumeLogCount(t, requestID), "an unsuccessful committed response must not create a positive consume log")
+			var errorLogs []model.Log
+			require.NoError(t, h.db.Where("request_id = ? AND type = ?", requestID, model.LogTypeError).Find(&errorLogs).Error)
+			require.Len(t, errorLogs, 1, "the owner must be able to find a post-commit failure in usage logs")
+			other, err := common.StrToMap(errorLogs[0].Other)
+			require.NoError(t, err)
+			receipt, ok := other["smart_router_receipt"].(map[string]interface{})
+			require.True(t, ok)
+			assert.Equal(t, false, receipt["completed"])
+		})
+	}
+
+	t.Run("insufficient balance prevents the expensive dispatcher and refunds cheap hold", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 40)
+		ctx, _, routeRequest := h.newRequest(t, "fallback-insufficient-balance")
+		var channels []int
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+		})
+
+		require.NotNil(t, resultErr)
+		assert.Equal(t, types.ErrorCodeInsufficientUserQuota, resultErr.GetErrorCode())
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel}, channels, "plus must not dispatch before its larger hold succeeds")
+		reservation := h.reservation(t, "fallback-insufficient-balance")
+		assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+		assert.False(t, reservation.SettlementPending)
+		assert.Equal(t, h.quota, h.userQuota(t))
+	})
+
+	t.Run("one request never repeats a ChannelID through another group", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		ctx, _, routeRequest := h.newRequest(t, "no-duplicate-channel")
+		var channels []int
+		var groups []string
+
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+			channels = append(channels, channelID)
+			groups = append(groups, info.UsingGroup)
+			if channelID == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+
+		require.Nil(t, resultErr)
+		assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+		assert.Equal(t, []string{"cheap", "cheap", "plus"}, groups, "the confirmation keeps the same route; the mid route still shares the cheap ChannelID and must be skipped")
+	})
+}
+
+func TestSmartTextReplayAdmission(t *testing.T) {
+	assert.True(t, isSmartTextReplayRoutable(smartrouter.ReplaySafeText))
+	assert.True(t, isSmartTextReplayRoutable(smartrouter.ReplaySideEffecting))
+	assert.False(t, isSmartTextReplayRoutable(smartrouter.ReplayStateBound))
+	assert.False(t, isSmartTextReplayRoutable(smartrouter.ReplayUnsupported))
+}
+
+func configureSmartRelayTestGlobals(t *testing.T) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	originalMainDB := common.MainDatabaseType()
+	originalLogDB := common.LogDatabaseType()
+	originalMemoryCache := common.MemoryCacheEnabled
+	originalRedis := common.RedisEnabled
+	originalBatchUpdates := common.BatchUpdateEnabled
+	originalErrorLog := constant.ErrorLogEnabled
+	originalPreConsumedQuota := common.PreConsumedQuota
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	originalUsableGroups := rootsetting.UserUsableGroups2JSONString()
+
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.MemoryCacheEnabled = false
+	common.RedisEnabled = false
+	common.BatchUpdateEnabled = false
+	constant.ErrorLogEnabled = false
+	common.PreConsumedQuota = 500
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-5.6-sol":2.5}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"cheap":0.02,"mid":0.035,"plus":0.05}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"default":"default","cheap":"cheap","mid":"mid","plus":"plus"}`))
+
+	t.Cleanup(func() {
+		common.SetDatabaseTypes(originalMainDB, originalLogDB)
+		common.MemoryCacheEnabled = originalMemoryCache
+		common.RedisEnabled = originalRedis
+		common.BatchUpdateEnabled = originalBatchUpdates
+		constant.ErrorLogEnabled = originalErrorLog
+		common.PreConsumedQuota = originalPreConsumedQuota
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalUsableGroups))
+	})
+}
+
+func newSmartRelayTestHarness(t *testing.T, quota int) *smartRelayTestHarness {
+	t.Helper()
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	model.LOG_DB = db
+	require.NoError(t, db.AutoMigrate(
+		&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Log{}, &model.QuotaReservation{}, &model.SmartRouteBlock{},
+	))
+
+	user := model.User{
+		Id: smartRelayTestUserID, Username: "smart-relay-user", Password: "test-password",
+		Status: common.UserStatusEnabled, Quota: quota, Group: "default", AffCode: "smart-relay-aff",
+	}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{
+		Id: smartRelayTestTokenID, UserId: user.Id, Key: strings.Repeat("k", 48), Name: "smart relay token",
+		Status: common.TokenStatusEnabled, CreatedTime: 1, AccessedTime: 1, ExpiredTime: -1,
+		UnlimitedQuota: true, Group: "auto",
+	}
+	require.NoError(t, db.Create(&token).Error)
+
+	zero := 0
+	cheapBaseURL := "https://cheap.invalid/v1"
+	plusBaseURL := "https://plus.invalid/v1"
+	channels := []model.Channel{
+		{
+			Id: smartRelayTestCheapChannel, Type: constant.ChannelTypeOpenAI, Key: "cheap-key",
+			Status: common.ChannelStatusEnabled, Name: "cheap", BaseURL: &cheapBaseURL,
+			Models: smartRelayTestModel, Group: "cheap,mid", AutoBan: &zero,
+		},
+		{
+			Id: smartRelayTestPlusChannel, Type: constant.ChannelTypeOpenAI, Key: "plus-key",
+			Status: common.ChannelStatusEnabled, Name: "plus", BaseURL: &plusBaseURL,
+			Models: smartRelayTestModel, Group: "plus", AutoBan: &zero,
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	priority := int64(10)
+	abilities := []model.Ability{
+		{Group: "cheap", Model: smartRelayTestModel, ChannelId: smartRelayTestCheapChannel, Enabled: true, Priority: &priority, Weight: 100},
+		{Group: "mid", Model: smartRelayTestModel, ChannelId: smartRelayTestCheapChannel, Enabled: true, Priority: &priority, Weight: 100},
+		{Group: "plus", Model: smartRelayTestModel, ChannelId: smartRelayTestPlusChannel, Enabled: true, Priority: &priority, Weight: 100},
+	}
+	require.NoError(t, db.Create(&abilities).Error)
+
+	setting := smartRelayTestSetting()
+	settingProvider := func() smartroutersetting.Setting { return setting }
+	catalogs := service.NewCatalogManager(service.NewGormCatalogSource(db), settingProvider)
+	prices := service.NewPriceSnapshotManager(catalogs, nil)
+	state, err := service.NewMemorySmartRouteStateStore(service.DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	engine, err := service.NewSmartRouterEngine(
+		catalogs, prices, state, service.NewMemorySmartRouteAffinityStore(nil, 100), settingProvider,
+	)
+	require.NoError(t, err)
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	contractID, _, err := service.BuildSmartContractIdentity(smartRelayTestModel, service.SmartEndpointChat)
+	require.NoError(t, err)
+	contract, exists := catalog.Contracts[contractID]
+	require.True(t, exists)
+	require.NotEmpty(t, contract.Pools["balanced-v1"].Candidates)
+	priceSnapshot, err := prices.Refresh(context.Background(), "default")
+	require.NoError(t, err)
+	for _, route := range contract.Pools["balanced-v1"].Candidates {
+		_, priced := priceSnapshot.RatiosPPM[route.RouteID]
+		require.True(t, priced)
+		if route.Group != "plus" {
+			continue
+		}
+		// These controller cases exercise failover after the shared router has
+		// already observed a usable alternative. V4 intentionally has no
+		// administrator-declared stable fallback, so the fixture must establish
+		// that runtime evidence explicitly instead of relying on group metadata.
+		require.NoError(t, state.RecordAttempt(context.Background(), service.SmartRouteAttemptRecord{
+			RouteID: route.RouteID, Group: route.Group, Model: smartRelayTestModel,
+			ChannelID: route.ChannelID, ContractID: contract.Contract.ContractID,
+			Endpoint: contract.Contract.Endpoint, CapacityDomain: route.CapacityDomain,
+			CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			Outcome:          smartrouter.OutcomeSuccess, Admission: smartrouter.AdmissionNormal,
+		}))
+	}
+
+	t.Cleanup(func() {
+		prices.Close()
+		catalogs.Close()
+		sqlDB, sqlErr := db.DB()
+		if sqlErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	return &smartRelayTestHarness{db: db, engine: engine, state: state, setting: setting, quota: quota}
+}
+
+func smartRelayTestSetting() smartroutersetting.Setting {
+	policy := smartrouter.NormalizePolicy(smartrouter.Policy{
+		Version: smartrouter.PolicyVersion, PolicyID: "controller-fault-injection-v1", Enabled: true,
+		PoolPolicy: "balanced-v1", OrderMode: smartrouter.OrderAutoPrice,
+		MaxEffectiveRatioPPM: 50_000, HealthGuard: true,
+		RecoveryProfile: smartrouter.RecoveryBalanced, AllowFutureGroups: true,
+	})
+	return smartroutersetting.Setting{
+		Enabled: true,
+		CertifiedGroups: map[string]smartroutersetting.CertifiedGroupSetting{
+			"cheap": {Pools: []string{"balanced-v1"}, AdminOrder: 10},
+			"mid":   {Pools: []string{"balanced-v1"}, AdminOrder: 20},
+			"plus":  {Pools: []string{"balanced-v1"}, StableFallback: true, AdminOrder: 30},
+		},
+		TextContracts: []smartroutersetting.TextContractSetting{{
+			Endpoint: constant.EndpointTypeOpenAI, Capabilities: smartroutersetting.CapabilityText,
+			MaxContext: 128_000, ModelAllow: []string{smartRelayTestModel},
+		}},
+		ChannelProfiles: map[string]smartroutersetting.ChannelProfileSetting{
+			fmt.Sprint(smartRelayTestCheapChannel): {MaxInflight: 4},
+			fmt.Sprint(smartRelayTestPlusChannel):  {MaxInflight: 4},
+		},
+		DefaultPolicy: policy, MaxAttempts: 3, CatalogRefreshSeconds: 3600,
+		KillSwitchMode: smartroutersetting.KillSwitchNormal,
+	}
+}
+
+func configureCheapMultiKeyChannel(t *testing.T, h *smartRelayTestHarness, automaticDisable bool) {
+	t.Helper()
+	originalAutomaticDisable := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = automaticDisable
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = originalAutomaticDisable })
+
+	var channel model.Channel
+	require.NoError(t, h.db.First(&channel, smartRelayTestCheapChannel).Error)
+	one := 1
+	channel.Key = "cheap-invalid-key\ncheap-valid-key"
+	channel.AutoBan = &one
+	channel.ChannelInfo = model.ChannelInfo{
+		IsMultiKey:           true,
+		MultiKeySize:         2,
+		MultiKeyStatusList:   make(map[int]int),
+		MultiKeyPollingIndex: 0,
+		MultiKeyMode:         constant.MultiKeyModePolling,
+	}
+	require.NoError(t, h.db.Save(&channel).Error)
+	h.engine.Catalogs.Invalidate()
+	h.engine.Prices.InvalidateAll()
+	_, err := h.engine.Catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	_, err = h.engine.Prices.Refresh(context.Background(), "default")
+	require.NoError(t, err)
+}
+
+func (h *smartRelayTestHarness) newRequest(
+	t *testing.T,
+	requestID string,
+) (*gin.Context, *httptest.ResponseRecorder, smartrouter.RouteRequest) {
+	t.Helper()
+	body := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set(common.RequestIdKey, requestID)
+	common.SetContextKey(ctx, constant.ContextKeyRequestStartTime, time.Now())
+	common.SetContextKey(ctx, constant.ContextKeyOriginalModel, smartRelayTestModel)
+	common.SetContextKey(ctx, constant.ContextKeyUserId, smartRelayTestUserID)
+	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(ctx, constant.ContextKeyUserQuota, h.quota)
+	common.SetContextKey(ctx, constant.ContextKeyUserEmail, "smart-relay@example.invalid")
+	common.SetContextKey(ctx, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: "wallet_only"})
+	common.SetContextKey(ctx, constant.ContextKeyTokenId, smartRelayTestTokenID)
+	common.SetContextKey(ctx, constant.ContextKeyTokenKey, strings.Repeat("k", 48))
+	common.SetContextKey(ctx, constant.ContextKeyTokenUnlimited, true)
+	common.SetContextKey(ctx, constant.ContextKeyTokenGroup, "auto")
+	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "auto")
+
+	routeRequest, err := service.BuildSmartRouteRequest(ctx, smartRelayTestModel, 100)
+	require.NoError(t, err)
+	t.Cleanup(func() { common.CleanupBodyStorage(ctx) })
+	return ctx, recorder, routeRequest
+}
+
+func (h *smartRelayTestHarness) relay(
+	ctx *gin.Context,
+	routeRequest smartrouter.RouteRequest,
+	dispatch smartRelayAttemptDispatcher,
+) *types.NewAPIError {
+	baseInfo := &relaycommon.RelayInfo{
+		TokenId: smartRelayTestTokenID, UserGroup: "default", OriginModelName: smartRelayTestModel,
+	}
+	return relaySmartWithEngine(
+		ctx, types.RelayFormatOpenAI, baseInfo, 100, &types.TokenCountMeta{},
+		h.setting.DefaultPolicy, routeRequest, h.engine, dispatch,
+	)
+}
+
+func (h *smartRelayTestHarness) reservation(t *testing.T, requestID string) model.QuotaReservation {
+	t.Helper()
+	var reservation model.QuotaReservation
+	require.NoError(t, h.db.Where("request_id = ?", requestID).First(&reservation).Error)
+	return reservation
+}
+
+func (h *smartRelayTestHarness) userQuota(t *testing.T) int {
+	t.Helper()
+	var user model.User
+	require.NoError(t, h.db.Select("id", "quota").First(&user, smartRelayTestUserID).Error)
+	return user.Quota
+}
+
+func (h *smartRelayTestHarness) positiveConsumeLogCount(t *testing.T, requestID string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, h.db.Model(&model.Log{}).
+		Where("request_id = ? AND quota > 0", requestID).
+		Count(&count).Error)
+	return count
+}
+
+func (h *smartRelayTestHarness) activeReservedQuota(t *testing.T, requestID string) int64 {
+	t.Helper()
+	var total int64
+	require.NoError(t, h.db.Model(&model.QuotaReservation{}).
+		Where("request_id = ? AND status = ?", requestID, model.QuotaReservationStatusActive).
+		Select("COALESCE(SUM(reserved_quota), 0)").
+		Scan(&total).Error)
+	return total
+}
+
+func (h *smartRelayTestHarness) catalog(t *testing.T) smartrouter.CertifiedRouteCatalog {
+	t.Helper()
+	catalog, exists := h.engine.Catalogs.Current()
+	require.True(t, exists)
+	require.NotNil(t, catalog)
+	return *catalog
+}
+
+func catalogRouteByContractGroup(
+	t *testing.T,
+	catalog smartrouter.CertifiedRouteCatalog,
+	contractID string,
+	group string,
+) smartrouter.CertifiedRoute {
+	t.Helper()
+	contract, exists := catalog.Contracts[contractID]
+	require.Truef(t, exists, "catalog has no contract %q", contractID)
+	for _, pool := range contract.Pools {
+		for _, route := range pool.Candidates {
+			if route.Group == group {
+				return route
+			}
+		}
+	}
+	require.Failf(t, "missing route", "catalog contract %q has no route for group %q", contractID, group)
+	return smartrouter.CertifiedRoute{}
+}
+
+func catalogStateRoutes(catalog smartrouter.CertifiedRouteCatalog) []service.SmartRouteStateRoute {
+	seen := make(map[string]struct{})
+	var routes []service.SmartRouteStateRoute
+	for _, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				if _, exists := seen[route.RouteID]; exists {
+					continue
+				}
+				seen[route.RouteID] = struct{}{}
+				routes = append(routes, service.SmartRouteStateRoute{
+					RouteID: route.RouteID, CapacityDomain: route.CapacityDomain,
+					StableFallback: route.StableFallback, MaxInflight: route.MaxInflight,
+				})
+			}
+		}
+	}
+	return routes
+}
+
+func smartRelayTestError(status int, code types.ErrorCode, retryAfter time.Duration) *types.NewAPIError {
+	err := types.NewErrorWithStatusCode(errors.New(http.StatusText(status)), code, status)
+	err.RetryAfter = retryAfter
+	return err
+}

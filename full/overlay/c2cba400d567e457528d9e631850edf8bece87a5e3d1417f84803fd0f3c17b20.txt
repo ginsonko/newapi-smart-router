@@ -1,0 +1,86 @@
+package sora
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestConfiguredSubmissionIdentityStableAndNoTransparentReplay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Idempotency-Key", "untrusted-client-key")
+	info := &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_server_operation"}}
+	a := &TaskAdaptor{apiKey: "provider-test-key"}
+	for _, enabled := range []bool{false, true, true, false} {
+		c.Set(submitIdempotencyContextKey, enabled)
+		req, err := http.NewRequest(http.MethodPost, "https://provider.invalid/v1/videos", strings.NewReader(`{}`))
+		require.NoError(t, err)
+		require.NoError(t, a.BuildRequestHeader(c, req, info))
+		if enabled {
+			assert.Equal(t, "task_server_operation", req.Header.Get("Idempotency-Key"))
+			assert.Nil(t, req.GetBody)
+		} else {
+			assert.Empty(t, req.Header.Get("Idempotency-Key"))
+			assert.NotNil(t, req.GetBody)
+		}
+		assert.Equal(t, "Bearer provider-test-key", req.Header.Get("Authorization"))
+	}
+	c.Set(submitIdempotencyContextKey, true)
+	req, err := http.NewRequest(http.MethodPost, "https://provider.invalid/v1/videos", nil)
+	require.NoError(t, err)
+	info.PublicTaskID = "task_independent_operation"
+	require.NoError(t, a.BuildRequestHeader(c, req, info))
+	assert.Equal(t, info.PublicTaskID, req.Header.Get("Idempotency-Key"))
+	info.PublicTaskID = ""
+	assert.Error(t, a.BuildRequestHeader(c, req, info))
+}
+
+func TestProviderSecondsNumberAndStringPreserveAcceptedTask(t *testing.T) {
+	for _, seconds := range []string{`5`, `"5"`} {
+		t.Run(seconds, func(t *testing.T) {
+			body := `{"id":"provider-task","status":"queued","seconds":` + seconds + `}`
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			info := &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+			upstream, raw, err := (&TaskAdaptor{}).DoResponse(c, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, info)
+			require.Nil(t, err)
+			assert.Equal(t, "provider-task", upstream)
+			assert.JSONEq(t, body, string(raw))
+			var public map[string]interface{}
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &public))
+			assert.Equal(t, "5", public["seconds"])
+			assert.Equal(t, "task_public", public["id"])
+			result, parseErr := (&TaskAdaptor{}).ParseTaskResult([]byte(strings.Replace(body, "queued", "completed", 1)))
+			require.NoError(t, parseErr)
+			assert.Equal(t, model.TaskStatusSuccess, result.Status)
+		})
+	}
+}
+
+func TestConfiguredIntegerDurationAndSourceReferences(t *testing.T) {
+	prompt := " @图片1 的小船轻轻漂动，保持原文。 "
+	req := relaycommon.TaskSubmitReq{Seconds: "5", Duration: 5, Resolution: "1080p", AspectRatio: "16:9", References: []relaycommon.MediaReference{{Type: "image", Role: "reference", ResolvedURL: "https://media.example/boat.png"}}}
+	body := map[string]interface{}{"model": "configured-provider-model", "prompt": prompt, "seconds": "5"}
+	cap := mediaservice.Capability{RuntimeEnforced: true, ReferenceURLField: "source", GenerationFields: map[string]string{"seconds": "duration"}}
+	require.NoError(t, applyManagedCapabilityPayload(body, req, cap))
+	assert.Equal(t, 5, body["duration"])
+	assert.NotContains(t, body, "seconds")
+	assert.Equal(t, prompt, body["prompt"])
+	refs := body["references"].([]map[string]string)
+	require.Len(t, refs, 1)
+	assert.Equal(t, "https://media.example/boat.png", refs[0]["source"])
+	assert.Equal(t, "reference", refs[0]["role"])
+}

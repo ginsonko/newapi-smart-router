@@ -1,0 +1,361 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupTenantParameterAdminTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previousDB := model.DB
+	previousMain := common.MainDatabaseType()
+	dsn := fmt.Sprintf("file:tenant-param-admin-%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousMain)
+	})
+
+	require.NoError(t, db.AutoMigrate(
+		&model.TenantCostDownstream{}, &model.TenantCostProductSlot{}, &model.TenantCostSlotProvisionReceipt{}, &model.TenantCostKeyRotationReceipt{},
+		&model.TenantCredentialBinding{}, &model.TenantRouteProfile{}, &model.TenantCostSequence{},
+		&model.TenantCostEvent{}, &model.TenantCostOutbox{}, &model.TenantReportingToken{}, &model.TenantCostAuditEvent{}, &model.TenantCostProjectionRetry{},
+		&model.TenantCostWorkerControl{},
+		&model.User{}, &model.Token{}, &model.Channel{}, &model.UserSubscription{}, &model.QuotaReservation{}, &model.Task{}, &model.TaskBillingReceipt{},
+	))
+
+	require.NoError(t, model.EnsureDefaultTenantCostDownstream())
+
+	otherDownstream := &model.TenantCostDownstream{
+		TenantID:    "tenant-other",
+		DisplayName: "Other Tenant",
+		ConfigKey:   "tenant_other",
+		Status:      model.TenantCostDownstreamActive,
+	}
+	require.NoError(t, model.UpsertTenantCostDownstream(otherDownstream))
+
+	oldBatch, oldRedis := common.BatchUpdateEnabled, common.RedisEnabled
+	common.BatchUpdateEnabled, common.RedisEnabled = false, false
+	t.Cleanup(func() {
+		common.BatchUpdateEnabled, common.RedisEnabled = oldBatch, oldRedis
+	})
+
+	require.NoError(t, db.Create(&model.User{
+		Id: 1, Username: "param_user_1", Status: common.UserStatusEnabled, Quota: 1000000, AffCode: "aff-param-1",
+	}).Error)
+	require.NoError(t, db.Create(&model.User{
+		Id: 2, Username: "param_user_2", Status: common.UserStatusEnabled, Quota: 1000000, AffCode: "aff-param-2",
+	}).Error)
+	require.NoError(t, db.Create(&model.Token{
+		Id: 1, UserId: 1, Key: "sk-tok1", Status: common.TokenStatusEnabled, RemainQuota: 1000000, UnlimitedQuota: false,
+	}).Error)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 109, Name: "param channel 109",
+	}).Error)
+	require.NoError(t, db.Create(&model.TenantCredentialBinding{
+		ID: 1, TokenID: 1, TenantID: model.DownstreamTenantID, CredentialPurpose: model.TenantCredentialPurposeDataPlane,
+		KeyID: "test-key", KeySuffix: "12345678", ProductPoolID: "image_generation", ServiceTier: "pro", RouteProfileID: "route", ProfileRevision: "route-v1",
+		ModelCatalogRevision: "models-v1", BindingStatus: model.TenantBindingEnabled,
+	}).Error)
+
+	return db
+}
+
+func testParameterAdminCostContext() model.ParameterReservationCostContext {
+	return model.ParameterReservationCostContext{
+		SchemaVersion: 1,
+		RequestID:     "req-admin-param",
+		OccurredAt:    time.Unix(1700000000, 0).UnixNano(),
+		Quote: types.ParameterPriceSnapshot{
+			SchemaVersion: 1, Revision: "price-v1", RuleID: "image-rule", Group: "retail", Model: "image-model", ChannelID: 109,
+			UpstreamModel: "provider-image", MappingRevision: "mapping-v1", Unit: "per_request", Currency: "USD", UnitPrice: "0.036", Quantity: "1", Amount: "0.036", Quota: 18000,
+			SourceUnitPrice: "0.03", SourceCurrency: "USD", SourceAmount: "0.03", Parameters: map[string]string{"count": "1"},
+		},
+		Binding: model.TenantCostTaskContext{
+			BindingID: 1, TenantID: model.DownstreamTenantID, DownstreamRequestId: "tv-req-admin", ProductPoolID: "image_generation", ServiceTier: "pro",
+			RouteProfileID: "route", ProfileRevision: "route-v1", ModelCatalogRevision: "models-v1", KeyID: "test-key",
+		},
+	}
+}
+
+func invokeAdminCorrection(t *testing.T, pathParam, body string, queryTenant string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	url := "/api/tenant-cost/events/provider-correction"
+	if queryTenant != "" {
+		url += "?tenant_id=" + queryTenant
+	}
+	ctx.Request = httptest.NewRequest(http.MethodPost, url, bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	if pathParam != "" {
+		ctx.Params = append(ctx.Params, gin.Param{Key: "event_id", Value: pathParam})
+	}
+	ctx.Set("id", 100) // root operator
+	AdminAppendTenantProviderCostCorrection(ctx)
+	return recorder
+}
+
+func invokeAdminRefund(t *testing.T, pathParam, body string, queryTenant string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	url := "/api/tenant-cost/events/refund"
+	if queryTenant != "" {
+		url += "?tenant_id=" + queryTenant
+	}
+	ctx.Request = httptest.NewRequest(http.MethodPost, url, bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	if pathParam != "" {
+		ctx.Params = append(ctx.Params, gin.Param{Key: "event_id", Value: pathParam})
+	}
+	ctx.Set("id", 100) // root operator
+	AdminApplyTenantParameterRefund(ctx)
+	return recorder
+}
+
+// 1. 测试真实供应商更正：正常更正、重放幂等、异参冲突、未知实扣不能写金额、更正不改用户钱包、敏感脱敏
+func TestAdminAppendTenantProviderCostCorrection(t *testing.T) {
+	db := setupTenantParameterAdminTestDB(t)
+	cost := testParameterAdminCostContext()
+
+	// 准备一个同步结算预扣
+	reservationID := "direct:admin-provider"
+	_, err := model.ReserveQuotaTo(context.Background(), model.QuotaReservationSpec{
+		ReservationId:  reservationID,
+		RequestId:      reservationID + "-request",
+		UserId:         1,
+		TokenId:        1,
+		TokenUnlimited: false,
+		FundingSource:  model.QuotaReservationFundingWallet,
+	}, 18000)
+	require.NoError(t, err)
+	require.NoError(t, model.PersistParameterReservationCost(context.Background(), reservationID, 1, 1, cost))
+	_, err = model.SettleQuotaReservation(context.Background(), reservationID, 18000)
+	require.NoError(t, err)
+
+	spec, err := model.ReadParameterReservationTerminal(context.Background(), model.DownstreamTenantID, reservationID)
+	require.NoError(t, err)
+	firstAppend, err := model.AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	parentEventID := firstAppend.Event.EventID
+
+	var uBefore model.User
+	require.NoError(t, db.First(&uBefore, 1).Error)
+
+	// 1.1 首次更正：真实2美元供应商收据 (2.000000000000000000)
+	costAmt := "2.00"
+	body := fmt.Sprintf(`{"operation_id":"corr-001","parent_event_id":"%s","amount":"%s","currency":"USD","evidence":"exact","receipt_reference":"receipt-prov-2usd"}`, parentEventID, costAmt)
+	rec := invokeAdminCorrection(t, parentEventID, body, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Success  bool                   `json:"success"`
+		Replayed bool                   `json:"replayed"`
+		Data     map[string]interface{} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.True(t, resp.Success)
+	assert.False(t, resp.Replayed)
+	assert.Equal(t, model.TenantCostEventCorrection, resp.Data["event_type"])
+
+	// 验证敏感字段在响应中脱敏
+	payloadMap := resp.Data["payload"].(map[string]interface{})
+	assert.Nil(t, payloadMap["provider_url"])
+	assert.Nil(t, payloadMap["provider_key"])
+	assert.Nil(t, payloadMap["candidate_spec"])
+
+	// 验证用户钱包与已消耗未受任何影响
+	var uAfter model.User
+	require.NoError(t, db.First(&uAfter, 1).Error)
+	assert.Equal(t, uBefore.Quota, uAfter.Quota, "供应商成本更正严禁改变用户钱包")
+	assert.Equal(t, uBefore.UsedQuota, uAfter.UsedQuota, "供应商成本更正严禁改变用户消耗")
+
+	// 1.2 同 operation_id 幂等重放
+	recReplay := invokeAdminCorrection(t, parentEventID, body, "")
+	require.Equal(t, http.StatusOK, recReplay.Code)
+	var replayResp struct {
+		Success  bool                   `json:"success"`
+		Replayed bool                   `json:"replayed"`
+		Data     map[string]interface{} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(recReplay.Body.Bytes(), &replayResp))
+	assert.True(t, replayResp.Success)
+	assert.True(t, replayResp.Replayed, "相同 operation_id 必须幂等返回原更正")
+	assert.Equal(t, resp.Data["event_id"], replayResp.Data["event_id"])
+
+	// 1.3 异参冲突：同 operation_id 但不同金额
+	bodyConflict := fmt.Sprintf(`{"operation_id":"corr-001","parent_event_id":"%s","amount":"3.00","currency":"USD","evidence":"exact","receipt_reference":"receipt-prov-2usd"}`, parentEventID)
+	recConflict := invokeAdminCorrection(t, parentEventID, bodyConflict, "")
+	assert.Equal(t, http.StatusConflict, recConflict.Code, "同 operation_id 异参必须返回 409 Conflict")
+
+	// 1.4 成本未知不能写金额
+	bodyUnknownWithAmt := fmt.Sprintf(`{"operation_id":"corr-002","parent_event_id":"%s","amount":"0.00","currency":"USD","evidence":"unknown"}`, parentEventID)
+	recUnknown := invokeAdminCorrection(t, parentEventID, bodyUnknownWithAmt, "")
+	assert.Equal(t, http.StatusBadRequest, recUnknown.Code, "未知实扣不能赋值或写零")
+
+	// 1.5 跨租户拒绝：请求指定 tenant-other 与父事件所属 downstream 冲突
+	recCross := invokeAdminCorrection(t, parentEventID, body, "tenant-other")
+	assert.Equal(t, http.StatusForbidden, recCross.Code, "跨租户选择冲突必须被 403 拒绝")
+}
+
+// 2. 测试异步任务退款与同步预扣退款：守恒、防重放、异参冲突、超额拒绝、非伪造用户ID
+func TestAdminApplyTenantParameterRefund(t *testing.T) {
+	db := setupTenantParameterAdminTestDB(t)
+	cost := testParameterAdminCostContext()
+
+	// 2.A 异步任务退款
+	reservationID := "direct:task-refund-test"
+	_, err := model.ReserveQuotaTo(context.Background(), model.QuotaReservationSpec{
+		ReservationId:  reservationID,
+		RequestId:      reservationID + "-request",
+		UserId:         1,
+		TokenId:        1,
+		TokenUnlimited: false,
+		FundingSource:  model.QuotaReservationFundingWallet,
+	}, 18000)
+	require.NoError(t, err)
+
+	task := model.Task{
+		TaskID: "task-param-001", UserId: 1, ChannelId: 109, Status: model.TaskStatusInProgress, Quota: 18000, BillingReservationID: reservationID,
+		StartTime: 1700000000,
+		PrivateData: model.TaskPrivateData{
+			TokenId: 1, BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: "task-req-001",
+			BillingContext: &model.TaskBillingContext{
+				ParameterPricing: &cost.Quote,
+				TenantCost:       &cost.Binding,
+			},
+		},
+	}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		now := common.GetTimestamp()
+		receipt := &model.TaskBillingReceipt{
+			TaskRowID: task.ID, RequestID: "task-req-001", UserID: task.UserId, TokenID: 1, ChannelID: 109,
+			FundingSource: model.QuotaReservationFundingWallet, SubmissionQuota: 18000, PreConsumedQuota: 18000, TargetQuota: 18000,
+			State: model.TaskBillingReceiptSubmissionPending, Version: 1, CreatedAt: now, UpdatedAt: now,
+			ReservationID: &reservationID,
+		}
+		return tx.Create(receipt).Error
+	}))
+	_, err = model.ApplyTaskBillingSubmission(task.ID)
+	require.NoError(t, err)
+	require.NoError(t, model.StageTaskBillingTerminal(&task, model.TaskStatusSuccess, 18000))
+	_, err = model.ApplyTaskBillingTerminal(task.ID)
+	require.NoError(t, err)
+
+	var receipt model.TaskBillingReceipt
+	require.NoError(t, db.Where("task_row_id = ?", task.ID).First(&receipt).Error)
+	parentSpec, err := model.BuildParameterTaskCostSpec(&task, &receipt)
+	require.NoError(t, err)
+	parentAppend, err := model.AppendTenantCostEvent(parentSpec)
+	require.NoError(t, err)
+	taskParentEventID := parentAppend.Event.EventID
+
+	var uBeforeRefund model.User
+	require.NoError(t, db.First(&uBeforeRefund, 1).Error)
+
+	// 2.A.1 正常部分退款 (退 6000 quota)
+	bodyRefund := fmt.Sprintf(`{"operation_id":"refund-op-1","parent_event_id":"%s","refund_quota":6000}`, taskParentEventID)
+	recRefund := invokeAdminRefund(t, taskParentEventID, bodyRefund, "")
+	require.Equal(t, http.StatusOK, recRefund.Code)
+	var refResp struct {
+		Success  bool                   `json:"success"`
+		Replayed bool                   `json:"replayed"`
+		Data     map[string]interface{} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(recRefund.Body.Bytes(), &refResp))
+	assert.True(t, refResp.Success)
+	assert.False(t, refResp.Replayed)
+
+	// 验证退款资金守恒：用户钱包增加 6000，使用量减少 6000
+	var uAfterRefund model.User
+	require.NoError(t, db.First(&uAfterRefund, 1).Error)
+	assert.Equal(t, uBeforeRefund.Quota+6000, uAfterRefund.Quota, "退款后用户钱包必须增加对应额度")
+	assert.Equal(t, uBeforeRefund.UsedQuota-6000, uAfterRefund.UsedQuota, "退款后已消耗额度必须同步减少")
+
+	// 2.A.2 重复调用同一 operation_id 幂等重放
+	recReplay := invokeAdminRefund(t, taskParentEventID, bodyRefund, "")
+	require.Equal(t, http.StatusOK, recReplay.Code)
+	var refReplayResp struct {
+		Success  bool `json:"success"`
+		Replayed bool `json:"replayed"`
+	}
+	require.NoError(t, json.Unmarshal(recReplay.Body.Bytes(), &refReplayResp))
+	assert.True(t, refReplayResp.Success)
+	assert.True(t, refReplayResp.Replayed, "同一 operation_id 必须幂等重放")
+
+	// 验证钱包没有被二次退款
+	var uAfterReplay model.User
+	require.NoError(t, db.First(&uAfterReplay, 1).Error)
+	assert.Equal(t, uAfterRefund.Quota, uAfterReplay.Quota, "幂等重放严禁二次退款")
+
+	// 2.A.3 异参冲突：同 operation_id 但不同 refund_quota
+	bodyConflict := fmt.Sprintf(`{"operation_id":"refund-op-1","parent_event_id":"%s","refund_quota":8000}`, taskParentEventID)
+	recConflict := invokeAdminRefund(t, taskParentEventID, bodyConflict, "")
+	assert.Equal(t, http.StatusConflict, recConflict.Code, "同 operation_id 异参必须返回 409 Conflict")
+
+	// 2.A.4 超额退款拒绝 (当前剩余 12000，试图退 15000)
+	bodyOver := fmt.Sprintf(`{"operation_id":"refund-op-over","parent_event_id":"%s","refund_quota":15000}`, taskParentEventID)
+	recOver := invokeAdminRefund(t, taskParentEventID, bodyOver, "")
+	assert.Equal(t, http.StatusConflict, recOver.Code, "超额退款必须被拒绝")
+
+	// 2.A.5 伪造不一致 caller user_id 必须被拒绝
+	bodyForgedUser := fmt.Sprintf(`{"operation_id":"refund-op-forged","parent_event_id":"%s","user_id":2,"refund_quota":1000}`, taskParentEventID)
+	recForged := invokeAdminRefund(t, taskParentEventID, bodyForgedUser, "")
+	assert.Equal(t, http.StatusForbidden, recForged.Code, "指定与DB中task所有者不一致的user_id必须拒绝")
+
+	// 2.B 同步预扣退款 (直接针对 QuotaReservation)
+	resSyncID := "direct:sync-refund-test"
+	_, err = model.ReserveQuotaTo(context.Background(), model.QuotaReservationSpec{
+		ReservationId:  resSyncID,
+		RequestId:      resSyncID + "-request",
+		UserId:         1,
+		TokenId:        1,
+		TokenUnlimited: false,
+		FundingSource:  model.QuotaReservationFundingWallet,
+	}, 18000)
+	require.NoError(t, err)
+	require.NoError(t, model.PersistParameterReservationCost(context.Background(), resSyncID, 1, 1, cost))
+	_, err = model.SettleQuotaReservation(context.Background(), resSyncID, 18000)
+	require.NoError(t, err)
+	specSync, err := model.ReadParameterReservationTerminal(context.Background(), model.DownstreamTenantID, resSyncID)
+	require.NoError(t, err)
+	appendSync, err := model.AppendTenantCostEvent(specSync)
+	require.NoError(t, err)
+	syncParentEventID := appendSync.Event.EventID
+
+	// 2.B.1 同步预扣退款正常执行
+	bodySyncRefund := fmt.Sprintf(`{"operation_id":"sync-refund-op-1","parent_event_id":"%s","refund_quota":5000}`, syncParentEventID)
+	recSync := invokeAdminRefund(t, syncParentEventID, bodySyncRefund, "")
+	require.Equal(t, http.StatusOK, recSync.Code)
+	var syncRefResp struct {
+		Success  bool `json:"success"`
+		Replayed bool `json:"replayed"`
+	}
+	require.NoError(t, json.Unmarshal(recSync.Body.Bytes(), &syncRefResp))
+	assert.True(t, syncRefResp.Success)
+	assert.False(t, syncRefResp.Replayed)
+}

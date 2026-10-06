@@ -1,0 +1,125 @@
+package claude
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNativeClaudeNonStreamUsageAndEmptyResults(t *testing.T) {
+	for _, test := range []struct {
+		name, body            string
+		input, output, cache  int
+		empty, estimateOutput bool
+	}{
+		{"explicit zero", `{"content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":0,"output_tokens":0}}`, 0, 0, 0, false, false},
+		{"cache only input", `{"content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":0,"output_tokens":4,"cache_read_input_tokens":2000}}`, 0, 4, 2000, false, false},
+		{"empty omitted usage", `{"content":[]}`, 0, 0, 0, true, false},
+		{"empty zero usage", `{"content":[],"usage":{"input_tokens":0,"output_tokens":0}}`, 0, 0, 0, true, false},
+		{"real tool missing usage", `{"content":[{"type":"tool_use","id":"call_a","name":"read_file","input":{"path":"example.txt"}}]}`, 20, 0, 0, false, true},
+		{"missing input excludes cache", `{"content":[{"type":"text","text":"OK"}],"usage":{"output_tokens":4,"cache_read_input_tokens":15}}`, 5, 4, 15, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}}
+			info.SetEstimatePromptTokens(20)
+			state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+			err := HandleClaudeResponseData(c, info, state, &http.Response{Header: make(http.Header)}, []byte(test.body))
+			if test.empty {
+				require.NotNil(t, err)
+				require.Equal(t, types.ErrorCodeEmptyResponse, err.GetErrorCode())
+				return
+			}
+			require.Nil(t, err)
+			require.Equal(t, test.input, state.Usage.PromptTokens)
+			require.Equal(t, test.cache, state.Usage.PromptTokensDetails.CachedTokens)
+			if test.estimateOutput {
+				require.Positive(t, state.Usage.CompletionTokens)
+			} else {
+				require.Equal(t, test.output, state.Usage.CompletionTokens)
+			}
+		})
+	}
+}
+
+func TestNativeClaudeFinalUsagePreservesExplicitZeroAndCache(t *testing.T) {
+	for _, test := range []struct {
+		name, start, final   string
+		input, output, cache int
+	}{
+		{"zero", `{"input_tokens":0,"output_tokens":1}`, `{"input_tokens":0,"output_tokens":0}`, 0, 0, 0},
+		{"cached input only", `{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":2000}`, `{"output_tokens":4}`, 0, 4, 2000},
+		{"input from start", `{"input_tokens":12,"output_tokens":1}`, `{"output_tokens":4}`, 12, 4, 0},
+		{"explicit final cache zero", `{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":2000}`, `{"input_tokens":12,"output_tokens":4,"cache_read_input_tokens":0}`, 12, 4, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+			for _, raw := range []string{
+				`{"type":"message_start","message":{"usage":` + test.start + `}}`,
+				`{"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":` + test.final + `}`,
+			} {
+				var event dto.ClaudeResponse
+				require.NoError(t, common.Unmarshal([]byte(raw), &event))
+				require.True(t, FormatClaudeResponseInfo(&event, nil, state))
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude, ChannelMeta: &relaycommon.ChannelMeta{}}
+			info.SetEstimatePromptTokens(532949)
+			HandleStreamFinalResponse(c, info, state)
+			require.Equal(t, test.input, state.Usage.PromptTokens)
+			require.Equal(t, test.output, state.Usage.CompletionTokens)
+			require.Equal(t, test.cache, state.Usage.PromptTokensDetails.CachedTokens)
+		})
+	}
+}
+
+func TestNativeClaudeEmptyUsageDoesNotEstimatePrompt(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude, ChannelMeta: &relaycommon.ChannelMeta{}}
+	info.SetEstimatePromptTokens(532949)
+	state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+	HandleStreamFinalResponse(c, info, state)
+	require.Zero(t, state.Usage.PromptTokens)
+	require.Zero(t, state.Usage.CompletionTokens)
+}
+
+func TestNativeClaudeFinalZeroClearsPriorCacheCreationBreakdown(t *testing.T) {
+	state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+	for _, raw := range []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100}}}}`,
+		`{"type":"message_delta","usage":{"output_tokens":1,"cache_creation_input_tokens":0}}`,
+	} {
+		var event dto.ClaudeResponse
+		require.NoError(t, common.Unmarshal([]byte(raw), &event))
+		require.True(t, FormatClaudeResponseInfo(&event, nil, state))
+	}
+	require.Zero(t, state.Usage.PromptTokensDetails.CachedCreationTokens)
+	require.Zero(t, state.Usage.ClaudeCacheCreation5mTokens)
+	require.Zero(t, cacheCreationTokensForOpenAIUsage(state.Usage))
+}
+
+func TestNativeClaudeToolArgumentsContributeToMissingOutputEstimate(t *testing.T) {
+	state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+	for _, raw := range []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":0,"cache_read_input_tokens":2000}}}`,
+		`{"type":"content_block_start","content_block":{"type":"tool_use","id":"call_a","name":"read_file","input":{}}}`,
+		`{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"path\":\"example.txt\"}"}}`,
+	} {
+		var event dto.ClaudeResponse
+		require.NoError(t, common.Unmarshal([]byte(raw), &event))
+		require.True(t, FormatClaudeResponseInfo(&event, nil, state))
+	}
+	require.True(t, state.HasContent)
+	require.True(t, state.InputReported)
+	require.False(t, state.OutputReported)
+	require.Contains(t, state.ResponseText.String(), "read_file")
+	require.Contains(t, state.ResponseText.String(), "example.txt")
+}

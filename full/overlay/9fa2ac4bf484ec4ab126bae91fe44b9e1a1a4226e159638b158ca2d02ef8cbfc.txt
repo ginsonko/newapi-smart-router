@@ -1,0 +1,130 @@
+package service
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+var upstreamRequestIDTextPattern = regexp.MustCompile(`(?i)(?:request[ _-]?id|request id)\s*[:=]\s*([A-Za-z0-9._:-]{4,128})`)
+
+func CloseResponseBodyGracefully(httpResponse *http.Response) {
+	if httpResponse == nil || httpResponse.Body == nil {
+		return
+	}
+	err := httpResponse.Body.Close()
+	if err != nil {
+		common.SysError("failed to close response body: " + err.Error())
+	}
+}
+
+// ShouldCopyUpstreamHeader checks whether a given upstream response header
+// should be copied to the client response. It returns false for Content-Length
+// (managed separately) and X-Oneapi-Request-Id (to preserve the local instance
+// ID). When the upstream header is X-Oneapi-Request-Id, the value is captured
+// into the Gin context for later logging.
+func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
+	if strings.EqualFold(k, "Content-Length") {
+		return false
+	}
+	if strings.EqualFold(k, common.RequestIdKey) || strings.EqualFold(k, "X-Request-Id") || strings.EqualFold(k, "Request-Id") || strings.EqualFold(k, "OpenAI-Request-ID") {
+		if c != nil && len(v) > 0 {
+			if strings.TrimSpace(c.GetString(common.UpstreamRequestIdKey)) == "" {
+				c.Set(common.UpstreamRequestIdKey, strings.TrimSpace(v[0]))
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// CaptureUpstreamRequestIDFromBody stores a provider correlation id only when
+// the body contains an explicit request_id/requestId label or textual
+// "request id:" marker. It never replaces the local request id.
+func CaptureUpstreamRequestIDFromBody(c *gin.Context, body []byte) {
+	if c == nil || strings.TrimSpace(c.GetString(common.UpstreamRequestIdKey)) != "" || len(body) == 0 {
+		return
+	}
+	var envelope struct {
+		RequestID string `json:"request_id"`
+		RequestId string `json:"requestId"`
+		Error     struct {
+			RequestID string `json:"request_id"`
+			RequestId string `json:"requestId"`
+		} `json:"error"`
+	}
+	if err := common.Unmarshal(body, &envelope); err == nil {
+		for _, candidate := range []string{envelope.RequestID, envelope.RequestId, envelope.Error.RequestID, envelope.Error.RequestId} {
+			if candidate = strings.TrimSpace(candidate); candidate != "" {
+				c.Set(common.UpstreamRequestIdKey, candidate)
+				return
+			}
+		}
+	}
+	match := upstreamRequestIDTextPattern.FindSubmatch(body)
+	if len(match) == 2 {
+		c.Set(common.UpstreamRequestIdKey, string(match[1]))
+	}
+}
+
+func CaptureUpstreamRequestIDFromError(c *gin.Context, err error) {
+	if c == nil || strings.TrimSpace(c.GetString(common.UpstreamRequestIdKey)) != "" || err == nil {
+		return
+	}
+	if typed, ok := err.(interface{ ToOpenAIError() types.OpenAIError }); ok {
+		if requestID := strings.TrimSpace(typed.ToOpenAIError().RequestID); requestID != "" {
+			c.Set(common.UpstreamRequestIdKey, requestID)
+			return
+		}
+	}
+	match := upstreamRequestIDTextPattern.FindStringSubmatch(err.Error())
+	if len(match) == 2 {
+		c.Set(common.UpstreamRequestIdKey, match[1])
+	}
+}
+
+func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
+	if c.Writer == nil {
+		return
+	}
+
+	body := io.NopCloser(bytes.NewBuffer(data))
+
+	// We shouldn't set the header before we parse the response body, because the parse part may fail.
+	// And then we will have to send an error response, but in this case, the header has already been set.
+	// So the httpClient will be confused by the response.
+	// For example, Postman will report error, and we cannot check the response at all.
+	if src != nil {
+		for k, v := range src.Header {
+			if !ShouldCopyUpstreamHeader(c, k, v) {
+				continue
+			}
+			c.Writer.Header().Set(k, v[0])
+		}
+	}
+
+	// set Content-Length header manually BEFORE calling WriteHeader
+	c.Writer.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+
+	// Write header with status code (this sends the headers)
+	if src != nil {
+		c.Writer.WriteHeader(src.StatusCode)
+	} else {
+		c.Writer.WriteHeader(http.StatusOK)
+	}
+
+	_, err := io.Copy(c.Writer, body)
+	if err != nil {
+		logger.LogError(c, fmt.Sprintf("failed to copy response body: %s", err.Error()))
+	}
+	c.Writer.Flush()
+}

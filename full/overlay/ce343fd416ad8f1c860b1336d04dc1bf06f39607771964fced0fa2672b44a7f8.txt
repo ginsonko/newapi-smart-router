@@ -1,0 +1,34 @@
+package common
+
+import (
+	"io"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+// NewOutboundJSONBody wraps the already-marshaled upstream request body into a
+// BodyStorage. When disk cache is enabled and the payload exceeds the configured
+// threshold, the data is written to a temp file and the original []byte can be
+// GC'd, significantly reducing the heap residency while waiting for the
+// upstream provider to respond (the dominant cost for large base64 payloads).
+//
+// In memory mode the underlying memoryStorage reuses the same backing array,
+// so this is equivalent to bytes.NewReader(data) in terms of memory usage.
+//
+// This storage belongs to one outbound attempt. The HTTP transport closes it
+// after sending the request, so it is not retained throughout a slow response.
+// The caller MUST also defer closer.Close() for failures before transport handoff.
+//
+// Only this independent outbound copy is transport-owned. The reusable inbound
+// source still uses ReaderOnly and remains available for another route attempt.
+// Set http.Request.ContentLength from size because the wrapper hides its length.
+func NewOutboundJSONBody(data []byte) (body io.Reader, size int64, closer io.Closer, err error) {
+	storage, err := common.CreateBodyStorage(data)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{storage, storage}, storage.Size(), storage, nil
+}

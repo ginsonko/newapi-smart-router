@@ -1,0 +1,676 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  buildUserModelViews,
+  canonicalHealthState,
+  cheapestCurrentlyEligibleItem,
+  formatSmartRouterRoutePrice,
+  isSafeTextLastResort,
+  matchesHealthFilter,
+  recentActualSuccessItem,
+  type SmartRouterModelView,
+} from './health-view-model.ts'
+import {
+  mergeIndexedContractDetails,
+  shouldUseLegacySmartRouterStatus,
+} from './status-query.ts'
+
+describe('smart routing health compatibility states', () => {
+  test('keeps unknown and unproven certified routes usable', () => {
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'unknown-route',
+        status: 'unknown',
+      }),
+      'unknown'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'bootstrap-route',
+        primary_state: 'bootstrap',
+        availability: 'available_unproven',
+      }),
+      'unknown'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'warming-route',
+        status: 'unknown',
+        phase: 'warming',
+      }),
+      'unknown'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'modern-unknown-route',
+        primary_state: 'unknown',
+        status: 'open',
+        phase: 'warming',
+      }),
+      'unknown'
+    )
+  })
+
+  test('normalizes legacy recovery buckets without recreating an admission gate', () => {
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'legacy-recovering-route',
+        primary_state: 'recovering',
+      }),
+      'unavailable'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'legacy-degraded-route',
+        primary_state: 'degraded_usable',
+      }),
+      'unknown'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'legacy-warming-success-route',
+        status: 'unknown',
+        phase: 'warming',
+        last_success_at_ms: 20,
+        last_failure_at_ms: 10,
+      }),
+      'healthy'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'legacy-warming-failure-route',
+        status: 'unknown',
+        phase: 'warming',
+        last_success_at_ms: 10,
+        last_failure_at_ms: 20,
+      }),
+      'unavailable'
+    )
+    assert.equal(
+      matchesHealthFilter(
+        { route_id: 'failed-route', primary_state: 'unavailable' },
+        'recovering'
+      ),
+      true
+    )
+    assert.equal(
+      matchesHealthFilter(
+        { route_id: 'fresh-route', primary_state: 'unknown' },
+        'pending'
+      ),
+      true
+    )
+  })
+
+  test('retains explicit hard blocks as unavailable or review-needed', () => {
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'credential-blocked',
+        status: 'unknown',
+        credential_blocked: true,
+      }),
+      'unavailable'
+    )
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'manual-block',
+        status: 'unknown',
+        requires_admin_review: true,
+      }),
+      'needs_review'
+    )
+  })
+
+  test('separates an unhealthy signal from safe-text dispatch eligibility', () => {
+    const fallback = {
+      route_id: 'responses-last-resort',
+      primary_state: 'unavailable',
+      dispatch_eligibility: 'safe_last_resort',
+    }
+    assert.equal(canonicalHealthState(fallback), 'unavailable')
+    assert.equal(isSafeTextLastResort(fallback), true)
+    assert.equal(
+      canonicalHealthState({
+        route_id: 'responses-contract-summary',
+        primary_state: 'serving_with_recovery',
+      }),
+      'degraded_usable'
+    )
+  })
+})
+
+describe('smart routing status price labels', () => {
+  const keyOnly = ((key: string) => key) as Parameters<
+    typeof formatSmartRouterRoutePrice
+  >[1]
+
+  test('describes inherited global pricing without the obsolete 1x default', () => {
+    const label = formatSmartRouterRoutePrice(
+      {
+        billing_mode: 'ratio',
+        billing_unit: 'per_token',
+        score_ppm: 150000,
+        static_comparable: true,
+        scope: 'global',
+      },
+      keyOnly
+    )
+    assert.equal(
+      label,
+      '{{price}} effective input price ratio (inherits the global model base price)'
+    )
+    assert.equal(label?.includes('1x'), false)
+  })
+
+  test('labels explicit group-model ratios as effective input price', () => {
+    assert.equal(
+      formatSmartRouterRoutePrice(
+        {
+          billing_mode: 'ratio',
+          billing_unit: 'per_token',
+          score_ppm: 45000,
+          static_comparable: true,
+          scope: 'group_model',
+        },
+        keyOnly
+      ),
+      '{{price}} effective input price ratio'
+    )
+  })
+})
+
+function indexedModel(): SmartRouterModelView {
+  const contract = (contractId: string, endpoint: string) => ({
+    id: contractId,
+    contractId,
+    model: 'gpt-tabs',
+    endpoint,
+    items: [
+      {
+        contract_id: contractId,
+        model: 'gpt-tabs',
+        endpoint,
+        group: '',
+        primary_state: 'pending_sample' as const,
+      },
+    ],
+    cheaperUnavailable: [],
+    decisionRank: 5,
+    latestActivityAt: 0,
+    minimumRatio: Number.MAX_SAFE_INTEGER,
+  })
+  return {
+    model: 'gpt-tabs',
+    contracts: [
+      contract('contract-chat', 'openai-chat-v1'),
+      contract('contract-messages', 'anthropic-messages-v1'),
+    ],
+    decisionRank: 5,
+    pendingOnly: true,
+    latestActivityAt: 0,
+    minimumRatio: Number.MAX_SAFE_INTEGER,
+  }
+}
+
+describe('smart routing status compatibility fallback', () => {
+  test('never calls the model-specific legacy endpoint without a model', () => {
+    assert.equal(
+      shouldUseLegacySmartRouterStatus({
+        tokenId: 7,
+        modelIndexFailed: true,
+      }),
+      false
+    )
+    assert.equal(
+      shouldUseLegacySmartRouterStatus({
+        tokenId: 7,
+        model: '   ',
+        modelIndexFailed: true,
+      }),
+      false
+    )
+  })
+
+  test('uses the legacy endpoint only for an indexed failure with a model', () => {
+    assert.equal(
+      shouldUseLegacySmartRouterStatus({
+        tokenId: 7,
+        model: 'gpt-5.6-sol',
+        modelIndexFailed: false,
+      }),
+      false
+    )
+    assert.equal(
+      shouldUseLegacySmartRouterStatus({
+        tokenId: 7,
+        model: 'gpt-5.6-sol',
+        modelIndexFailed: true,
+      }),
+      true
+    )
+  })
+})
+
+describe('smart routing canonical contract detail merge', () => {
+  test('keeps canonical tab order when detail requests finish out of order', () => {
+    const merged = mergeIndexedContractDetails(indexedModel(), [
+      {
+        requestedContractId: 'contract-messages',
+        requestedEndpoint: 'anthropic-messages-v1',
+        pending: false,
+        error: false,
+        data: {
+          contract_id: 'contract-messages',
+          endpoint: 'anthropic-messages-v1',
+          items: [
+            {
+              contract_id: 'contract-messages',
+              model: 'gpt-tabs',
+              endpoint: 'anthropic-messages-v1',
+              group: 'messages-group',
+              selected: true,
+            },
+          ],
+        },
+      },
+      {
+        requestedContractId: 'contract-chat',
+        requestedEndpoint: 'openai-chat-v1',
+        pending: false,
+        error: false,
+        data: {
+          contract_id: 'contract-chat',
+          endpoint: 'openai-chat-v1',
+          items: [
+            {
+              contract_id: 'contract-chat',
+              model: 'gpt-tabs',
+              endpoint: 'openai-chat-v1',
+              group: 'chat-group',
+              selected: true,
+            },
+          ],
+        },
+      },
+    ])
+
+    assert.deepEqual(
+      merged.contracts.map((contract) => contract.id),
+      ['contract-chat', 'contract-messages']
+    )
+    assert.equal(merged.contracts[0]?.items[0]?.group, 'chat-group')
+    assert.equal(merged.contracts[1]?.items[0]?.group, 'messages-group')
+  })
+
+  test('one failed contract keeps its tab while the other contract updates', () => {
+    const merged = mergeIndexedContractDetails(indexedModel(), [
+      {
+        requestedContractId: 'contract-chat',
+        requestedEndpoint: 'openai-chat-v1',
+        pending: false,
+        error: true,
+      },
+      {
+        requestedContractId: 'contract-messages',
+        requestedEndpoint: 'anthropic-messages-v1',
+        pending: false,
+        error: false,
+        data: {
+          contract_id: 'contract-messages',
+          endpoint: 'anthropic-messages-v1',
+          items: [
+            {
+              contract_id: 'contract-messages',
+              model: 'gpt-tabs',
+              endpoint: 'anthropic-messages-v1',
+              group: 'messages-group',
+            },
+          ],
+        },
+      },
+    ])
+
+    assert.equal(merged.contracts.length, 2)
+    assert.equal(merged.contracts[0]?.id, 'contract-chat')
+    assert.equal(merged.contracts[0]?.error, true)
+    assert.equal(merged.contracts[1]?.items[0]?.group, 'messages-group')
+  })
+
+  test('rejects a response carrying another canonical contract identity', () => {
+    const merged = mergeIndexedContractDetails(indexedModel(), [
+      {
+        requestedContractId: 'contract-chat',
+        requestedEndpoint: 'openai-chat-v1',
+        pending: false,
+        error: false,
+        data: {
+          contract_id: 'contract-messages',
+          endpoint: 'anthropic-messages-v1',
+          items: [],
+        },
+      },
+    ])
+
+    assert.equal(merged.contracts[0]?.error, true)
+    assert.equal(merged.contracts[0]?.items[0]?.group, '')
+    assert.equal(merged.contracts[1]?.error, undefined)
+  })
+})
+
+describe('smart routing evidence-only decision labels', () => {
+  test('does not invent a recent actual group without a real success timestamp', () => {
+    const contract = indexedModel().contracts[0]
+    assert.ok(contract)
+    assert.equal(recentActualSuccessItem(contract), undefined)
+  })
+
+  test('shows only explicit recent success and currently eligible price data', () => {
+    const indexedContract = indexedModel().contracts[0]
+    assert.ok(indexedContract)
+    const contract = {
+      ...indexedContract,
+      items: [
+        {
+          model: 'gpt-tabs',
+          endpoint: 'openai-chat-v1',
+          group: 'cheap-but-recovering',
+          effective_ratio_ppm: 20_000,
+          price_known: true,
+          decision: 'rejected',
+          last_real_success_at_ms: 100,
+        },
+        {
+          model: 'gpt-tabs',
+          endpoint: 'openai-chat-v1',
+          group: 'eligible',
+          effective_ratio_ppm: 50_000,
+          price_known: true,
+          decision: 'eligible',
+          last_real_success_at_ms: 200,
+        },
+      ],
+    }
+
+    assert.equal(recentActualSuccessItem(contract)?.group, 'eligible')
+    assert.equal(cheapestCurrentlyEligibleItem(contract)?.group, 'eligible')
+  })
+
+  test('does not call a lower Key ratio cheaper when its real model price is higher', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'video-model',
+        endpoint: 'openai-video',
+        group: 'selected',
+        selected: true,
+        effective_ratio_ppm: 200_000,
+        price_known: true,
+        price: {
+          billing_mode: 'fixed_price',
+          billing_unit: 'per_second',
+          comparison_class: 'fixed-second',
+          score_ppm: 200_000,
+          static_comparable: true,
+        },
+        price_comparison: 'equal',
+      },
+      {
+        model: 'video-model',
+        endpoint: 'openai-video',
+        group: 'lower-cap-higher-price',
+        effective_ratio_ppm: 100_000,
+        price_known: true,
+        price: {
+          billing_mode: 'fixed_price',
+          billing_unit: 'per_second',
+          comparison_class: 'fixed-second',
+          score_ppm: 1_000_000,
+          static_comparable: true,
+        },
+        price_comparison: 'more_expensive',
+        cheaper_than_preference: false,
+      },
+    ])
+
+    assert.equal(views[0]?.contracts[0]?.preference?.group, 'selected')
+    assert.equal(views[0]?.contracts[0]?.cheaperUnavailable.length, 0)
+  })
+
+  test('rejects a stale cheaper flag across incompatible billing units', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'video-model',
+        endpoint: 'openai-video',
+        group: 'selected-request',
+        selected: true,
+        effective_ratio_ppm: 200_000,
+        price: {
+          billing_mode: 'fixed_price',
+          billing_unit: 'per_request',
+          comparison_class: 'fixed-request',
+          score_ppm: 200_000,
+          static_comparable: true,
+        },
+      },
+      {
+        model: 'video-model',
+        endpoint: 'openai-video',
+        group: 'per-second',
+        effective_ratio_ppm: 1,
+        price: {
+          billing_mode: 'fixed_price',
+          billing_unit: 'per_second',
+          comparison_class: 'fixed-second',
+          score_ppm: 1,
+          static_comparable: true,
+        },
+        price_comparison: 'incomparable',
+        cheaper_than_preference: true,
+      },
+    ])
+
+    assert.equal(views[0]?.contracts[0]?.cheaperUnavailable.length, 0)
+  })
+
+  test('uses backend candidate rank instead of re-sorting by static price', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'gpt-ranked',
+        endpoint: 'openai-chat-v1',
+        group: 'cache-efficient',
+        selected: true,
+        selection_rank: 1,
+        decision: 'selected',
+        effective_ratio_ppm: 200_000,
+        price_known: true,
+        price: {
+          billing_mode: 'ratio',
+          billing_unit: 'token',
+          comparison_class: 'token',
+          score_ppm: 200_000,
+          static_comparable: true,
+        },
+        ranking_cost_basis: 'recent_actual_input_cost',
+        ranking_cost_source: 'observed',
+        ranking_cost_comparison: 'equal',
+        estimated_input_cost_ppm: 30_000,
+      },
+      {
+        model: 'gpt-ranked',
+        endpoint: 'openai-chat-v1',
+        group: 'static-cheaper',
+        selection_rank: 2,
+        decision: 'eligible',
+        effective_ratio_ppm: 100_000,
+        price_known: true,
+        price: {
+          billing_mode: 'ratio',
+          billing_unit: 'token',
+          comparison_class: 'token',
+          score_ppm: 100_000,
+          static_comparable: true,
+        },
+        ranking_cost_basis: 'recent_actual_input_cost',
+        ranking_cost_source: 'observed',
+        ranking_cost_comparison: 'more_expensive',
+        estimated_input_cost_ppm: 60_000,
+      },
+    ])
+
+    const contract = views[0]?.contracts[0]
+    assert.equal(contract?.items[0]?.group, 'cache-efficient')
+    assert.ok(contract)
+    assert.equal(
+      cheapestCurrentlyEligibleItem(contract)?.group,
+      'cache-efficient'
+    )
+    assert.equal(contract.cheaperUnavailable.length, 0)
+  })
+
+  test('keeps rank one above a selected rank two during capacity spill', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'gpt-capacity',
+        endpoint: 'openai-chat-v1',
+        group: 'rank-one-busy',
+        selection_rank: 1,
+        decision: 'conditional',
+        availability: 'capacity_busy',
+        capacity_limited: true,
+        effective_ratio_ppm: 100_000,
+        price_known: true,
+        ranking_cost_basis: 'recent_actual_input_cost',
+        ranking_cost_source: 'observed',
+        ranking_cost_comparison: 'cheaper',
+      },
+      {
+        model: 'gpt-capacity',
+        endpoint: 'openai-chat-v1',
+        group: 'rank-two-selected',
+        selected: true,
+        selection_rank: 2,
+        decision: 'selected',
+        effective_ratio_ppm: 120_000,
+        price_known: true,
+        ranking_cost_basis: 'recent_actual_input_cost',
+        ranking_cost_source: 'observed',
+        ranking_cost_comparison: 'equal',
+      },
+    ])
+
+    const contract = views[0]?.contracts[0]
+    assert.equal(contract?.items[0]?.group, 'rank-one-busy')
+    assert.equal(contract?.items[1]?.group, 'rank-two-selected')
+    assert.equal(contract?.preference?.group, 'rank-two-selected')
+    assert.equal(contract?.cheaperUnavailable[0]?.group, 'rank-one-busy')
+  })
+
+  test('preserves the legacy selected-first and static-price fallback', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'gpt-v6',
+        endpoint: 'openai-chat-v1',
+        group: 'selected',
+        selected: true,
+        effective_ratio_ppm: 200_000,
+        price_known: true,
+        price: {
+          billing_mode: 'ratio',
+          billing_unit: 'token',
+          comparison_class: 'token',
+          score_ppm: 200_000,
+          static_comparable: true,
+        },
+        price_comparison: 'equal',
+      },
+      {
+        model: 'gpt-v6',
+        endpoint: 'openai-chat-v1',
+        group: 'legacy-cheaper',
+        effective_ratio_ppm: 100_000,
+        price_known: true,
+        price: {
+          billing_mode: 'ratio',
+          billing_unit: 'token',
+          comparison_class: 'token',
+          score_ppm: 100_000,
+          static_comparable: true,
+        },
+        price_comparison: 'cheaper',
+        cheaper_than_preference: true,
+      },
+    ])
+
+    const contract = views[0]?.contracts[0]
+    assert.equal(contract?.items[0]?.group, 'selected')
+    assert.equal(contract?.cheaperUnavailable[0]?.group, 'legacy-cheaper')
+  })
+
+  test('keeps an observed zero cache rate distinct from missing evidence', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'gpt-zero-cache',
+        endpoint: 'openai-chat-v1',
+        group: 'observed-zero',
+        selected: true,
+        selection_rank: 1,
+        effective_ratio_ppm: 100_000,
+        price_known: true,
+        ranking_cost_basis: 'recent_actual_input_cost',
+        ranking_cost_source: 'observed',
+        ranking_cost_used: true,
+        recent_cache_rate_ppm: 0,
+        estimated_input_cost_ppm: 0,
+        estimated_input_usd_per_million: 0,
+        actual_input_cost_samples: 1,
+      },
+    ])
+
+    const item = views[0]?.contracts[0]?.items[0]
+    assert.equal(item?.recent_cache_rate_ppm, 0)
+    assert.equal(item?.estimated_input_cost_ppm, 0)
+    assert.equal(item?.estimated_input_usd_per_million, 0)
+    assert.equal(item?.actual_input_cost_samples, 1)
+  })
+
+  test('does not synthesize display metrics for a hidden cold-start prior', () => {
+    const views = buildUserModelViews([
+      {
+        model: 'gpt-cold-start',
+        endpoint: 'openai-chat-v1',
+        group: 'unobserved',
+        selected: true,
+        selection_rank: 1,
+        effective_ratio_ppm: 100_000,
+        price_known: true,
+        ranking_cost_basis: 'recent_actual_input_cost',
+        ranking_cost_source: 'optimistic_unobserved',
+        ranking_cost_used: true,
+      },
+    ])
+
+    const item = views[0]?.contracts[0]?.items[0]
+    assert.equal(item?.recent_cache_rate_ppm, undefined)
+    assert.equal(item?.estimated_input_cost_ppm, undefined)
+    assert.equal(item?.estimated_input_usd_per_million, undefined)
+    assert.equal(item?.actual_input_cost_samples, undefined)
+  })
+})

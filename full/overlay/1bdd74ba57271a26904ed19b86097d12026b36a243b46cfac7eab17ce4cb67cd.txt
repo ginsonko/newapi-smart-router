@@ -1,0 +1,104 @@
+package controller
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/gin-gonic/gin"
+)
+
+const parameterPricingRequestLimit = 9 << 20
+
+type parameterPricingWriteRequest struct {
+	ExpectedRevision string          `json:"expected_revision"`
+	Contract         json.RawMessage `json:"contract"`
+}
+
+func parameterPricingResponse(contract billing_setting.ParameterPricingContract) gin.H {
+	entries := len(contract.Rules)
+	return gin.H{
+		"supported":      true,
+		"schema_version": billing_setting.ParameterPricingSchemaVersion,
+		"revision":       contract.Revision,
+		
+		"entry_count":    entries,
+		"contract":       contract,
+	}
+}
+
+func decodeParameterPricingWriteRequest(c *gin.Context) (parameterPricingWriteRequest, string, error) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, parameterPricingRequestLimit)
+	var request parameterPricingWriteRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		return request, "", err
+	}
+	if len(request.Contract) == 0 || string(request.Contract) == "null" {
+		return request, "", &parameterPricingRequestError{message: "contract is required"}
+	}
+	contractRaw, err := common.Marshal(request.Contract)
+	if err != nil {
+		return request, "", err
+	}
+	return request, string(contractRaw), nil
+}
+
+type parameterPricingRequestError struct{ message string }
+
+func (err *parameterPricingRequestError) Error() string { return err.message }
+
+func parameterPricingError(c *gin.Context, status int, code, message string, extra gin.H) {
+	payload := gin.H{"success": false, "code": code, "message": message}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	c.JSON(status, payload)
+}
+
+func GetParameterPricing(c *gin.Context) {
+	common.ApiSuccess(c, parameterPricingResponse(billing_setting.GetParameterPricingContract()))
+}
+
+func PreviewParameterPricing(c *gin.Context) {
+	request, raw, err := decodeParameterPricingWriteRequest(c)
+	if err != nil {
+		parameterPricingError(c, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	contract, _, err := billing_setting.NormalizeParameterPricingContract(raw)
+	if err != nil {
+		parameterPricingError(c, http.StatusBadRequest, "validation_failed", err.Error(), nil)
+		return
+	}
+	current := billing_setting.GetParameterPricingContract()
+	data := parameterPricingResponse(contract)
+	data["current_revision"] = current.Revision
+	data["expected_revision_matches"] = request.ExpectedRevision == "" || request.ExpectedRevision == current.Revision
+	data["changed"] = contract.Revision != current.Revision
+	common.ApiSuccess(c, data)
+}
+
+func UpdateParameterPricing(c *gin.Context) {
+	request, raw, err := decodeParameterPricingWriteRequest(c)
+	if err != nil {
+		parameterPricingError(c, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	contract, changed, err := model.UpdateParameterPricingOption(request.ExpectedRevision, raw)
+	if err != nil {
+		if conflict, ok := model.IsParameterPricingRevisionConflict(err); ok {
+			parameterPricingError(c, http.StatusConflict, "revision_conflict", err.Error(), gin.H{
+				"expected_revision": conflict.Expected,
+				"current_revision":  conflict.Actual,
+			})
+			return
+		}
+		parameterPricingError(c, http.StatusBadRequest, "update_failed", err.Error(), nil)
+		return
+	}
+	data := parameterPricingResponse(contract)
+	data["changed"] = changed
+	common.ApiSuccess(c, data)
+}

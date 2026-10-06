@@ -1,0 +1,189 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { studioDurationHintCopy } from '@/features/media/parameter-capability'
+
+import type {
+  PricingModel,
+  PublicMediaCapabilityReferenceLimit,
+} from '../types'
+
+export function ModelMediaCapability(props: { model: PricingModel }) {
+  const { t } = useTranslation()
+  const [chosenGroup, setChosenGroup] = useState('')
+  const available = props.model.media_capability_contracts ?? []
+  const groups = [
+    ...new Set([
+      ...Object.keys(props.model.group_pricing ?? {}),
+      ...available.map((contract) => contract.target.group),
+    ]),
+  ]
+  const group = groups.includes(chosenGroup) ? chosenGroup : (groups[0] ?? '')
+  const contracts = available.filter(
+    (contract) =>
+      contract.target.model === props.model.model_name &&
+      contract.target.group === group
+  )
+  const referenceLimit = (limit?: PublicMediaCapabilityReferenceLimit) =>
+    limit?.enabled === false
+      ? t('Not supported')
+      : (limit?.max ?? t('Not specified'))
+  const billingUnitLabel = (unit?: string) => {
+    if (unit === 'fixed_duration') return t('Fixed price')
+    if (unit === 'per_second') return t('Per second')
+    if (unit === 'per_request') return t('Per Request')
+    if (unit === 'per_image') return t('Per image')
+    return unit ? t('Billing unit unavailable') : t('Not specified')
+  }
+  const bytesHint = (limit?: PublicMediaCapabilityReferenceLimit) => {
+    if (!limit || limit.enabled === false) return ''
+    const parts: string[] = []
+    if (limit.max_bytes) {
+      parts.push(
+        `${t('Per file')}: ${`${Number((limit.max_bytes / 1048576).toFixed(2))} MiB`}`
+      )
+    }
+    if (limit.max_remote_bytes) {
+      parts.push(
+        `${t('Remote file')}: ${`${Number((limit.max_remote_bytes / 1000000).toFixed(2))} MB`}`
+      )
+    }
+    if (limit.max_total_bytes) {
+      parts.push(
+        `${t('Total')}: ${`${Number((limit.max_total_bytes / 1048576).toFixed(2))} MiB`}`
+      )
+    }
+    if (limit.mime_types?.length) {
+      parts.push(limit.mime_types.join(', '))
+    }
+    return parts.join(' · ')
+  }
+
+  return (
+    <section className='space-y-3 rounded-xl border p-4'>
+      <h3 className='text-sm font-semibold'>
+        {t('Model capability contract')}
+      </h3>
+      {groups.length > 1 && (
+        <NativeSelect
+          aria-label={t('Group')}
+          value={group}
+          onChange={(event) => setChosenGroup(event.target.value)}
+        >
+          {groups.map((name) => (
+            <NativeSelectOption key={name} value={name}>
+              {name}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      )}
+      {contracts.length === 0 && (
+        <p className='text-muted-foreground text-xs'>
+          {t('No capability contract is available for this group')}
+        </p>
+      )}
+      {contracts.map((capability) => {
+        const durationCopy = studioDurationHintCopy(
+          capability.generation.duration
+        )
+        const imageBytes = bytesHint(capability.references?.images)
+        return (
+          <div
+            key={`${capability.contract_id}:${capability.revision}`}
+            className='space-y-2 border-t pt-3 text-xs'
+          >
+            {capability.references?.native_human_images === true && (
+              <p>{t('Native human image references supported')}</p>
+            )}
+            {capability.generation.resolutions?.length ? (
+              <p>
+                {t('Resolution')}:{' '}
+                {capability.generation.resolutions.join(' / ')}
+              </p>
+            ) : null}
+            {capability.generation.aspect_ratios?.length ? (
+              <p>
+                {t('Aspect ratio')}:{' '}
+                {capability.generation.aspect_ratios.join(' / ')}
+              </p>
+            ) : null}
+            {durationCopy ? (
+              <p>{t(durationCopy.key, durationCopy.values)}</p>
+            ) : null}
+            {capability.commercial?.consumer_offer?.billing_unit ? (
+              <p>
+                {t('Billing unit')}:{' '}
+                {billingUnitLabel(
+                  capability.commercial.consumer_offer.billing_unit
+                )}
+              </p>
+            ) : null}
+            <p>
+              {t('Images')}: {referenceLimit(capability.references?.images)} ·{' '}
+              {t('Videos')}: {referenceLimit(capability.references?.videos)} ·{' '}
+              {t('Audio')}: {referenceLimit(capability.references?.audios)}
+            </p>
+            {imageBytes ? (
+              <p>
+                {t('Image limits')}: {imageBytes}
+              </p>
+            ) : null}
+            {capability.references?.max_total !== undefined && (
+              <p>
+                {t('Up to {{count}} reference files in total', {
+                  count: capability.references.max_total,
+                })}
+              </p>
+            )}
+            {capability.references?.mixed !== undefined && (
+              <p>
+                {t('Mixed reference files')}:{' '}
+                {t(capability.references.mixed ? 'Supported' : 'Not supported')}
+              </p>
+            )}
+            {capability.references?.prompt_reference?.required && (
+              <p>
+                {t('Insert every reference into the prompt before creating')}
+              </p>
+            )}
+            {capability.references?.forbidden_roles?.length ? (
+              <p>
+                {t('Forbidden reference roles')}:{' '}
+                {capability.references.forbidden_roles
+                  .map((role) => t(role))
+                  .join(' / ')}
+              </p>
+            ) : null}
+            {capability.generation.forbidden_modes?.length ? (
+              <p>
+                {t('Unsupported modes')}:{' '}
+                {capability.generation.forbidden_modes
+                  .map((mode) => t(mode))
+                  .join(' / ')}
+              </p>
+            ) : null}
+          </div>
+        )
+      })}
+    </section>
+  )
+}

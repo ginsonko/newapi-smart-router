@@ -1,0 +1,241 @@
+package service
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type actualInputCostOptionPriceSource struct {
+	*fakeSmartRatioSource
+}
+
+func (actualInputCostOptionPriceSource) ModelPricingRevisions() smartRouteModelPricingRevisions {
+	return smartRouteModelPricingRevisions{}
+}
+
+func (actualInputCostOptionPriceSource) RoutePriceDescriptor(
+	_ string,
+	_ string,
+	groupRatioPPM int64,
+) (smartrouter.RoutePrice, error) {
+	return actualInputCostVisibilityPrice(groupRatioPPM), nil
+}
+
+func TestEligibleGroupOptionsUseAutomaticPoolWithoutLegacyPolicyIdentifiers(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{
+		"economy":"Economy route",
+		"fallback":"Stable fallback",
+		"unrelated":"Not certified"
+	}`))
+	t.Cleanup(func() { require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups)) })
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.DefaultMaxEffectiveRatioPPM = 100_000
+	setting.AbsoluteMaxEffectiveRatioPPM = 1_000_000
+	setting.CertifiedGroups = nil
+	setting.TextContracts = nil
+	setting.DefaultPolicy.PolicyID = ""
+	setting.DefaultPolicy.PoolPolicy = ""
+	catalogs := NewCatalogManager(smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI), func() smartroutersetting.Setting { return setting })
+	defer catalogs.Close()
+	_, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	prices := NewPriceSnapshotManager(catalogs, &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000, "fallback": 200_000, "unrelated": 1_000},
+		},
+	})
+	defer prices.Close()
+	engine := &SmartRouterEngine{
+		Catalogs: catalogs,
+		Prices:   prices,
+		Settings: func() smartroutersetting.Setting { return setting },
+	}
+
+	options, err := engine.EligibleGroupOptions(context.Background(), "standard", setting.DefaultPolicy)
+	require.NoError(t, err)
+	require.Len(t, options, 2)
+	assert.Equal(t, SmartRouteGroupOption{
+		Group: "economy", Description: "Economy route", EffectiveRatioPPM: 20_000,
+		SupportedModelCount: 1, HealthyRouteCount: 0, RouteCount: 2, HealthStatus: "unknown",
+	}, options[0])
+	assert.Equal(t, SmartRouteGroupOption{
+		Group: "fallback", Description: "Stable fallback", EffectiveRatioPPM: 200_000,
+		SupportedModelCount: 1, HealthyRouteCount: 0, RouteCount: 2, HealthStatus: "unknown",
+	}, options[1])
+
+	defaultCapPolicy := setting.DefaultPolicy
+	defaultCapPolicy.ExcludedGroups = []string{"economy"}
+	models, err := engine.EligibleModels(context.Background(), "standard", defaultCapPolicy)
+	require.NoError(t, err)
+	assert.Empty(t, models, "a visible group above the Key cap must not become dispatch-eligible")
+
+	raisedCapPolicy := defaultCapPolicy
+	raisedCapPolicy.MaxEffectiveRatioPPM = 300_000
+	models, err = engine.EligibleModels(context.Background(), "standard", raisedCapPolicy)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"gpt-test"}, models, "raising the Key cap should make the already-visible group eligible")
+
+	visibilityPolicy := SmartRouterCatalogVisibilityPolicy(setting.DefaultPolicy, setting)
+	models, err = engine.EligibleModels(context.Background(), "standard", visibilityPolicy)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"gpt-test"}, models, "the smart-key picker must expose models available below the site absolute ceiling")
+}
+
+func TestEligibleModelsForEndpointsSeparatesVideoFromTextAndImages(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"economy":"Economy route"}`))
+	t.Cleanup(func() { require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups)) })
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeImageGeneration,
+		constant.EndpointTypeOpenAIVideo,
+	}
+	priority := int64(1)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "gpt-5.6-sol", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "gpt-image-2", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "sora-2", ChannelId: 2, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 2, Type: constant.ChannelTypeSora, Status: common.ChannelStatusEnabled},
+		},
+	}
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	defer catalogs.Close()
+	_, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	prices := NewPriceSnapshotManager(catalogs, &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000},
+		},
+	})
+	defer prices.Close()
+	engine := &SmartRouterEngine{
+		Catalogs: catalogs,
+		Prices:   prices,
+		Settings: func() smartroutersetting.Setting { return setting },
+	}
+
+	videos, err := engine.EligibleModelsForEndpoints(
+		context.Background(), "standard", setting.DefaultPolicy,
+		SmartEndpointVideos, SmartEndpointVideoTasks,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sora-2"}, videos)
+
+	images, err := engine.EligibleModelsForEndpoints(
+		context.Background(), "standard", setting.DefaultPolicy,
+		SmartEndpointImages, SmartEndpointImageEdits,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"gpt-image-2"}, images)
+
+	all, err := engine.EligibleModelsForEndpoints(
+		context.Background(), "standard", setting.DefaultPolicy,
+		SmartEndpointChat, SmartEndpointImages, SmartEndpointVideos,
+	)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"gpt-5.6-sol", "gpt-image-2", "sora-2"}, all)
+}
+
+func TestEligibleGroupOptionsExposeZeroCacheRateAndSampleModelCount(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{
+		"economy":"Economy route",
+		"fallback":"Stable fallback"
+	}`))
+	t.Cleanup(func() { require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups)) })
+
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.DefaultMaxEffectiveRatioPPM = 100_000
+	setting.AbsoluteMaxEffectiveRatioPPM = 1_000_000
+	catalogs := NewCatalogManager(
+		smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI),
+		func() smartroutersetting.Setting { return setting },
+	)
+	defer catalogs.Close()
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+
+	prices := NewPriceSnapshotManager(catalogs, actualInputCostOptionPriceSource{
+		fakeSmartRatioSource: &fakeSmartRatioSource{
+			revision: 1,
+			ratios: map[string]map[string]int64{
+				"standard": {"economy": 20_000, "fallback": 50_000},
+			},
+		},
+	})
+	defer prices.Close()
+	_, err = prices.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+
+	chat := contractByEndpoint(t, *catalog, SmartEndpointChat)
+	var economyRoute smartrouter.CertifiedRoute
+	for _, route := range chat.Pools[SmartRouteAutoDiscoveredPool].Candidates {
+		if route.Group == "economy" {
+			economyRoute = route
+			break
+		}
+	}
+	require.NotEmpty(t, economyRoute.RouteID)
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointChat}).UsageSemantic()
+	exactKey := smartrouter.ActualInputCostKey(
+		economyRoute.CacheNamespaceIdentity(), economyRoute.UpstreamModel,
+		chat.Contract.CanonicalModel, SmartEndpointChat, usageSemantic,
+	)
+	eventMS := time.Now().UnixMilli()
+	profile := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			Key: exactKey, TotalInputTokens: 100, RegularInputTokens: 100, Reliable: true,
+		},
+		eventMS,
+	)
+	engine := &SmartRouterEngine{
+		Catalogs: catalogs,
+		Prices:   prices,
+		Settings: func() smartroutersetting.Setting { return setting },
+		ActualInputCosts: visibilitySnapshotStore{
+			snapshot: smartrouter.ActualInputCostSnapshot{exactKey: profile},
+		},
+	}
+
+	options, err := engine.EligibleGroupOptions(context.Background(), "standard", setting.DefaultPolicy)
+	require.NoError(t, err)
+	var economy SmartRouteGroupOption
+	for _, option := range options {
+		if option.Group == "economy" {
+			economy = option
+			break
+		}
+	}
+	require.Equal(t, "economy", economy.Group)
+	require.NotNil(t, economy.RecentCacheRatePPM)
+	assert.LessOrEqual(t, *economy.RecentCacheRatePPM, int64(100), "a fresh measured zero must remain visible as zero, not disappear as missing")
+	assert.Equal(t, 1, economy.ActualInputCostModelCount)
+	assert.Equal(t, int64(1), economy.ActualInputCostSamples)
+	// The option projection takes its read-time snapshot after the observation
+	// is inserted. Under the race detector that can cross a millisecond tick;
+	// assert the timestamp remains a fresh observation instead of requiring an
+	// implementation-dependent exact tick.
+	assert.GreaterOrEqual(t, economy.ActualInputCostLastObservedMS, eventMS)
+	assert.LessOrEqual(t, economy.ActualInputCostLastObservedMS-eventMS, int64(1000))
+}

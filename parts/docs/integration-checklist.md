@@ -1,5 +1,7 @@
 # Smart Router 宿主集成与验收清单
 
+当前目标为 `v0.4.0-alpha.1` / `bridge-spi-v1alpha4`。历史版本小节保留作追溯；当前验收必须同时覆盖 [R98 host hooks](../spec/r98-host-hooks.md) 的每 Key 记忆、授权目录/报价隔离、绘图退款后 fallback 和 unknown 不重放，以及 Web/Worker 同一 artifact。
+
 状态：设计期检查表，不是自动认证结果。
 
 ## A. 授权与基线

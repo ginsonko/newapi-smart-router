@@ -1,0 +1,93 @@
+package helper
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+)
+
+// ValidateParameterImageWire checks pricing controls after conversion and
+// channel overrides. Large image fields are skipped by the decoder; only the
+// small scalar controls are retained for this check.
+func ValidateParameterImageWire(q *types.ParameterPriceSnapshot, raw []byte) error {
+	if q == nil {
+		return nil
+	}
+	var controls struct {
+		Model      string `json:"model"`
+		Size       string `json:"size"`
+		Resolution string `json:"resolution"`
+		Quality    string `json:"quality"`
+		N          *uint  `json:"n"`
+	}
+	if err := common.Unmarshal(raw, &controls); err != nil {
+		return err
+	}
+	if controls.Model != q.UpstreamModel {
+		return fmt.Errorf("outbound model differs from the priced supply")
+	}
+	count := uint(1)
+	if controls.N != nil {
+		count = *controls.N
+	}
+	if strconv.FormatUint(uint64(count), 10) != q.Parameters["count"] {
+		return fmt.Errorf("outbound image count differs from the quote")
+	}
+	resolution := strings.ToLower(strings.TrimSpace(controls.Resolution))
+	size := strings.ToLower(strings.TrimSpace(controls.Size))
+	if resolution != "" && size != "" && resolution != size {
+		if expectedSize := strings.ToLower(strings.TrimSpace(q.Parameters["size"])); expectedSize == "" || size != expectedSize {
+			return fmt.Errorf("outbound resolution and size conflict")
+		}
+	}
+	if expectedSize := strings.ToLower(strings.TrimSpace(q.Parameters["size"])); expectedSize != "" && size != expectedSize {
+		return fmt.Errorf("outbound image size differs from the quote")
+	}
+	if resolution == "" {
+		resolution = size
+	}
+	if want := strings.ToLower(strings.TrimSpace(q.Parameters["resolution"])); want != "" && resolution != want {
+		// A declared pixel-size alias is priced by its canonical resolution. If
+		// the converted request retained that literal size, the mismatch is
+		// expected and already constrained by the quote's size metadata above.
+		if size == "" || q.Parameters["size"] == "" || resolution != strings.ToLower(strings.TrimSpace(q.Parameters["size"])) {
+			if requested := strings.ToLower(strings.TrimSpace(q.Parameters["requested_resolution"])); requested == "" || resolution != requested {
+				return fmt.Errorf("outbound resolution differs from the quote")
+			}
+		}
+	}
+	if want := q.Parameters["quality"]; want != "" && strings.ToLower(strings.TrimSpace(controls.Quality)) != want {
+		return fmt.Errorf("outbound quality differs from the quote")
+	}
+	return nil
+}
+
+// ValidateParameterImageRequest is also used by multipart paths whose scalar
+// fields are copied from the original form and whose media content is streamed.
+func ValidateParameterImageRequest(info *relaycommon.RelayInfo, req *dto.ImageRequest) error {
+	if info.PriceData.ParameterPricing == nil {
+		return nil
+	}
+	var resolution string
+	if value, ok := req.Extra["resolution"]; ok {
+		if err := common.Unmarshal(value, &resolution); err != nil {
+			return fmt.Errorf("resolution must be a string")
+		}
+	}
+	raw, err := common.Marshal(struct {
+		Model      string `json:"model"`
+		Size       string `json:"size,omitempty"`
+		Resolution string `json:"resolution,omitempty"`
+		Quality    string `json:"quality,omitempty"`
+		N          *uint  `json:"n,omitempty"`
+	}{req.Model, req.Size, resolution, req.Quality, req.N})
+	if err != nil {
+		return err
+	}
+	return ValidateParameterImageWire(info.PriceData.ParameterPricing, raw)
+}

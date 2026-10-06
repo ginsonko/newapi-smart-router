@@ -1,0 +1,780 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"math"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+)
+
+const RouteAnalyticsQuerySchemaVersionV1 = 1
+
+var ErrRouteAnalyticsRangeV1 = errors.New("unsupported route analytics range")
+
+type routeAnalyticsRangeSpecV1 struct {
+	name              string
+	sourceGranularity string
+	pointWidth        time.Duration
+	pointCount        int
+}
+
+type RouteAnalyticsCoverageV1 struct {
+	CoverageStartMS int64  `json:"coverage_start_ms,omitempty"`
+	CoverageEndMS   int64  `json:"coverage_end_ms,omitempty"`
+	FreshnessAtMS   int64  `json:"freshness_at_ms,omitempty"`
+	Partial         bool   `json:"partial"`
+	MissingReason   string `json:"missing_reason,omitempty"`
+}
+
+type RouteAnalyticsPointV1 struct {
+	BucketStartMS              int64  `json:"bucket_start_ms"`
+	BucketEndMS                int64  `json:"bucket_end_ms"`
+	HasSamples                 bool   `json:"has_samples"`
+	LogicalRequests            int64  `json:"logical_requests"`
+	FinalSuccesses             int64  `json:"final_successes"`
+	FirstHitSuccesses          int64  `json:"first_hit_successes"`
+	RetryRecoveries            int64  `json:"retry_recoveries"`
+	ConfirmedFailures          int64  `json:"confirmed_failures"`
+	FinalAvailabilityRatePPM   *int64 `json:"final_availability_rate_ppm"`
+	FirstHitSuccessRatePPM     *int64 `json:"first_hit_success_rate_ppm"`
+	CacheReadTokens            int64  `json:"cache_read_tokens"`
+	TotalInputTokens           int64  `json:"total_input_tokens"`
+	CacheRatePPM               *int64 `json:"cache_rate_ppm"`
+	TTFTAverageMS              *int64 `json:"ttft_average_ms"`
+	TTFTP50MS                  *int64 `json:"ttft_p50_ms"`
+	TTFTP95MS                  *int64 `json:"ttft_p95_ms"`
+	TTFTSamples                int64  `json:"ttft_samples"`
+	TTFTPercentileCapped       bool   `json:"ttft_percentile_capped"`
+	PredictedInputCostPPM      *int64 `json:"predicted_input_cost_ppm"`
+	PredictedInputTokens       int64  `json:"predicted_input_tokens"`
+	HealthAvailableEvents      int64  `json:"health_available_events"`
+	HealthUnknownEvents        int64  `json:"health_unknown_events"`
+	HealthUnavailableEvents    int64  `json:"health_unavailable_events"`
+	ProbeSuccesses             int64  `json:"probe_successes"`
+	ProbeFailures              int64  `json:"probe_failures"`
+	DistinctPriceRevisionCount int    `json:"distinct_price_revision_count"`
+	UpdatedAtMS                int64  `json:"updated_at_ms,omitempty"`
+}
+
+type RouteAnalyticsSummaryV1 struct {
+	RouteAnalyticsPointV1
+	CoveragePoints int `json:"coverage_points"`
+	TotalPoints    int `json:"total_points"`
+}
+
+type RouteAnalyticsDetailReportV1 struct {
+	SchemaVersion        int                      `json:"schema_version"`
+	DetailID             string                   `json:"detail_id"`
+	Model                string                   `json:"model"`
+	Endpoint             string                   `json:"endpoint"`
+	GroupName            string                   `json:"group_name"`
+	GroupRatioPPM        int64                    `json:"group_ratio_ppm"`
+	CurrentState         string                   `json:"current_state,omitempty"`
+	DispatchEligibility  string                   `json:"dispatch_eligibility,omitempty"`
+	CurrentPrice         *smartrouter.RoutePrice  `json:"current_price,omitempty"`
+	CurrentDataAvailable bool                     `json:"current_data_available"`
+	Range                string                   `json:"range"`
+	PointWidthMS         int64                    `json:"point_width_ms"`
+	Coverage             RouteAnalyticsCoverageV1 `json:"coverage"`
+	Summary              RouteAnalyticsSummaryV1  `json:"summary"`
+	Points               []RouteAnalyticsPointV1  `json:"points"`
+	DataSource           string                   `json:"data_source"`
+	MetricContract       string                   `json:"metric_contract"`
+}
+
+func (engine *SmartRouterEngine) EnrichRouteAnalyticsDetailReportV1(
+	ctx context.Context,
+	userGroup string,
+	report *RouteAnalyticsDetailReportV1,
+) {
+	if engine == nil || report == nil || report.Model == "" || report.Endpoint == "" {
+		return
+	}
+	status, err := engine.GlobalLeaderboardStatusReport(ctx, SmartRouteGlobalLeaderboardStatusRequest{
+		UserGroup: userGroup,
+		Model:     report.Model, Endpoint: report.Endpoint, IncludeExcluded: true,
+		Page: 1, PageSize: smartRouteStatusMaxPageSize,
+	})
+	if err != nil {
+		return
+	}
+	for _, item := range status.Items {
+		if item.DetailID != report.DetailID {
+			continue
+		}
+		report.CurrentState = item.PrimaryState
+		report.DispatchEligibility = item.DispatchEligibility
+		report.CurrentPrice = item.Price
+		report.GroupRatioPPM = item.EffectiveRatioPPM
+		report.CurrentDataAvailable = true
+		return
+	}
+}
+
+type KeyUsageAnalyticsPointV1 struct {
+	BucketStartMS        int64    `json:"bucket_start_ms"`
+	BucketEndMS          int64    `json:"bucket_end_ms"`
+	HasSamples           bool     `json:"has_samples"`
+	LogicalRequests      int64    `json:"logical_requests"`
+	Successes            int64    `json:"successes"`
+	Failures             int64    `json:"failures"`
+	SuccessRatePPM       *int64   `json:"success_rate_ppm"`
+	PositiveQuota        int64    `json:"positive_quota"`
+	RefundQuota          int64    `json:"refund_quota"`
+	NetQuota             int64    `json:"net_quota"`
+	InputTokens          int64    `json:"input_tokens"`
+	OutputTokens         int64    `json:"output_tokens"`
+	CacheReadTokens      int64    `json:"cache_read_tokens"`
+	CacheRatePPM         *int64   `json:"cache_rate_ppm"`
+	TTFTAverageMS        *int64   `json:"ttft_average_ms"`
+	TTFTP50MS            *int64   `json:"ttft_p50_ms"`
+	TTFTP95MS            *int64   `json:"ttft_p95_ms"`
+	TTFTSamples          int64    `json:"ttft_samples"`
+	TTFTPercentileCapped bool     `json:"ttft_percentile_capped"`
+	NetQuotaPer100MInput *float64 `json:"net_quota_per_100m_input"`
+	UpdatedAtMS          int64    `json:"updated_at_ms,omitempty"`
+}
+
+type KeyUsageAnalyticsModelV1 struct {
+	Model    string                   `json:"model"`
+	Endpoint string                   `json:"endpoint,omitempty"`
+	Summary  KeyUsageAnalyticsPointV1 `json:"summary"`
+}
+
+type KeyUsageAnalyticsGroupV1 struct {
+	Group    string                   `json:"group"`
+	Endpoint string                   `json:"endpoint,omitempty"`
+	Summary  KeyUsageAnalyticsPointV1 `json:"summary"`
+}
+
+type KeyUsageAnalyticsReportV1 struct {
+	SchemaVersion int                        `json:"schema_version"`
+	TokenID       int                        `json:"token_id"`
+	Range         string                     `json:"range"`
+	ModelFilter   string                     `json:"model_filter,omitempty"`
+	PointWidthMS  int64                      `json:"point_width_ms"`
+	Coverage      RouteAnalyticsCoverageV1   `json:"coverage"`
+	Summary       KeyUsageAnalyticsPointV1   `json:"summary"`
+	Points        []KeyUsageAnalyticsPointV1 `json:"points"`
+	Models        []KeyUsageAnalyticsModelV1 `json:"models"`
+	Groups        []KeyUsageAnalyticsGroupV1 `json:"groups"`
+	DataSource    string                     `json:"data_source"`
+}
+
+type UserUsageAnalyticsReportV1 struct {
+	SchemaVersion int                        `json:"schema_version"`
+	Range         string                     `json:"range"`
+	WindowStartMS int64                      `json:"window_start_ms"`
+	WindowEndMS   int64                      `json:"window_end_ms"`
+	PointWidthMS  int64                      `json:"point_width_ms"`
+	Coverage      RouteAnalyticsCoverageV1   `json:"coverage"`
+	Summary       KeyUsageAnalyticsPointV1   `json:"summary"`
+	Points        []KeyUsageAnalyticsPointV1 `json:"points"`
+	Models        []KeyUsageAnalyticsModelV1 `json:"models"`
+	Groups        []KeyUsageAnalyticsGroupV1 `json:"groups"`
+	DataSource    string                     `json:"data_source"`
+}
+
+type routeAnalyticsAccumulatorV1 struct {
+	RouteAnalyticsPointV1
+	ttftSumMS            int64
+	predictedInputMicros int64
+	ttftRaw              []string
+	priceRevisions       map[string]struct{}
+}
+
+type keyUsageAnalyticsAccumulatorV1 struct {
+	KeyUsageAnalyticsPointV1
+	ttftSumMS int64
+	ttftRaw   []string
+}
+
+func routeAnalyticsDetailRangeSpecV1(value string) (routeAnalyticsRangeSpecV1, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "1h":
+		return routeAnalyticsRangeSpecV1{name: "1h", sourceGranularity: model.RouteAnalyticsGranularity5m, pointWidth: 5 * time.Minute, pointCount: 12}, nil
+	case "24h", "1d":
+		return routeAnalyticsRangeSpecV1{name: "24h", sourceGranularity: model.RouteAnalyticsGranularity5m, pointWidth: 15 * time.Minute, pointCount: 96}, nil
+	case "3d":
+		return routeAnalyticsRangeSpecV1{name: "3d", sourceGranularity: model.RouteAnalyticsGranularity1h, pointWidth: time.Hour, pointCount: 72}, nil
+	default:
+		return routeAnalyticsRangeSpecV1{}, ErrRouteAnalyticsRangeV1
+	}
+}
+
+func keyUsageAnalyticsRangeSpecV1(value string) (routeAnalyticsRangeSpecV1, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "1h":
+		return routeAnalyticsRangeSpecV1{name: "1h", sourceGranularity: model.RouteAnalyticsGranularity5m, pointWidth: 5 * time.Minute, pointCount: 12}, nil
+	case "1d", "24h":
+		return routeAnalyticsRangeSpecV1{name: "1d", sourceGranularity: model.RouteAnalyticsGranularity5m, pointWidth: 15 * time.Minute, pointCount: 96}, nil
+	case "7d":
+		return routeAnalyticsRangeSpecV1{name: "7d", sourceGranularity: model.RouteAnalyticsGranularity1h, pointWidth: time.Hour, pointCount: 168}, nil
+	default:
+		return routeAnalyticsRangeSpecV1{}, ErrRouteAnalyticsRangeV1
+	}
+}
+
+func userUsageAnalyticsRangeSpecV1(value string) (routeAnalyticsRangeSpecV1, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "today":
+		return routeAnalyticsRangeSpecV1{name: "today", sourceGranularity: model.RouteAnalyticsGranularity5m, pointWidth: 15 * time.Minute, pointCount: 96}, nil
+	case "24h":
+		return routeAnalyticsRangeSpecV1{name: "24h", sourceGranularity: model.RouteAnalyticsGranularity5m, pointWidth: 15 * time.Minute, pointCount: 96}, nil
+	case "7d_complete":
+		return routeAnalyticsRangeSpecV1{name: "7d_complete", sourceGranularity: model.RouteAnalyticsGranularity1h, pointWidth: time.Hour, pointCount: 168}, nil
+	case "7d":
+		return routeAnalyticsRangeSpecV1{name: "7d", sourceGranularity: model.RouteAnalyticsGranularity1h, pointWidth: time.Hour, pointCount: 168}, nil
+	case "30d":
+		return routeAnalyticsRangeSpecV1{name: "30d", sourceGranularity: model.RouteAnalyticsGranularity1h, pointWidth: time.Hour, pointCount: 720}, nil
+	default:
+		return routeAnalyticsRangeSpecV1{}, ErrRouteAnalyticsRangeV1
+	}
+}
+
+func GetRouteAnalyticsDetailReportV1(
+	ctx context.Context,
+	detailID string,
+	rangeValue string,
+	now time.Time,
+) (RouteAnalyticsDetailReportV1, error) {
+	spec, err := routeAnalyticsDetailRangeSpecV1(rangeValue)
+	if err != nil {
+		return RouteAnalyticsDetailReportV1{}, err
+	}
+	dimension, err := model.GetRouteAnalyticsDimensionByDetailIDV1(ctx, detailID)
+	if err != nil {
+		return RouteAnalyticsDetailReportV1{}, err
+	}
+	startMS, endMS := analyticsAlignedRangeV1(now, spec)
+	buckets, err := model.ListRouteAnalyticsBucketsV1(ctx, dimension.DetailID, spec.sourceGranularity, startMS, endMS)
+	if err != nil {
+		return RouteAnalyticsDetailReportV1{}, err
+	}
+	points, summary, err := buildRouteAnalyticsPointsV1(buckets, spec, startMS)
+	if err != nil {
+		return RouteAnalyticsDetailReportV1{}, err
+	}
+	coverage := routeAnalyticsCoverageV1(ctx, startMS, endMS, now, summary.LogicalRequests > 0)
+	return RouteAnalyticsDetailReportV1{
+		SchemaVersion: RouteAnalyticsQuerySchemaVersionV1, DetailID: dimension.DetailID,
+		Model: dimension.Model, Endpoint: dimension.Endpoint, GroupName: dimension.PublicGroupName,
+		GroupRatioPPM: dimension.GroupRatioPPM, Range: spec.name,
+		PointWidthMS: spec.pointWidth.Milliseconds(), Coverage: coverage, Summary: summary, Points: points,
+		DataSource: "site-wide-real-request-buckets-v1", MetricContract: "route-logical-request-v1",
+	}, nil
+}
+
+func GetKeyUsageAnalyticsReportV1(
+	ctx context.Context,
+	userID int,
+	tokenID int,
+	rangeValue string,
+	modelFilter string,
+	now time.Time,
+) (KeyUsageAnalyticsReportV1, error) {
+	spec, err := keyUsageAnalyticsRangeSpecV1(rangeValue)
+	if err != nil {
+		return KeyUsageAnalyticsReportV1{}, err
+	}
+	startMS, endMS := analyticsAlignedRangeV1(now, spec)
+	modelFilter = strings.TrimSpace(modelFilter)
+	buckets, err := model.ListKeyUsageAnalyticsBucketsV1(
+		ctx, userID, tokenID, spec.sourceGranularity, startMS, endMS, modelFilter,
+	)
+	if err != nil {
+		return KeyUsageAnalyticsReportV1{}, err
+	}
+	points, summary, models, groups, err := buildKeyUsageAnalyticsPointsV1(buckets, spec, startMS)
+	if err != nil {
+		return KeyUsageAnalyticsReportV1{}, err
+	}
+	coverage := routeAnalyticsCoverageV1(ctx, startMS, endMS, now, summary.LogicalRequests > 0 || summary.PositiveQuota > 0 || summary.RefundQuota > 0)
+	return KeyUsageAnalyticsReportV1{
+		SchemaVersion: RouteAnalyticsQuerySchemaVersionV1, TokenID: tokenID, Range: spec.name,
+		ModelFilter: modelFilter, PointWidthMS: spec.pointWidth.Milliseconds(), Coverage: coverage,
+		Summary: summary, Points: points, Models: models, Groups: groups, DataSource: "owned-key-usage-buckets-v1",
+	}, nil
+}
+
+func GetUserUsageAnalyticsReportV1(
+	ctx context.Context,
+	userID int,
+	rangeValue string,
+	now time.Time,
+) (UserUsageAnalyticsReportV1, error) {
+	spec, err := userUsageAnalyticsRangeSpecV1(rangeValue)
+	if err != nil {
+		return UserUsageAnalyticsReportV1{}, err
+	}
+	startMS, endMS, windowStartMS, windowEndMS := userUsageAnalyticsBoundsV1(now, spec)
+	if spec.name == "today" {
+		widthMS := spec.pointWidth.Milliseconds()
+		points := int((endMS - startMS) / widthMS)
+		if points < 1 {
+			points = 1
+		}
+		spec.pointCount = points
+	}
+	buckets, err := model.ListUserKeyUsageAnalyticsBucketsV1(ctx, userID, spec.sourceGranularity, startMS, endMS)
+	if err != nil {
+		return UserUsageAnalyticsReportV1{}, err
+	}
+	points, summary, models, groups, err := buildKeyUsageAnalyticsPointsV1(buckets, spec, startMS)
+	if err != nil {
+		return UserUsageAnalyticsReportV1{}, err
+	}
+	coverage := routeAnalyticsCoverageV1(ctx, startMS, endMS, now, summary.HasSamples)
+	return UserUsageAnalyticsReportV1{
+		SchemaVersion: RouteAnalyticsQuerySchemaVersionV1, Range: spec.name,
+		WindowStartMS: windowStartMS, WindowEndMS: windowEndMS,
+		PointWidthMS: spec.pointWidth.Milliseconds(), Coverage: coverage, Summary: summary,
+		Points: points, Models: models, Groups: groups, DataSource: "owned-account-key-usage-buckets-v1",
+	}, nil
+}
+
+// userUsageAnalyticsBoundsV1 uses Asia/Shanghai calendar boundaries only for
+// the natural-day windows. Legacy rolling windows retain their historical
+// aligned range semantics.
+func userUsageAnalyticsBoundsV1(now time.Time, spec routeAnalyticsRangeSpecV1) (int64, int64, int64, int64) {
+	if spec.name != "today" && spec.name != "7d_complete" {
+		startMS, endMS := analyticsAlignedRangeV1(now, spec)
+		return startMS, endMS, startMS, endMS
+	}
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		location = time.FixedZone("CST", 8*60*60)
+	}
+	localNow := now.In(location)
+	todayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
+	windowStart := todayStart
+	windowEnd := localNow
+	if spec.name == "7d_complete" {
+		windowEnd = todayStart
+		windowStart = todayStart.Add(-7 * 24 * time.Hour)
+	}
+	windowStartMS, windowEndMS := windowStart.UnixMilli(), windowEnd.UnixMilli()
+	queryEndMS := windowEndMS
+	if spec.name == "today" {
+		widthMS := spec.pointWidth.Milliseconds()
+		elapsed := windowEndMS - windowStartMS
+		if elapsed < widthMS {
+			elapsed = widthMS
+		}
+		spec.pointCount = int((elapsed + widthMS - 1) / widthMS)
+		queryEndMS = windowStartMS + int64(spec.pointCount)*widthMS
+	}
+	return windowStartMS, queryEndMS, windowStartMS, windowEndMS
+}
+
+func analyticsAlignedRangeV1(now time.Time, spec routeAnalyticsRangeSpecV1) (int64, int64) {
+	widthMS := spec.pointWidth.Milliseconds()
+	nowMS := now.UnixMilli()
+	endMS := nowMS - nowMS%widthMS + widthMS
+	return endMS - int64(spec.pointCount)*widthMS, endMS
+}
+
+func buildRouteAnalyticsPointsV1(
+	buckets []model.RouteAnalyticsBucketV1,
+	spec routeAnalyticsRangeSpecV1,
+	startMS int64,
+) ([]RouteAnalyticsPointV1, RouteAnalyticsSummaryV1, error) {
+	widthMS := spec.pointWidth.Milliseconds()
+	accumulators := make(map[int64]*routeAnalyticsAccumulatorV1, spec.pointCount)
+	for _, bucket := range buckets {
+		pointStart := bucket.BucketStartMS - bucket.BucketStartMS%widthMS
+		if pointStart < startMS || pointStart >= startMS+int64(spec.pointCount)*widthMS {
+			continue
+		}
+		accumulator := accumulators[pointStart]
+		if accumulator == nil {
+			accumulator = &routeAnalyticsAccumulatorV1{priceRevisions: make(map[string]struct{})}
+			accumulators[pointStart] = accumulator
+		}
+		if err := addRouteAnalyticsBucketV1(accumulator, bucket); err != nil {
+			return nil, RouteAnalyticsSummaryV1{}, err
+		}
+	}
+
+	points := make([]RouteAnalyticsPointV1, 0, spec.pointCount)
+	summaryAccumulator := &routeAnalyticsAccumulatorV1{priceRevisions: make(map[string]struct{})}
+	coveragePoints := 0
+	for index := 0; index < spec.pointCount; index++ {
+		pointStart := startMS + int64(index)*widthMS
+		accumulator := accumulators[pointStart]
+		if accumulator == nil {
+			points = append(points, RouteAnalyticsPointV1{BucketStartMS: pointStart, BucketEndMS: pointStart + widthMS})
+			continue
+		}
+		point, err := finalizeRouteAnalyticsAccumulatorV1(accumulator, pointStart, pointStart+widthMS)
+		if err != nil {
+			return nil, RouteAnalyticsSummaryV1{}, err
+		}
+		if point.HasSamples {
+			coveragePoints++
+		}
+		points = append(points, point)
+		if err := addRouteAnalyticsPointToSummaryV1(summaryAccumulator, accumulator); err != nil {
+			return nil, RouteAnalyticsSummaryV1{}, err
+		}
+	}
+	summaryPoint, err := finalizeRouteAnalyticsAccumulatorV1(summaryAccumulator, startMS, startMS+int64(spec.pointCount)*widthMS)
+	if err != nil {
+		return nil, RouteAnalyticsSummaryV1{}, err
+	}
+	return points, RouteAnalyticsSummaryV1{
+		RouteAnalyticsPointV1: summaryPoint, CoveragePoints: coveragePoints, TotalPoints: spec.pointCount,
+	}, nil
+}
+
+func addRouteAnalyticsBucketV1(accumulator *routeAnalyticsAccumulatorV1, bucket model.RouteAnalyticsBucketV1) error {
+	values := []struct {
+		target *int64
+		value  int64
+	}{
+		{&accumulator.LogicalRequests, bucket.LogicalRequests}, {&accumulator.FinalSuccesses, bucket.FinalSuccesses},
+		{&accumulator.FirstHitSuccesses, bucket.FirstHitSuccesses}, {&accumulator.RetryRecoveries, bucket.RetryRecoveries},
+		{&accumulator.ConfirmedFailures, bucket.ConfirmedFailures}, {&accumulator.CacheReadTokens, bucket.CacheReadTokens},
+		{&accumulator.TotalInputTokens, bucket.TotalInputTokens}, {&accumulator.ttftSumMS, bucket.TTFTSumMS},
+		{&accumulator.TTFTSamples, bucket.TTFTCount},
+		{&accumulator.PredictedInputTokens, bucket.PredictedInputTokens},
+		{&accumulator.HealthAvailableEvents, bucket.HealthAvailableEvents},
+		{&accumulator.HealthUnknownEvents, bucket.HealthUnknownEvents},
+		{&accumulator.HealthUnavailableEvents, bucket.HealthUnavailableEvents},
+		{&accumulator.ProbeSuccesses, bucket.ProbeSuccesses}, {&accumulator.ProbeFailures, bucket.ProbeFailures},
+	}
+	for _, value := range values {
+		if err := addAnalyticsNonNegativeV1(value.target, value.value); err != nil {
+			return err
+		}
+	}
+	if err := addAnalyticsNonNegativeV1(&accumulator.predictedInputMicros, bucket.PredictedInputMicros); err != nil {
+		return err
+	}
+	accumulator.ttftRaw = append(accumulator.ttftRaw, bucket.TTFTHistogramJSON)
+	var revisions map[string]int64
+	if strings.TrimSpace(bucket.PriceRevisionCountsJSON) != "" && strings.TrimSpace(bucket.PriceRevisionCountsJSON) != "{}" {
+		if err := common.UnmarshalJsonStr(bucket.PriceRevisionCountsJSON, &revisions); err != nil {
+			return err
+		}
+		for revision, count := range revisions {
+			if count > 0 {
+				accumulator.priceRevisions[revision] = struct{}{}
+			}
+		}
+	}
+	if bucket.UpdatedAtMS > accumulator.UpdatedAtMS {
+		accumulator.UpdatedAtMS = bucket.UpdatedAtMS
+	}
+	return nil
+}
+
+func addRouteAnalyticsPointToSummaryV1(
+	target *routeAnalyticsAccumulatorV1,
+	value *routeAnalyticsAccumulatorV1,
+) error {
+	if target == nil || value == nil {
+		return errors.New("route analytics summary accumulator is nil")
+	}
+	values := []struct {
+		target *int64
+		value  int64
+	}{
+		{&target.LogicalRequests, value.LogicalRequests}, {&target.FinalSuccesses, value.FinalSuccesses},
+		{&target.FirstHitSuccesses, value.FirstHitSuccesses}, {&target.RetryRecoveries, value.RetryRecoveries},
+		{&target.ConfirmedFailures, value.ConfirmedFailures}, {&target.CacheReadTokens, value.CacheReadTokens},
+		{&target.TotalInputTokens, value.TotalInputTokens}, {&target.ttftSumMS, value.ttftSumMS},
+		{&target.TTFTSamples, value.TTFTSamples}, {&target.predictedInputMicros, value.predictedInputMicros},
+		{&target.PredictedInputTokens, value.PredictedInputTokens},
+		{&target.HealthAvailableEvents, value.HealthAvailableEvents},
+		{&target.HealthUnknownEvents, value.HealthUnknownEvents},
+		{&target.HealthUnavailableEvents, value.HealthUnavailableEvents},
+		{&target.ProbeSuccesses, value.ProbeSuccesses}, {&target.ProbeFailures, value.ProbeFailures},
+	}
+	for _, current := range values {
+		if err := addAnalyticsNonNegativeV1(current.target, current.value); err != nil {
+			return err
+		}
+	}
+	target.ttftRaw = append(target.ttftRaw, value.ttftRaw...)
+	for revision := range value.priceRevisions {
+		target.priceRevisions[revision] = struct{}{}
+	}
+	if value.UpdatedAtMS > target.UpdatedAtMS {
+		target.UpdatedAtMS = value.UpdatedAtMS
+	}
+	return nil
+}
+
+func finalizeRouteAnalyticsAccumulatorV1(
+	accumulator *routeAnalyticsAccumulatorV1,
+	startMS int64,
+	endMS int64,
+) (RouteAnalyticsPointV1, error) {
+	if accumulator == nil {
+		return RouteAnalyticsPointV1{BucketStartMS: startMS, BucketEndMS: endMS}, nil
+	}
+	point := accumulator.RouteAnalyticsPointV1
+	point.BucketStartMS = startMS
+	point.BucketEndMS = endMS
+	point.HasSamples = point.LogicalRequests > 0 || point.TTFTSamples > 0 || point.TotalInputTokens > 0 ||
+		point.HealthAvailableEvents > 0 || point.HealthUnknownEvents > 0 || point.HealthUnavailableEvents > 0 ||
+		point.ProbeSuccesses > 0 || point.ProbeFailures > 0
+	point.FinalAvailabilityRatePPM = analyticsRatePPMV1(point.FinalSuccesses, point.LogicalRequests)
+	point.FirstHitSuccessRatePPM = analyticsRatePPMV1(point.FirstHitSuccesses, point.LogicalRequests)
+	point.CacheRatePPM = analyticsRatePPMV1(point.CacheReadTokens, point.TotalInputTokens)
+	point.TTFTAverageMS = analyticsAverageInt64V1(accumulator.ttftSumMS, point.TTFTSamples)
+	p50, p95, histogramTotal, capped, err := model.RouteAnalyticsTTFTPercentilesV1(accumulator.ttftRaw)
+	if err != nil {
+		return RouteAnalyticsPointV1{}, err
+	}
+	if histogramTotal == point.TTFTSamples {
+		point.TTFTP50MS = p50
+		point.TTFTP95MS = p95
+		point.TTFTPercentileCapped = capped
+	}
+	point.PredictedInputCostPPM = analyticsAverageInt64V1(
+		accumulator.predictedInputMicros,
+		point.PredictedInputTokens,
+	)
+	point.DistinctPriceRevisionCount = len(accumulator.priceRevisions)
+	return point, nil
+}
+
+func buildKeyUsageAnalyticsPointsV1(
+	buckets []model.KeyUsageAnalyticsBucketV1,
+	spec routeAnalyticsRangeSpecV1,
+	startMS int64,
+) ([]KeyUsageAnalyticsPointV1, KeyUsageAnalyticsPointV1, []KeyUsageAnalyticsModelV1, []KeyUsageAnalyticsGroupV1, error) {
+	widthMS := spec.pointWidth.Milliseconds()
+	pointAccumulators := make(map[int64]*keyUsageAnalyticsAccumulatorV1, spec.pointCount)
+	modelAccumulators := make(map[string]*keyUsageAnalyticsAccumulatorV1)
+	modelEndpoints := make(map[string]map[string]struct{})
+	groupAccumulators := make(map[string]*keyUsageAnalyticsAccumulatorV1)
+	groupEndpoints := make(map[string]map[string]struct{})
+	summaryAccumulator := &keyUsageAnalyticsAccumulatorV1{}
+	for _, bucket := range buckets {
+		pointStart := bucket.BucketStartMS - bucket.BucketStartMS%widthMS
+		if pointStart < startMS || pointStart >= startMS+int64(spec.pointCount)*widthMS {
+			continue
+		}
+		pointAccumulator := pointAccumulators[pointStart]
+		if pointAccumulator == nil {
+			pointAccumulator = &keyUsageAnalyticsAccumulatorV1{}
+			pointAccumulators[pointStart] = pointAccumulator
+		}
+		if err := addKeyUsageAnalyticsBucketV1(pointAccumulator, bucket); err != nil {
+			return nil, KeyUsageAnalyticsPointV1{}, nil, nil, err
+		}
+		modelAccumulator := modelAccumulators[bucket.Model]
+		if modelAccumulator == nil {
+			modelAccumulator = &keyUsageAnalyticsAccumulatorV1{}
+			modelAccumulators[bucket.Model] = modelAccumulator
+			modelEndpoints[bucket.Model] = make(map[string]struct{})
+		}
+		groupName := strings.TrimSpace(bucket.Group)
+		if groupName == "" {
+			groupName = "unknown"
+		}
+		groupAccumulator := groupAccumulators[groupName]
+		if groupAccumulator == nil {
+			groupAccumulator = &keyUsageAnalyticsAccumulatorV1{}
+			groupAccumulators[groupName] = groupAccumulator
+			groupEndpoints[groupName] = make(map[string]struct{})
+		}
+		groupEndpoints[groupName][bucket.Endpoint] = struct{}{}
+		if err := addKeyUsageAnalyticsBucketV1(groupAccumulator, bucket); err != nil {
+			return nil, KeyUsageAnalyticsPointV1{}, nil, nil, err
+		}
+		modelEndpoints[bucket.Model][bucket.Endpoint] = struct{}{}
+		if err := addKeyUsageAnalyticsBucketV1(modelAccumulator, bucket); err != nil {
+			return nil, KeyUsageAnalyticsPointV1{}, nil, nil, err
+		}
+		if err := addKeyUsageAnalyticsBucketV1(summaryAccumulator, bucket); err != nil {
+			return nil, KeyUsageAnalyticsPointV1{}, nil, nil, err
+		}
+	}
+
+	points := make([]KeyUsageAnalyticsPointV1, 0, spec.pointCount)
+	for index := 0; index < spec.pointCount; index++ {
+		pointStart := startMS + int64(index)*widthMS
+		points = append(points, finalizeKeyUsageAnalyticsAccumulatorV1(
+			pointAccumulators[pointStart], pointStart, pointStart+widthMS,
+		))
+	}
+	summary := finalizeKeyUsageAnalyticsAccumulatorV1(
+		summaryAccumulator, startMS, startMS+int64(spec.pointCount)*widthMS,
+	)
+	models := make([]KeyUsageAnalyticsModelV1, 0, len(modelAccumulators))
+	for modelName, accumulator := range modelAccumulators {
+		endpoint := ""
+		if len(modelEndpoints[modelName]) == 1 {
+			for current := range modelEndpoints[modelName] {
+				endpoint = current
+			}
+		}
+		models = append(models, KeyUsageAnalyticsModelV1{
+			Model: modelName, Endpoint: endpoint,
+			Summary: finalizeKeyUsageAnalyticsAccumulatorV1(
+				accumulator, startMS, startMS+int64(spec.pointCount)*widthMS,
+			),
+		})
+	}
+	sort.SliceStable(models, func(left, right int) bool {
+		if models[left].Summary.NetQuota != models[right].Summary.NetQuota {
+			return models[left].Summary.NetQuota > models[right].Summary.NetQuota
+		}
+		return models[left].Model < models[right].Model
+	})
+	groups := make([]KeyUsageAnalyticsGroupV1, 0, len(groupAccumulators))
+	for groupName, accumulator := range groupAccumulators {
+		endpoint := ""
+		if len(groupEndpoints[groupName]) == 1 {
+			for current := range groupEndpoints[groupName] {
+				endpoint = current
+			}
+		}
+		groups = append(groups, KeyUsageAnalyticsGroupV1{
+			Group: groupName, Endpoint: endpoint,
+			Summary: finalizeKeyUsageAnalyticsAccumulatorV1(accumulator, startMS, startMS+int64(spec.pointCount)*widthMS),
+		})
+	}
+	sort.SliceStable(groups, func(left, right int) bool {
+		if groups[left].Summary.NetQuota != groups[right].Summary.NetQuota {
+			return groups[left].Summary.NetQuota > groups[right].Summary.NetQuota
+		}
+		return groups[left].Group < groups[right].Group
+	})
+	return points, summary, models, groups, nil
+}
+
+func addKeyUsageAnalyticsBucketV1(
+	accumulator *keyUsageAnalyticsAccumulatorV1,
+	bucket model.KeyUsageAnalyticsBucketV1,
+) error {
+	if accumulator == nil {
+		return errors.New("key usage analytics accumulator is nil")
+	}
+	values := []struct {
+		target *int64
+		value  int64
+	}{
+		{&accumulator.LogicalRequests, bucket.LogicalRequests}, {&accumulator.Successes, bucket.Successes},
+		{&accumulator.Failures, bucket.Failures}, {&accumulator.PositiveQuota, bucket.PositiveQuota},
+		{&accumulator.RefundQuota, bucket.RefundQuota}, {&accumulator.InputTokens, bucket.InputTokens},
+		{&accumulator.OutputTokens, bucket.OutputTokens}, {&accumulator.CacheReadTokens, bucket.CacheReadTokens},
+		{&accumulator.ttftSumMS, bucket.TTFTSumMS}, {&accumulator.TTFTSamples, bucket.TTFTCount},
+	}
+	for _, value := range values {
+		if err := addAnalyticsNonNegativeV1(value.target, value.value); err != nil {
+			return err
+		}
+	}
+	accumulator.ttftRaw = append(accumulator.ttftRaw, bucket.TTFTHistogramJSON)
+	if bucket.UpdatedAtMS > accumulator.UpdatedAtMS {
+		accumulator.UpdatedAtMS = bucket.UpdatedAtMS
+	}
+	return nil
+}
+
+func finalizeKeyUsageAnalyticsAccumulatorV1(
+	accumulator *keyUsageAnalyticsAccumulatorV1,
+	startMS int64,
+	endMS int64,
+) KeyUsageAnalyticsPointV1 {
+	if accumulator == nil {
+		return KeyUsageAnalyticsPointV1{BucketStartMS: startMS, BucketEndMS: endMS}
+	}
+	point := accumulator.KeyUsageAnalyticsPointV1
+	point.BucketStartMS = startMS
+	point.BucketEndMS = endMS
+	point.HasSamples = point.LogicalRequests > 0 || point.PositiveQuota > 0 || point.RefundQuota > 0 ||
+		point.InputTokens > 0 || point.OutputTokens > 0 || point.TTFTSamples > 0
+	point.SuccessRatePPM = analyticsRatePPMV1(point.Successes, point.LogicalRequests)
+	point.CacheRatePPM = analyticsRatePPMV1(point.CacheReadTokens, point.InputTokens)
+	point.TTFTAverageMS = analyticsAverageInt64V1(accumulator.ttftSumMS, point.TTFTSamples)
+	p50, p95, histogramTotal, capped, err := model.RouteAnalyticsTTFTPercentilesV1(accumulator.ttftRaw)
+	if err == nil && histogramTotal == point.TTFTSamples {
+		point.TTFTP50MS = p50
+		point.TTFTP95MS = p95
+		point.TTFTPercentileCapped = capped
+	}
+	point.NetQuota = point.PositiveQuota - point.RefundQuota
+	if point.InputTokens > 0 {
+		value := float64(point.NetQuota) / float64(point.InputTokens) * 100_000_000
+		if !math.IsNaN(value) && !math.IsInf(value, 0) {
+			point.NetQuotaPer100MInput = &value
+		}
+	}
+	return point
+}
+
+func routeAnalyticsCoverageV1(
+	ctx context.Context,
+	startMS int64,
+	endMS int64,
+	now time.Time,
+	hasSamples bool,
+) RouteAnalyticsCoverageV1 {
+	state, err := model.GetRouteAnalyticsWorkerStateV1(ctx)
+	if err != nil {
+		return RouteAnalyticsCoverageV1{Partial: true, MissingReason: "source_unavailable"}
+	}
+	coverage := RouteAnalyticsCoverageV1{
+		CoverageStartMS: state.CoverageStartMS,
+		CoverageEndMS:   state.CoverageEndMS,
+		FreshnessAtMS:   state.FreshnessAtMS,
+	}
+	stale := state.FreshnessAtMS <= 0 || state.FreshnessAtMS < now.Add(-5*time.Minute).UnixMilli()
+	expectedEndMS := min(endMS, now.Add(-routeAnalyticsSafeDelayV1).UnixMilli())
+	endMissing := state.CoverageEndMS <= 0 || state.CoverageEndMS < expectedEndMS-5*time.Minute.Milliseconds()
+	coverage.Partial = state.CoverageStartMS <= 0 || state.CoverageStartMS > startMS || stale || endMissing
+	switch {
+	case !hasSamples && state.BackfillInProgress && state.CoverageStartMS > startMS:
+		coverage.MissingReason = "backfill_in_progress"
+	case !hasSamples && stale:
+		coverage.MissingReason = "source_lag"
+	case !hasSamples:
+		coverage.MissingReason = "no_samples"
+	case coverage.Partial && state.BackfillInProgress:
+		coverage.MissingReason = "partial_backfill"
+	case coverage.Partial:
+		coverage.MissingReason = "partial_coverage"
+	}
+	return coverage
+}
+
+func analyticsRatePPMV1(numerator int64, denominator int64) *int64 {
+	if numerator < 0 || denominator <= 0 || numerator > denominator {
+		return nil
+	}
+	whole := numerator / denominator
+	remainder := numerator % denominator
+	value := whole*1_000_000 + remainder*1_000_000/denominator
+	return &value
+}
+
+func analyticsAverageInt64V1(total int64, count int64) *int64 {
+	if total < 0 || count <= 0 {
+		return nil
+	}
+	value := total / count
+	return &value
+}
+
+func addAnalyticsNonNegativeV1(target *int64, value int64) error {
+	if target == nil || *target < 0 || value < 0 {
+		return errors.New("analytics aggregate contains a negative value")
+	}
+	if *target > math.MaxInt64-value {
+		return errors.New("analytics aggregate would overflow")
+	}
+	*target += value
+	return nil
+}

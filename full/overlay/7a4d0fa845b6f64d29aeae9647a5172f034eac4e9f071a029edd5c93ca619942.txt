@@ -1,0 +1,417 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+var ErrNoPricedSmartRoutes = errors.New("smart router price snapshot has no eligible routes")
+
+type SmartRouteRatioSource interface {
+	Revision() uint64
+	RouteRatioPPM(userGroup, usingGroup string) (int64, bool)
+}
+
+type smartRouteModelPricingRevisions struct {
+	global     uint64
+	groupModel uint64
+}
+
+type SmartRouteModelPriceSource interface {
+	ModelPricingRevisions() smartRouteModelPricingRevisions
+	RoutePriceDescriptor(model, group string, groupRatioPPM int64) (smartrouter.RoutePrice, error)
+}
+
+// NewAPIRouteRatioSource reads the same user-group override used by billing.
+// Missing group ratios and inaccessible groups are omitted rather than falling
+// back to 1x, so an incomplete pricing configuration cannot become billable by
+// accident.
+type NewAPIRouteRatioSource struct{}
+
+func (NewAPIRouteRatioSource) Revision() uint64 {
+	return ratio_setting.GetGroupRatioRevision()
+}
+
+func (NewAPIRouteRatioSource) ModelPricingRevisions() smartRouteModelPricingRevisions {
+	return smartRouteModelPricingRevisions{
+		global:     ratio_setting.GetModelPricingRevision(),
+		groupModel: billing_setting.GetGroupModelPricingRevision(),
+	}
+}
+
+func (NewAPIRouteRatioSource) RoutePriceDescriptor(model, group string, groupRatioPPM int64) (smartrouter.RoutePrice, error) {
+	resolved := billing_setting.ResolveModelPricing(model, group)
+	unit := "per_token"
+	fixedDuration := 0
+	if resolved.HasTaskProfile {
+		unit = resolved.TaskProfile.Unit
+		fixedDuration = resolved.TaskProfile.FixedDurationSeconds
+	} else if resolved.BillingMode == billing_setting.BillingModeFixedPrice {
+		unit = billing_setting.TaskBillingUnitPerRequest
+	}
+	revision := billing_setting.BuildPricingBasisRevision(
+		resolved,
+		float64(groupRatioPPM)/1_000_000,
+		ratio_setting.GetGroupRatioContentRevision(),
+	)
+	base := smartrouter.RoutePrice{
+		BillingMode: resolved.BillingMode, BillingUnit: unit,
+		FixedDurationSeconds: fixedDuration, Scope: resolved.Scope, Revision: revision,
+	}
+	incomparable := func(reason string) smartrouter.RoutePrice {
+		base.IncomparableReason = reason
+		return base
+	}
+	priceClass := struct {
+		BillingMode          string  `json:"billing_mode"`
+		BillingUnit          string  `json:"billing_unit"`
+		FixedDurationSeconds int     `json:"fixed_duration_seconds,omitempty"`
+		CompletionRatio      float64 `json:"completion_ratio,omitempty"`
+		CacheRatio           float64 `json:"cache_ratio,omitempty"`
+		CacheCreationRatio   float64 `json:"cache_creation_ratio,omitempty"`
+		CacheCreation5mRatio float64 `json:"cache_creation_5m_ratio,omitempty"`
+		CacheCreation1hRatio float64 `json:"cache_creation_1h_ratio,omitempty"`
+		ImageRatio           float64 `json:"image_ratio,omitempty"`
+		AudioRatio           float64 `json:"audio_ratio,omitempty"`
+		AudioCompletionRatio float64 `json:"audio_completion_ratio,omitempty"`
+		BillingExpr          string  `json:"billing_expr,omitempty"`
+	}{BillingMode: resolved.BillingMode, BillingUnit: unit, FixedDurationSeconds: fixedDuration}
+	var scoreBase float64
+	switch resolved.BillingMode {
+	case billing_setting.BillingModeFixedPrice:
+		if !resolved.UsePrice || resolved.ModelPrice < 0 {
+			return incomparable(smartrouter.PriceIncomparableUnresolved), nil
+		}
+		scoreBase = resolved.ModelPrice
+	case billing_setting.BillingModeRatio:
+		if !resolved.HasModelRatio || resolved.ModelRatio < 0 {
+			return incomparable(smartrouter.PriceIncomparableUnresolved), nil
+		}
+		// ResolveModelPricing already applies the billing contract: an explicit
+		// R27 ratio replaces the global base, while an absent/inherit entry keeps
+		// the real global ratio. Routing must compare that same base and apply the
+		// effective group ratio exactly once.
+		scoreBase = resolved.ModelRatio
+		priceClass.CompletionRatio = resolved.CompletionRatio
+		priceClass.CacheRatio = resolved.CacheRatio
+		priceClass.CacheCreationRatio = resolved.CacheCreationRatio
+		priceClass.CacheCreation5mRatio = resolved.CacheCreation5mRatio
+		priceClass.CacheCreation1hRatio = resolved.CacheCreation1hRatio
+		priceClass.ImageRatio = resolved.ImageRatio
+		priceClass.AudioRatio = resolved.AudioRatio
+		priceClass.AudioCompletionRatio = resolved.AudioCompletionRatio
+		// Actual-input ranking is valid only for token billing. Keep its
+		// comparison class independent from output and cache multipliers; those
+		// multipliers are applied to the observed token mix below, while the
+		// legacy static class remains strict for the existing price strategy.
+		if unit == "per_token" {
+			actualClass, classErr := smartContentHash("actual_input_price_class", struct {
+				Unit string `json:"unit"`
+			}{Unit: "quota_per_million_input_v2"})
+			if classErr != nil {
+				return smartrouter.RoutePrice{}, classErr
+			}
+			base.ActualInputComparisonClass = actualClass
+			// ResolveModelPricing always supplies the runtime cache prices used by
+			// billing, including the documented defaults when no override exists
+			// (read=1x, 5m creation=1.25x, 1h creation=2x).  The Has* flags
+			// describe configuration provenance, not whether the price is usable.
+			// Keep the ordering descriptor aligned with the actual billing defaults;
+			// only malformed numeric values make cache pricing unknown.
+			base.CachePricingKnown = true
+			readPPM, readOK := ratioToFixedPPM(resolved.CacheRatio)
+			create5PPM, create5OK := ratioToFixedPPM(resolved.CacheCreation5mRatio)
+			create1PPM, create1OK := ratioToFixedPPM(resolved.CacheCreation1hRatio)
+			if !readOK || !create5OK || !create1OK {
+				base.CachePricingKnown = false
+			} else {
+				base.CacheReadRatioPPM = readPPM
+				base.CacheCreation5mRatioPPM = create5PPM
+				base.CacheCreation1hRatioPPM = create1PPM
+			}
+		}
+	case billing_setting.BillingModeTieredExpr:
+		if resolved.BillingExpr == "" {
+			return incomparable(smartrouter.PriceIncomparableUnresolved), nil
+		}
+		scoreBase = 1
+		priceClass.BillingExpr = resolved.BillingExpr
+		if unit == "per_token" {
+			actualClass, classErr := smartContentHash("actual_input_price_class", struct {
+				Unit string `json:"unit"`
+			}{Unit: "quota_per_million_input_v2"})
+			if classErr != nil {
+				return smartrouter.RoutePrice{}, classErr
+			}
+			base.ActualInputComparisonClass = actualClass
+			base.TieredExpression = resolved.BillingExpr
+			base.TieredExpressionHash = billingexpr.ExprHashString(resolved.BillingExpr)
+			base.TieredInputPredictable = tieredExpressionSupportsInputPrediction(resolved.BillingExpr)
+		}
+	default:
+		return incomparable("unsupported_billing_mode"), nil
+	}
+	scorePPM, ok := modelPriceScorePPM(scoreBase, groupRatioPPM)
+	if !ok {
+		return incomparable("price_score_out_of_range"), nil
+	}
+	comparisonClass, err := smartContentHash("price_class", priceClass)
+	if err != nil {
+		return smartrouter.RoutePrice{}, err
+	}
+	base.ComparisonClass = comparisonClass
+	base.ScorePPM = scorePPM
+	base.StaticComparable = true
+	return base, nil
+}
+
+func tieredExpressionSupportsInputPrediction(expression string) bool {
+	// Keep the catalog capability bit coupled to the exact same static
+	// extraction used by routing and analytics. Conditions may select a tier at
+	// request time, but every numeric price arm must be independently
+	// enumerable; request metadata and wall-clock-dependent prices are rejected
+	// by CheapestTierInputPrices rather than silently dropping the trend.
+	_, _, ok := billingexpr.CheapestTierInputPrices(expression, billingexpr.ExprHashString(expression))
+	return ok
+}
+
+func (NewAPIRouteRatioSource) RouteRatioPPM(userGroup, usingGroup string) (int64, bool) {
+	if !GroupInUserUsableGroups(userGroup, usingGroup) {
+		return 0, false
+	}
+	ratio, _, _, configured, _ := ratio_setting.ResolveConfiguredGroupRatio(userGroup, usingGroup)
+	if !configured {
+		return 0, false
+	}
+	return ratioToFixedPPM(ratio)
+}
+
+func ratioToFixedPPM(ratio float64) (int64, bool) {
+	if ratio < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return 0, false
+	}
+	const scale = float64(1_000_000)
+	scaled := ratio * scale
+	// float64 cannot represent MaxInt64 exactly; the nearest value is 2^63.
+	// Reject that boundary instead of permitting a float-to-int overflow.
+	if math.IsInf(scaled, 0) || scaled >= float64(math.MaxInt64) {
+		return 0, false
+	}
+	rounded := math.Floor(scaled + 0.5)
+	if rounded >= float64(math.MaxInt64) {
+		return 0, false
+	}
+	return int64(rounded), true
+}
+
+func modelPriceScorePPM(modelPrice float64, groupRatioPPM int64) (int64, bool) {
+	if modelPrice < 0 || groupRatioPPM < 0 || math.IsNaN(modelPrice) || math.IsInf(modelPrice, 0) {
+		return 0, false
+	}
+	scaled := modelPrice * float64(groupRatioPPM)
+	if math.IsInf(scaled, 0) || scaled >= float64(math.MaxInt64) {
+		return 0, false
+	}
+	rounded := math.Floor(scaled + 0.5)
+	if rounded >= float64(math.MaxInt64) {
+		return 0, false
+	}
+	return int64(rounded), true
+}
+
+type priceSnapshotCacheEntry struct {
+	catalogVersion       string
+	ratioRevision        uint64
+	usableGroupRevision  uint64
+	modelPricingRevision uint64
+	groupModelRevision   uint64
+	snapshot             *smartrouter.PriceSnapshot
+}
+
+type PriceSnapshotManager struct {
+	catalogs *CatalogManager
+	ratios   SmartRouteRatioSource
+	prices   SmartRouteModelPriceSource
+
+	mu          sync.RWMutex
+	entries     map[string]priceSnapshotCacheEntry
+	unsubscribe func()
+	closeOnce   sync.Once
+}
+
+func NewPriceSnapshotManager(catalogs *CatalogManager, ratios SmartRouteRatioSource) *PriceSnapshotManager {
+	if ratios == nil {
+		ratios = NewAPIRouteRatioSource{}
+	}
+	manager := &PriceSnapshotManager{
+		catalogs: catalogs,
+		ratios:   ratios,
+		entries:  make(map[string]priceSnapshotCacheEntry),
+	}
+	if prices, ok := ratios.(SmartRouteModelPriceSource); ok {
+		manager.prices = prices
+	}
+	if catalogs != nil && catalogs.globalSettings {
+		manager.unsubscribe = smartroutersetting.SubscribeSmartRouterSettingChanges(manager.InvalidateAll)
+	}
+	return manager
+}
+
+func (manager *PriceSnapshotManager) Close() {
+	if manager == nil {
+		return
+	}
+	manager.closeOnce.Do(func() {
+		if manager.unsubscribe != nil {
+			manager.unsubscribe()
+		}
+	})
+}
+
+// Current returns a cached immutable snapshot only when both the catalog content
+// version and ratio-setting revision still match.
+func (manager *PriceSnapshotManager) Current(userGroup string) (*smartrouter.PriceSnapshot, bool) {
+	if manager == nil || manager.catalogs == nil || manager.ratios == nil {
+		return nil, false
+	}
+	catalog, exists := manager.catalogs.Current()
+	if !exists {
+		return nil, false
+	}
+	revision := manager.ratios.Revision()
+	usableGroupRevision := rootsetting.GetUserUsableGroupsRevision()
+	pricingRevisions := manager.modelPricingRevisions()
+	manager.mu.RLock()
+	entry, exists := manager.entries[userGroup]
+	manager.mu.RUnlock()
+	if !exists || entry.catalogVersion != catalog.Version || entry.ratioRevision != revision ||
+		entry.usableGroupRevision != usableGroupRevision ||
+		entry.modelPricingRevision != pricingRevisions.global ||
+		entry.groupModelRevision != pricingRevisions.groupModel || entry.snapshot == nil {
+		return nil, false
+	}
+	return entry.snapshot, true
+}
+
+func (manager *PriceSnapshotManager) modelPricingRevisions() smartRouteModelPricingRevisions {
+	if manager == nil || manager.prices == nil {
+		return smartRouteModelPricingRevisions{}
+	}
+	return manager.prices.ModelPricingRevisions()
+}
+
+func (manager *PriceSnapshotManager) GetOrRefresh(ctx context.Context, userGroup string) (*smartrouter.PriceSnapshot, error) {
+	if snapshot, exists := manager.Current(userGroup); exists {
+		return snapshot, nil
+	}
+	return manager.Refresh(ctx, userGroup)
+}
+
+func (manager *PriceSnapshotManager) Refresh(ctx context.Context, userGroup string) (*smartrouter.PriceSnapshot, error) {
+	if manager == nil || manager.catalogs == nil || manager.ratios == nil {
+		return nil, ErrNoPricedSmartRoutes
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	catalog, exists := manager.catalogs.Current()
+	if !exists {
+		return nil, ErrNoCurrentSmartCatalog
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		revision := manager.ratios.Revision()
+		usableGroupRevision := rootsetting.GetUserUsableGroupsRevision()
+		pricingRevisions := manager.modelPricingRevisions()
+		ratiosPPM := make(map[string]int64)
+		var routePrices map[string]smartrouter.RoutePrice
+		if manager.prices != nil {
+			routePrices = make(map[string]smartrouter.RoutePrice)
+		}
+		for _, contract := range catalog.Contracts {
+			for _, pool := range contract.Pools {
+				for _, route := range pool.Candidates {
+					if _, alreadyPriced := ratiosPPM[route.RouteID]; alreadyPriced {
+						continue
+					}
+					ratioPPM, eligible := manager.ratios.RouteRatioPPM(userGroup, route.Group)
+					if !eligible {
+						continue
+					}
+					ratiosPPM[route.RouteID] = ratioPPM
+					if manager.prices != nil {
+						price, err := manager.prices.RoutePriceDescriptor(contract.Contract.CanonicalModel, route.Group, ratioPPM)
+						if err != nil {
+							return nil, fmt.Errorf("build smart route price for %s: %w", route.RouteID, err)
+						}
+						routePrices[route.RouteID] = price
+					}
+				}
+			}
+		}
+		if len(ratiosPPM) == 0 {
+			delete(manager.entries, userGroup)
+			return nil, ErrNoPricedSmartRoutes
+		}
+		if revision != manager.ratios.Revision() || usableGroupRevision != rootsetting.GetUserUsableGroupsRevision() ||
+			pricingRevisions != manager.modelPricingRevisions() {
+			continue
+		}
+		version, err := smartContentHash("price", struct {
+			CatalogVersion string                            `json:"catalog_version"`
+			UserGroup      string                            `json:"user_group"`
+			RatiosPPM      map[string]int64                  `json:"ratios_ppm"`
+			RoutePrices    map[string]smartrouter.RoutePrice `json:"route_prices,omitempty"`
+		}{CatalogVersion: catalog.Version, UserGroup: userGroup, RatiosPPM: ratiosPPM, RoutePrices: routePrices})
+		if err != nil {
+			return nil, err
+		}
+		snapshot := &smartrouter.PriceSnapshot{Version: version, RatiosPPM: ratiosPPM, RoutePrices: routePrices}
+		if err := snapshot.Validate(); err != nil {
+			return nil, fmt.Errorf("validate smart router price snapshot: %w", err)
+		}
+		if previous, exists := manager.entries[userGroup]; exists && previous.snapshot != nil && previous.snapshot.Version == snapshot.Version {
+			snapshot = previous.snapshot
+		}
+		manager.entries[userGroup] = priceSnapshotCacheEntry{
+			catalogVersion: catalog.Version, ratioRevision: revision,
+			usableGroupRevision: usableGroupRevision, modelPricingRevision: pricingRevisions.global,
+			groupModelRevision: pricingRevisions.groupModel, snapshot: snapshot,
+		}
+		return snapshot, nil
+	}
+	return nil, errors.New("smart router pricing changed repeatedly while building a snapshot")
+}
+
+func (manager *PriceSnapshotManager) Invalidate(userGroup string) {
+	if manager == nil {
+		return
+	}
+	manager.mu.Lock()
+	delete(manager.entries, userGroup)
+	manager.mu.Unlock()
+}
+
+func (manager *PriceSnapshotManager) InvalidateAll() {
+	if manager == nil {
+		return
+	}
+	manager.mu.Lock()
+	manager.entries = make(map[string]priceSnapshotCacheEntry)
+	manager.mu.Unlock()
+}

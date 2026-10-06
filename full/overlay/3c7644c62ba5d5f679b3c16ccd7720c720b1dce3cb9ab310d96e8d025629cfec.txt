@@ -1,0 +1,66 @@
+package service
+
+import (
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestClaudeDistinctToolsInSeparateChunks(t *testing.T) {
+	for _, mode := range []string{"both", "id", "index"} {
+		t.Run(mode, func(t *testing.T) {
+			info := claudeStreamInfo()
+			events := []*dto.ClaudeResponse{}
+			for i, name := range []string{"read", "write"} {
+				id := []string{"callA", "callB"}[i]
+				idx := intPointer(i)
+				if mode == "id" {
+					idx = nil
+				}
+				if mode == "index" {
+					id = ""
+				}
+				events = append(events, StreamResponseOpenAI2Claude(toolChunk("model", toolCall(id, name, `{"a":`, idx)), info)...)
+				require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+			}
+			for i := 1; i >= 0; i-- {
+				id := []string{"callA", "callB"}[i]
+				idx := intPointer(i)
+				if mode == "id" {
+					idx = nil
+				}
+				if mode == "index" {
+					id = ""
+				}
+				events = append(events, StreamResponseOpenAI2Claude(toolChunk("model", toolCall(id, "", `1}`, idx)), info)...)
+				require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+			}
+			events = append(events, StreamResponseOpenAI2Claude(finishChunk("model", "tool_calls"), info)...)
+			require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+			require.Equal(t, []int{0, 1}, eventIndices(events, "content_block_start"))
+			require.Equal(t, []int{0, 1}, eventIndices(events, "content_block_stop"))
+			arguments := map[int]string{}
+			for _, e := range events {
+				if e.Type == "content_block_delta" && e.Delta.PartialJson != nil {
+					arguments[e.GetIndex()] += *e.Delta.PartialJson
+				}
+			}
+			require.Equal(t, map[int]string{0: `{"a":1}`, 1: `{"a":1}`}, arguments)
+		})
+	}
+}
+func TestClaudeLateToolIdentityRetainsAnonymousBlock(t *testing.T) {
+	info := claudeStreamInfo()
+	first := StreamResponseOpenAI2Claude(toolChunk("model", toolCall("", "read", `{`, nil)), info)
+	second := StreamResponseOpenAI2Claude(toolChunk("model", toolCall("callA", "", `}`, intPointer(0))), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Equal(t, []int{0}, eventIndices(first, "content_block_start"))
+	require.Empty(t, eventIndices(second, "content_block_start"))
+	require.Equal(t, []int{0}, eventIndices(second, "content_block_delta"))
+}
+func TestClaudeChangedIDForKnownIndexStillFails(t *testing.T) {
+	info := claudeStreamInfo()
+	_ = StreamResponseOpenAI2Claude(toolChunk("model", toolCall("callA", "read", `{`, intPointer(0))), info)
+	_ = StreamResponseOpenAI2Claude(toolChunk("model", toolCall("callB", "", `}`, intPointer(0))), info)
+	require.Error(t, info.ClaudeConvertInfo.ProtocolError)
+}

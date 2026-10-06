@@ -1,0 +1,17 @@
+import { createFileRoute, Outlet } from '@tanstack/react-router'
+
+export const Route = createFileRoute(
+  '/_authenticated/smart-routing/leaderboard'
+)({
+  component: SmartRouterLeaderboardLayout,
+})
+
+function SmartRouterLeaderboardLayout() {
+  return (
+    <div className='hover-scrollbar flex min-h-0 flex-1 overflow-y-auto overscroll-contain'>
+      <div className='mx-auto w-full max-w-7xl p-4 md:p-6'>
+        <Outlet />
+      </div>
+    </div>
+  )
+}

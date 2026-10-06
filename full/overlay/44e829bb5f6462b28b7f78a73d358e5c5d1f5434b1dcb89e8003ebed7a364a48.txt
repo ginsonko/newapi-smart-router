@@ -1,0 +1,174 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sort"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRelaySmartProductionShapeExhaustsEveryUsablePhysicalChannel(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 10_000)
+
+	zero := 0
+	priority := int64(10)
+	for index := 0; index < 20; index++ {
+		channelID := 9_200 + index
+		baseURL := fmt.Sprintf("https://production-shape-%d.invalid/v1", index)
+		require.NoError(t, h.db.Create(&model.Channel{
+			Id: channelID, Type: constant.ChannelTypeOpenAI, Key: fmt.Sprintf("shape-key-%d", index),
+			Status: common.ChannelStatusEnabled, Name: fmt.Sprintf("shape-%d", index), BaseURL: &baseURL,
+			Models: smartRelayTestModel, Group: "cheap", AutoBan: &zero,
+		}).Error)
+		require.NoError(t, h.db.Create(&model.Ability{
+			Group: "cheap", Model: smartRelayTestModel, ChannelId: channelID,
+			Enabled: true, Priority: &priority, Weight: 100,
+		}).Error)
+	}
+
+	h.engine.Catalogs.Invalidate()
+	h.engine.Prices.InvalidateAll()
+	catalog, err := h.engine.Catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	_, err = h.engine.Prices.Refresh(context.Background(), "default")
+	require.NoError(t, err)
+	contractID, _, err := service.BuildSmartContractIdentity(smartRelayTestModel, service.SmartEndpointChat)
+	require.NoError(t, err)
+	contract, exists := catalog.Contracts[contractID]
+	require.True(t, exists)
+	pool, exists := contract.Pools[smartrouter.AutomaticPoolID]
+	require.True(t, exists)
+
+	routesByChannel := make(map[int][]smartrouter.CertifiedRoute)
+	for _, route := range pool.Candidates {
+		routesByChannel[route.ChannelID] = append(routesByChannel[route.ChannelID], route)
+	}
+	channelIDs := make([]int, 0, len(routesByChannel))
+	for channelID := range routesByChannel {
+		channelIDs = append(channelIDs, channelID)
+	}
+	sort.Ints(channelIDs)
+	require.GreaterOrEqual(t, len(channelIDs), 22)
+
+	for _, channelID := range channelIDs[:2] {
+		for _, route := range routesByChannel[channelID] {
+			require.NoError(t, h.state.RecordAttempt(context.Background(), service.SmartRouteAttemptRecord{
+				RouteID: route.RouteID, Group: route.Group, Model: smartRelayTestModel,
+				ChannelID: route.ChannelID, ContractID: contractID, Endpoint: service.SmartEndpointChat,
+				CapacityDomain: route.CapacityDomain, CredentialDomain: smartrouter.RouteCredentialDomain(route),
+				Outcome: smartrouter.OutcomeInfrastructure, Admission: smartrouter.AdmissionNormal,
+			}))
+		}
+	}
+	// Reproduce inherited legacy warming state on two other physical channels.
+	// They have newer success evidence and therefore remain eligible as
+	// last-resort routes after the normal candidates are exhausted.
+	for _, channelID := range channelIDs[2:4] {
+		for _, route := range routesByChannel[channelID] {
+			base := service.SmartRouteAttemptRecord{
+				RouteID: route.RouteID, Group: route.Group, Model: smartRelayTestModel,
+				ChannelID: route.ChannelID, ContractID: contractID, Endpoint: service.SmartEndpointChat,
+				CapacityDomain: route.CapacityDomain, CredentialDomain: smartrouter.RouteCredentialDomain(route),
+				Admission: smartrouter.AdmissionNormal,
+			}
+			base.Outcome = smartrouter.OutcomeInfrastructure
+			require.NoError(t, h.state.RecordAttempt(context.Background(), base))
+			base.Outcome = smartrouter.OutcomeSuccess
+			require.NoError(t, h.state.RecordAttempt(context.Background(), base))
+		}
+	}
+
+	// Safe text exhausts every certified physical route, including routes whose
+	// health state is currently open; those routes are appended as last resort.
+	expected := append([]int(nil), channelIDs...)
+	ctx, _, routeRequest := h.newRequest(t, "production-shape-all-upstream-errors")
+	attempted := make([]int, 0, len(expected))
+	statuses := []int{http.StatusBadRequest, http.StatusForbidden, http.StatusRequestEntityTooLarge,
+		http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable}
+	resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, _ *relaycommon.RelayInfo) *types.NewAPIError {
+		channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+		attempted = append(attempted, channelID)
+		status := statuses[(len(attempted)-1)%len(statuses)]
+		message := http.StatusText(status)
+		if status == http.StatusRequestEntityTooLarge {
+			message = "Request payload is too large"
+		}
+		return types.WithOpenAIError(types.OpenAIError{
+			Message: message, Type: "upstream_error", Code: fmt.Sprintf("upstream_%d", status),
+		}, status, types.ErrOptionWithUpstreamResponseReceived())
+	})
+
+	require.NotNil(t, resultErr)
+	assert.Len(t, attempted, len(expected)*2, "every failed safe-text route receives one confirmation retry")
+	assert.Equal(t, len(expected), len(uniqueSmartRelayChannels(attempted)))
+	for _, channelID := range expected {
+		count := 0
+		for _, attemptedChannelID := range attempted {
+			if attemptedChannelID == channelID {
+				count++
+			}
+		}
+		assert.Equal(t, 2, count, "channel %d must dispatch once plus one confirmation retry", channelID)
+	}
+	// Safe text is allowed to exhaust the full certified pool. Previously open
+	// routes are intentionally tried only after normal candidates, preserving
+	// the no-single-channel-error contract while keeping recovery state intact.
+	sortedAttempted := make([]int, 0, len(uniqueSmartRelayChannels(attempted)))
+	for channelID := range uniqueSmartRelayChannels(attempted) {
+		sortedAttempted = append(sortedAttempted, channelID)
+	}
+	sort.Ints(sortedAttempted)
+	assert.Equal(t, expected, sortedAttempted)
+	assert.Contains(t, resultErr.ToOpenAIError().Message, fmt.Sprintf("%d 个", len(expected)))
+	reservation := h.reservation(t, "production-shape-all-upstream-errors")
+	assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+	assert.Equal(t, len(expected)*2, reservation.AttemptCount)
+}
+
+func TestRelaySmartSideEffectingExplicitRefusalCanUseNextRoute(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 1_000)
+	ctx, _, routeRequest := h.newRequest(t, "side-effecting-explicit-refusal")
+	routeRequest.ReplayClass = smartrouter.ReplaySideEffecting
+	var channels []int
+
+	resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+		channels = append(channels, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+		if len(channels) == 1 {
+			common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, true)
+			common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, http.StatusRequestEntityTooLarge)
+			return types.WithOpenAIError(types.OpenAIError{
+				Message: "Request payload is too large", Type: "invalid_request_error", Code: "payload_too_large",
+			}, http.StatusRequestEntityTooLarge, types.ErrOptionWithUpstreamResponseReceived())
+		}
+		require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+		return nil
+	})
+
+	require.Nil(t, resultErr)
+	assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+	assert.Equal(t, model.QuotaReservationStatusSettled, h.reservation(t, "side-effecting-explicit-refusal").Status)
+}
+
+func uniqueSmartRelayChannels(channels []int) map[int]struct{} {
+	unique := make(map[int]struct{}, len(channels))
+	for _, channelID := range channels {
+		unique[channelID] = struct{}{}
+	}
+	return unique
+}

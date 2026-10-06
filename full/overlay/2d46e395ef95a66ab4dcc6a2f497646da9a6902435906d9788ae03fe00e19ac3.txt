@@ -1,0 +1,1225 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+
+	"gorm.io/gorm"
+)
+
+var (
+	ErrSmartRouterDisabled      = errors.New("smart router is disabled")
+	ErrNoDiscoveredSmartRoutes  = errors.New("smart router catalog has no routable text or media routes")
+	ErrNoCertifiedSmartRoutes   = ErrNoDiscoveredSmartRoutes // v3 source compatibility
+	ErrNoCurrentSmartCatalog    = errors.New("smart router catalog is unavailable")
+	ErrSmartRouterSourceMissing = errors.New("smart router catalog source is unavailable")
+)
+
+const SmartRouteAutoDiscoveredPool = "auto-discovered"
+
+type CatalogSource interface {
+	LoadEnabledRoutingState(ctx context.Context) ([]model.Ability, []model.Channel, error)
+}
+
+type CatalogBlockSource interface {
+	LoadActiveSmartRouteBlocks(ctx context.Context, now time.Time) ([]model.SmartRouteBlock, error)
+}
+
+// GormCatalogSource deliberately uses two ordinary GORM queries and joins the
+// results in Go. It avoids dialect-specific quoting of the abilities.group
+// column and therefore behaves identically on SQLite, MySQL, and PostgreSQL.
+type GormCatalogSource struct {
+	DB *gorm.DB
+}
+
+// MainDatabaseCatalogSource resolves model.DB at load time, so a default
+// manager may be constructed during package initialization before DB startup.
+type MainDatabaseCatalogSource struct{}
+
+func NewGormCatalogSource(db *gorm.DB) GormCatalogSource {
+	return GormCatalogSource{DB: db}
+}
+
+func (source GormCatalogSource) LoadEnabledRoutingState(ctx context.Context) ([]model.Ability, []model.Channel, error) {
+	if source.DB == nil {
+		return nil, nil, ErrSmartRouterSourceMissing
+	}
+	var abilities []model.Ability
+	if err := source.DB.WithContext(ctx).
+		Where("enabled = ?", true).
+		Find(&abilities).Error; err != nil {
+		return nil, nil, fmt.Errorf("load enabled abilities: %w", err)
+	}
+	var channels []model.Channel
+	if err := source.DB.WithContext(ctx).
+		Where("status = ?", common.ChannelStatusEnabled).
+		Find(&channels).Error; err != nil {
+		return nil, nil, fmt.Errorf("load enabled channels: %w", err)
+	}
+	return abilities, channels, nil
+}
+
+func (source GormCatalogSource) LoadActiveSmartRouteBlocks(ctx context.Context, now time.Time) ([]model.SmartRouteBlock, error) {
+	if source.DB == nil {
+		return nil, ErrSmartRouterSourceMissing
+	}
+	var blocks []model.SmartRouteBlock
+	if err := source.DB.WithContext(ctx).
+		Where("expires_at = 0 OR expires_at > ?", now.Unix()).
+		Order("id ASC").Find(&blocks).Error; err != nil {
+		return nil, fmt.Errorf("load active smart route blocks: %w", err)
+	}
+	return blocks, nil
+}
+
+func (MainDatabaseCatalogSource) LoadEnabledRoutingState(ctx context.Context) ([]model.Ability, []model.Channel, error) {
+	// Populate explicit model endpoint metadata before the catalog resolves
+	// routes. Test/isolated GORM sources remain side-effect free.
+	_ = model.GetPricing()
+	return NewGormCatalogSource(model.DB).LoadEnabledRoutingState(ctx)
+}
+
+func (MainDatabaseCatalogSource) LoadActiveSmartRouteBlocks(ctx context.Context, now time.Time) ([]model.SmartRouteBlock, error) {
+	return NewGormCatalogSource(model.DB).LoadActiveSmartRouteBlocks(ctx, now)
+}
+
+type CatalogRouteRejection struct {
+	Group     string                `json:"group,omitempty"`
+	Model     string                `json:"model,omitempty"`
+	ChannelID int                   `json:"channel_id,omitempty"`
+	Endpoint  constant.EndpointType `json:"endpoint,omitempty"`
+	Reason    string                `json:"reason"`
+}
+
+// CatalogBlockedRoute is an internal, privacy-preserving bridge between
+// catalog construction and the user-facing status report. The route and
+// contract fields are deliberately omitted from JSON: they contain channel
+// and execution identifiers that must never be returned to a user. Keeping
+// them in the in-memory report lets the status endpoint explain an
+// auto-health quarantine even though the route is (correctly) absent from
+// the dispatch catalog.
+type CatalogBlockedRoute struct {
+	Route      smartrouter.CertifiedRoute `json:"-"`
+	Contract   smartrouter.RouteContract  `json:"-"`
+	Source     string                     `json:"source"`
+	CreatedAt  int64                      `json:"created_at,omitempty"`
+	UpdatedAt  int64                      `json:"updated_at,omitempty"`
+	ExpiresAt  int64                      `json:"expires_at,omitempty"`
+	BlockEpoch uint64                     `json:"epoch,omitempty"`
+	Reason     string                     `json:"-"`
+}
+
+type CatalogBuildReport struct {
+	AbilityCount               int                     `json:"ability_count"`
+	EnabledChannels            int                     `json:"enabled_channels"`
+	PublishedRoutes            int                     `json:"published_routes"`
+	PublishedContracts         int                     `json:"published_contracts"`
+	OmittedContracts           int                     `json:"omitted_contracts"`
+	DiscoveredModels           int                     `json:"discovered_models"`
+	DiscoveredRoutes           int                     `json:"discovered_routes"`
+	DiscoveredGroups           int                     `json:"discovered_groups"`
+	BlacklistedRoutes          int                     `json:"blacklisted_routes"`
+	MissingRatioRoutes         int                     `json:"missing_ratio_routes"`
+	IncompatibleEndpointRoutes int                     `json:"incompatible_endpoint_routes"`
+	QuarantinedRoutes          int                     `json:"quarantined_routes"`
+	BlockRevision              uint64                  `json:"block_revision"`
+	UpdatedAt                  int64                   `json:"updated_at"`
+	Rejections                 []CatalogRouteRejection `json:"rejections,omitempty"`
+	// BlockedRoutes is intentionally omitted from the public admin JSON. The
+	// admin health endpoint already exposes operational details through its
+	// privileged report; this field exists for the redacted user status view.
+	BlockedRoutes []CatalogBlockedRoute `json:"-"`
+}
+
+type preparedSmartChannel struct {
+	channel       model.Channel
+	generation    string
+	modelMapping  map[string]string
+	mappingErr    error
+	advanced      *dto.AdvancedCustomConfig
+	advancedErr   error
+	profile       smartroutersetting.ChannelProfileSetting
+	profileExists bool
+}
+
+type orderedCertifiedRoute struct {
+	route           smartrouter.CertifiedRoute
+	abilityPriority int64
+	abilityWeight   uint
+}
+
+type pendingContract struct {
+	contract smartrouter.RouteContract
+	pools    map[string][]orderedCertifiedRoute
+}
+
+// BuildCertifiedRouteCatalog automatically discovers routable text and media routes
+// from enabled abilities and channels. The historical name is retained for
+// API/source compatibility; v4 no longer requires administrator certification.
+func BuildCertifiedRouteCatalog(
+	ctx context.Context,
+	setting smartroutersetting.Setting,
+	source CatalogSource,
+) (smartrouter.CertifiedRouteCatalog, CatalogBuildReport, error) {
+	if !setting.Enabled {
+		return smartrouter.CertifiedRouteCatalog{}, CatalogBuildReport{}, ErrSmartRouterDisabled
+	}
+	if err := setting.Validate(); err != nil {
+		return smartrouter.CertifiedRouteCatalog{}, CatalogBuildReport{}, err
+	}
+	setting = smartroutersetting.Normalize(setting)
+	if source == nil {
+		return smartrouter.CertifiedRouteCatalog{}, CatalogBuildReport{}, ErrSmartRouterSourceMissing
+	}
+
+	abilities, channels, err := source.LoadEnabledRoutingState(ctx)
+	if err != nil {
+		return smartrouter.CertifiedRouteCatalog{}, CatalogBuildReport{}, err
+	}
+	report := CatalogBuildReport{
+		AbilityCount:    len(abilities),
+		EnabledChannels: len(channels),
+		BlockRevision:   GetSmartRouteBlockRevision(),
+		UpdatedAt:       time.Now().Unix(),
+	}
+	var blocks []model.SmartRouteBlock
+	if blockSource, ok := source.(CatalogBlockSource); ok {
+		blocks, err = blockSource.LoadActiveSmartRouteBlocks(ctx, time.Now())
+		if err != nil {
+			return smartrouter.CertifiedRouteCatalog{}, report, err
+		}
+	}
+	preparedChannels := prepareSmartChannels(channels, setting.ChannelProfiles)
+	sort.Slice(abilities, func(i, j int) bool {
+		left := abilities[i]
+		right := abilities[j]
+		if left.Group != right.Group {
+			return left.Group < right.Group
+		}
+		if left.Model != right.Model {
+			return left.Model < right.Model
+		}
+		return left.ChannelId < right.ChannelId
+	})
+
+	pending := make(map[string]*pendingContract)
+	poolIDs := automaticSmartPoolIDs(setting)
+	allowedEndpoints := make(map[constant.EndpointType]struct{}, len(setting.Discovery.AllowedTextEndpoints))
+	for _, endpoint := range setting.Discovery.AllowedTextEndpoints {
+		allowedEndpoints[endpoint] = struct{}{}
+	}
+	virtualGroups := make(map[string]struct{}, len(setting.Discovery.ExcludeVirtualGroups))
+	for _, group := range setting.Discovery.ExcludeVirtualGroups {
+		virtualGroups[group] = struct{}{}
+	}
+	discoveredModels := make(map[string]struct{})
+	discoveredGroups := make(map[string]struct{})
+	for _, ability := range abilities {
+		if err := ctx.Err(); err != nil {
+			return smartrouter.CertifiedRouteCatalog{}, report, err
+		}
+		group := strings.TrimSpace(ability.Group)
+		canonicalModel := strings.TrimSpace(ability.Model)
+		if group == "" || canonicalModel == "" {
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: "ability has an empty group or model",
+			})
+			continue
+		}
+		if _, excluded := virtualGroups[group]; excluded {
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: "virtual group is excluded from automatic discovery",
+			})
+			continue
+		}
+		preparedChannel, exists := preparedChannels[ability.ChannelId]
+		if !exists {
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: "enabled ability has no enabled channel",
+			})
+			continue
+		}
+		if preparedChannel.mappingErr != nil {
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: preparedChannel.mappingErr.Error(),
+			})
+			continue
+		}
+		if preparedChannel.channel.Type == constant.ChannelTypeAdvancedCustom && preparedChannel.advancedErr != nil {
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: preparedChannel.advancedErr.Error(),
+			})
+			continue
+		}
+		if unsafeAutomaticSmartChannelType(preparedChannel.channel.Type) {
+			report.IncompatibleEndpointRoutes++
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: "channel does not expose a supported smart-routing contract",
+			})
+			continue
+		}
+
+		upstreamModel, mappingErr := resolveSmartUpstreamModel(canonicalModel, preparedChannel.modelMapping)
+		if mappingErr != nil {
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: mappingErr.Error(),
+			})
+			continue
+		}
+		endpointTypes := automaticSmartEndpointTypes(preparedChannel, canonicalModel, allowedEndpoints)
+		if len(endpointTypes) == 0 {
+			report.IncompatibleEndpointRoutes++
+			report.Rejections = append(report.Rejections, CatalogRouteRejection{
+				Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+				Reason: "no compatible smart-routing endpoint",
+			})
+			continue
+		}
+		maxContext := automaticSmartMaxContext(preparedChannel.profile)
+		for _, endpointType := range endpointTypes {
+			for _, endpoint := range smartEndpointVariants(endpointType) {
+				if !preparedChannel.supportsEndpoint(endpoint, canonicalModel) {
+					if preparedChannel.channel.Type == constant.ChannelTypeAdvancedCustom {
+						report.Rejections = append(report.Rejections, CatalogRouteRejection{
+							Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+							Endpoint: endpointType,
+							Reason:   "advanced custom channel does not expose compatible path " + endpoint.requestPath,
+						})
+					}
+					continue
+				}
+				capabilities, mediaContract, err := automaticSmartCapabilities(
+					preparedChannel.profile, endpointType, endpoint.protocol, ability.ChannelId,
+					preparedChannel.channel.Type, upstreamModel, preparedChannel.channel.GetBaseURL(),
+				)
+				if err != nil {
+					return smartrouter.CertifiedRouteCatalog{}, report, err
+				}
+				contractID, fingerprint, err := BuildSmartContractIdentity(canonicalModel, endpoint.protocol)
+				if err != nil {
+					return smartrouter.CertifiedRouteCatalog{}, report, err
+				}
+				routeID, err := smartContentHash("route", struct {
+					ContractID        string                               `json:"contract_id"`
+					ChannelID         int                                  `json:"channel_id"`
+					ChannelGeneration string                               `json:"channel_generation"`
+					Group             string                               `json:"group"`
+					UpstreamModel     string                               `json:"upstream_model"`
+					Capabilities      uint64                               `json:"capabilities"`
+					MaxContext        int                                  `json:"max_context"`
+					Media             *smartrouter.MediaCapabilityContract `json:"media,omitempty"`
+				}{contractID, ability.ChannelId, preparedChannel.generation, group, upstreamModel, capabilities, maxContext, mediaContract})
+				if err != nil {
+					return smartrouter.CertifiedRouteCatalog{}, report, err
+				}
+
+				cacheDomain := preparedChannel.profile.CacheDomain
+				if cacheDomain == "" {
+					cacheDomain = fmt.Sprintf("channel:%d", ability.ChannelId)
+				}
+				cacheNamespaceRevision, err := smartContentHash("cache_namespace", struct {
+					CacheDomain       string `json:"cache_domain"`
+					ChannelGeneration string `json:"channel_generation"`
+					UpstreamModel     string `json:"upstream_model"`
+					Protocol          string `json:"protocol"`
+				}{
+					CacheDomain: cacheDomain, ChannelGeneration: preparedChannel.generation,
+					UpstreamModel: upstreamModel, Protocol: endpoint.protocol,
+				})
+				if err != nil {
+					return smartrouter.CertifiedRouteCatalog{}, report, err
+				}
+				capacityDomain := preparedChannel.profile.CapacityDomain
+				if capacityDomain == "" {
+					capacityDomain = fmt.Sprintf("channel:%d", ability.ChannelId)
+				}
+				failureDomain := preparedChannel.profile.FailureDomain
+				if failureDomain == "" {
+					failureDomain = fmt.Sprintf("channel:%d:%s", ability.ChannelId, preparedChannel.generation)
+				}
+				route := orderedCertifiedRoute{
+					route: smartrouter.CertifiedRoute{
+						RouteID: routeID, ChannelGeneration: preparedChannel.generation,
+						Group: group, ChannelID: ability.ChannelId,
+						UpstreamModel: upstreamModel, Capabilities: capabilities,
+						PassiveRecovery: model.ModelRequiresPassiveRecovery(preparedChannel.channel.Type, canonicalModel, upstreamModel),
+						Media:           mediaContract,
+						MaxContext:      maxContext, CacheDomain: cacheDomain,
+						CacheNamespaceRevision: cacheNamespaceRevision,
+						CapacityDomain:         capacityDomain, FailureDomain: failureDomain,
+						MaxInflight:    preparedChannel.profile.MaxInflight,
+						StableFallback: false,
+					},
+					abilityWeight: ability.Weight,
+				}
+				matched := matchingSmartRouteBlocks(blocks, SmartRouteBlockTarget{
+					Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+					ContractID: contractID, Endpoint: endpoint.protocol, RouteID: routeID,
+				}, endpointType)
+				if len(matched) > 0 {
+					report.BlacklistedRoutes++
+					report.Rejections = append(report.Rejections, CatalogRouteRejection{
+						Group: group, Model: canonicalModel, ChannelID: ability.ChannelId,
+						Endpoint: endpointType, Reason: "excluded by smart-route block",
+					})
+					continue
+				}
+				if !ratio_setting.ContainsGroupRatio(group) {
+					report.MissingRatioRoutes++
+				}
+				if ability.Priority != nil {
+					route.abilityPriority = *ability.Priority
+				}
+				entry := pending[contractID]
+				if entry == nil {
+					entry = &pendingContract{
+						contract: smartrouter.RouteContract{
+							ContractID: contractID, CanonicalModel: canonicalModel,
+							Endpoint: endpoint.protocol, CapabilityFingerprint: fingerprint,
+						},
+						pools: make(map[string][]orderedCertifiedRoute),
+					}
+					pending[contractID] = entry
+				}
+				for _, poolID := range poolIDs {
+					entry.pools[poolID] = appendUniqueOrderedRoute(entry.pools[poolID], route)
+				}
+				discoveredModels[canonicalModel] = struct{}{}
+				discoveredGroups[group] = struct{}{}
+			}
+		}
+	}
+
+	catalog := smartrouter.CertifiedRouteCatalog{Contracts: make(map[string]smartrouter.ContractCatalog)}
+	for contractID, entry := range pending {
+		contractCatalog := smartrouter.ContractCatalog{
+			Contract: entry.contract,
+			Pools:    make(map[string]smartrouter.CertifiedPool),
+		}
+		for poolID, routes := range entry.pools {
+			if len(routes) == 0 {
+				continue
+			}
+			sortOrderedSmartRoutes(routes)
+			candidates := make([]smartrouter.CertifiedRoute, len(routes))
+			for index, route := range routes {
+				candidates[index] = route.route
+			}
+			contractCatalog.Pools[poolID] = smartrouter.CertifiedPool{Candidates: candidates}
+		}
+		if len(contractCatalog.Pools) == 0 {
+			report.OmittedContracts++
+			continue
+		}
+		catalog.Contracts[contractID] = contractCatalog
+	}
+	if len(catalog.Contracts) == 0 {
+		return smartrouter.CertifiedRouteCatalog{}, report, ErrNoCertifiedSmartRoutes
+	}
+	report.PublishedContracts = len(catalog.Contracts)
+	report.DiscoveredModels = len(discoveredModels)
+	report.DiscoveredGroups = len(discoveredGroups)
+	uniquePublishedRoutes := make(map[string]struct{})
+	for _, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				uniquePublishedRoutes[route.RouteID] = struct{}{}
+			}
+		}
+	}
+	report.PublishedRoutes = len(uniquePublishedRoutes)
+	report.DiscoveredRoutes = len(uniquePublishedRoutes)
+	applyStrictestCapacityLimits(&catalog)
+
+	version, err := smartContentHash("catalog", struct {
+		Contracts     map[string]smartrouter.ContractCatalog `json:"contracts"`
+		BlockRevision uint64                                 `json:"block_revision"`
+	}{Contracts: catalog.Contracts, BlockRevision: report.BlockRevision})
+	if err != nil {
+		return smartrouter.CertifiedRouteCatalog{}, report, err
+	}
+	catalog.Version = version
+	if err := catalog.Validate(); err != nil {
+		return smartrouter.CertifiedRouteCatalog{}, report, err
+	}
+	return catalog, report, nil
+}
+
+func prepareSmartChannels(channels []model.Channel, profiles map[string]smartroutersetting.ChannelProfileSetting) map[int]preparedSmartChannel {
+	prepared := make(map[int]preparedSmartChannel, len(channels))
+	for _, channel := range channels {
+		entry := preparedSmartChannel{
+			channel:    channel,
+			generation: SmartRouteChannelGeneration(channel),
+		}
+		profile, profileExists := profiles[strconv.Itoa(channel.Id)]
+		entry.profile = profile
+		entry.profileExists = profileExists
+		mappingJSON := strings.TrimSpace(channel.GetModelMapping())
+		if mappingJSON != "" && mappingJSON != "{}" {
+			entry.modelMapping = make(map[string]string)
+			if err := common.UnmarshalJsonStr(mappingJSON, &entry.modelMapping); err != nil {
+				entry.mappingErr = fmt.Errorf("invalid channel model_mapping")
+			}
+		}
+		if channel.Type == constant.ChannelTypeAdvancedCustom {
+			var otherSettings dto.ChannelOtherSettings
+			if strings.TrimSpace(channel.OtherSettings) == "" {
+				entry.advancedErr = errors.New("advanced custom channel has no settings")
+			} else if err := common.UnmarshalJsonStr(channel.OtherSettings, &otherSettings); err != nil {
+				entry.advancedErr = errors.New("advanced custom channel settings are invalid")
+			} else if otherSettings.AdvancedCustom == nil {
+				entry.advancedErr = errors.New("advanced custom channel has no advanced_custom routes")
+			} else if err := otherSettings.AdvancedCustom.Validate(); err != nil {
+				entry.advancedErr = fmt.Errorf("advanced custom channel validation failed: %w", err)
+			} else {
+				entry.advanced = otherSettings.AdvancedCustom
+			}
+		}
+		prepared[channel.Id] = entry
+	}
+	return prepared
+}
+
+// SmartRouteChannelGeneration is an opaque digest of the execution-relevant
+// channel configuration. It changes when credentials, BaseURL, or relay
+// overrides change, while never publishing those values in the route catalog.
+func SmartRouteChannelGeneration(channel model.Channel) string {
+	encoded, err := common.Marshal(struct {
+		ChannelID          int     `json:"channel_id"`
+		Type               int     `json:"type"`
+		Key                string  `json:"key"`
+		OpenAIOrganization *string `json:"openai_organization"`
+		BaseURL            *string `json:"base_url"`
+		Other              string  `json:"other"`
+		ModelMapping       *string `json:"model_mapping"`
+		ParamOverride      *string `json:"param_override"`
+		HeaderOverride     *string `json:"header_override"`
+		Setting            *string `json:"setting"`
+		OtherSettings      string  `json:"other_settings"`
+	}{
+		ChannelID: channel.Id, Type: channel.Type, Key: channel.Key,
+		OpenAIOrganization: channel.OpenAIOrganization, BaseURL: channel.BaseURL,
+		Other: channel.Other, ModelMapping: channel.ModelMapping,
+		ParamOverride: channel.ParamOverride, HeaderOverride: channel.HeaderOverride,
+		Setting: channel.Setting, OtherSettings: channel.OtherSettings,
+	})
+	if err != nil {
+		// The struct contains only JSON-supported scalar fields. Keep failure
+		// closed if that invariant ever changes.
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return "channel_sha256_" + hex.EncodeToString(digest[:])
+}
+
+type smartEndpointVariant struct {
+	endpointType constant.EndpointType
+	requestPath  string
+	protocol     string
+}
+
+func smartEndpointVariants(endpoint constant.EndpointType) []smartEndpointVariant {
+	switch endpoint {
+	case constant.EndpointTypeOpenAI:
+		return []smartEndpointVariant{
+			{endpointType: endpoint, requestPath: "/v1/chat/completions", protocol: SmartEndpointChat},
+			{endpointType: endpoint, requestPath: "/v1/completions", protocol: SmartEndpointCompletions},
+		}
+	case constant.EndpointTypeOpenAIResponse:
+		return []smartEndpointVariant{
+			{endpointType: endpoint, requestPath: "/v1/responses", protocol: SmartEndpointResponses},
+			{endpointType: endpoint, requestPath: "/v1/alpha/search", protocol: SmartEndpointStandaloneSearch},
+		}
+	case constant.EndpointTypeAnthropic:
+		return []smartEndpointVariant{{endpointType: endpoint, requestPath: "/v1/messages", protocol: SmartEndpointMessages}}
+	case constant.EndpointTypeImageGeneration:
+		return []smartEndpointVariant{
+			{endpointType: endpoint, requestPath: "/v1/images/generations", protocol: SmartEndpointImages},
+			{endpointType: endpoint, requestPath: "/v1/images/edits", protocol: SmartEndpointImageEdits},
+		}
+	case constant.EndpointTypeOpenAIVideo:
+		return []smartEndpointVariant{
+			{endpointType: endpoint, requestPath: "/v1/videos", protocol: SmartEndpointVideos},
+			{endpointType: endpoint, requestPath: "/v1/video/generations", protocol: SmartEndpointVideoTasks},
+		}
+	case constant.EndpointTypeAudioSpeech:
+		return []smartEndpointVariant{{endpointType: endpoint, requestPath: "/v1/audio/speech", protocol: SmartEndpointAudioSpeech}}
+	case constant.EndpointTypeAudioTranscription:
+		return []smartEndpointVariant{{endpointType: endpoint, requestPath: "/v1/audio/transcriptions", protocol: SmartEndpointAudioTranscription}}
+	case constant.EndpointTypeAudioTranslation:
+		return []smartEndpointVariant{{endpointType: endpoint, requestPath: "/v1/audio/translations", protocol: SmartEndpointAudioTranslation}}
+	default:
+		return nil
+	}
+}
+
+const automaticSmartDefaultMaxContext = 1_000_000
+
+func automaticSmartCapabilities(
+	profile smartroutersetting.ChannelProfileSetting,
+	endpoint constant.EndpointType,
+	protocol string,
+	channelID int,
+	channelType int,
+	modelName string,
+	baseURL string,
+) (uint64, *smartrouter.MediaCapabilityContract, error) {
+	capabilities := profile.Capabilities
+	switch endpoint {
+	case constant.EndpointTypeImageGeneration:
+		mediaCapability := media.ResolveCapabilityForRoute(channelID, channelType, modelName, protocol, baseURL)
+		mediaContract, err := smartMediaCapabilityContract(channelID, modelName, protocol, mediaCapability)
+		if err != nil {
+			return 0, nil, err
+		}
+		capabilities |= smartroutersetting.CapabilityImageGeneration
+		if mediaCapability.ReferenceImage {
+			capabilities |= smartroutersetting.CapabilityReferenceImage
+		}
+		return capabilities, mediaContract, nil
+	case constant.EndpointTypeOpenAIVideo:
+		mediaCapability := media.ResolveCapabilityForRoute(channelID, channelType, modelName, protocol, baseURL)
+		mediaContract, err := smartMediaCapabilityContract(channelID, modelName, protocol, mediaCapability)
+		if err != nil {
+			return 0, nil, err
+		}
+		capabilities |= smartroutersetting.CapabilityVideoGeneration | smartroutersetting.CapabilityAsyncTask
+		if mediaCapability.ReferenceImage {
+			capabilities |= smartroutersetting.CapabilityReferenceImage
+		}
+		if mediaCapability.ReferenceVideo {
+			capabilities |= smartroutersetting.CapabilityReferenceVideo
+		}
+		if mediaCapability.ReferenceAudio {
+			capabilities |= smartroutersetting.CapabilityReferenceAudio
+		}
+		return capabilities, mediaContract, nil
+	case constant.EndpointTypeAudioSpeech:
+		mediaContract, err := smartMediaCapabilityContract(channelID, modelName, protocol,
+			media.ResolveCapabilityForRoute(channelID, channelType, modelName, protocol, baseURL))
+		return capabilities | smartroutersetting.CapabilityAudioSpeech, mediaContract, err
+	case constant.EndpointTypeAudioTranscription, constant.EndpointTypeAudioTranslation:
+		mediaContract, err := smartMediaCapabilityContract(channelID, modelName, protocol,
+			media.ResolveCapabilityForRoute(channelID, channelType, modelName, protocol, baseURL))
+		return capabilities | smartroutersetting.CapabilityAudioTranscription, mediaContract, err
+	}
+	if capabilities != 0 {
+		return capabilities | smartroutersetting.CapabilityText, nil, nil
+	}
+	return smartroutersetting.CapabilityText |
+		smartroutersetting.CapabilityStreaming |
+		smartroutersetting.CapabilityTools |
+		smartroutersetting.CapabilityVision |
+		smartroutersetting.CapabilityStructuredOutput |
+		smartroutersetting.CapabilityReasoning |
+		smartroutersetting.CapabilityPromptCache, nil, nil
+}
+
+func smartMediaCapabilityContract(
+	channelID int,
+	modelName string,
+	protocol string,
+	capability media.Capability,
+) (*smartrouter.MediaCapabilityContract, error) {
+	outputKnown := capability.ProviderContract != "" ||
+		media.HasCapabilityOverride(channelID, modelName, protocol)
+	contract := &smartrouter.MediaCapabilityContract{
+		ReferenceImage:                capability.ReferenceImage,
+		ReferenceVideo:                capability.ReferenceVideo,
+		ReferenceAudio:                capability.ReferenceAudio,
+		ImageRoles:                    append([]string(nil), capability.ImageRoles...),
+		VideoRoles:                    append([]string(nil), capability.VideoRoles...),
+		AudioRoles:                    append([]string(nil), capability.AudioRoles...),
+		MinImages:                     capability.MinImages,
+		MaxImages:                     capability.MaxImages,
+		MaxVideos:                     capability.MaxVideos,
+		MaxAudios:                     capability.MaxAudios,
+		MaxTotalReferences:            capability.MaxTotalReferences,
+		MaxImageBytes:                 capability.MaxImageBytes,
+		MaxVideoBytes:                 capability.MaxVideoBytes,
+		MaxAudioBytes:                 capability.MaxAudioBytes,
+		MinReferenceVideoSeconds:      capability.MinReferenceVideoSeconds,
+		MaxReferenceVideoSeconds:      capability.MaxReferenceVideoSeconds,
+		MaxTotalReferenceVideoSeconds: capability.MaxTotalReferenceVideoSecond,
+		AspectRatios:                  append([]string(nil), capability.AspectRatios...),
+		Resolutions:                   append([]string(nil), capability.Resolutions...),
+		Duration: smartrouter.MediaDurationContract{
+			Mode: capability.Duration.Mode, Min: capability.Duration.Min, Max: capability.Duration.Max,
+			Step: capability.Duration.Step, Default: capability.Duration.Default, Fixed: capability.Duration.Fixed,
+		},
+		OutputCount: smartrouter.MediaOutputCountContract{
+			Known: outputKnown, Min: capability.OutputCount.Min, Max: capability.OutputCount.Max,
+			Default: capability.OutputCount.Default,
+		},
+		ProviderContract: capability.ProviderContract,
+	}
+	if !outputKnown {
+		contract.OutputCount = smartrouter.MediaOutputCountContract{}
+	}
+	if err := contract.Validate(); err != nil {
+		return nil, err
+	}
+	revision, err := smartContentHash("media_capability", contract)
+	if err != nil {
+		return nil, err
+	}
+	contract.Revision = revision
+	return contract, nil
+}
+
+func automaticSmartMaxContext(profile smartroutersetting.ChannelProfileSetting) int {
+	if profile.MaxContext > 0 {
+		return profile.MaxContext
+	}
+	return automaticSmartDefaultMaxContext
+}
+
+func automaticSmartEndpointTypes(
+	channel preparedSmartChannel,
+	modelName string,
+	allowed map[constant.EndpointType]struct{},
+) []constant.EndpointType {
+	var candidates []constant.EndpointType
+	if channel.channel.Type == constant.ChannelTypeAdvancedCustom {
+		// Advanced custom routes are the one case where the channel itself does
+		// not provide a reliable type-to-protocol inference. Start from the
+		// supported endpoint boundary and let SupportsPath below perform the
+		// exact path check.
+		for endpoint := range allowed {
+			candidates = append(candidates, endpoint)
+		}
+	} else if len(channel.profile.EndpointAllow) > 0 {
+		// Preserve an explicit text protocol assertion for rolling upgrades, but
+		// never let the old text-only profile suppress a natively inferred image
+		// or video contract. Media endpoint capability is derived from the real
+		// channel/model adapter and remains subject to the global block list.
+		candidates = append(candidates, channel.profile.EndpointAllow...)
+		for _, inferred := range model.ResolveModelEndpointTypes(channel.channel.Type, modelName) {
+			if isSmartMediaEndpointType(inferred) {
+				candidates = append(candidates, inferred)
+			}
+		}
+	} else {
+		// No profile is required for ordinary channels. New groups and channels
+		// are discovered from their relay adapter capabilities automatically.
+		candidates = automaticSmartAdapterEndpointTypes(channel.channel.Type, modelName)
+	}
+	seen := make(map[constant.EndpointType]struct{}, len(candidates))
+	result := make([]constant.EndpointType, 0, len(candidates))
+	for _, endpoint := range candidates {
+		if _, accepted := allowed[endpoint]; !accepted || !smartroutersetting.IsSupportedEndpoint(endpoint) {
+			continue
+		}
+		if _, exists := seen[endpoint]; exists {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		result = append(result, endpoint)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+func isSmartMediaEndpointType(endpoint constant.EndpointType) bool {
+	switch endpoint {
+	case constant.EndpointTypeImageGeneration,
+		constant.EndpointTypeOpenAIVideo,
+		constant.EndpointTypeAudioSpeech,
+		constant.EndpointTypeAudioTranscription,
+		constant.EndpointTypeAudioTranslation:
+		return true
+	default:
+		return false
+	}
+}
+
+// automaticSmartAdapterEndpointTypes is deliberately separate from
+// common.GetEndpointTypesByChannelType. The latter describes New API's
+// preferred endpoint for a channel/model pair; a smart-routing catalog needs
+// every incoming protocol that the selected relay adapter can safely accept.
+// Keeping the registry here avoids changing pricing/model-market behavior and
+// makes new adapter capabilities an explicit, testable routing contract.
+func automaticSmartAdapterEndpointTypes(channelType int, modelName string) []constant.EndpointType {
+	preferred := model.ResolveModelEndpointTypes(channelType, modelName)
+	apiType, _ := common.ChannelType2APIType(channelType)
+	if apiType == constant.APITypeCodex {
+		return []constant.EndpointType{constant.EndpointTypeOpenAIResponse}
+	}
+
+	hasOpenAIEndpoint := false
+	for _, endpoint := range preferred {
+		if endpoint == constant.EndpointTypeOpenAI {
+			hasOpenAIEndpoint = true
+			break
+		}
+	}
+	if !hasOpenAIEndpoint {
+		return preferred
+	}
+
+	switch apiType {
+	case constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference:
+		// These API types all resolve to relay/channel/openai.Adaptor. It handles
+		// native OpenAI requests and Responses, and converts Claude Messages to
+		// OpenAI Chat before forwarding. Exact-contract health still determines
+		// whether an individual upstream actually supports the advertised path.
+		return append(preferred,
+			constant.EndpointTypeOpenAIResponse,
+			constant.EndpointTypeAnthropic,
+		)
+	default:
+		return preferred
+	}
+}
+
+// These adapters are asynchronous, media-specific, or stateful. New API's
+// generic endpoint fallback would otherwise make some of them look like an
+// OpenAI text channel, which is not sufficient evidence for replay safety.
+func unsafeAutomaticSmartChannelType(channelType int) bool {
+	switch channelType {
+	case constant.ChannelTypeUnknown,
+		constant.ChannelTypeMidjourney,
+		constant.ChannelTypeMidjourneyPlus,
+		constant.ChannelTypeFastGPT,
+		constant.ChannelTypeSunoAPI,
+		constant.ChannelTypeDify,
+		constant.ChannelTypeCoze,
+		constant.ChannelTypeReplicate,
+		constant.ChannelTypeSubmodel,
+		constant.ChannelTypeJina:
+		return true
+	default:
+		return false
+	}
+}
+
+func automaticSmartPoolIDs(setting smartroutersetting.Setting) []string {
+	seen := map[string]struct{}{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	add(setting.DefaultPolicy.PoolPolicy)
+	add(SmartRouteAutoDiscoveredPool)
+	for _, override := range setting.DefaultPolicy.ContractOverrides {
+		add(override.PoolPolicy)
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func matchingSmartRouteBlocks(
+	blocks []model.SmartRouteBlock,
+	target SmartRouteBlockTarget,
+	endpointType constant.EndpointType,
+) []model.SmartRouteBlock {
+	matched := make([]model.SmartRouteBlock, 0)
+	for _, block := range blocks {
+		// Automatic health and model-404 records are legacy evidence, never
+		// catalog authority. Only an explicit administrator blacklist may remove
+		// a route or suppress its recovery indefinitely.
+		if block.Source != SmartRouteBlockSourceManual {
+			continue
+		}
+		if SmartRouteBlockMatches(block, target) {
+			matched = append(matched, block)
+			continue
+		}
+		if block.Scope == SmartRouteBlockScopeEndpoint && block.Endpoint == string(endpointType) {
+			matched = append(matched, block)
+		}
+	}
+	return matched
+}
+
+func (channel preparedSmartChannel) supportsEndpoint(endpoint smartEndpointVariant, modelName string) bool {
+	if !smartroutersetting.IsSupportedEndpoint(endpoint.endpointType) {
+		return false
+	}
+	if endpoint.protocol == SmartEndpointStandaloneSearch {
+		return channel.channel.Type == constant.ChannelTypeOpenAI || channel.channel.Type == constant.ChannelTypeCodex
+	}
+	if endpoint.endpointType == constant.EndpointTypeOpenAIVideo && !common.ChannelSupportsOpenAIVideo(channel.channel.Type) {
+		return false
+	}
+	if channel.channel.Type == constant.ChannelTypeAdvancedCustom {
+		return channel.advancedErr == nil && channel.advanced != nil && channel.advanced.SupportsPath(endpoint.requestPath)
+	}
+	for _, inferred := range automaticSmartAdapterEndpointTypes(channel.channel.Type, modelName) {
+		if inferred == endpoint.endpointType {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveSmartUpstreamModel(modelName string, mapping map[string]string) (string, error) {
+	current := modelName
+	visited := map[string]struct{}{current: {}}
+	for {
+		mapped, exists := mapping[current]
+		mapped = strings.TrimSpace(mapped)
+		if !exists || mapped == "" || mapped == current {
+			return current, nil
+		}
+		if _, exists := visited[mapped]; exists {
+			return "", fmt.Errorf("channel model_mapping contains a cycle for model %q", modelName)
+		}
+		visited[mapped] = struct{}{}
+		current = mapped
+	}
+}
+
+func modelAllowed(modelName string, allow, deny []string) bool {
+	for _, pattern := range deny {
+		if wildcardMatch(pattern, modelName) {
+			return false
+		}
+	}
+	if len(allow) == 0 {
+		return true
+	}
+	for _, pattern := range allow {
+		if wildcardMatch(pattern, modelName) {
+			return true
+		}
+	}
+	return false
+}
+
+// wildcardMatch intentionally supports only '*' and '?'. Unlike path.Match,
+// '*' also spans '/', which is expected for provider-qualified model names.
+func wildcardMatch(pattern, value string) bool {
+	patternRunes := []rune(pattern)
+	valueRunes := []rune(value)
+	matched := make([]bool, len(valueRunes)+1)
+	matched[0] = true
+	for _, token := range patternRunes {
+		next := make([]bool, len(valueRunes)+1)
+		switch token {
+		case '*':
+			next[0] = matched[0]
+			for index := 1; index <= len(valueRunes); index++ {
+				next[index] = matched[index] || next[index-1]
+			}
+		case '?':
+			for index := 1; index <= len(valueRunes); index++ {
+				next[index] = matched[index-1]
+			}
+		default:
+			for index := 1; index <= len(valueRunes); index++ {
+				next[index] = matched[index-1] && valueRunes[index-1] == token
+			}
+		}
+		matched = next
+	}
+	return matched[len(valueRunes)]
+}
+
+func intAllowed(value int, allow []int) bool {
+	if len(allow) == 0 {
+		return true
+	}
+	index := sort.SearchInts(allow, value)
+	return index < len(allow) && allow[index] == value
+}
+
+func appendUniqueOrderedRoute(routes []orderedCertifiedRoute, candidate orderedCertifiedRoute) []orderedCertifiedRoute {
+	for _, route := range routes {
+		if route.route.RouteID == candidate.route.RouteID {
+			return routes
+		}
+	}
+	return append(routes, candidate)
+}
+
+func appendUniqueCatalogBlockedRoute(routes []CatalogBlockedRoute, candidate CatalogBlockedRoute) []CatalogBlockedRoute {
+	for index := range routes {
+		if routes[index].Route.RouteID == candidate.Route.RouteID && routes[index].Source == candidate.Source {
+			// Keep the newest epoch/timestamps if an overlapping block was
+			// written during a catalog refresh. This makes the status page
+			// deterministic without duplicating a route row.
+			if candidate.BlockEpoch > routes[index].BlockEpoch || candidate.CreatedAt > routes[index].CreatedAt {
+				routes[index] = candidate
+			}
+			return routes
+		}
+	}
+	return append(routes, candidate)
+}
+
+// applyStrictestCapacityLimits makes every route sharing a capacity domain use
+// the smallest configured positive limit. Zero means unknown/unlimited and does
+// not weaken a known limit supplied by another route in the same domain.
+func applyStrictestCapacityLimits(catalog *smartrouter.CertifiedRouteCatalog) {
+	if catalog == nil {
+		return
+	}
+	limits := make(map[string]int)
+	for _, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				if route.MaxInflight <= 0 {
+					continue
+				}
+				current, exists := limits[route.CapacityDomain]
+				if !exists || route.MaxInflight < current {
+					limits[route.CapacityDomain] = route.MaxInflight
+				}
+			}
+		}
+	}
+	for contractID, contract := range catalog.Contracts {
+		for poolID, pool := range contract.Pools {
+			for index := range pool.Candidates {
+				if limit := limits[pool.Candidates[index].CapacityDomain]; limit > 0 {
+					pool.Candidates[index].MaxInflight = limit
+				}
+			}
+			contract.Pools[poolID] = pool
+		}
+		catalog.Contracts[contractID] = contract
+	}
+}
+
+func sortOrderedSmartRoutes(routes []orderedCertifiedRoute) {
+	sort.Slice(routes, func(i, j int) bool {
+		left := routes[i]
+		right := routes[j]
+		if left.abilityPriority != right.abilityPriority {
+			return left.abilityPriority > right.abilityPriority
+		}
+		if left.abilityWeight != right.abilityWeight {
+			return left.abilityWeight > right.abilityWeight
+		}
+		if left.route.ChannelID != right.route.ChannelID {
+			return left.route.ChannelID < right.route.ChannelID
+		}
+		return left.route.RouteID < right.route.RouteID
+	})
+}
+
+func smartContentHash(prefix string, value any) (string, error) {
+	encoded, err := common.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("marshal smart router %s content: %w", prefix, err)
+	}
+	digest := sha256.Sum256(encoded)
+	return prefix + "_sha256_" + hex.EncodeToString(digest[:]), nil
+}
+
+type CatalogManager struct {
+	source         CatalogSource
+	settings       func() smartroutersetting.Setting
+	globalSettings bool
+
+	refreshMu            sync.Mutex
+	current              atomic.Pointer[smartrouter.CertifiedRouteCatalog]
+	currentHash          atomic.Pointer[string]
+	currentBlockRevision atomic.Uint64
+	lastReport           atomic.Pointer[CatalogBuildReport]
+	dirty                atomic.Bool
+	lastRefresh          atomic.Int64
+	unsubscribe          func()
+	closeOnce            sync.Once
+}
+
+func NewCatalogManager(source CatalogSource, settings func() smartroutersetting.Setting) *CatalogManager {
+	globalSettings := settings == nil
+	if settings == nil {
+		settings = smartroutersetting.GetSmartRouterSettingSnapshot
+	}
+	manager := &CatalogManager{source: source, settings: settings, globalSettings: globalSettings}
+	manager.dirty.Store(true)
+	if globalSettings {
+		manager.unsubscribe = smartroutersetting.SubscribeSmartRouterSettingChanges(func() {
+			manager.Invalidate()
+			if !smartroutersetting.GetSmartRouterSettingSnapshot().Enabled {
+				manager.current.Store(nil)
+				manager.currentHash.Store(nil)
+				manager.currentBlockRevision.Store(0)
+			}
+		})
+	}
+	return manager
+}
+
+func NewDefaultCatalogManager() *CatalogManager {
+	return NewCatalogManager(MainDatabaseCatalogSource{}, nil)
+}
+
+func (manager *CatalogManager) Close() {
+	if manager == nil {
+		return
+	}
+	manager.closeOnce.Do(func() {
+		if manager.unsubscribe != nil {
+			manager.unsubscribe()
+		}
+	})
+}
+
+// Current returns the immutable published catalog. Callers must not mutate it.
+func (manager *CatalogManager) Current() (*smartrouter.CertifiedRouteCatalog, bool) {
+	if manager == nil {
+		return nil, false
+	}
+	catalog := manager.current.Load()
+	if manager.globalSettings && catalog != nil && manager.currentBlockRevision.Load() != GetSmartRouteBlockRevision() {
+		return nil, false
+	}
+	return catalog, catalog != nil
+}
+
+func (manager *CatalogManager) LastReport() (CatalogBuildReport, bool) {
+	if manager == nil {
+		return CatalogBuildReport{}, false
+	}
+	report := manager.lastReport.Load()
+	if report == nil {
+		return CatalogBuildReport{}, false
+	}
+	copyReport := *report
+	copyReport.Rejections = append([]CatalogRouteRejection(nil), report.Rejections...)
+	copyReport.BlockedRoutes = append([]CatalogBlockedRoute(nil), report.BlockedRoutes...)
+	return copyReport, true
+}
+
+func (manager *CatalogManager) Invalidate() {
+	if manager != nil {
+		manager.dirty.Store(true)
+	}
+}
+
+func (manager *CatalogManager) Refresh(ctx context.Context) (*smartrouter.CertifiedRouteCatalog, error) {
+	if manager == nil || manager.settings == nil {
+		return nil, ErrNoCurrentSmartCatalog
+	}
+	manager.refreshMu.Lock()
+	defer manager.refreshMu.Unlock()
+
+	setting := manager.settings()
+	if !setting.Enabled {
+		manager.current.Store(nil)
+		manager.currentHash.Store(nil)
+		manager.currentBlockRevision.Store(0)
+		manager.dirty.Store(false)
+		return nil, ErrSmartRouterDisabled
+	}
+	if err := setting.Validate(); err != nil {
+		manager.dirty.Store(true)
+		return manager.current.Load(), err
+	}
+	settingHash, err := smartCatalogSettingHash(setting)
+	if err != nil {
+		manager.dirty.Store(true)
+		return manager.current.Load(), err
+	}
+	catalog, report, err := BuildCertifiedRouteCatalog(ctx, setting, manager.source)
+	if err != nil {
+		if errors.Is(err, ErrNoCertifiedSmartRoutes) {
+			manager.lastReport.Store(&report)
+			// The source load succeeded authoritatively, so an empty result means
+			// the administrator revoked the last usable route. Retaining the LKG
+			// here would silently resurrect a removed channel.
+			manager.current.Store(nil)
+			manager.currentHash.Store(nil)
+			manager.currentBlockRevision.Store(report.BlockRevision)
+			manager.lastRefresh.Store(time.Now().Unix())
+			manager.dirty.Store(false)
+			return nil, err
+		}
+		if publishedHash := manager.currentHash.Load(); publishedHash == nil || *publishedHash != settingHash ||
+			(manager.globalSettings && manager.currentBlockRevision.Load() != GetSmartRouteBlockRevision()) {
+			// A catalog derived from a different administrator configuration is
+			// not a valid LKG. Preserve LKG only for transient source failures
+			// while the catalog-affecting configuration is unchanged.
+			manager.current.Store(nil)
+			manager.currentHash.Store(nil)
+			manager.currentBlockRevision.Store(0)
+		}
+		manager.dirty.Store(true)
+		return manager.current.Load(), err
+	}
+	current := manager.current.Load()
+	if current == nil || current.Version != catalog.Version {
+		published := catalog
+		manager.current.Store(&published)
+		current = &published
+	}
+	publishedHash := settingHash
+	manager.currentHash.Store(&publishedHash)
+	manager.currentBlockRevision.Store(report.BlockRevision)
+	publishedReport := report
+	manager.lastReport.Store(&publishedReport)
+	manager.lastRefresh.Store(time.Now().Unix())
+	manager.dirty.Store(false)
+	return current, nil
+}
+
+func smartCatalogSettingHash(setting smartroutersetting.Setting) (string, error) {
+	setting = smartroutersetting.Normalize(setting)
+	return smartContentHash("catalog-setting", struct {
+		Discovery       smartroutersetting.DiscoverySetting                 `json:"discovery"`
+		ChannelProfiles map[string]smartroutersetting.ChannelProfileSetting `json:"channel_profiles"`
+		DefaultPool     string                                              `json:"default_pool"`
+	}{
+		Discovery:       setting.Discovery,
+		ChannelProfiles: setting.ChannelProfiles,
+		DefaultPool:     setting.DefaultPolicy.PoolPolicy,
+	})
+}
+
+func (manager *CatalogManager) RefreshIfDue(ctx context.Context) (*smartrouter.CertifiedRouteCatalog, error) {
+	if manager == nil || manager.settings == nil {
+		return nil, ErrNoCurrentSmartCatalog
+	}
+	setting := manager.settings()
+	if !setting.Enabled {
+		manager.current.Store(nil)
+		manager.currentHash.Store(nil)
+		manager.currentBlockRevision.Store(0)
+		manager.dirty.Store(false)
+		return nil, ErrSmartRouterDisabled
+	}
+	current := manager.current.Load()
+	lastRefresh := manager.lastRefresh.Load()
+	blocksChanged := manager.globalSettings && manager.currentBlockRevision.Load() != GetSmartRouteBlockRevision()
+	refreshDue := lastRefresh == 0 || time.Now().Unix()-lastRefresh >= int64(setting.CatalogRefreshSeconds)
+	if current != nil && !manager.dirty.Load() && !refreshDue && !blocksChanged {
+		return current, nil
+	}
+	return manager.Refresh(ctx)
+}

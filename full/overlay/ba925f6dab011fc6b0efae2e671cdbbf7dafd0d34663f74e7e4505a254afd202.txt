@@ -1,0 +1,85 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestSessionGroupRefreshGrantRevokeAndFailClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldDB, oldRedis := model.DB, common.RedisEnabled
+	oldType := common.MainDatabaseType()
+	oldLogDB, oldLogType := model.LOG_DB, common.LogDatabaseType()
+	database, err := gorm.Open(sqlite.Open("file:session-group-refresh?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, common.RedisEnabled = database, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	t.Cleanup(func() {
+		model.DB, common.RedisEnabled = oldDB, oldRedis
+		common.SetMainDatabaseType(oldType)
+		model.LOG_DB = oldLogDB
+		common.SetLogDatabaseType(oldLogType)
+		connection, _ := database.DB()
+		_ = connection.Close()
+	})
+	require.NoError(t, database.AutoMigrate(&model.User{}))
+	require.NoError(t, database.Create(&model.User{Id: 7, Username: "alice", Group: "default", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}).Error)
+	router := gin.New()
+	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("session-group-refresh-test"))))
+	router.GET("/login", func(context *gin.Context) {
+		session := sessions.Default(context)
+		session.Set("id", 7)
+		session.Set("username", "alice")
+		session.Set("role", common.RoleCommonUser)
+		session.Set("status", common.UserStatusEnabled)
+		session.Set("group", "default")
+		require.NoError(t, session.Save())
+		context.Status(http.StatusNoContent)
+	})
+	router.GET("/catalog", UserAuth(), func(context *gin.Context) {
+		context.JSON(http.StatusOK, gin.H{"group": context.GetString("group"), "user_group": context.GetString("user_group")})
+	})
+	login := httptest.NewRecorder()
+	router.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "/login", nil))
+	cookies := login.Result().Cookies()
+	get := func(userID string, authenticated bool) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, "/catalog", nil)
+		request.Header.Set("New-Api-User", userID)
+		if authenticated {
+			for _, sessionCookie := range cookies {
+				request.AddCookie(sessionCookie)
+			}
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	for _, group := range []string{"default", "private-vip", "default"} {
+		require.NoError(t, database.Model(&model.User{}).Where("id = ?", 7).Update("group", group).Error)
+		response := get("7", true)
+		require.Equal(t, http.StatusOK, response.Code)
+		var payload map[string]string
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+		require.Equal(t, group, payload["group"])
+		require.Equal(t, group, payload["user_group"])
+		require.Empty(t, response.Result().Cookies())
+	}
+	require.Equal(t, http.StatusUnauthorized, get("8", true).Code)
+	require.Equal(t, http.StatusUnauthorized, get("7", false).Code)
+	require.NoError(t, database.Delete(&model.User{}, 7).Error)
+	require.Equal(t, http.StatusServiceUnavailable, get("7", true).Code)
+	require.NoError(t, database.Migrator().DropTable(&model.User{}))
+	require.Equal(t, http.StatusServiceUnavailable, get("7", true).Code)
+}

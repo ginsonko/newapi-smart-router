@@ -1,0 +1,86 @@
+package model
+
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
+
+func validTenantCostProductPool(value string) bool {
+	return validTenantCostPublicIdentifier(strings.TrimSpace(value), 64)
+}
+
+func validTenantCostServiceTier(value string) bool {
+	return validTenantCostPublicIdentifier(strings.TrimSpace(value), 32)
+}
+
+func tenantProviderClassHasToken(value, wanted string) bool {
+	wanted = strings.ToLower(strings.TrimSpace(wanted))
+	if wanted == "" {
+		return false
+	}
+	parts := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(value)), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	for _, part := range parts {
+		if part == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateTenantRouteProfile rejects ambiguous pricing/capability data before
+// it becomes a binding. It deliberately does not reject unknown future model
+// names; those remain pending until an operator supplies evidence.
+func ValidateTenantRouteProfile(profile *TenantRouteProfile) error {
+	if profile == nil || !IsValidTenantCostTenantID(profile.TenantID) ||
+		!validTenantCostPublicIdentifier(profile.ProfileID, 128) || !validTenantCostPublicIdentifier(profile.Revision, 96) ||
+		strings.TrimSpace(profile.ProductPoolID) == "" || strings.TrimSpace(profile.ServiceTier) == "" ||
+		strings.TrimSpace(profile.PublicLabel) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	productPoolID := strings.TrimSpace(profile.ProductPoolID)
+	serviceTier := strings.TrimSpace(profile.ServiceTier)
+	publicLabel := strings.TrimSpace(profile.PublicLabel)
+	if !validTenantCostProductPool(productPoolID) || !validTenantCostServiceTier(serviceTier) {
+		return fmt.Errorf("tenant route profile uses an invalid pool or service tier")
+	}
+	if profile.Status != "" && !validTenantBindingStatus(profile.Status) {
+		return fmt.Errorf("tenant route profile has an invalid status")
+	}
+	if !validTenantCostVisibleLabel(publicLabel, 64) {
+		return fmt.Errorf("tenant route profile public label is invalid")
+	}
+	if profile.MinRatioPPM < 0 || profile.MaxRatioPPM < 0 || profile.MaxRatioPPM > 0 && profile.MaxRatioPPM < profile.MinRatioPPM {
+		return ErrTenantCostInvalidInput
+	}
+	if strings.Contains(strings.ToLower(profile.CandidateSpec), "sk-") || strings.Contains(strings.ToLower(profile.CandidateSpec), "://") ||
+		strings.Contains(strings.ToLower(profile.CapabilitySpec), "sk-") || strings.Contains(strings.ToLower(profile.CapabilitySpec), "://") ||
+		strings.Contains(strings.ToLower(profile.ProviderClass), "sk-") || strings.Contains(strings.ToLower(profile.ProviderClass), "://") {
+		return fmt.Errorf("tenant route profile contains secret or URL material")
+	}
+	switch productPoolID {
+	case "claude_kiro", "claude_third_party", "claude_ccmax":
+		providerClass := strings.ToLower(strings.TrimSpace(profile.ProviderClass))
+		hasKiro := tenantProviderClassHasToken(providerClass, "kiro")
+		hasCCMax := tenantProviderClassHasToken(providerClass, "ccmax")
+		hasThirdParty := tenantProviderClassHasToken(providerClass, "third") ||
+			tenantProviderClassHasToken(providerClass, "thirdparty")
+		switch productPoolID {
+		case "claude_kiro":
+			if !hasKiro || hasCCMax || hasThirdParty {
+				return fmt.Errorf("Claude Kiro profile requires one explicit Kiro provider class")
+			}
+		case "claude_third_party":
+			if !hasThirdParty || hasKiro || hasCCMax {
+				return fmt.Errorf("third-party Claude profile requires one explicit third-party provider class")
+			}
+		case "claude_ccmax":
+			if !hasCCMax || hasKiro || hasThirdParty {
+				return fmt.Errorf("Claude CCMax profile requires one explicit CCMax provider class")
+			}
+		}
+	}
+	return nil
+}

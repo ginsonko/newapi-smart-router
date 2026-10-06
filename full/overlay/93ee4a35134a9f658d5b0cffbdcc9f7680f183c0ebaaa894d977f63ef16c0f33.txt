@@ -1,0 +1,1284 @@
+package model
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	MediaStorageBackendLocal  = "local"
+	MediaStorageBackendRemote = "remote"
+
+	MediaBlobStatusUploading = "uploading"
+	MediaBlobStatusReady     = "ready"
+	MediaBlobStatusDeleting  = "deleting"
+	MediaBlobStatusDeleted   = "deleted"
+	MediaBlobStatusFailed    = "failed"
+
+	MediaMaterializePending   = "pending"
+	MediaMaterializeRunning   = "running"
+	MediaMaterializeRetry     = "retry"
+	MediaMaterializeComplete  = "complete"
+	MediaMaterializeAbandoned = "abandoned"
+	MediaMaterializeDisabled  = "disabled"
+	// MediaMaterializePermanentlyUnavailable is an explicit terminal marker
+	// used by the bounded history repair job. It is deliberately distinct from
+	// abandoned/retry so the UI can explain that the source was checked and is
+	// no longer recoverable without making another task submission.
+	MediaMaterializePermanentlyUnavailable = "permanently_unavailable"
+
+	MediaModerationUnreviewed = "unreviewed"
+	MediaModerationApproved   = "approved"
+	MediaModerationViolation  = "violation"
+)
+
+var (
+	ErrMediaModerationForbidden      = errors.New("media moderation target is outside the administrator role boundary")
+	ErrMediaModerationReasonRequired = errors.New("media moderation reason is required")
+)
+
+// MediaBlob is the ownership and lifecycle boundary for every uploaded or
+// generated media object. Private storage coordinates are never serialized.
+type MediaBlob struct {
+	ID                     int64           `json:"-" gorm:"primaryKey;autoIncrement"`
+	PublicID               string          `json:"id" gorm:"type:varchar(191);uniqueIndex"`
+	UserID                 int             `json:"user_id,omitempty" gorm:"index;not null"`
+	UsernameSnapshot       string          `json:"username,omitempty" gorm:"type:varchar(64);index"`
+	Filename               string          `json:"filename" gorm:"type:varchar(255)"`
+	Purpose                string          `json:"purpose" gorm:"type:varchar(64);index"`
+	MediaType              string          `json:"type" gorm:"type:varchar(32);index"`
+	Role                   string          `json:"role" gorm:"type:varchar(32);index"`
+	SourceKind             string          `json:"source_kind" gorm:"type:varchar(32);index"`
+	StorageBackend         string          `json:"storage_backend" gorm:"type:varchar(32);index"`
+	ObjectKey              string          `json:"-" gorm:"type:text"`
+	PrivateSource          string          `json:"-" gorm:"type:text"`
+	ContentHash            string          `json:"content_hash,omitempty" gorm:"type:char(64);index"`
+	MimeType               string          `json:"mime_type" gorm:"type:varchar(128);index"`
+	SizeBytes              int64           `json:"size_bytes" gorm:"index"`
+	DurationSeconds        float64         `json:"duration_seconds,omitempty"`
+	Width                  int             `json:"width,omitempty"`
+	Height                 int             `json:"height,omitempty"`
+	HasAudio               bool            `json:"has_audio,omitempty"`
+	Status                 string          `json:"status" gorm:"type:varchar(24);index"`
+	TaskPublicID           string          `json:"task_id,omitempty" gorm:"type:varchar(191);index"`
+	ChannelID              int             `json:"channel_id,omitempty" gorm:"index"`
+	Model                  string          `json:"model,omitempty" gorm:"type:varchar(191);index"`
+	Group                  string          `json:"group,omitempty" gorm:"type:varchar(64);index"`
+	Metadata               json.RawMessage `json:"metadata,omitempty" gorm:"type:json"`
+	ModerationStatus       string          `json:"moderation_status" gorm:"type:varchar(24);index"`
+	ModerationReason       string          `json:"moderation_reason,omitempty" gorm:"type:text"`
+	AdminHold              bool            `json:"admin_hold" gorm:"index"`
+	AccessLeaseCount       int             `json:"-"`
+	AccessLeaseUntil       int64           `json:"-" gorm:"index"`
+	TaskLeaseCount         int             `json:"-" gorm:"index"`
+	MaterializeStatus      string          `json:"materialize_status,omitempty" gorm:"type:varchar(24);index"`
+	MaterializeAttempts    int             `json:"materialize_attempts,omitempty"`
+	MaterializeNextRetryAt int64           `json:"materialize_next_retry_at,omitempty" gorm:"index"`
+	MaterializeLastError   string          `json:"materialize_last_error,omitempty" gorm:"type:text"`
+	MaterializeLeaseOwner  string          `json:"-" gorm:"type:varchar(128);index"`
+	MaterializeLeaseUntil  int64           `json:"-" gorm:"index"`
+	MaterializedAt         int64           `json:"materialized_at,omitempty" gorm:"index"`
+	DeleteLeaseOwner       string          `json:"-" gorm:"type:varchar(128);index"`
+	DeleteLeaseUntil       int64           `json:"-" gorm:"index"`
+	CleanupAttempts        int             `json:"-" gorm:"not null;default:0"`
+	CleanupNextRetryAt     int64           `json:"-" gorm:"index"`
+	CleanupLastError       string          `json:"-" gorm:"type:text"`
+	LastAccessedAt         int64           `json:"last_accessed_at" gorm:"index"`
+	ExpiresAt              int64           `json:"expires_at" gorm:"index"`
+	DeletedAt              int64           `json:"deleted_at,omitempty" gorm:"index"`
+	CreatedAt              int64           `json:"created_at" gorm:"autoCreateTime;index"`
+	UpdatedAt              int64           `json:"updated_at" gorm:"autoUpdateTime"`
+}
+
+type TaskMediaInput struct {
+	ID          int64           `json:"id" gorm:"primaryKey;autoIncrement"`
+	TaskRowID   int64           `json:"task_row_id" gorm:"uniqueIndex:idx_task_media_input"`
+	MediaBlobID int64           `json:"media_blob_id" gorm:"uniqueIndex:idx_task_media_input;index"`
+	Type        string          `json:"type" gorm:"type:varchar(32)"`
+	Role        string          `json:"role" gorm:"type:varchar(32)"`
+	Position    int             `json:"index" gorm:"uniqueIndex:idx_task_media_input"`
+	Metadata    json.RawMessage `json:"metadata,omitempty" gorm:"type:json"`
+	ReleasedAt  int64           `json:"released_at,omitempty" gorm:"index"`
+	CreatedAt   int64           `json:"created_at" gorm:"autoCreateTime"`
+}
+
+type TaskMediaInputBinding struct {
+	MediaBlobID int64
+	Type        string
+	Role        string
+	Position    int
+	Metadata    json.RawMessage
+}
+
+type TaskArtifact struct {
+	ID                     int64           `json:"-" gorm:"primaryKey;autoIncrement"`
+	PublicAssetID          string          `json:"id" gorm:"type:varchar(191);uniqueIndex"`
+	TaskRowID              int64           `json:"task_row_id,omitempty" gorm:"index;uniqueIndex:idx_task_artifact_identity"`
+	TaskPublicID           string          `json:"task_id,omitempty" gorm:"type:varchar(191);index"`
+	MediaBlobID            int64           `json:"-" gorm:"index"`
+	UserID                 int             `json:"-" gorm:"index"`
+	ChannelID              int             `json:"-" gorm:"index"`
+	ProviderOutputIdentity string          `json:"-" gorm:"type:varchar(191);uniqueIndex:idx_task_artifact_identity"`
+	Type                   string          `json:"type" gorm:"type:varchar(32);index"`
+	Role                   string          `json:"role" gorm:"type:varchar(32);index"`
+	Position               int             `json:"index" gorm:"index"`
+	Status                 string          `json:"status" gorm:"type:varchar(24);index"`
+	MimeType               string          `json:"mime_type" gorm:"type:varchar(128)"`
+	Filename               string          `json:"filename" gorm:"type:varchar(255)"`
+	SizeBytes              int64           `json:"size_bytes,omitempty"`
+	DurationSeconds        float64         `json:"duration_seconds,omitempty"`
+	Width                  int             `json:"width,omitempty"`
+	Height                 int             `json:"height,omitempty"`
+	HasAudio               bool            `json:"has_audio,omitempty"`
+	Metadata               json.RawMessage `json:"metadata,omitempty" gorm:"type:json"`
+	ExpiresAt              int64           `json:"expires_at,omitempty" gorm:"index"`
+	CreatedAt              int64           `json:"created_at" gorm:"autoCreateTime;index"`
+	UpdatedAt              int64           `json:"updated_at" gorm:"autoUpdateTime"`
+}
+
+type MediaModerationEvent struct {
+	ID             int64  `json:"id" gorm:"primaryKey;autoIncrement"`
+	MediaBlobID    int64  `json:"media_blob_id" gorm:"index"`
+	PublicAssetID  string `json:"asset_id" gorm:"type:varchar(191);index"`
+	UserID         int    `json:"user_id" gorm:"index"`
+	Username       string `json:"username" gorm:"type:varchar(64);index"`
+	AdminUserID    int    `json:"admin_user_id" gorm:"index"`
+	Action         string `json:"action" gorm:"type:varchar(32);index"`
+	Reason         string `json:"reason" gorm:"type:text"`
+	PreviousStatus string `json:"previous_status" gorm:"type:varchar(24)"`
+	NewStatus      string `json:"new_status" gorm:"type:varchar(24)"`
+	CreatedAt      int64  `json:"created_at" gorm:"autoCreateTime;index"`
+}
+
+type MediaCleanupRun struct {
+	ID             int64  `json:"id" gorm:"primaryKey;autoIncrement"`
+	Trigger        string `json:"trigger" gorm:"type:varchar(32);index"`
+	RequestedBy    int    `json:"requested_by,omitempty" gorm:"index"`
+	CapacityBefore int64  `json:"capacity_before"`
+	CapacityAfter  int64  `json:"capacity_after"`
+	ExaminedCount  int    `json:"examined_count"`
+	DeletedCount   int    `json:"deleted_count"`
+	FreedBytes     int64  `json:"freed_bytes"`
+	ErrorCount     int    `json:"error_count"`
+	LastError      string `json:"last_error,omitempty" gorm:"type:text"`
+	StartedAt      int64  `json:"started_at" gorm:"index"`
+	FinishedAt     int64  `json:"finished_at" gorm:"index"`
+}
+
+type TaskDeliverySnapshot struct {
+	ID                      int64  `json:"-" gorm:"primaryKey;autoIncrement"`
+	TaskRowID               int64  `json:"task_row_id" gorm:"uniqueIndex"`
+	ChannelID               int    `json:"channel_id" gorm:"index"`
+	ChannelType             int    `json:"channel_type"`
+	UpstreamBaseURL         string `json:"-" gorm:"type:text"`
+	UpstreamProxy           string `json:"-" gorm:"type:text"`
+	UpstreamTaskID          string `json:"-" gorm:"type:varchar(191);index"`
+	CredentialRef           string `json:"-" gorm:"type:varchar(191)"`
+	ProviderContractVersion string `json:"provider_contract_version" gorm:"type:varchar(64)"`
+	CreatedAt               int64  `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt               int64  `json:"updated_at" gorm:"autoUpdateTime"`
+}
+
+// MediaMaterializationCredential is an internal, non-serializable view of the
+// immutable task delivery contract. Callers must still prove that the media
+// source belongs to this exact provider task before using Credential.
+type MediaMaterializationCredential struct {
+	Credential      string `json:"-"`
+	UpstreamBaseURL string `json:"-"`
+	UpstreamTaskID  string `json:"-"`
+	ResultURL       string `json:"-"`
+}
+
+type MediaStorageState struct {
+	ID                 int    `json:"id" gorm:"primaryKey"`
+	UsedBytes          int64  `json:"used_bytes"`
+	ReservedBytes      int64  `json:"reserved_bytes"`
+	PhysicalUsedBytes  int64  `json:"physical_used_bytes"`
+	LedgerBytesAtScan  int64  `json:"-"`
+	UntrackedBytes     int64  `json:"untracked_bytes"`
+	TemporaryBytes     int64  `json:"temporary_bytes"`
+	PhysicalFileCount  int64  `json:"physical_file_count"`
+	UntrackedFileCount int64  `json:"untracked_file_count"`
+	TemporaryFileCount int64  `json:"temporary_file_count"`
+	LastScannedAt      int64  `json:"last_scanned_at" gorm:"index"`
+	LastScanError      string `json:"last_scan_error,omitempty" gorm:"type:text"`
+	CleanupLeaseOwner  string `json:"-" gorm:"type:varchar(128);index"`
+	CleanupLeaseUntil  int64  `json:"-" gorm:"index"`
+	UpdatedAt          int64  `json:"updated_at" gorm:"autoUpdateTime"`
+}
+
+type MediaStorageReservation struct {
+	ID        int64  `json:"-" gorm:"primaryKey;autoIncrement"`
+	Token     string `json:"-" gorm:"type:varchar(191);uniqueIndex"`
+	UserID    int    `json:"-" gorm:"index"`
+	Bytes     int64  `json:"-"`
+	State     string `json:"-" gorm:"type:varchar(24);index"`
+	ExpiresAt int64  `json:"-" gorm:"index"`
+	CreatedAt int64  `json:"-" gorm:"autoCreateTime"`
+	UpdatedAt int64  `json:"-" gorm:"autoUpdateTime"`
+}
+
+func EnsureMediaStorageState(tx *gorm.DB) (*MediaStorageState, error) {
+	state := &MediaStorageState{ID: 1}
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).FirstOrCreate(state, MediaStorageState{ID: 1}).Error; err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func GetMediaBlob(publicID string) (*MediaBlob, error) {
+	var blob MediaBlob
+	err := DB.Where("public_id = ? AND deleted_at = 0", publicID).First(&blob).Error
+	return &blob, err
+}
+
+func GetMediaBlobForUser(userID int, publicID string) (*MediaBlob, error) {
+	var blob MediaBlob
+	err := DB.Where("user_id = ? AND public_id = ? AND deleted_at = 0", userID, publicID).First(&blob).Error
+	return &blob, err
+}
+
+type MediaAssetPrompt struct {
+	Prompt    string
+	Truncated bool
+}
+
+type mediaAssetTaskKey struct {
+	UserID int
+	TaskID string
+}
+
+const maxMediaAssetPromptRunes = 4096
+
+// ListMediaAssetPrompts projects prompts for an asset page with one task
+// query. Task-backed prompts take precedence over synchronous image metadata.
+func ListMediaAssetPrompts(blobs []MediaBlob) (map[int64]MediaAssetPrompt, error) {
+	result := make(map[int64]MediaAssetPrompt, len(blobs))
+	uniqueTaskKeys := make(map[mediaAssetTaskKey]struct{})
+	taskKeys := make([]mediaAssetTaskKey, 0, len(blobs))
+	for index := range blobs {
+		blob := &blobs[index]
+		if prompt, ok := mediaAssetPromptFromMetadata(blob.Metadata); ok {
+			result[blob.ID] = prompt
+		}
+		if blob.UserID <= 0 || strings.TrimSpace(blob.TaskPublicID) == "" {
+			continue
+		}
+		key := mediaAssetTaskKey{UserID: blob.UserID, TaskID: blob.TaskPublicID}
+		if _, exists := uniqueTaskKeys[key]; exists {
+			continue
+		}
+		uniqueTaskKeys[key] = struct{}{}
+		taskKeys = append(taskKeys, key)
+	}
+	if len(taskKeys) == 0 {
+		return result, nil
+	}
+
+	conditions := make([]string, 0, len(taskKeys))
+	arguments := make([]any, 0, len(taskKeys)*2)
+	for _, key := range taskKeys {
+		conditions = append(conditions, "(user_id = ? AND task_id = ?)")
+		arguments = append(arguments, key.UserID, key.TaskID)
+	}
+	var tasks []Task
+	if err := DB.Select("id", "user_id", "task_id", "properties").
+		Where(strings.Join(conditions, " OR "), arguments...).
+		Order("id DESC").Find(&tasks).Error; err != nil {
+		return result, err
+	}
+	taskPrompts := make(map[mediaAssetTaskKey]MediaAssetPrompt, len(tasks))
+	for index := range tasks {
+		task := &tasks[index]
+		key := mediaAssetTaskKey{UserID: task.UserId, TaskID: task.TaskID}
+		if _, exists := taskPrompts[key]; exists || strings.TrimSpace(task.Properties.Input) == "" {
+			continue
+		}
+		taskPrompts[key] = boundedMediaAssetPrompt(task.Properties.Input, false)
+	}
+	for index := range blobs {
+		blob := &blobs[index]
+		if prompt, exists := taskPrompts[mediaAssetTaskKey{UserID: blob.UserID, TaskID: blob.TaskPublicID}]; exists {
+			result[blob.ID] = prompt
+		}
+	}
+	return result, nil
+}
+
+func mediaAssetPromptFromMetadata(metadata json.RawMessage) (MediaAssetPrompt, bool) {
+	if len(metadata) == 0 {
+		return MediaAssetPrompt{}, false
+	}
+	var value map[string]any
+	if err := common.Unmarshal(metadata, &value); err != nil {
+		return MediaAssetPrompt{}, false
+	}
+	prompt, _ := value["request_prompt"].(string)
+	if strings.TrimSpace(prompt) == "" {
+		return MediaAssetPrompt{}, false
+	}
+	truncated, _ := value["request_prompt_truncated"].(bool)
+	return boundedMediaAssetPrompt(prompt, truncated), true
+}
+
+func boundedMediaAssetPrompt(prompt string, alreadyTruncated bool) MediaAssetPrompt {
+	runes := 0
+	for index := range prompt {
+		if runes == maxMediaAssetPromptRunes {
+			return MediaAssetPrompt{Prompt: prompt[:index], Truncated: true}
+		}
+		runes++
+	}
+	return MediaAssetPrompt{Prompt: prompt, Truncated: alreadyTruncated}
+}
+
+func ListMediaBlobsByIDs(ids []int64) (map[int64]MediaBlob, error) {
+	result := make(map[int64]MediaBlob, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	var blobs []MediaBlob
+	if err := DB.Where("id IN ?", ids).Find(&blobs).Error; err != nil {
+		return nil, err
+	}
+	for index := range blobs {
+		blob := blobs[index]
+		result[blob.ID] = blob
+	}
+	return result, nil
+}
+
+// ListMediaHistoryRepairBlobs returns a bounded, deterministic set of media
+// rows that may need reconciliation after a storage mount change or an
+// interrupted materialization. It intentionally excludes deleted rows and
+// never treats a database row as proof that its bytes exist.
+func ListMediaHistoryRepairBlobs(limit int) ([]MediaBlob, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	var blobs []MediaBlob
+	err := DB.Where("deleted_at = 0").Where(
+		"status <> ? OR storage_backend = ? OR materialize_status IN ?",
+		MediaBlobStatusReady, MediaStorageBackendLocal,
+		[]string{MediaMaterializeAbandoned, MediaMaterializeRetry, MediaMaterializePending},
+	).Order("updated_at ASC, id ASC").Limit(limit).Find(&blobs).Error
+	return blobs, err
+}
+
+// RestoreMediaBlobFromLocalObject marks a row ready only after the caller has
+// verified the object bytes. No billing/task state is touched.
+func RestoreMediaBlobFromLocalObject(blobID int64, sizeBytes int64) error {
+	if blobID <= 0 || sizeBytes <= 0 {
+		return errors.New("invalid local media restoration")
+	}
+	return DB.Model(&MediaBlob{}).Where("id = ? AND deleted_at = 0", blobID).Updates(map[string]any{
+		"status":                 MediaBlobStatusReady,
+		"size_bytes":             sizeBytes,
+		"materialize_status":     MediaMaterializeComplete,
+		"materialize_last_error": "",
+		"materialized_at":        time.Now().Unix(),
+		"updated_at":             time.Now().Unix(),
+	}).Error
+}
+
+// RequeueMediaMaterialization resets only the materializer state. It does not
+// create a task, alter a task status, or create a billing/settlement record.
+func RequeueMediaMaterialization(blobID int64) error {
+	if blobID <= 0 {
+		return errors.New("invalid media blob")
+	}
+	now := time.Now().Unix()
+	return DB.Model(&MediaBlob{}).Where("id = ? AND deleted_at = 0", blobID).Updates(map[string]any{
+		"status":                    MediaBlobStatusReady,
+		"materialize_status":        MediaMaterializePending,
+		"materialize_attempts":      0,
+		"materialize_next_retry_at": now,
+		"materialize_last_error":    "history repair requeued source",
+		"materialize_lease_owner":   "",
+		"materialize_lease_until":   0,
+	}).Error
+}
+
+// MarkMediaPermanentlyUnavailable records an explicit, user-visible terminal
+// state after local and remote source checks fail. The row remains queryable so
+// operators can audit what was lost; it is never silently reported as ready.
+func MarkMediaPermanentlyUnavailable(blobID int64, reason string) error {
+	if blobID <= 0 {
+		return errors.New("invalid media blob")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "media source is unavailable"
+	}
+	if len(reason) > 1024 {
+		reason = reason[:1024]
+	}
+	return DB.Model(&MediaBlob{}).Where("id = ? AND deleted_at = 0", blobID).Updates(map[string]any{
+		"status":                  MediaBlobStatusFailed,
+		"materialize_status":      MediaMaterializePermanentlyUnavailable,
+		"materialize_last_error":  reason,
+		"materialize_lease_owner": "",
+		"materialize_lease_until": 0,
+	}).Error
+}
+
+func GetMediaBlobByAssetID(userID int, assetID string, admin bool) (*MediaBlob, *TaskArtifact, error) {
+	var artifact TaskArtifact
+	query := DB.Where("public_asset_id = ? AND status = ?", assetID, "ready")
+	if !admin {
+		query = query.Where("user_id = ?", userID)
+	}
+	artifactLookup := query.Limit(1).Find(&artifact)
+	if artifactLookup.Error != nil {
+		return nil, nil, artifactLookup.Error
+	}
+	if artifactLookup.RowsAffected == 0 {
+		return nil, nil, gorm.ErrRecordNotFound
+	}
+	var blob MediaBlob
+	blobQuery := DB.Where("id = ? AND deleted_at = 0 AND status = ?", artifact.MediaBlobID, MediaBlobStatusReady)
+	if !admin {
+		blobQuery = blobQuery.Where("user_id = ?", userID)
+	}
+	if err := blobQuery.First(&blob).Error; err != nil {
+		return nil, nil, err
+	}
+	return &blob, &artifact, nil
+}
+
+type MediaListFilter struct {
+	UserID            int
+	Username          string
+	Purpose           string
+	MediaType         string
+	Status            string
+	ModerationStatus  string
+	TaskPublicID      string
+	ChannelID         int
+	Model             string
+	Group             string
+	StorageBackend    string
+	MaterializeStatus string
+	Search            string
+	IncludeDeleted    bool
+}
+
+// ListStudioOperationBlobs projects synchronous studio outputs (whose
+// operation id is stored in task_public_id) for the workbench history. These
+// rows have no Task record by design, so they must be queried separately from
+// async provider tasks and grouped by the stable operation id by the caller.
+func ListStudioOperationBlobs(userID int, limit int) ([]MediaBlob, error) {
+	if userID <= 0 {
+		return nil, fmt.Errorf("invalid media user")
+	}
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	var blobs []MediaBlob
+	err := DB.Where("user_id = ? AND deleted_at = 0 AND status = ?", userID, MediaBlobStatusReady).
+		Where("task_public_id LIKE ?", "studio_%").
+		Where("media_type IN ?", []string{"image", "video"}).
+		Order("created_at DESC, id DESC").Limit(limit).Find(&blobs).Error
+	return blobs, err
+}
+
+type MediaStorageOverview struct {
+	UsedBytes          int64  `json:"used_bytes"`
+	ReservedBytes      int64  `json:"reserved_bytes"`
+	PhysicalUsedBytes  int64  `json:"physical_used_bytes"`
+	EffectiveUsedBytes int64  `json:"effective_used_bytes"`
+	UntrackedBytes     int64  `json:"untracked_bytes"`
+	TemporaryBytes     int64  `json:"temporary_bytes"`
+	PhysicalFileCount  int64  `json:"physical_file_count"`
+	UntrackedFileCount int64  `json:"untracked_file_count"`
+	TemporaryFileCount int64  `json:"temporary_file_count"`
+	LastScannedAt      int64  `json:"last_scanned_at"`
+	LastScanError      string `json:"last_scan_error,omitempty"`
+	ReadyCount         int64  `json:"ready_count"`
+	UploadingCount     int64  `json:"uploading_count"`
+	FailedCount        int64  `json:"failed_count"`
+	DeletedCount       int64  `json:"deleted_count"`
+	UnreviewedCount    int64  `json:"unreviewed_count"`
+	ViolationCount     int64  `json:"violation_count"`
+	ProtectedCount     int64  `json:"protected_count"`
+	OldestAssetAt      int64  `json:"oldest_asset_at"`
+	NewestAssetAt      int64  `json:"newest_asset_at"`
+}
+
+func ListMediaBlobs(start, limit int, filter MediaListFilter) ([]MediaBlob, int64, error) {
+	query := DB.Model(&MediaBlob{})
+	if !filter.IncludeDeleted {
+		query = query.Where("deleted_at = 0")
+		// A task:// blob is a compatibility proxy for clients that only know the
+		// historical single-video endpoint. Once the same task has a concrete
+		// provider artifact, listing both creates a second 0 B card for one real
+		// output. Keep the proxy durable for old links, but hide it from ordinary
+		// asset listings and totals while a concrete sibling is available.
+		query = query.Where(`NOT (
+			media_blobs.private_source LIKE ? AND EXISTS (
+				SELECT 1
+				FROM task_artifacts AS concrete_artifact
+				JOIN media_blobs AS concrete_blob ON concrete_blob.id = concrete_artifact.media_blob_id
+				WHERE concrete_artifact.task_public_id = media_blobs.task_public_id
+				  AND concrete_artifact.type = media_blobs.media_type
+				  AND concrete_artifact.provider_output_identity <> ?
+				  AND concrete_artifact.provider_output_identity NOT LIKE ?
+				  AND concrete_blob.deleted_at = 0
+				  AND concrete_blob.status = ?
+			)
+		)`, "task://%", "task.result_url", "task-proxy:%", MediaBlobStatusReady)
+	}
+	if filter.UserID != 0 {
+		query = query.Where("user_id = ?", filter.UserID)
+	}
+	if filter.Username != "" {
+		query = query.Where("username_snapshot = ?", filter.Username)
+	}
+	if filter.Purpose != "" {
+		query = query.Where("purpose = ?", filter.Purpose)
+	}
+	if filter.MediaType != "" {
+		query = query.Where("media_type = ?", filter.MediaType)
+	}
+	if filter.Status != "" {
+		query = query.Where("status = ?", filter.Status)
+	}
+	if filter.ModerationStatus != "" {
+		query = query.Where("moderation_status = ?", filter.ModerationStatus)
+	}
+	if filter.TaskPublicID != "" {
+		query = query.Where("task_public_id = ?", filter.TaskPublicID)
+	}
+	if filter.ChannelID > 0 {
+		query = query.Where("channel_id = ?", filter.ChannelID)
+	}
+	if filter.Model != "" {
+		query = query.Where("model = ?", filter.Model)
+	}
+	if filter.Group != "" {
+		query = query.Where(commonGroupCol+" = ?", filter.Group)
+	}
+	if filter.StorageBackend != "" {
+		query = query.Where("storage_backend = ?", filter.StorageBackend)
+	}
+	if filter.MaterializeStatus != "" {
+		query = query.Where("materialize_status = ?", filter.MaterializeStatus)
+	}
+	if filter.Search != "" {
+		pattern := "%" + filter.Search + "%"
+		query = query.Where("public_id LIKE ? OR filename LIKE ? OR model LIKE ?", pattern, pattern, pattern)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var blobs []MediaBlob
+	if err := query.Order("created_at DESC, id DESC").Offset(start).Limit(limit).Find(&blobs).Error; err != nil {
+		return nil, 0, err
+	}
+	return blobs, total, nil
+}
+
+func ListTaskArtifacts(userID int, taskPublicID string) ([]TaskArtifact, error) {
+	var artifacts []TaskArtifact
+	err := DB.Where("user_id = ? AND task_public_id = ?", userID, taskPublicID).
+		Order("position ASC, id ASC").Find(&artifacts).Error
+	return artifacts, err
+}
+
+func ListTaskArtifactsForTasks(userID int, taskPublicIDs []string) (map[string][]TaskArtifact, error) {
+	result := make(map[string][]TaskArtifact, len(taskPublicIDs))
+	if userID <= 0 || len(taskPublicIDs) == 0 {
+		return result, nil
+	}
+	var artifacts []TaskArtifact
+	if err := DB.Where("user_id = ? AND task_public_id IN ?", userID, taskPublicIDs).
+		Order("task_public_id ASC, position ASC, id ASC").Find(&artifacts).Error; err != nil {
+		return nil, err
+	}
+	for index := range artifacts {
+		artifact := artifacts[index]
+		result[artifact.TaskPublicID] = append(result[artifact.TaskPublicID], artifact)
+	}
+	return result, nil
+}
+
+// ListDeliverableTaskArtifacts is the user-facing artifact projection. Raw
+// artifact rows remain available through ListTaskArtifacts for archive
+// idempotency and audit, but deleted or unresolved rows must never become
+// clickable result links again.
+func ListDeliverableTaskArtifacts(userID int, taskPublicID string) ([]TaskArtifact, error) {
+	var artifacts []TaskArtifact
+	err := deliverableTaskArtifactsQuery(userID).
+		Where("artifact.task_public_id = ?", taskPublicID).
+		Order("artifact.position ASC, artifact.id ASC").
+		Find(&artifacts).Error
+	return artifacts, err
+}
+
+func ListDeliverableTaskArtifactsForTasks(userID int, taskPublicIDs []string) (map[string][]TaskArtifact, error) {
+	result := make(map[string][]TaskArtifact, len(taskPublicIDs))
+	if userID <= 0 || len(taskPublicIDs) == 0 {
+		return result, nil
+	}
+	var artifacts []TaskArtifact
+	if err := deliverableTaskArtifactsQuery(userID).
+		Where("artifact.task_public_id IN ?", taskPublicIDs).
+		Order("artifact.task_public_id ASC, artifact.position ASC, artifact.id ASC").
+		Find(&artifacts).Error; err != nil {
+		return nil, err
+	}
+	for index := range artifacts {
+		artifact := artifacts[index]
+		result[artifact.TaskPublicID] = append(result[artifact.TaskPublicID], artifact)
+	}
+	return result, nil
+}
+
+func deliverableTaskArtifactsQuery(userID int) *gorm.DB {
+	return DB.Table("task_artifacts AS artifact").
+		Select("artifact.*").
+		Joins("JOIN media_blobs AS blob ON blob.id = artifact.media_blob_id AND blob.user_id = artifact.user_id").
+		Where("artifact.user_id = ? AND artifact.status = ?", userID, "ready").
+		Where("blob.deleted_at = 0 AND blob.status = ?", MediaBlobStatusReady).
+		Where("COALESCE(blob.moderation_status, '') <> ?", MediaModerationViolation).
+		Where(`(
+			(blob.storage_backend = ? AND blob.object_key <> '' AND blob.size_bytes > 0) OR
+			(blob.storage_backend = ? AND blob.private_source <> '')
+		)`, MediaStorageBackendLocal, MediaStorageBackendRemote)
+}
+
+func GetMediaStorageOverview() (MediaStorageOverview, error) {
+	overview := MediaStorageOverview{}
+	state := MediaStorageState{ID: 1}
+	if err := DB.FirstOrCreate(&state, MediaStorageState{ID: 1}).Error; err != nil {
+		return overview, err
+	}
+	overview.UsedBytes = state.UsedBytes
+	overview.ReservedBytes = state.ReservedBytes
+	overview.PhysicalUsedBytes = state.PhysicalUsedBytes
+	physicalWithLedgerDelta := state.PhysicalUsedBytes
+	if state.UsedBytes > state.LedgerBytesAtScan {
+		physicalWithLedgerDelta += state.UsedBytes - state.LedgerBytesAtScan
+	}
+	overview.EffectiveUsedBytes = max(state.UsedBytes, physicalWithLedgerDelta)
+	overview.UntrackedBytes = state.UntrackedBytes
+	overview.TemporaryBytes = state.TemporaryBytes
+	overview.PhysicalFileCount = state.PhysicalFileCount
+	overview.UntrackedFileCount = state.UntrackedFileCount
+	overview.TemporaryFileCount = state.TemporaryFileCount
+	overview.LastScannedAt = state.LastScannedAt
+	overview.LastScanError = state.LastScanError
+
+	counts := []struct {
+		Status string
+		Count  int64
+	}{}
+	if err := DB.Model(&MediaBlob{}).Select("status, COUNT(*) AS count").Group("status").Scan(&counts).Error; err != nil {
+		return overview, err
+	}
+	for _, row := range counts {
+		switch row.Status {
+		case MediaBlobStatusReady:
+			overview.ReadyCount = row.Count
+		case MediaBlobStatusUploading:
+			overview.UploadingCount = row.Count
+		case MediaBlobStatusFailed:
+			overview.FailedCount = row.Count
+		case MediaBlobStatusDeleted:
+			overview.DeletedCount = row.Count
+		}
+	}
+	if err := DB.Model(&MediaBlob{}).Where("deleted_at = 0 AND moderation_status = ?", MediaModerationUnreviewed).Count(&overview.UnreviewedCount).Error; err != nil {
+		return overview, err
+	}
+	if err := DB.Model(&MediaBlob{}).Where("deleted_at = 0 AND moderation_status = ?", MediaModerationViolation).Count(&overview.ViolationCount).Error; err != nil {
+		return overview, err
+	}
+	if err := DB.Model(&MediaBlob{}).Where("deleted_at = 0 AND admin_hold = ?", true).Count(&overview.ProtectedCount).Error; err != nil {
+		return overview, err
+	}
+	_ = DB.Model(&MediaBlob{}).Where("deleted_at = 0").Select("COALESCE(MIN(created_at), 0)").Scan(&overview.OldestAssetAt).Error
+	_ = DB.Model(&MediaBlob{}).Where("deleted_at = 0").Select("COALESCE(MAX(created_at), 0)").Scan(&overview.NewestAssetAt).Error
+	return overview, nil
+}
+
+func ListMediaCleanupRuns(start, limit int) ([]MediaCleanupRun, int64, error) {
+	query := DB.Model(&MediaCleanupRun{})
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var runs []MediaCleanupRun
+	if err := query.Order("started_at DESC, id DESC").Offset(start).Limit(limit).Find(&runs).Error; err != nil {
+		return nil, 0, err
+	}
+	return runs, total, nil
+}
+
+func ListMediaModerationEvents(start, limit int, userID int, action string) ([]MediaModerationEvent, int64, error) {
+	query := DB.Model(&MediaModerationEvent{})
+	if userID > 0 {
+		query = query.Where("user_id = ?", userID)
+	}
+	if action != "" {
+		query = query.Where("action = ?", action)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var events []MediaModerationEvent
+	if err := query.Order("created_at DESC, id DESC").Offset(start).Limit(limit).Find(&events).Error; err != nil {
+		return nil, 0, err
+	}
+	return events, total, nil
+}
+
+func UpdateMediaAccess(blobID int64) {
+	_ = DB.Model(&MediaBlob{}).Where("id = ?", blobID).Update("last_accessed_at", time.Now().Unix()).Error
+}
+
+func AcquireMediaAccessLease(blobID int64) error {
+	leaseUntil := time.Now().Add(24 * time.Hour).Unix()
+	result := DB.Model(&MediaBlob{}).
+		Where("id = ? AND deleted_at = 0 AND status = ?", blobID, MediaBlobStatusReady).
+		Updates(map[string]any{
+			"access_lease_count": gorm.Expr("access_lease_count + 1"),
+			"access_lease_until": gorm.Expr("CASE WHEN access_lease_until > ? THEN access_lease_until ELSE ? END", leaseUntil, leaseUntil),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func ReleaseMediaAccessLease(blobID int64) {
+	_ = DB.Model(&MediaBlob{}).Where("id = ?", blobID).
+		Updates(map[string]any{
+			"access_lease_count": gorm.Expr("CASE WHEN access_lease_count > 0 THEN access_lease_count - 1 ELSE 0 END"),
+			"access_lease_until": gorm.Expr("CASE WHEN access_lease_count <= 1 THEN 0 ELSE access_lease_until END"),
+		}).Error
+}
+
+func AcquireMediaTaskLease(blobID int64) error {
+	result := DB.Model(&MediaBlob{}).
+		Where("id = ? AND deleted_at = 0 AND status = ?", blobID, MediaBlobStatusReady).
+		UpdateColumn("task_lease_count", gorm.Expr("task_lease_count + 1"))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func ReleaseMediaTaskLease(blobID int64) {
+	_ = DB.Model(&MediaBlob{}).Where("id = ?", blobID).
+		UpdateColumn("task_lease_count", gorm.Expr("CASE WHEN task_lease_count > 0 THEN task_lease_count - 1 ELSE 0 END")).Error
+}
+
+// BindTaskMediaInputs persists the leases already acquired while normalizing a
+// request. The rows become the durable authority for releasing those leases
+// when the asynchronous task reaches a terminal state.
+func BindTaskMediaInputs(taskRowID int64, bindings []TaskMediaInputBinding) error {
+	if taskRowID <= 0 || len(bindings) == 0 {
+		return nil
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var task Task
+		if err := tx.Select("id", "user_id").Where("id = ?", taskRowID).First(&task).Error; err != nil {
+			return err
+		}
+		if err := validateTaskMediaInputOwnership(tx, task.UserId, bindings); err != nil {
+			return err
+		}
+		return createTaskMediaInputs(tx, taskRowID, bindings)
+	})
+}
+
+// InsertTaskWithMediaInputs makes the accepted task and its input-retention
+// authority visible atomically. A tracked asynchronous task can therefore
+// never exist without the leases that keep its reference files alive.
+func InsertTaskWithMediaInputs(task *Task, bindings []TaskMediaInputBinding) error {
+	return InsertTaskWithMediaInputsAndSnapshot(task, bindings, nil)
+}
+
+func InsertTaskWithMediaInputsAndSnapshot(task *Task, bindings []TaskMediaInputBinding, snapshot *TaskDeliverySnapshot) error {
+	if task == nil || task.UserId <= 0 {
+		return fmt.Errorf("invalid task media input owner")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := validateTaskMediaInputOwnership(tx, task.UserId, bindings); err != nil {
+			return err
+		}
+		if task.PrivateData.ImageTask != nil {
+			var user User
+			if err := lockForUpdate(tx).Select("id").First(&user, task.UserId).Error; err != nil {
+				return err
+			}
+			var count int64
+			if err := tx.Model(&Task{}).Where("user_id = ? AND task_id = ?", task.UserId, task.TaskID).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				return ErrImageTaskExists
+			}
+		}
+		if err := tx.Create(task).Error; err != nil {
+			return err
+		}
+		if _, err := ensureTaskBillingReceiptTx(tx, task, false); err != nil {
+			return err
+		}
+		if err := createTaskMediaInputs(tx, task.ID, bindings); err != nil {
+			return err
+		}
+		if task.PrivateData.ImageTask != nil && task.PrivateData.ImageTask.RouteJobID > 0 {
+			if err := bindImageRouteJobTaskTx(tx, task.PrivateData.ImageTask.RouteJobID, task.TaskID); err != nil {
+				return err
+			}
+		}
+		if snapshot == nil {
+			return nil
+		}
+		snapshot.TaskRowID = task.ID
+		if snapshot.ChannelID == 0 {
+			snapshot.ChannelID = task.ChannelId
+		}
+		if snapshot.UpstreamTaskID == "" {
+			snapshot.UpstreamTaskID = task.GetUpstreamTaskID()
+		}
+		return tx.Create(snapshot).Error
+	})
+}
+
+func validateTaskMediaInputOwnership(tx *gorm.DB, userID int, bindings []TaskMediaInputBinding) error {
+	if len(bindings) == 0 {
+		return nil
+	}
+	blobIDs := make([]int64, 0, len(bindings))
+	seen := make(map[int64]struct{}, len(bindings))
+	for _, binding := range bindings {
+		if binding.MediaBlobID <= 0 {
+			return gorm.ErrRecordNotFound
+		}
+		if _, exists := seen[binding.MediaBlobID]; exists {
+			continue
+		}
+		seen[binding.MediaBlobID] = struct{}{}
+		blobIDs = append(blobIDs, binding.MediaBlobID)
+	}
+	var count int64
+	if err := tx.Model(&MediaBlob{}).
+		Where("id IN ? AND user_id = ? AND deleted_at = 0 AND status = ? AND task_lease_count > 0",
+			blobIDs, userID, MediaBlobStatusReady).
+		Count(&count).Error; err != nil {
+		return err
+	}
+	if count != int64(len(blobIDs)) {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func createTaskMediaInputs(tx *gorm.DB, taskRowID int64, bindings []TaskMediaInputBinding) error {
+	for _, binding := range bindings {
+		input := TaskMediaInput{
+			TaskRowID: taskRowID, MediaBlobID: binding.MediaBlobID,
+			Type: binding.Type, Role: binding.Role, Position: binding.Position,
+			Metadata: binding.Metadata,
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&input).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReleaseTaskMediaInputs is idempotent across pollers and process retries.
+// Only rows transitioned from unreleased to released decrement the blob lease.
+func ReleaseTaskMediaInputs(taskRowID int64) error {
+	if taskRowID <= 0 {
+		return nil
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var inputs []TaskMediaInput
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("task_row_id = ? AND released_at = 0", taskRowID).Find(&inputs).Error; err != nil {
+			return err
+		}
+		if len(inputs) == 0 {
+			return nil
+		}
+		ids := make([]int64, 0, len(inputs))
+		for _, input := range inputs {
+			ids = append(ids, input.ID)
+		}
+		now := time.Now().Unix()
+		if err := tx.Model(&TaskMediaInput{}).Where("id IN ? AND released_at = 0", ids).
+			Update("released_at", now).Error; err != nil {
+			return err
+		}
+		blobIDs := make(map[int64]struct{}, len(inputs))
+		for _, input := range inputs {
+			blobIDs[input.MediaBlobID] = struct{}{}
+		}
+		for blobID := range blobIDs {
+			if err := tx.Model(&MediaBlob{}).Where("id = ?", blobID).
+				UpdateColumn("task_lease_count", gorm.Expr("CASE WHEN task_lease_count > 0 THEN task_lease_count - 1 ELSE 0 END")).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func GetTaskDeliverySnapshot(taskRowID int64) (*TaskDeliverySnapshot, error) {
+	var snapshot TaskDeliverySnapshot
+	err := DB.Where("task_row_id = ?", taskRowID).First(&snapshot).Error
+	return &snapshot, err
+}
+
+func GetMediaMaterializationCredential(blobID int64) (*MediaMaterializationCredential, error) {
+	if blobID <= 0 {
+		return nil, fmt.Errorf("media blob id is required")
+	}
+	var artifact TaskArtifact
+	if err := DB.Where("media_blob_id = ?", blobID).Order("id DESC").First(&artifact).Error; err != nil {
+		return nil, err
+	}
+	var task Task
+	if err := DB.Where("id = ?", artifact.TaskRowID).First(&task).Error; err != nil {
+		return nil, err
+	}
+	snapshot, err := GetTaskDeliverySnapshot(task.ID)
+	if err != nil {
+		return nil, err
+	}
+	// The snapshot is created before an asynchronous provider submission can
+	// assign its real task id. Prefer the immutable task private-data value when
+	// it is available; otherwise a stale local task id makes a completed video
+	// download target the local proxy and leaves the task at 99% forever.
+	upstreamTaskID := strings.TrimSpace(snapshot.UpstreamTaskID)
+	if task.PrivateData.UpstreamTaskID != "" {
+		upstreamTaskID = strings.TrimSpace(task.PrivateData.UpstreamTaskID)
+	}
+	credential := ""
+	if strings.TrimSpace(snapshot.CredentialRef) == "task.private_data.key" {
+		credential = strings.TrimSpace(task.PrivateData.Key)
+	}
+	return &MediaMaterializationCredential{
+		Credential: credential, UpstreamBaseURL: strings.TrimSpace(snapshot.UpstreamBaseURL),
+		UpstreamTaskID: upstreamTaskID,
+		ResultURL:      strings.TrimSpace(task.GetResultURL()),
+	}, nil
+}
+
+// ReconcileTaskMediaInputLeases rebuilds durable task retention from the
+// binding rows. Transient download leases are deliberately independent, so a
+// blue-green startup cannot invalidate a file that the old instance is still
+// streaming.
+func ReconcileTaskMediaInputLeases() error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var inputs []TaskMediaInput
+		if err := tx.Where("released_at = 0").Find(&inputs).Error; err != nil {
+			return err
+		}
+		taskIDs := make([]int64, 0, len(inputs))
+		seenTasks := make(map[int64]struct{}, len(inputs))
+		for _, input := range inputs {
+			if _, exists := seenTasks[input.TaskRowID]; exists {
+				continue
+			}
+			seenTasks[input.TaskRowID] = struct{}{}
+			taskIDs = append(taskIDs, input.TaskRowID)
+		}
+		tasks := make([]Task, 0, len(taskIDs))
+		if len(taskIDs) > 0 {
+			if err := tx.Select("id", "status").Where("id IN ?", taskIDs).Find(&tasks).Error; err != nil {
+				return err
+			}
+		}
+		activeTasks := make(map[int64]struct{}, len(tasks))
+		for _, task := range tasks {
+			if task.Status != TaskStatusSuccess && task.Status != TaskStatusFailure {
+				activeTasks[task.ID] = struct{}{}
+			}
+		}
+		now := time.Now().Unix()
+		inactiveInputIDs := make([]int64, 0)
+		activeByBlob := make(map[int64]map[int64]struct{})
+		for _, input := range inputs {
+			if _, active := activeTasks[input.TaskRowID]; !active {
+				inactiveInputIDs = append(inactiveInputIDs, input.ID)
+				continue
+			}
+			if activeByBlob[input.MediaBlobID] == nil {
+				activeByBlob[input.MediaBlobID] = make(map[int64]struct{})
+			}
+			activeByBlob[input.MediaBlobID][input.TaskRowID] = struct{}{}
+		}
+		if len(inactiveInputIDs) > 0 {
+			if err := tx.Model(&TaskMediaInput{}).Where("id IN ? AND released_at = 0", inactiveInputIDs).
+				Update("released_at", now).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&MediaBlob{}).Where("task_lease_count <> 0").Update("task_lease_count", 0).Error; err != nil {
+			return err
+		}
+		for blobID, taskSet := range activeByBlob {
+			if err := tx.Model(&MediaBlob{}).Where("id = ? AND deleted_at = 0", blobID).
+				Update("task_lease_count", len(taskSet)).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func ClaimNextMediaMaterialization(owner string, leaseTTL time.Duration) (*MediaBlob, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("materialization lease owner is required")
+	}
+	now := time.Now().Unix()
+	for attempts := 0; attempts < 4; attempts++ {
+		var candidate MediaBlob
+		query := DB.Where(
+			"storage_backend = ? AND deleted_at = 0 AND status = ? AND ((materialize_status IN ? AND materialize_next_retry_at <= ?) OR (materialize_status = ? AND materialize_lease_until < ?))",
+			MediaStorageBackendRemote, MediaBlobStatusReady,
+			[]string{MediaMaterializePending, MediaMaterializeRetry}, now,
+			MediaMaterializeRunning, now,
+		).Order("materialize_next_retry_at ASC, created_at ASC, id ASC").Limit(1).Find(&candidate)
+		if query.Error != nil {
+			return nil, query.Error
+		}
+		if query.RowsAffected == 0 {
+			return nil, gorm.ErrRecordNotFound
+		}
+		result := DB.Model(&MediaBlob{}).Where(
+			"id = ? AND storage_backend = ? AND deleted_at = 0 AND ((materialize_status IN ? AND materialize_next_retry_at <= ?) OR (materialize_status = ? AND materialize_lease_until < ?))",
+			candidate.ID, MediaStorageBackendRemote,
+			[]string{MediaMaterializePending, MediaMaterializeRetry}, now,
+			MediaMaterializeRunning, now,
+		).Updates(map[string]any{
+			"materialize_status":      MediaMaterializeRunning,
+			"materialize_lease_owner": owner,
+			"materialize_lease_until": time.Now().Add(leaseTTL).Unix(),
+		})
+		if result.Error != nil {
+			return nil, result.Error
+		}
+		if result.RowsAffected > 0 {
+			candidate.MaterializeStatus = MediaMaterializeRunning
+			candidate.MaterializeLeaseOwner = owner
+			candidate.MaterializeLeaseUntil = time.Now().Add(leaseTTL).Unix()
+			return &candidate, nil
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func FailMediaMaterialization(blobID int64, owner, message string, nextRetryAt int64, abandoned bool) error {
+	status := MediaMaterializeRetry
+	if abandoned {
+		status = MediaMaterializeAbandoned
+		nextRetryAt = 0
+	}
+	return DB.Model(&MediaBlob{}).
+		Where("id = ? AND materialize_lease_owner = ?", blobID, owner).
+		Updates(map[string]any{
+			"materialize_status":        status,
+			"materialize_attempts":      gorm.Expr("materialize_attempts + 1"),
+			"materialize_next_retry_at": nextRetryAt,
+			"materialize_last_error":    message,
+			"materialize_lease_owner":   "",
+			"materialize_lease_until":   0,
+		}).Error
+}
+
+func DisableMediaMaterialization(blobID int64, owner, reason string) error {
+	return DB.Model(&MediaBlob{}).
+		Where("id = ? AND materialize_lease_owner = ?", blobID, owner).
+		Updates(map[string]any{
+			"materialize_status":        MediaMaterializeDisabled,
+			"materialize_last_error":    reason,
+			"materialize_next_retry_at": 0,
+			"materialize_lease_owner":   "",
+			"materialize_lease_until":   0,
+		}).Error
+}
+
+func ModerateMediaBlob(publicID string, adminUserID int, action, reason, nextStatus string, adminHold bool) error {
+	return ModerateMediaBlobWithDecision(publicID, adminUserID, action, reason, nextStatus, adminHold, false)
+}
+
+// ModerateMediaBlobWithDecision commits the evidence state, audit event, and
+// optional user suspension as one database decision. An administrator may only
+// act on a lower-role account, which prevents peer or root account suspension
+// through the media console.
+func ModerateMediaBlobWithDecision(
+	publicID string,
+	adminUserID int,
+	action string,
+	reason string,
+	nextStatus string,
+	adminHold bool,
+	banUser bool,
+) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" && (banUser || nextStatus == MediaModerationViolation || action == "hold") {
+		return ErrMediaModerationReasonRequired
+	}
+	var suspendedUser *User
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var administrator User
+		if err := tx.Select("id", "role").Where("id = ?", adminUserID).First(&administrator).Error; err != nil {
+			return err
+		}
+		if administrator.Role < common.RoleAdminUser {
+			return ErrMediaModerationForbidden
+		}
+		var blob MediaBlob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ?", publicID).First(&blob).Error; err != nil {
+			return err
+		}
+		var target User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", blob.UserID).First(&target).Error; err != nil {
+			return err
+		}
+		if target.Role >= administrator.Role {
+			return ErrMediaModerationForbidden
+		}
+		previous := blob.ModerationStatus
+		if err := tx.Model(&blob).Updates(map[string]any{
+			"moderation_status": nextStatus,
+			"moderation_reason": reason,
+			"admin_hold":        adminHold,
+		}).Error; err != nil {
+			return err
+		}
+		if banUser {
+			if err := tx.Model(&target).Update("status", common.UserStatusDisabled).Error; err != nil {
+				return err
+			}
+			target.Status = common.UserStatusDisabled
+			suspendedUser = &target
+		}
+		event := MediaModerationEvent{
+			MediaBlobID: blob.ID, PublicAssetID: publicID, UserID: blob.UserID,
+			Username: blob.UsernameSnapshot, AdminUserID: adminUserID, Action: action,
+			Reason: reason, PreviousStatus: previous, NewStatus: nextStatus,
+		}
+		return tx.Create(&event).Error
+	})
+	if err != nil {
+		return err
+	}
+	if suspendedUser != nil {
+		if cacheErr := updateUserCache(*suspendedUser); cacheErr != nil {
+			common.SysLog("failed to refresh user cache after media moderation: " + cacheErr.Error())
+		}
+	}
+	return nil
+}
+
+// BeginMediaBlobDeletion persists an authorized deletion intent before any
+// irreversible storage operation starts. The event remains useful evidence if
+// the process stops between deleting the object and recording the final state.
+func BeginMediaBlobDeletion(publicID, publicAssetID string, adminUserID int, reason string) (*MediaModerationEvent, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil, ErrMediaModerationReasonRequired
+	}
+	publicAssetID = strings.TrimSpace(publicAssetID)
+	if publicAssetID == "" {
+		publicAssetID = publicID
+	}
+	event := &MediaModerationEvent{}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var administrator User
+		if err := tx.Select("id", "role").Where("id = ?", adminUserID).First(&administrator).Error; err != nil {
+			return err
+		}
+		if administrator.Role < common.RoleAdminUser {
+			return ErrMediaModerationForbidden
+		}
+		var blob MediaBlob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND deleted_at = 0", publicID).First(&blob).Error; err != nil {
+			return err
+		}
+		var target User
+		if err := tx.Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "role").Where("id = ?", blob.UserID).First(&target).Error; err != nil {
+			return err
+		}
+		if target.Role >= administrator.Role {
+			return ErrMediaModerationForbidden
+		}
+		*event = MediaModerationEvent{
+			MediaBlobID: blob.ID, PublicAssetID: publicAssetID, UserID: blob.UserID,
+			Username: blob.UsernameSnapshot, AdminUserID: adminUserID, Action: "delete_requested",
+			Reason: reason, PreviousStatus: blob.Status, NewStatus: "deleting",
+		}
+		return tx.Create(event).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+// CompleteMediaBlobDeletionAudit is idempotent so an administrative retry can
+// safely reconcile the outcome of a deletion whose HTTP response was lost.
+func CompleteMediaBlobDeletionAudit(eventID int64, succeeded bool) error {
+	if eventID <= 0 {
+		return fmt.Errorf("invalid media deletion audit event")
+	}
+	action := "delete_failed"
+	status := "delete_failed"
+	if succeeded {
+		action = "delete_succeeded"
+		status = MediaBlobStatusDeleted
+	}
+	result := DB.Model(&MediaModerationEvent{}).
+		Where("id = ? AND action = ?", eventID, "delete_requested").
+		Updates(map[string]any{"action": action, "new_status": status})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	var existing MediaModerationEvent
+	if err := DB.First(&existing, eventID).Error; err != nil {
+		return err
+	}
+	if existing.Action == action && existing.NewStatus == status {
+		return nil
+	}
+	return fmt.Errorf("media deletion audit event is already finalized as %s", existing.Action)
+}
+
+func IsRecordNotFound(err error) bool {
+	return errors.Is(err, gorm.ErrRecordNotFound)
+}

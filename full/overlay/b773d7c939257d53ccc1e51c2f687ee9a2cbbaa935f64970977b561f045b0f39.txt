@@ -1,0 +1,80 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+*/
+
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, relative } from 'node:path'
+
+const root = process.cwd()
+const dist = join(root, 'dist')
+const jsRoot = join(dist, 'static', 'js')
+const htmlPath = join(dist, 'index.html')
+
+function fail(message) {
+  console.error(`[bundle-check] ${message}`)
+  process.exitCode = 1
+}
+
+function walk(directory, files = []) {
+  if (!existsSync(directory)) return files
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) walk(path, files)
+    else if (entry.isFile() && path.endsWith('.js')) files.push(path)
+  }
+  return files
+}
+
+if (!existsSync(htmlPath)) fail('dist/index.html is missing')
+if (!existsSync(jsRoot)) fail('dist/static/js is missing')
+
+if (existsSync(htmlPath)) {
+  const html = readFileSync(htmlPath, 'utf8')
+  if (!html.includes('id="root"')) fail('index.html has no React root')
+
+  const references = [...html.matchAll(/(?:src|href)="(\/static\/[^"?#]+)"/g)]
+  for (const [, reference] of references) {
+    const asset = join(dist, reference.slice('/'.length))
+    if (!existsSync(asset) || !statSync(asset).isFile()) {
+      fail(`index.html references a missing asset: ${reference}`)
+    }
+  }
+}
+
+const bundles = walk(jsRoot)
+const entryBundles = bundles.filter((path) =>
+  /[\\/]index\.[^/\\]+\.js$/.test(path)
+)
+if (entryBundles.length === 0) fail('no hashed index JavaScript entry found')
+
+let routeUpdateCount = 0
+for (const path of bundles) {
+  const source = readFileSync(path, 'utf8')
+  const matches = source.match(/\.Route\.update\(/g)
+  if (matches) {
+    routeUpdateCount += matches.length
+    fail(
+      `${relative(dist, path)} contains the invalid empty-route call .Route.update(`
+    )
+  }
+}
+
+if (routeUpdateCount > 0) fail('route export integrity check failed')
+if (process.exitCode) process.exit()
+
+console.log(
+  `[bundle-check] PASS: ${bundles.length} JavaScript bundles, ${entryBundles.length} entry bundle(s), all HTML assets present`
+)

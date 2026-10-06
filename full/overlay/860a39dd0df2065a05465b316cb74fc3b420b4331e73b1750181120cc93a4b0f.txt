@@ -1,0 +1,547 @@
+package billing_setting
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/shopspring/decimal"
+)
+
+const (
+	ParameterPricingField         = "parameter_pricing"
+	ParameterPricingOptionKey     = "billing_setting." + ParameterPricingField
+	ParameterPricingSchemaVersion = 1
+	TaskBillingUnitPerImage       = "per_image"
+
+	// Bound decimal parsing before allocating a coefficient. Amounts are never
+	// parsed through float64, and exponent notation is intentionally unsupported.
+	maxParameterDecimalBytes      = 64
+	maxParameterDecimalWhole      = 18
+	maxParameterDecimalFractional = 18
+)
+
+// ParameterPricingContract is an independent option; existing group pricing
+// readers never need to interpret the new rules or change their semantics.
+type ParameterPricingContract struct {
+	SchemaVersion int                  `json:"schema_version"`
+	Revision      string               `json:"revision"`
+	Rules         []ParameterPriceRule `json:"rules"`
+}
+
+type ParameterPriceRule struct {
+	ID                   string            `json:"id"`
+	Group                string            `json:"group"`
+	Model                string            `json:"model"`
+	ChannelID            int               `json:"channel_id"`
+	Conditions           map[string]string `json:"conditions"`
+	Unit                 string            `json:"unit"`
+	UnitPrice            string            `json:"unit_price"`
+	Currency             string            `json:"currency"`
+	SourceUnitPrice      string            `json:"source_unit_price,omitempty"`
+	SourceCurrency       string            `json:"source_currency,omitempty"`
+	Source               string            `json:"source,omitempty"`
+	SourceRevision       string            `json:"source_revision,omitempty"`
+	FixedDurationSeconds int               `json:"fixed_duration_seconds,omitempty"`
+}
+
+// Callers normalize protocol aliases and apply capability defaults first.
+// Count must be explicit (normally 1); the engine cannot distinguish an omitted
+// quantity from a client-supplied zero and therefore never defaults zero.
+type ParameterPriceInput struct {
+	Group           string
+	Model           string
+	Resolution      string
+	Quality         string
+	DurationSeconds string
+	ChannelID       int
+	Count           int
+}
+
+type ParameterPriceSnapshot = types.ParameterPriceSnapshot
+
+type parameterPriceScope struct {
+	group     string
+	model     string
+	channelID int
+}
+
+type parameterModelScope struct {
+	group string
+	model string
+}
+
+type parameterConditionPair struct {
+	resolution string
+	quality    string
+}
+
+type parameterRuleIndex struct {
+	base       *ParameterPriceRule
+	resolution map[string]*ParameterPriceRule
+	quality    map[string]*ParameterPriceRule
+	both       map[parameterConditionPair]*ParameterPriceRule
+}
+
+type parameterPricingSnapshot struct {
+	contract       ParameterPricingContract
+	normalizedJSON string
+	scopes         map[parameterPriceScope]*parameterRuleIndex
+	enabled        map[parameterModelScope]struct{}
+}
+
+var parameterPricingState atomic.Pointer[parameterPricingSnapshot]
+
+func init() {
+	if _, _, err := UpdateParameterPricingFromJSONString(""); err != nil {
+		panic(err)
+	}
+}
+
+func NormalizeParameterPricingContract(raw string) (ParameterPricingContract, string, error) {
+	if len(raw) > maxGroupModelPricingBytes {
+		return ParameterPricingContract{}, "", fmt.Errorf("parameter pricing exceeds %d bytes", maxGroupModelPricingBytes)
+	}
+	contract := ParameterPricingContract{}
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		if err := validateParameterPricingFields(trimmed); err != nil {
+			return ParameterPricingContract{}, "", err
+		}
+		if err := common.UnmarshalJsonStr(trimmed, &contract); err != nil {
+			return ParameterPricingContract{}, "", fmt.Errorf("decode parameter pricing: %w", err)
+		}
+	}
+	if contract.SchemaVersion == 0 {
+		contract.SchemaVersion = ParameterPricingSchemaVersion
+	}
+	if contract.SchemaVersion != ParameterPricingSchemaVersion {
+		return ParameterPricingContract{}, "", fmt.Errorf("unsupported parameter pricing schema_version %d", contract.SchemaVersion)
+	}
+	if len(contract.Revision) > maxPricingRevisionBytes {
+		return ParameterPricingContract{}, "", fmt.Errorf("revision exceeds %d bytes", maxPricingRevisionBytes)
+	}
+	if len(contract.Rules) > maxGroupModelPricingEntries {
+		return ParameterPricingContract{}, "", fmt.Errorf("parameter pricing exceeds %d rules", maxGroupModelPricingEntries)
+	}
+	if contract.Rules == nil {
+		contract.Rules = []ParameterPriceRule{}
+	}
+	groups := make(map[string]struct{})
+	ids := make(map[string]struct{}, len(contract.Rules))
+	for i := range contract.Rules {
+		rule, err := normalizeParameterPriceRule(contract.Rules[i])
+		if err != nil {
+			return ParameterPricingContract{}, "", fmt.Errorf("rule %d: %w", i, err)
+		}
+		if _, exists := ids[rule.ID]; exists {
+			return ParameterPricingContract{}, "", fmt.Errorf("duplicate parameter pricing rule id %q", rule.ID)
+		}
+		ids[rule.ID] = struct{}{}
+		groups[rule.Group] = struct{}{}
+		contract.Rules[i] = rule
+	}
+	if len(groups) > maxGroupModelPricingGroups {
+		return ParameterPricingContract{}, "", fmt.Errorf("parameter pricing exceeds %d groups", maxGroupModelPricingGroups)
+	}
+	// Stable IDs make an administrator's row ordering immaterial to revisions.
+	sort.Slice(contract.Rules, func(i, j int) bool { return contract.Rules[i].ID < contract.Rules[j].ID })
+	if _, _, err := buildParameterPricingIndex(contract); err != nil {
+		return ParameterPricingContract{}, "", err
+	}
+	contract.Revision = ""
+	payload, err := common.Marshal(struct {
+		SchemaVersion int                  `json:"schema_version"`
+		Rules         []ParameterPriceRule `json:"rules"`
+	}{contract.SchemaVersion, contract.Rules})
+	if err != nil {
+		return ParameterPricingContract{}, "", fmt.Errorf("encode parameter pricing revision: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	contract.Revision = hex.EncodeToString(digest[:])
+	encoded, err := common.Marshal(contract)
+	if err != nil {
+		return ParameterPricingContract{}, "", fmt.Errorf("encode parameter pricing: %w", err)
+	}
+	return contract, string(encoded), nil
+}
+
+func validateParameterPricingFields(raw string) error {
+	var root map[string]json.RawMessage
+	if err := common.UnmarshalJsonStr(raw, &root); err != nil {
+		return fmt.Errorf("parameter pricing must be an object: %w", err)
+	}
+	if root == nil {
+		return fmt.Errorf("parameter pricing must be an object")
+	}
+	if err := rejectUnknownFields("parameter pricing", root, map[string]struct{}{
+		"schema_version": {}, "revision": {}, "rules": {},
+	}); err != nil {
+		return err
+	}
+	var rules []json.RawMessage
+	if value, exists := root["rules"]; exists {
+		if common.GetJsonType(value) != "array" {
+			return fmt.Errorf("parameter pricing rules must be an array")
+		}
+		if err := common.Unmarshal(value, &rules); err != nil {
+			return fmt.Errorf("decode parameter pricing rules: %w", err)
+		}
+	}
+	if len(rules) > maxGroupModelPricingEntries {
+		return fmt.Errorf("parameter pricing exceeds %d rules", maxGroupModelPricingEntries)
+	}
+	allowed := map[string]struct{}{
+		"id": {}, "group": {}, "model": {}, "channel_id": {}, "conditions": {},
+		"unit": {}, "unit_price": {}, "currency": {}, "source_unit_price": {},
+		"source_currency": {}, "source": {}, "source_revision": {}, "fixed_duration_seconds": {},
+	}
+	for i, rawRule := range rules {
+		var fields map[string]json.RawMessage
+		if err := common.Unmarshal(rawRule, &fields); err != nil || fields == nil {
+			return fmt.Errorf("parameter pricing rule %d must be an object", i)
+		}
+		if err := rejectUnknownFields(fmt.Sprintf("rule %d", i), fields, allowed); err != nil {
+			return err
+		}
+		for field, value := range fields {
+			if field != "conditions" && common.GetJsonType(value) == "null" {
+				return fmt.Errorf("rule %d field %q cannot be null", i, field)
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeParameterPriceRule(rule ParameterPriceRule) (ParameterPriceRule, error) {
+	rule.ID = strings.TrimSpace(rule.ID)
+	rule.Group = strings.TrimSpace(rule.Group)
+	rule.Model = strings.TrimSpace(rule.Model)
+	for _, field := range []struct{ name, value string }{{"id", rule.ID}, {"group", rule.Group}, {"model", rule.Model}} {
+		if err := validatePricingIdentity(field.name, field.value); err != nil {
+			return ParameterPriceRule{}, err
+		}
+	}
+	if rule.Model == "*" {
+		return ParameterPriceRule{}, fmt.Errorf("model must be an exact model name")
+	}
+	if rule.ChannelID < 0 {
+		return ParameterPriceRule{}, fmt.Errorf("channel_id cannot be negative")
+	}
+	normalizedConditions := make(map[string]string, len(rule.Conditions))
+	for key, value := range rule.Conditions {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key != "resolution" && key != "quality" {
+			return ParameterPriceRule{}, fmt.Errorf("unsupported parameter condition %q", key)
+		}
+		if _, exists := normalizedConditions[key]; exists {
+			return ParameterPriceRule{}, fmt.Errorf("duplicate normalized condition %q", key)
+		}
+		value = strings.ToLower(strings.TrimSpace(value))
+		if err := validatePricingIdentity("condition "+key, value); err != nil {
+			return ParameterPriceRule{}, err
+		}
+		normalizedConditions[key] = value
+	}
+	rule.Conditions = normalizedConditions
+	rule.Unit = strings.ToLower(strings.TrimSpace(rule.Unit))
+	switch rule.Unit {
+	case TaskBillingUnitPerRequest, TaskBillingUnitPerImage, TaskBillingUnitPerSecond:
+		if rule.FixedDurationSeconds != 0 {
+			return ParameterPriceRule{}, fmt.Errorf("%s cannot set fixed_duration_seconds", rule.Unit)
+		}
+	case TaskBillingUnitFixedDuration:
+		if rule.FixedDurationSeconds < 1 || rule.FixedDurationSeconds > common.MaxTaskDurationSeconds {
+			return ParameterPriceRule{}, fmt.Errorf("fixed_duration_seconds must be between 1 and %d", common.MaxTaskDurationSeconds)
+		}
+	default:
+		return ParameterPriceRule{}, fmt.Errorf("unsupported parameter billing unit %q", rule.Unit)
+	}
+	price, err := parseParameterDecimal(rule.UnitPrice)
+	if err != nil {
+		return ParameterPriceRule{}, fmt.Errorf("unit_price: %w", err)
+	}
+	rule.UnitPrice = price.String()
+	rule.Currency = strings.ToUpper(strings.TrimSpace(rule.Currency))
+	if rule.Currency != "USD" {
+		return ParameterPriceRule{}, fmt.Errorf("currency must be USD; currency conversion is not configured")
+	}
+	rule.SourceCurrency = strings.ToUpper(strings.TrimSpace(rule.SourceCurrency))
+	if rule.SourceUnitPrice != "" {
+		sourcePrice, err := parseParameterDecimal(rule.SourceUnitPrice)
+		if err != nil {
+			return ParameterPriceRule{}, fmt.Errorf("source_unit_price: %w", err)
+		}
+		rule.SourceUnitPrice = sourcePrice.String()
+		if rule.SourceCurrency == "" {
+			rule.SourceCurrency = rule.Currency
+		}
+		if rule.SourceCurrency != "USD" {
+			return ParameterPriceRule{}, fmt.Errorf("source_currency must be USD; currency conversion is not configured")
+		}
+	} else if rule.SourceCurrency != "" {
+		return ParameterPriceRule{}, fmt.Errorf("source_currency requires source_unit_price")
+	}
+	rule.Source = strings.TrimSpace(rule.Source)
+	rule.SourceRevision = strings.TrimSpace(rule.SourceRevision)
+	if len(rule.Source) > maxPricingSourceBytes || len(rule.SourceRevision) > maxPricingRevisionBytes {
+		return ParameterPriceRule{}, fmt.Errorf("source or source_revision exceeds the pricing metadata limit")
+	}
+	return rule, nil
+}
+
+func parseParameterDecimal(raw string) (decimal.Decimal, error) {
+	if len(raw) > maxParameterDecimalBytes {
+		return decimal.Zero, fmt.Errorf("decimal exceeds %d bytes", maxParameterDecimalBytes)
+	}
+	value := strings.TrimSpace(raw)
+	whole, fractional, dot := 0, 0, false
+	for _, c := range value {
+		if c == '.' && !dot {
+			dot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return decimal.Zero, fmt.Errorf("must be a non-negative plain decimal string without an exponent")
+		}
+		if dot {
+			fractional++
+		} else {
+			whole++
+		}
+	}
+	if whole+fractional == 0 || (dot && fractional == 0) {
+		return decimal.Zero, fmt.Errorf("must contain decimal digits")
+	}
+	if whole > maxParameterDecimalWhole || fractional > maxParameterDecimalFractional {
+		return decimal.Zero, fmt.Errorf("decimal allows at most %d integer and %d fractional digits", maxParameterDecimalWhole, maxParameterDecimalFractional)
+	}
+	return decimal.NewFromString(value)
+}
+
+// Only two supported dimensions make overlap detection and runtime lookup
+// bounded: two one-dimensional rules overlap if they constrain different keys.
+func buildParameterPricingIndex(contract ParameterPricingContract) (map[parameterPriceScope]*parameterRuleIndex, map[parameterModelScope]struct{}, error) {
+	scopes := make(map[parameterPriceScope]*parameterRuleIndex)
+	enabled := make(map[parameterModelScope]struct{})
+	for i := range contract.Rules {
+		rule := &contract.Rules[i]
+		scope := parameterPriceScope{rule.Group, rule.Model, rule.ChannelID}
+		index := scopes[scope]
+		if index == nil {
+			index = &parameterRuleIndex{resolution: make(map[string]*ParameterPriceRule), quality: make(map[string]*ParameterPriceRule), both: make(map[parameterConditionPair]*ParameterPriceRule)}
+			scopes[scope] = index
+		}
+		enabled[parameterModelScope{rule.Group, rule.Model}] = struct{}{}
+		overlap := false
+		switch len(rule.Conditions) {
+		case 0:
+			overlap = index.base != nil
+			index.base = rule
+		case 1:
+			if resolution, exists := rule.Conditions["resolution"]; exists {
+				overlap = index.resolution[resolution] != nil || len(index.quality) > 0
+				index.resolution[resolution] = rule
+			} else {
+				quality := rule.Conditions["quality"]
+				overlap = index.quality[quality] != nil || len(index.resolution) > 0
+				index.quality[quality] = rule
+			}
+		case 2:
+			pair := parameterConditionPair{rule.Conditions["resolution"], rule.Conditions["quality"]}
+			overlap = index.both[pair] != nil
+			index.both[pair] = rule
+		}
+		if overlap {
+			return nil, nil, fmt.Errorf("rule %q overlaps another rule at the same group/model/channel and condition specificity", rule.ID)
+		}
+	}
+	return scopes, enabled, nil
+}
+
+func cloneParameterPricingContract(contract ParameterPricingContract) ParameterPricingContract {
+	clone := contract
+	clone.Rules = make([]ParameterPriceRule, len(contract.Rules))
+	for i, rule := range contract.Rules {
+		clone.Rules[i] = rule
+		clone.Rules[i].Conditions = make(map[string]string, len(rule.Conditions))
+		for key, value := range rule.Conditions {
+			clone.Rules[i].Conditions[key] = value
+		}
+	}
+	return clone
+}
+
+func UpdateParameterPricingFromJSONString(raw string) (ParameterPricingContract, string, error) {
+	contract, normalized, err := NormalizeParameterPricingContract(raw)
+	if err != nil {
+		return ParameterPricingContract{}, "", err
+	}
+	private := cloneParameterPricingContract(contract)
+	scopes, enabled, err := buildParameterPricingIndex(private)
+	if err != nil {
+		return ParameterPricingContract{}, "", err
+	}
+	parameterPricingState.Store(&parameterPricingSnapshot{contract: private, normalizedJSON: normalized, scopes: scopes, enabled: enabled})
+	return contract, normalized, nil
+}
+
+func GetParameterPricingContract() ParameterPricingContract {
+	snapshot := parameterPricingState.Load()
+	if snapshot == nil {
+		return ParameterPricingContract{SchemaVersion: ParameterPricingSchemaVersion, Rules: []ParameterPriceRule{}}
+	}
+	return cloneParameterPricingContract(snapshot.contract)
+}
+
+func GetParameterPricingJSONString() string {
+	if snapshot := parameterPricingState.Load(); snapshot != nil {
+		return snapshot.normalizedJSON
+	}
+	return ""
+}
+
+func GetParameterPricingRevision() string {
+	if snapshot := parameterPricingState.Load(); snapshot != nil {
+		return snapshot.contract.Revision
+	}
+	return ""
+}
+
+// HasParameterPricing lets request adapters avoid parsing new parameters for
+// legacy models. Channel selection never turns an enabled model into old price.
+func HasParameterPricing(model, group string) bool {
+	snapshot := parameterPricingState.Load()
+	if snapshot == nil {
+		return false
+	}
+	model, group = strings.TrimSpace(model), strings.TrimSpace(group)
+	_, groupEnabled := snapshot.enabled[parameterModelScope{group, model}]
+	_, globalEnabled := snapshot.enabled[parameterModelScope{"*", model}]
+	return groupEnabled || globalEnabled
+}
+
+func ResolveParameterPrice(input ParameterPriceInput) (*ParameterPriceSnapshot, error) {
+	snapshot := parameterPricingState.Load()
+	if snapshot == nil {
+		return nil, nil
+	}
+	input.Group, input.Model = strings.TrimSpace(input.Group), strings.TrimSpace(input.Model)
+	_, groupEnabled := snapshot.enabled[parameterModelScope{input.Group, input.Model}]
+	_, globalEnabled := snapshot.enabled[parameterModelScope{"*", input.Model}]
+	if !groupEnabled && !globalEnabled {
+		return nil, nil
+	}
+	if input.ChannelID < 0 {
+		return nil, fmt.Errorf("channel_id cannot be negative")
+	}
+	if input.Count < 1 || input.Count > dto.MaxImageN {
+		return nil, fmt.Errorf("count must be between 1 and %d", dto.MaxImageN)
+	}
+	input.Resolution = strings.ToLower(strings.TrimSpace(input.Resolution))
+	input.Quality = strings.ToLower(strings.TrimSpace(input.Quality))
+	if len(input.Resolution) > maxPricingIdentityBytes || len(input.Quality) > maxPricingIdentityBytes {
+		return nil, fmt.Errorf("pricing parameters exceed %d bytes", maxPricingIdentityBytes)
+	}
+	params := map[string]string{"count": strconv.Itoa(input.Count)}
+	if input.Resolution != "" {
+		params["resolution"] = input.Resolution
+	}
+	if input.Quality != "" {
+		params["quality"] = input.Quality
+	}
+	var duration decimal.Decimal
+	if input.DurationSeconds != "" {
+		var err error
+		duration, err = parseParameterDecimal(input.DurationSeconds)
+		if err != nil || !duration.IsPositive() || duration.GreaterThan(decimal.NewFromInt(common.MaxTaskDurationSeconds)) {
+			return nil, fmt.Errorf("duration_seconds must be a positive decimal no greater than %d", common.MaxTaskDurationSeconds)
+		}
+		params["duration_seconds"] = duration.String()
+	}
+	var selected *ParameterPriceRule
+	// Scope precedes condition count. A more specific condition can override a
+	// base rule within one scope, but never outrank a matching higher scope.
+	for _, scope := range []parameterPriceScope{
+		{input.Group, input.Model, input.ChannelID}, {input.Group, input.Model, 0},
+		{"*", input.Model, input.ChannelID}, {"*", input.Model, 0},
+	} {
+		index := snapshot.scopes[scope]
+		if index == nil {
+			continue
+		}
+		selected = index.both[parameterConditionPair{input.Resolution, input.Quality}]
+		if selected == nil {
+			selected = index.resolution[input.Resolution]
+		}
+		if selected == nil {
+			selected = index.quality[input.Quality]
+		}
+		if selected == nil {
+			selected = index.base
+		}
+		if selected != nil {
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("%w: no parameter price for model %q in group %q with the selected channel and parameters", types.ErrParameterCandidateUnavailable, input.Model, input.Group)
+	}
+	quantity := decimal.NewFromInt(1)
+	switch selected.Unit {
+	case TaskBillingUnitPerImage:
+		quantity = decimal.NewFromInt(int64(input.Count))
+	case TaskBillingUnitPerSecond:
+		if !duration.IsPositive() {
+			return nil, fmt.Errorf("per_second pricing requires explicit duration_seconds")
+		}
+		quantity = duration
+	case TaskBillingUnitFixedDuration:
+		fixed := decimal.NewFromInt(int64(selected.FixedDurationSeconds))
+		if input.DurationSeconds != "" && !duration.Equal(fixed) {
+			return nil, fmt.Errorf("fixed_duration pricing requires exactly %d seconds", selected.FixedDurationSeconds)
+		}
+		params["duration_seconds"] = fixed.String()
+	}
+	price, err := parseParameterDecimal(selected.UnitPrice)
+	if err != nil {
+		return nil, fmt.Errorf("invalid stored unit price: %w", err)
+	}
+	amount := price.Mul(quantity)
+	if math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) || common.QuotaPerUnit <= 0 {
+		return nil, fmt.Errorf("invalid quota conversion factor")
+	}
+	// QuotaPerUnit is the existing USD unit, not a model price or exchange rate.
+	quotaFactor, err := decimal.NewFromString(strconv.FormatFloat(common.QuotaPerUnit, 'f', -1, 64))
+	if err != nil {
+		return nil, fmt.Errorf("invalid quota conversion factor: %w", err)
+	}
+	quota, clamp := common.QuotaFromDecimalChecked(amount.Mul(quotaFactor))
+	if clamp != nil {
+		return nil, fmt.Errorf("parameter price exceeds quota limit: %s", clamp.Kind)
+	}
+	quote := &ParameterPriceSnapshot{
+		SchemaVersion: ParameterPricingSchemaVersion, Revision: snapshot.contract.Revision,
+		RuleID: selected.ID, Group: input.Group, Model: input.Model, ChannelID: input.ChannelID,
+		Unit: selected.Unit, Currency: selected.Currency, UnitPrice: selected.UnitPrice,
+		Quantity: quantity.String(), Amount: amount.String(), Quota: quota, Parameters: params,
+		SourceUnitPrice: selected.SourceUnitPrice, SourceCurrency: selected.SourceCurrency,
+		Source: selected.Source, SourceRevision: selected.SourceRevision,
+	}
+	if selected.SourceUnitPrice != "" {
+		sourcePrice, err := parseParameterDecimal(selected.SourceUnitPrice)
+		if err != nil {
+			return nil, fmt.Errorf("invalid stored source price: %w", err)
+		}
+		quote.SourceAmount = sourcePrice.Mul(quantity).String()
+	}
+	return quote, nil
+}

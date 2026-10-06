@@ -1,0 +1,82 @@
+package model
+
+import (
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+type tenantCostOutboxTenantHead struct {
+	TenantID string `gorm:"column:tenant_id"`
+	HeadID   int64  `gorm:"column:head_id"`
+}
+
+func tenantCostOutboxDueQuery(tx *gorm.DB, now, staleBefore int64) *gorm.DB {
+	return tx.Where("((state IN ? AND next_attempt_at <= ?) OR (state = ? AND updated_at <= ?))",
+		[]string{TenantOutboxReady, TenantOutboxFailed}, now, TenantOutboxPending, staleBefore)
+}
+
+// ClaimTenantCostOutboxFair claims a bounded batch in tenant round-robin
+// order. When the batch can hold every due tenant, each tenant receives one
+// slot before any tenant receives a second slot. This prevents a large broken
+// downstream backlog from starving a healthy downstream.
+func ClaimTenantCostOutboxFair(limit int, now int64) ([]TenantCostOutbox, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	claimed := make([]TenantCostOutbox, 0, limit)
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		staleBefore := now - int64(10*time.Minute)
+		var heads []tenantCostOutboxTenantHead
+		if err := tenantCostOutboxDueQuery(tx.Model(&TenantCostOutbox{}), now, staleBefore).
+			Select("tenant_id, MIN(id) AS head_id").Group("tenant_id").Order("head_id asc").
+			Limit(500).Scan(&heads).Error; err != nil {
+			return err
+		}
+		for len(claimed) < limit && len(heads) > 0 {
+			madeProgress := false
+			for _, head := range heads {
+				if len(claimed) >= limit {
+					break
+				}
+				var row TenantCostOutbox
+				query := tenantCostOutboxDueQuery(lockForUpdate(tx).Where("tenant_id = ?", head.TenantID), now, staleBefore).
+					Order("id asc").First(&row)
+				if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+					continue
+				}
+				if query.Error != nil {
+					return query.Error
+				}
+				row.State = TenantOutboxPending
+				row.Attempts++
+				row.UpdatedAt = now
+				result := tx.Model(&TenantCostOutbox{}).
+					Where("id = ? AND tenant_id = ?", row.ID, row.TenantID).
+					Updates(map[string]interface{}{
+						"state": row.State, "attempts": row.Attempts, "updated_at": row.UpdatedAt,
+					})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return ErrTenantCostConflict
+				}
+				claimed = append(claimed, row)
+				madeProgress = true
+			}
+			if !madeProgress {
+				break
+			}
+		}
+		return nil
+	})
+	return claimed, err
+}

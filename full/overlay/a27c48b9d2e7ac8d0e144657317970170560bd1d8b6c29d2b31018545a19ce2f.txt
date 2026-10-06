@@ -1,0 +1,33 @@
+package common
+
+import (
+	media "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/require"
+	"maps"
+	"testing"
+)
+
+func TestParameterVideoWirePreservesDurationAndResolution(t *testing.T) {
+	quote := &types.ParameterPriceSnapshot{Unit: "per_second", UpstreamModel: "provider-video", Parameters: map[string]string{"duration_seconds": "4", "resolution": "480p", "count": "1"}}
+	capability := media.Capability{RuntimeEnforced: true, ProviderContract: "openai-videos-v1", Resolutions: []string{"480p", "720p", "1080p"}, RequireResolution: true}
+	fields := map[string]interface{}{"model": "provider-video", "seconds": "4", "resolution": "480p"}
+	require.NoError(t, ValidateParameterVideoWire(quote, fields, capability))
+	for key, value := range map[string]interface{}{"model": "other", "seconds": "1", "duration": 5, "mySeconds": 8, "resolution": "1080p", "size": "720p", "n": 2} {
+		t.Run(key, func(t *testing.T) {
+			changed := maps.Clone(fields)
+			changed[key] = value
+			require.Error(t, ValidateParameterVideoWire(quote, changed, capability))
+		})
+	}
+	require.NoError(t, ValidateParameterVideoWire(nil, fields, capability), "legacy pricing stays on its existing path")
+}
+
+func TestParameterVideoLegacySentinelNeedsFixedDurationContract(t *testing.T) {
+	quote := &types.ParameterPriceSnapshot{Unit: "fixed_duration", UpstreamModel: "legacy", Parameters: map[string]string{"duration_seconds": "15", "count": "1"}}
+	capability := media.Capability{ProviderContract: "aizzz-video-v1"}
+	fields := map[string]interface{}{"model": "legacy", "seconds": "1", "mySeconds": "15"}
+	require.NoError(t, ValidateParameterVideoWire(quote, fields, capability))
+	quote.Unit = "per_second"
+	require.Error(t, ValidateParameterVideoWire(quote, fields, capability), "a variable-duration quote cannot silently use the fixed-duration sentinel")
+}

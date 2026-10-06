@@ -1,0 +1,97 @@
+package controller
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestApplyEffectiveGroupPricingDoesNotMutateSharedCache(t *testing.T) {
+	basePrice := 5.0
+	baseEffective := 5.0
+	pricing := []model.Pricing{{
+		ModelName: "video-model",
+		GroupPricing: map[string]model.GroupPricing{
+			"video": {
+				Group: "video", BillingMode: "fixed_price", BillingUnit: "per_request",
+				ModelPrice: &basePrice, BaseGroupRatio: 1, EffectiveGroupRatio: 1, EffectiveModelPrice: &baseEffective,
+			},
+		},
+	}}
+
+	resolved := applyEffectiveGroupPricing(pricing, map[string]float64{"video": 0.5}, map[string]bool{"video": true})
+
+	actual := resolved[0].GroupPricing["video"]
+	assert.Equal(t, 0.5, actual.EffectiveGroupRatio)
+	assert.True(t, actual.HasUserGroupRatio)
+	require.NotNil(t, actual.EffectiveModelPrice)
+	assert.Equal(t, 2.5, *actual.EffectiveModelPrice)
+	assert.Equal(t, 1.0, pricing[0].GroupPricing["video"].EffectiveGroupRatio)
+	assert.Equal(t, 5.0, *pricing[0].GroupPricing["video"].EffectiveModelPrice)
+}
+
+func TestApplyActualInputCostVisibilityPreservesZeroRateWithoutMutatingPricing(t *testing.T) {
+	estimatedUSD := 0.25
+	pricing := []model.Pricing{{
+		ModelName: "token-model",
+		GroupPricing: map[string]model.GroupPricing{
+			"economy": {Group: "economy", BillingMode: "ratio", BillingUnit: "per_million_tokens"},
+		},
+	}}
+	visibility := service.SmartRouteActualInputCostVisibility{
+		ModelGroups: map[string]map[string]service.SmartRouteActualInputCostModelGroupSummary{
+			"token-model": {
+				"economy": {
+					Model: "token-model", Group: "economy", CacheReadRatePPM: 0,
+					Endpoint:         service.SmartEndpointResponses,
+					Basis:            service.SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes,
+					EstimatedUSDPerM: &estimatedUSD, Samples: 12, SampledRoutes: 2, LastObservedAtMS: 1234,
+				},
+			},
+		},
+	}
+
+	resolved := applyActualInputCostVisibility(pricing, visibility)
+	actual := resolved[0].GroupPricing["economy"]
+	assert.Equal(t, service.SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes, actual.ActualInputCostBasis)
+	assert.Equal(t, service.SmartEndpointResponses, actual.ActualInputCostEndpoint)
+	require.NotNil(t, actual.RecentCacheRatePPM)
+	assert.Zero(t, *actual.RecentCacheRatePPM)
+	require.NotNil(t, actual.EstimatedInputUSD)
+	assert.Equal(t, 0.25, *actual.EstimatedInputUSD)
+	assert.Equal(t, int64(12), actual.ActualCostSamples)
+	assert.Equal(t, 2, actual.SampledRouteCount)
+	assert.Equal(t, int64(1234), actual.ActualCostObservedMS)
+	assert.Nil(t, pricing[0].GroupPricing["economy"].RecentCacheRatePPM)
+}
+
+func TestApplyEffectiveGroupPricingDerivesTokenBaseAndSpecialGroupPrices(t *testing.T) {
+	modelRatio := 2.5
+	completionRatio := 6.0
+	pricing := []model.Pricing{{
+		ModelName: "token-model",
+		GroupPricing: map[string]model.GroupPricing{
+			"special": {
+				Group: "special", BillingMode: "ratio", BillingUnit: "per_million_tokens",
+				ModelRatio: &modelRatio, CompletionRatio: &completionRatio,
+				BaseGroupRatio: 1, EffectiveGroupRatio: 1,
+			},
+		},
+	}}
+
+	resolved := applyEffectiveGroupPricing(pricing, map[string]float64{"special": 0.15}, map[string]bool{"special": true})
+	actual := resolved[0].GroupPricing["special"]
+	require.NotNil(t, actual.BaseInputUSD)
+	require.NotNil(t, actual.BaseOutputUSD)
+	require.NotNil(t, actual.EffectiveInputUSD)
+	require.NotNil(t, actual.EffectiveOutputUSD)
+	assert.Equal(t, 5.0, *actual.BaseInputUSD)
+	assert.Equal(t, 30.0, *actual.BaseOutputUSD)
+	assert.InDelta(t, 0.75, *actual.EffectiveInputUSD, 1e-12)
+	assert.InDelta(t, 4.5, *actual.EffectiveOutputUSD, 1e-12)
+	assert.True(t, actual.HasUserGroupRatio)
+	assert.Equal(t, 1.0, pricing[0].GroupPricing["special"].EffectiveGroupRatio)
+}

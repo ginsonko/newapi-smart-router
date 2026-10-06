@@ -1,0 +1,974 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type managerTestRatioSource struct {
+	mu       sync.Mutex
+	revision uint64
+	ratios   map[string]int64
+}
+
+type managerTestRecoveryHintSink struct{}
+
+func (managerTestRecoveryHintSink) Hint(SmartRouteRecoveryHint) {}
+
+type managerTestColdStartSuccessSink struct {
+	calls        int
+	physicalKeys []string
+	hints        []SmartRouteRecoveryHint
+}
+
+func (sink *managerTestColdStartSuccessSink) Hint(hint SmartRouteRecoveryHint) {
+	sink.hints = append(sink.hints, hint)
+}
+
+func (sink *managerTestColdStartSuccessSink) ColdStartSucceeded(
+	_ smartrouter.RouteRequest,
+	physicalKey string,
+) {
+	sink.calls++
+	sink.physicalKeys = append(sink.physicalKeys, physicalKey)
+}
+
+func (source *managerTestRatioSource) Revision() uint64 {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	return source.revision
+}
+
+func (source *managerTestRatioSource) RouteRatioPPM(_ string, usingGroup string) (int64, bool) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	ratio, exists := source.ratios[usingGroup]
+	return ratio, exists
+}
+
+func (source *managerTestRatioSource) update(group string, ratio int64) {
+	source.mu.Lock()
+	source.revision++
+	source.ratios[group] = ratio
+	source.mu.Unlock()
+}
+
+type managerOrderingStateStore struct {
+	mu      sync.Mutex
+	order   []string
+	records []SmartRouteAttemptRecord
+	onProbe func()
+}
+
+func (store *managerOrderingStateStore) append(value string) {
+	store.mu.Lock()
+	store.order = append(store.order, value)
+	store.mu.Unlock()
+}
+
+func (store *managerOrderingStateStore) values() []string {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return append([]string(nil), store.order...)
+}
+
+func (store *managerOrderingStateStore) attemptRecords() []SmartRouteAttemptRecord {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return append([]SmartRouteAttemptRecord(nil), store.records...)
+}
+
+func (store *managerOrderingStateStore) Snapshot(
+	_ context.Context,
+	request SmartRouteStateSnapshotRequest,
+) (SmartRouteRuntimeSnapshot, error) {
+	quality := make(map[string]smartrouter.QualityState, len(request.Routes))
+	capacity := make(map[string]smartrouter.CapacityState, len(request.Routes))
+	for _, route := range request.Routes {
+		quality[route.RouteID] = smartrouter.InitialQuality(route.StableFallback)
+		capacity[route.CapacityDomain] = smartrouter.CapacityState{
+			Known: true, MaxInflight: route.MaxInflight,
+		}
+	}
+	return SmartRouteRuntimeSnapshot{
+		Quality:  smartrouter.QualitySnapshot{Version: "quality", Routes: quality},
+		TTFT:     smartrouter.TTFTSnapshot{Version: "ttft", Routes: map[string]smartrouter.TTFTState{}},
+		Capacity: smartrouter.CapacitySnapshot{Version: "capacity", Domains: capacity},
+	}, nil
+}
+
+func (store *managerOrderingStateStore) TryAcquireProbe(
+	_ context.Context,
+	_ SmartRouteProbeRequest,
+) (*SmartRouteLease, bool, error) {
+	store.append("probe")
+	if store.onProbe != nil {
+		store.onProbe()
+	}
+	return managerTestLease(func() { store.append("probe_release") }), true, nil
+}
+
+func (store *managerOrderingStateStore) TryAcquireCapacity(
+	_ context.Context,
+	_ SmartRouteCapacityRequest,
+) (SmartRouteCapacityAcquisition, error) {
+	store.append("capacity")
+	return SmartRouteCapacityAcquisition{
+		Disposition: SmartRouteCapacityGranted,
+		Lease:       managerTestLease(func() { store.append("capacity_release") }),
+	}, nil
+}
+
+func (store *managerOrderingStateStore) RecordAttempt(_ context.Context, record SmartRouteAttemptRecord) error {
+	store.mu.Lock()
+	store.order = append(store.order, "record:"+string(record.Admission))
+	store.records = append(store.records, record)
+	store.mu.Unlock()
+	return nil
+}
+
+func (store *managerOrderingStateStore) QuarantineRoute(context.Context, SmartRouteQuarantineRequest) error {
+	return nil
+}
+
+func (store *managerOrderingStateStore) RouteExclusions(
+	context.Context,
+	SmartRouteExclusionRequest,
+) (SmartRouteExclusionSnapshot, error) {
+	return SmartRouteExclusionSnapshot{Version: "none"}, nil
+}
+
+func managerTestLease(onRelease func()) *SmartRouteLease {
+	return &SmartRouteLease{
+		ID:          "manager-test-lease",
+		expiresAtMS: time.Now().Add(time.Minute).UnixMilli(),
+		renewTTL:    time.Minute,
+		release: func(context.Context) error {
+			onRelease()
+			return nil
+		},
+		renew: func(context.Context, time.Duration) (int64, error) {
+			return time.Now().Add(time.Minute).UnixMilli(), nil
+		},
+	}
+}
+
+func managerTestSession(t *testing.T, state SmartRouteStateStore) (*SmartRoutingSession, *managerTestRatioSource) {
+	t.Helper()
+	contractID, fingerprint, err := BuildSmartContractIdentity("gpt-test", SmartEndpointChat)
+	require.NoError(t, err)
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "manager-catalog",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			contractID: {
+				Contract: smartrouter.RouteContract{
+					ContractID: contractID, CanonicalModel: "gpt-test",
+					Endpoint: SmartEndpointChat, CapabilityFingerprint: fingerprint,
+				},
+				Pools: map[string]smartrouter.CertifiedPool{
+					"balanced-v1": {Candidates: []smartrouter.CertifiedRoute{
+						{
+							RouteID: "cheap", Group: "economy", ChannelID: 1, UpstreamModel: "gpt-test",
+							Capabilities: smartroutersetting.CapabilityText, MaxContext: 128_000,
+							CacheDomain: "cheap-cache", CapacityDomain: "cheap-capacity", MaxInflight: 2,
+						},
+						{
+							RouteID: "fallback", Group: "fallback", ChannelID: 2, UpstreamModel: "gpt-test",
+							Capabilities: smartroutersetting.CapabilityText, MaxContext: 128_000,
+							CacheDomain: "fallback-cache", CapacityDomain: "fallback-capacity", MaxInflight: 2,
+							StableFallback: true,
+						},
+					}},
+				},
+			},
+		},
+	}
+	catalogs := &CatalogManager{settings: func() smartroutersetting.Setting {
+		return smartroutersetting.Setting{Enabled: true, CatalogRefreshSeconds: 3600}
+	}}
+	catalogs.current.Store(&catalog)
+	catalogs.lastRefresh.Store(time.Now().Unix())
+	ratioSource := &managerTestRatioSource{revision: 1, ratios: map[string]int64{
+		"economy": 20_000, "fallback": 50_000,
+	}}
+	prices := NewPriceSnapshotManager(catalogs, ratioSource)
+	policy := smartrouter.NormalizePolicy(smartrouter.Policy{
+		Version: smartrouter.PolicyVersion, PolicyID: "manager-policy", Enabled: true,
+		PoolPolicy: "balanced-v1", OrderMode: smartrouter.OrderAutoPrice,
+		MaxEffectiveRatioPPM: 50_000, HealthGuard: true,
+		AllowFutureGroups: true,
+		RecoveryProfile:   smartrouter.RecoveryBalanced,
+	})
+	immediateProbe := 0
+	setting := smartroutersetting.Setting{
+		TextRecoveryProbeAfterSeconds: &immediateProbe,
+		Enabled:                       true, MaxAttempts: 3, CatalogRefreshSeconds: 3600,
+		KillSwitchMode: smartroutersetting.KillSwitchNormal,
+	}
+	engine := &SmartRouterEngine{
+		Catalogs: catalogs, Prices: prices, State: state,
+		Affinity: NewMemorySmartRouteAffinityStore(nil, 100),
+		Settings: func() smartroutersetting.Setting { return setting },
+	}
+	return &SmartRoutingSession{
+		engine: engine,
+		request: smartrouter.RouteRequest{
+			ContractID: contractID, CanonicalModel: "gpt-test", Endpoint: SmartEndpointChat,
+			CapabilityFingerprint: fingerprint, RequiredCapabilities: smartroutersetting.CapabilityText,
+			EstimatedContext: 100, ReplayClass: smartrouter.ReplaySafeText,
+		},
+		policy: policy, userGroup: "standard", allowedGroups: []string{"economy", "fallback"},
+		attempt: smartrouter.AttemptState{MaxAttempts: 3}, blockedRoutes: map[string]struct{}{},
+		probeSubject: "token-1",
+	}, ratioSource
+}
+
+func TestSmartRoutingSessionUsesNormalAdmissionForSafeTextAndRecordsBeforeRelease(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, smartrouter.AdmissionNormal, handle.Plan.Admission)
+	assert.False(t, session.attempt.RecoveryProbeUsed,
+		"safe text must not acquire a virgin/probe lease just to obtain its first sample")
+	assert.Zero(t, handle.AttemptTimeout, "foreground traffic must never inherit the recovery probe deadline")
+	assert.Equal(t, []string{"capacity"}, state.values())
+
+	session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeSuccess,
+	}, 0, 100*time.Millisecond, true)
+	assert.Equal(t, []string{
+		"capacity", "record:normal", "capacity_release",
+	}, state.values())
+}
+
+func TestSmartRoutingSessionSafeTextContinuesToSecondCertifiedRoute(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	contract := catalog.Contracts[session.request.ContractID]
+	pool := contract.Pools["balanced-v1"]
+	pool.Candidates[1].StableFallback = false
+	contract.Pools["balanced-v1"] = pool
+	catalog.Contracts[session.request.ContractID] = contract
+	setting := session.engine.Settings()
+	setting.BackgroundProbeEnabled = true
+	session.engine.Settings = func() smartroutersetting.Setting { return setting }
+
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "cheap", handle.Route.RouteID)
+	require.Equal(t, smartrouter.AdmissionNormal, handle.Plan.Admission)
+	assert.False(t, session.attempt.RecoveryProbeUsed)
+	session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true,
+		RetryNextRoute: true, AffectsRouteHealth: true,
+	}, 0, 0, false)
+
+	second, err := session.Next(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "fallback", second.Route.RouteID)
+	assert.Equal(t, smartrouter.AdmissionNormal, second.Plan.Admission)
+	second.stopAndRelease()
+}
+
+func TestSmartRoutingSessionMediaVirginRetryRequiresExplicitNonAcceptance(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		replayClass smartrouter.ReplayClass
+		disposition SmartMediaAttemptDisposition
+		committed   bool
+		wantNext    bool
+	}{
+		{name: "image explicitly not accepted", replayClass: smartrouter.ReplaySafeImage, disposition: SmartMediaAttemptNotAccepted, wantNext: true},
+		{name: "video explicitly not accepted", replayClass: smartrouter.ReplaySafeVideo, disposition: SmartMediaAttemptNotAccepted, wantNext: true},
+		{name: "image acceptance unknown", replayClass: smartrouter.ReplaySafeImage, disposition: SmartMediaAttemptAcceptanceUnknown},
+		{name: "video acceptance unknown", replayClass: smartrouter.ReplaySafeVideo, disposition: SmartMediaAttemptAcceptanceUnknown},
+		{name: "committed image", replayClass: smartrouter.ReplaySafeImage, disposition: SmartMediaAttemptNotAccepted, committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &managerOrderingStateStore{}
+			session, _ := managerTestSession(t, state)
+			session.request.ReplayClass = test.replayClass
+			catalog, ok := session.engine.Catalogs.Current()
+			require.True(t, ok)
+			contract := catalog.Contracts[session.request.ContractID]
+			pool := contract.Pools["balanced-v1"]
+			pool.Candidates[1].StableFallback = false
+			contract.Pools["balanced-v1"] = pool
+			catalog.Contracts[session.request.ContractID] = contract
+
+			first, err := session.Next(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, "cheap", first.Route.RouteID)
+			session.RecordAttempt(context.Background(), first, SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true,
+				RetryNextRoute: true, AffectsRouteHealth: true,
+			}, 0, 0, false)
+
+			authorized := session.CanTryNextMedia(SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true,
+				RetryNextRoute: true, AffectsRouteHealth: true,
+			}, test.committed, test.disposition)
+			assert.Equal(t, test.wantNext, authorized)
+			if !test.wantNext {
+				assert.False(t, session.attempt.VirginMediaRetryAuthorized)
+				return
+			}
+
+			second, err := session.Next(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, "fallback", second.Route.RouteID)
+			assert.Equal(t, smartrouter.AdmissionNormal, second.Plan.Admission)
+			assert.False(t, session.attempt.VirginMediaRetryAuthorized, "the grant must be consumed when the next attempt starts")
+			second.stopAndRelease()
+		})
+	}
+}
+
+func TestSmartRoutingSessionWaitsForOrderedColdStartDiscoveryThenReplans(t *testing.T) {
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	session, _ := managerTestSession(t, state)
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	contract := catalog.Contracts[session.request.ContractID]
+	pool := contract.Pools["balanced-v1"]
+	pool.Candidates[1].StableFallback = false
+	contract.Pools["balanced-v1"] = pool
+	catalog.Contracts[session.request.ContractID] = contract
+	setting := smartroutersetting.Normalize(smartroutersetting.Setting{
+		Enabled: true, BackgroundProbeEnabled: true, MaxAttempts: 3,
+		CatalogRefreshSeconds: 3600, KillSwitchMode: smartroutersetting.KillSwitchNormal,
+		ColdStartWaitMS: 500, ColdStartPollIntervalMS: 10,
+	})
+	session.engine.Settings = func() smartroutersetting.Setting { return setting }
+	session.engine.SetRecoveryHintSink(managerTestRecoveryHintSink{})
+
+	first, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "cheap", first.Route.RouteID)
+	session.RecordAttempt(context.Background(), first, SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true,
+		RetryNextRoute: true, AffectsRouteHealth: true,
+	}, 0, 0, false)
+
+	type nextResult struct {
+		handle *SmartRouteAttemptHandle
+		err    error
+	}
+	next := make(chan nextResult, 1)
+	go func() {
+		handle, nextErr := session.Next(context.Background())
+		next <- nextResult{handle: handle, err: nextErr}
+	}()
+	time.Sleep(30 * time.Millisecond)
+	require.NoError(t, state.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: "fallback", Group: "fallback", Model: session.request.CanonicalModel,
+		ChannelID: 2, ContractID: session.request.ContractID, Endpoint: session.request.Endpoint,
+		CapacityDomain: "fallback-capacity", StableFallback: false,
+		Outcome: smartrouter.OutcomeSuccess, Admission: smartrouter.AdmissionVirginBootstrap,
+		RouteEpoch: 1,
+	}))
+	notifySmartRouteDiscovery(session.request)
+
+	select {
+	case result := <-next:
+		require.NoError(t, result.err)
+		require.NotNil(t, result.handle)
+		assert.Equal(t, "fallback", result.handle.Route.RouteID)
+		assert.Equal(t, smartrouter.AdmissionNormal, result.handle.Plan.Admission)
+		result.handle.stopAndRelease()
+	case <-time.After(time.Second):
+		require.Fail(t, "cold-start discovery did not wake and replan the request")
+	}
+}
+
+func TestSmartRoutingSessionColdStartDiscoveryWaitIsBounded(t *testing.T) {
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	session, _ := managerTestSession(t, state)
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	contract := catalog.Contracts[session.request.ContractID]
+	pool := contract.Pools["balanced-v1"]
+	pool.Candidates[1].StableFallback = false
+	contract.Pools["balanced-v1"] = pool
+	catalog.Contracts[session.request.ContractID] = contract
+	setting := smartroutersetting.Normalize(smartroutersetting.Setting{
+		Enabled: true, BackgroundProbeEnabled: true, MaxAttempts: 3,
+		CatalogRefreshSeconds: 3600, KillSwitchMode: smartroutersetting.KillSwitchNormal,
+		ColdStartWaitMS: 40, ColdStartPollIntervalMS: 10,
+	})
+	session.engine.Settings = func() smartroutersetting.Setting { return setting }
+	session.engine.SetRecoveryHintSink(managerTestRecoveryHintSink{})
+
+	first, err := session.Next(context.Background())
+	require.NoError(t, err)
+	session.RecordAttempt(context.Background(), first, SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true,
+		RetryNextRoute: true, AffectsRouteHealth: true,
+	}, 0, 0, false)
+	started := time.Now()
+	second, err := session.Next(context.Background())
+	require.NoError(t, err,
+		"safe text must use the remaining certified route instead of waiting for a synthetic cold-start probe")
+	assert.Equal(t, "fallback", second.Route.RouteID)
+	assert.Less(t, time.Since(started), 30*time.Millisecond)
+	second.stopAndRelease()
+}
+
+func TestSmartRoutingSessionVirginBootstrapSuccessIsHealthyForNextRequest(t *testing.T) {
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	session, _ := managerTestSession(t, state)
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	contract := catalog.Contracts[session.request.ContractID]
+	pool := contract.Pools["balanced-v1"]
+	pool.Candidates[1].StableFallback = false
+	contract.Pools["balanced-v1"] = pool
+	catalog.Contracts[session.request.ContractID] = contract
+	setting := session.engine.Settings()
+	setting.BackgroundProbeEnabled = true
+	session.engine.Settings = func() smartroutersetting.Setting { return setting }
+
+	first, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, smartrouter.AdmissionNormal, first.Plan.Admission)
+	assert.False(t, session.attempt.RecoveryProbeUsed)
+	session.RecordAttempt(context.Background(), first, SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeSuccess,
+	}, 0, 100*time.Millisecond, true)
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "cheap", CapacityDomain: "cheap-capacity"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes["cheap"].Phase)
+
+	next := &SmartRoutingSession{
+		engine: session.engine, request: session.request, policy: session.policy,
+		userGroup: session.userGroup, allowedGroups: append([]string(nil), session.allowedGroups...),
+		attempt: smartrouter.AttemptState{MaxAttempts: 3}, blockedRoutes: map[string]struct{}{},
+		probeSubject: "token-2",
+	}
+	second, err := next.Next(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "cheap", second.Route.RouteID)
+	assert.Equal(t, smartrouter.AdmissionNormal, second.Plan.Admission)
+	second.stopAndRelease()
+}
+
+func TestSmartRoutingSessionDoesNotPublishSyntheticColdStartForUsableUnknownRoutes(t *testing.T) {
+	t.Run("unknown media success is an ordinary real success", func(t *testing.T) {
+		state := &managerOrderingStateStore{}
+		session, _ := managerTestSession(t, state)
+		setting := session.engine.Settings()
+		setting.BackgroundProbeEnabled = true
+		session.engine.Settings = func() smartroutersetting.Setting { return setting }
+		session.allowedGroups = []string{"economy"}
+		sink := &managerTestColdStartSuccessSink{}
+		session.engine.SetRecoveryHintSink(sink)
+		session.request.ReplayClass = smartrouter.ReplaySafeImage
+		handle, err := session.Next(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, smartrouter.AdmissionNormal, handle.Plan.Admission)
+		assert.Empty(t, sink.hints,
+			"unknown routes are usable and must not enqueue a synthetic recovery hint")
+		session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{
+			Outcome: smartrouter.OutcomeSuccess,
+		}, 0, time.Millisecond, true)
+		assert.Zero(t, sink.calls)
+	})
+
+	t.Run("ordinary healthy success does not rewrite the marker", func(t *testing.T) {
+		state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+		require.NoError(t, err)
+		state.mu.Lock()
+		state.quality["cheap"] = smartrouter.QualityState{Phase: smartrouter.QualityHealthy, Epoch: 1}
+		state.mu.Unlock()
+		session, _ := managerTestSession(t, state)
+		sink := &managerTestColdStartSuccessSink{}
+		session.engine.SetRecoveryHintSink(sink)
+		handle, err := session.Next(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, smartrouter.AdmissionNormal, handle.Plan.Admission)
+		session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{
+			Outcome: smartrouter.OutcomeSuccess,
+		}, 0, time.Millisecond, true)
+		assert.Zero(t, sink.calls)
+	})
+}
+
+func TestSmartRoutingSessionDoesNotForegroundProbeUnknownGroupAliases(t *testing.T) {
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	first, _ := managerTestSession(t, state)
+	catalog, ok := first.engine.Catalogs.Current()
+	require.True(t, ok)
+	entry := catalog.Contracts[first.request.ContractID]
+	pool := entry.Pools["balanced-v1"]
+	require.Len(t, pool.Candidates, 2)
+	pool.Candidates[1].StableFallback = false
+	pool.Candidates[1].ChannelID = pool.Candidates[0].ChannelID
+	pool.Candidates[1].ChannelGeneration = pool.Candidates[0].ChannelGeneration
+	pool.Candidates[1].UpstreamModel = pool.Candidates[0].UpstreamModel
+	pool.Candidates[1].CapacityDomain = "alias-capacity"
+	entry.Pools["balanced-v1"] = pool
+	catalog.Contracts[first.request.ContractID] = entry
+	first.engine.Catalogs.current.Store(catalog)
+	first.allowedGroups = []string{"economy"}
+	first.request.ReplayClass = smartrouter.ReplaySafeImage
+
+	firstHandle, err := first.Next(context.Background())
+	require.NoError(t, err)
+	assert.Nil(t, firstHandle.probe)
+
+	second := &SmartRoutingSession{
+		engine: first.engine, request: first.request, policy: first.policy,
+		userGroup: first.userGroup, allowedGroups: []string{"fallback"},
+		attempt: smartrouter.AttemptState{MaxAttempts: 3}, blockedRoutes: map[string]struct{}{},
+		probeSubject: "token-alias",
+	}
+	secondHandle, err := second.Next(context.Background())
+	require.NoError(t, err)
+	assert.Nil(t, secondHandle.probe)
+	assert.Equal(t, firstHandle.Route.ChannelID, secondHandle.Route.ChannelID)
+	secondHandle.stopAndRelease()
+	firstHandle.stopAndRelease()
+}
+
+func TestSmartRoutingSessionSharesPhysicalRouteHealthAcrossGroupAliases(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		outcome   SmartRouteOutcome
+		wantPhase smartrouter.QualityPhase
+	}{
+		{
+			name: "success", outcome: SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			wantPhase: smartrouter.QualityHealthy,
+		},
+		{
+			name: "infrastructure failure",
+			outcome: SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true,
+				RetryNextRoute: true, AffectsRouteHealth: true,
+			},
+			wantPhase: smartrouter.QualityDegraded,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+			require.NoError(t, err)
+			session, _ := managerTestSession(t, state)
+			catalog, ok := session.engine.Catalogs.Current()
+			require.True(t, ok)
+			contract := catalog.Contracts[session.request.ContractID]
+			pool := contract.Pools["balanced-v1"]
+			pool.Candidates[1].StableFallback = false
+			pool.Candidates[1].ChannelID = pool.Candidates[0].ChannelID
+			pool.Candidates[1].ChannelGeneration = pool.Candidates[0].ChannelGeneration
+			pool.Candidates[1].UpstreamModel = pool.Candidates[0].UpstreamModel
+			contract.Pools["balanced-v1"] = pool
+			catalog.Contracts[session.request.ContractID] = contract
+
+			handle, err := session.Next(context.Background())
+			require.NoError(t, err)
+			session.RecordAttempt(context.Background(), handle, test.outcome, 0, 100*time.Millisecond, true)
+			snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+				{RouteID: pool.Candidates[0].RouteID, CapacityDomain: pool.Candidates[0].CapacityDomain},
+				{RouteID: pool.Candidates[1].RouteID, CapacityDomain: pool.Candidates[1].CapacityDomain},
+			}})
+			require.NoError(t, err)
+			assert.Equal(t, test.wantPhase, snapshot.Quality.Routes[pool.Candidates[0].RouteID].Phase)
+			assert.Equal(t, test.wantPhase, snapshot.Quality.Routes[pool.Candidates[1].RouteID].Phase)
+		})
+	}
+}
+
+func TestSmartRouteLeaseHeartbeatIntervalUsesShortestLeaseTTL(t *testing.T) {
+	handle := &SmartRouteAttemptHandle{
+		probe:    &SmartRouteLease{renewTTL: 10 * time.Second},
+		capacity: &SmartRouteLease{renewTTL: 2 * time.Minute},
+	}
+	assert.Equal(t, 10*time.Second/3, smartRouteLeaseHeartbeatIntervalFor(handle))
+
+	handle.probe.renewTTL = 60 * time.Second
+	assert.Equal(t, smartRouteLeaseHeartbeatInterval, smartRouteLeaseHeartbeatIntervalFor(handle),
+		"long-lived leases retain the 15-second ceiling")
+}
+
+func TestSmartRoutingSessionOnlySkipsHealthForExplicitlyNeutralRouteFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		outcome  SmartRouteOutcome
+		wantSkip bool
+	}{
+		{
+			name: "route model tombstone",
+			outcome: SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeInfrastructure, FailureScope: SmartFailureRouteModel,
+				RouteFailure: true, RetryNextRoute: true, AffectsRouteHealth: false,
+			},
+			wantSkip: true,
+		},
+		{
+			name: "route contract tombstone",
+			outcome: SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeInfrastructure, FailureScope: SmartFailureRouteContract,
+				RouteFailure: true, RetryNextRoute: true, AffectsRouteHealth: false,
+			},
+			wantSkip: true,
+		},
+		{
+			name: "infrastructure failure",
+			outcome: SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeInfrastructure, FailureScope: SmartFailureInfrastructure,
+				RouteFailure: true, RetryNextRoute: true, AffectsRouteHealth: true,
+			},
+		},
+		{
+			name: "capacity failure keeps capacity accounting",
+			outcome: SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeCapacityLimited, FailureScope: SmartFailureCapacity,
+				RouteFailure: true, RetryNextRoute: true, AffectsRouteHealth: false,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := &managerOrderingStateStore{}
+			session, _ := managerTestSession(t, state)
+			handle, err := session.Next(context.Background())
+			require.NoError(t, err)
+			session.RecordAttempt(context.Background(), handle, test.outcome, 0, 0, false)
+
+			records := state.attemptRecords()
+			require.Len(t, records, 1)
+			assert.Equal(t, test.wantSkip, records[0].SkipHealthUpdate)
+		})
+	}
+}
+
+func TestSmartRoutingSessionUsesCurrentPriceWithoutForegroundProbeLease(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, ratios := managerTestSession(t, state)
+	session.request.ReplayClass = smartrouter.ReplaySafeImage
+	ratios.update("economy", 40_000)
+	ratios.update("fallback", 30_000)
+
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "fallback", handle.Route.RouteID)
+	assert.Equal(t, 1, session.attempt.StartedAttempts)
+	assert.Equal(t, []string{"fallback"}, session.attempt.AttemptedRoutes)
+	assert.Equal(t, []int{2}, session.attempt.AttemptedChannels)
+	assert.Equal(t, []string{"capacity"}, state.values())
+	handle.stopAndRelease()
+}
+
+func TestSmartRoutingSessionDiscardsUnusedPlanWhenPriceChangesBeforeDispatch(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, ratios := managerTestSession(t, state)
+
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "cheap", handle.Route.RouteID)
+	require.Equal(t, 1, session.attempt.StartedAttempts)
+
+	// The planner selected economy at 0.02x. A control-plane hot update lands
+	// before billing reservation or upstream dispatch and makes fallback cheaper.
+	ratios.update("economy", 40_000)
+	ratios.update("fallback", 30_000)
+	changed, err := session.ReplanIfPriceQuoteChanged(context.Background(), handle, "")
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Zero(t, session.attempt.StartedAttempts)
+	assert.Empty(t, session.attempt.AttemptedRoutes)
+	assert.Empty(t, session.attempt.AttemptedChannels)
+	assert.Equal(t, []string{"capacity", "capacity_release"}, state.values())
+
+	replanned, err := session.Next(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "fallback", replanned.Route.RouteID)
+	assert.Equal(t, int64(30_000), replanned.Plan.RatioPPM)
+	assert.Equal(t, 1, session.attempt.StartedAttempts,
+		"a price-only replan must not consume the upstream attempt budget")
+	replanned.stopAndRelease()
+}
+
+func TestSmartRoutingSessionKeepsLeasesWhenFinalPriceQuoteMatches(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+
+	changed, err := session.ReplanIfPriceQuoteChanged(context.Background(), handle, "")
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, 1, session.attempt.StartedAttempts)
+	assert.Equal(t, []string{"capacity"}, state.values(),
+		"an unchanged quote must retain its already acquired capacity lease")
+	handle.stopAndRelease()
+}
+
+func TestSmartRouterAcceptsBoundedShortWaitPolicy(t *testing.T) {
+	setting := smartCatalogTestSetting("openai")
+	policy := smartrouter.NormalizePolicy(setting.DefaultPolicy)
+	policy.QueuePolicy = smartrouter.QueuePolicy{
+		Mode: smartrouter.QueueModeShortWait, MaxWaitMS: 500, MinSavingPercent: 10,
+	}
+	engine := &SmartRouterEngine{Settings: func() smartroutersetting.Setting { return setting }}
+	session, err := engine.NewSession(context.Background(), 1, "default", smartrouter.RouteRequest{}, policy)
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QueueModeShortWait, session.policy.QueuePolicy.Mode)
+	assert.Equal(t, int64(500), session.policy.QueuePolicy.MaxWaitMS)
+}
+
+func TestNewSessionDerivesAdmissionKeyWithoutCreatingCacheAffinity(t *testing.T) {
+	setting := smartCatalogTestSetting("openai")
+	policy := smartrouter.NormalizePolicy(setting.DefaultPolicy)
+	engine := &SmartRouterEngine{
+		Settings: func() smartroutersetting.Setting { return setting },
+		Affinity: NewMemorySmartRouteAffinityStore(nil, 100),
+	}
+	request := smartrouter.RouteRequest{
+		ContractID: "contract-text", CanonicalModel: "gpt-test", Endpoint: SmartEndpointChat,
+		ReplayClass: smartrouter.ReplaySafeText,
+	}
+	session, err := engine.NewSession(context.Background(), 42, "default", request, policy)
+	require.NoError(t, err)
+	assert.NotEmpty(t, session.request.AdmissionKey)
+	assert.Empty(t, session.affinityKey, "absence of prompt_cache_key must not create strong cache affinity")
+}
+
+func TestNewSessionUsesFiniteCandidateExhaustionForEveryRoutableClass(t *testing.T) {
+	retryable := SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true, RetryNextRoute: true,
+	}
+	for _, test := range []struct {
+		name                string
+		limitEnabled        bool
+		replayClass         smartrouter.ReplayClass
+		wantExhaustEligible bool
+		wantNext            bool
+	}{
+		{name: "safe text exhausts when limit is off", replayClass: smartrouter.ReplaySafeText, wantExhaustEligible: true, wantNext: true},
+		{name: "safe text ignores legacy limit when limit is on", limitEnabled: true, replayClass: smartrouter.ReplaySafeText, wantExhaustEligible: true, wantNext: true},
+		{name: "side effecting exhausts only after explicit rejection", replayClass: smartrouter.ReplaySideEffecting, wantExhaustEligible: true, wantNext: true},
+		{name: "media exhausts only after controller authorization", replayClass: smartrouter.ReplaySafeVideo, wantExhaustEligible: true, wantNext: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setting := smartCatalogTestSetting("openai")
+			setting.AttemptLimitEnabled = test.limitEnabled
+			setting.MaxAttempts = 1
+			policy := smartrouter.NormalizePolicy(setting.DefaultPolicy)
+			policy.MaxAttempts = 1
+			engine := &SmartRouterEngine{
+				Settings: func() smartroutersetting.Setting { return setting },
+				Affinity: NewMemorySmartRouteAffinityStore(nil, 100),
+			}
+			session, err := engine.NewSession(context.Background(), 42, "default", smartrouter.RouteRequest{
+				ContractID: "contract-text", CanonicalModel: "gpt-test", Endpoint: SmartEndpointChat,
+				ReplayClass: test.replayClass,
+			}, policy)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantExhaustEligible, session.attempt.ExhaustEligibleChannels)
+			session.attempt.StartedAttempts = session.attempt.MaxAttempts
+			assert.Equal(t, test.wantNext, session.CanTryNext(retryable, false))
+		})
+	}
+}
+
+func TestSmartRoutingSessionExhaustsFinitePhysicalSetBeyondNumericLimit(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, ratios := managerTestSession(t, state)
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	updated := *catalog
+	updated.Contracts = make(map[string]smartrouter.ContractCatalog, len(catalog.Contracts))
+	for contractID, contract := range catalog.Contracts {
+		cloned := contract
+		cloned.Pools = make(map[string]smartrouter.CertifiedPool, len(contract.Pools))
+		for poolID, pool := range contract.Pools {
+			pool.Candidates = append([]smartrouter.CertifiedRoute(nil), pool.Candidates...)
+			cloned.Pools[poolID] = pool
+		}
+		updated.Contracts[contractID] = cloned
+	}
+	contract := updated.Contracts[session.request.ContractID]
+	pool := contract.Pools["balanced-v1"]
+	for channelID := 3; channelID <= 10; channelID++ {
+		group := fmt.Sprintf("route-%d", channelID)
+		pool.Candidates = append(pool.Candidates, smartrouter.CertifiedRoute{
+			RouteID: group, Group: group, ChannelID: channelID, UpstreamModel: "gpt-test",
+			Capabilities: smartroutersetting.CapabilityText, MaxContext: 128_000,
+			CacheDomain: group + "-cache", CapacityDomain: group + "-capacity", MaxInflight: 2,
+			StableFallback: true,
+		})
+		session.allowedGroups = append(session.allowedGroups, group)
+		ratios.update(group, int64(20_000+channelID))
+	}
+	contract.Pools["balanced-v1"] = pool
+	updated.Contracts[session.request.ContractID] = contract
+	session.engine.Catalogs.current.Store(&updated)
+	session.engine.Prices.InvalidateAll()
+	session.attempt.MaxAttempts = 8
+	session.attempt.ExhaustEligibleChannels = true
+
+	var attempted []int
+	for attempt := range 10 {
+		handle, err := session.Next(context.Background())
+		require.NoErrorf(t, err, "attempt %d must still have an eligible physical channel", attempt+1)
+		attempted = append(attempted, handle.Route.ChannelID)
+		session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{
+			Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true, RetryNextRoute: true,
+		}, 0, 0, false)
+	}
+	assert.Len(t, attempted, 10)
+	assert.Len(t, session.attempt.AttemptedChannels, 10)
+	uniqueChannels := make(map[int]struct{}, len(attempted))
+	for _, channelID := range attempted {
+		uniqueChannels[channelID] = struct{}{}
+	}
+	assert.Len(t, uniqueChannels, 10)
+	_, err := session.Next(context.Background())
+	require.ErrorIs(t, err, smartrouter.ErrNoCandidate)
+}
+
+func TestSmartRoutePolicyAllowsCandidateHonorsV4FixedGroupScopeForAutomaticStrategies(t *testing.T) {
+	policy := smartrouter.NormalizePolicy(smartrouter.Policy{
+		Version: smartrouter.PolicyVersion, Enabled: true,
+		Strategy: smartrouter.StrategyPrice, MaxEffectiveRatioPPM: 100_000,
+		ManualGroupOrder: []string{"plus"}, AllowFutureGroups: false,
+		HealthGuard: true,
+	})
+	prices := smartrouter.PriceSnapshot{RatiosPPM: map[string]int64{
+		"cheap-route": 20_000,
+		"plus-route":  50_000,
+	}}
+	allowed := map[string]struct{}{"cheap": {}, "plus": {}}
+
+	assert.False(t, smartRoutePolicyAllowsCandidate(
+		smartrouter.CertifiedRoute{RouteID: "cheap-route", Group: "cheap"},
+		"contract", policy, prices, allowed, nil,
+	))
+	assert.True(t, smartRoutePolicyAllowsCandidate(
+		smartrouter.CertifiedRoute{RouteID: "plus-route", Group: "plus"},
+		"contract", policy, prices, allowed, nil,
+	))
+}
+
+func TestSmartRoutingSessionAllowsSingleRouteModel(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	session.policy.ExcludedGroups = []string{"fallback"}
+
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+	assert.Equal(t, "cheap", handle.Route.RouteID)
+	handle.stopAndRelease()
+}
+
+func TestSmartRoutingSessionV4DoesNotRequireCertifiedFallbackSet(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	session.policy.ExcludedGroups = []string{"economy", "fallback"}
+
+	_, err := session.Next(context.Background())
+	require.ErrorIs(t, err, smartrouter.ErrNoCandidate)
+	assert.NotErrorIs(t, err, ErrSmartRouteUnsafeCandidateSet)
+}
+
+func TestSmartRoutingSessionLegacyRetainsCandidatePreflight(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	session.policy.Version = smartrouter.LegacyPolicyVersion
+	session.policy.ExcludedGroups = []string{"economy", "fallback"}
+
+	_, err := session.Next(context.Background())
+	require.ErrorIs(t, err, ErrSmartRouteUnsafeCandidateSet)
+}
+
+func TestSmartRouteHealthReportUsesSharedEvidenceContract(t *testing.T) {
+	state := &managerOrderingStateStore{}
+	session, _ := managerTestSession(t, state)
+	report, err := session.engine.HealthReport(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, report.Items)
+	assert.Equal(t, len(report.Items), report.Total)
+	assert.Equal(t, "memory", report.SharedStateBackend)
+	for _, item := range report.Items {
+		assert.NotEmpty(t, item.RouteID)
+		assert.NotEmpty(t, item.Status)
+	}
+}
+
+func TestSmartRouteCapacityOverflowDoesNotReplaceStrongAffinity(t *testing.T) {
+	store := NewMemorySmartRouteAffinityStore(nil, 100)
+	const affinityKey = "affinity-key"
+	original := smartrouter.AffinityState{
+		Strength: smartrouter.AffinityStrong, ContractID: "contract", RouteID: "original",
+		ChannelID: 1, CacheDomain: "cache-a", PolicyID: "policy",
+		LastSuccessMS: 100, LastSwitchMS: 90, LastActivityMS: 100,
+	}
+	require.NoError(t, store.Put(context.Background(), affinityKey, original, time.Hour))
+	session := &SmartRoutingSession{
+		engine: &SmartRouterEngine{Affinity: store}, affinityKey: affinityKey,
+		affinity: &original, request: smartrouter.RouteRequest{ContractID: "contract"},
+		policy: smartrouter.Policy{PolicyID: "policy"},
+	}
+	session.recordAffinity(&SmartRouteAttemptHandle{
+		Plan:  smartrouter.PlanResult{AffinityDisposition: smartrouter.AffinityPreserve, CapacityOverflow: true},
+		Route: smartrouter.CertifiedRoute{RouteID: "overflow", ChannelID: 2, CacheDomain: "cache-b"},
+	})
+
+	stored, found, err := store.Get(context.Background(), affinityKey)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "original", stored.RouteID)
+	assert.Equal(t, 1, stored.ChannelID)
+	assert.Equal(t, int64(100), stored.LastSuccessMS)
+	assert.Greater(t, stored.LastActivityMS, original.LastActivityMS)
+}
+
+func TestSmartRouteRecoveryTimeoutNeverCapsForegroundRequests(t *testing.T) {
+	plan := smartrouter.PlanResult{
+		Admission: smartrouter.AdmissionProbe, RouteID: "route", ChannelID: 1,
+		Candidates: []smartrouter.Candidate{{
+			Route:         smartrouter.CertifiedRoute{RouteID: "route", ChannelID: 1},
+			TTFTKnowledge: smartrouter.TTFTKnown, TTFTP95MS: 200,
+		}},
+	}
+	assert.Zero(t, smartRouteRecoveryTimeout(plan, smartrouter.RouteRequest{}))
+
+	request := smartrouter.RouteRequest{DeadlineMS: time.Now().Add(400 * time.Millisecond).UnixMilli()}
+	setting := smartroutersetting.Setting{ProbeTimeoutSeconds: 60}
+	assert.Zero(t, smartRouteRecoveryTimeout(plan, request, setting))
+}
+
+func TestSmartRouteStateConfigUsesHotCanarySettings(t *testing.T) {
+	setting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	setting.RecoveryCanaryInitialTrafficPPM = 200_000
+	setting.RecoveryCanaryHealthySamples = 4
+	setting.RecoveryCanaryFastHistorySamples = 7
+	setting.RecoveryCanaryFastReliabilityPPM = 820_000
+
+	config := smartRouteStateConfigFromSetting(setting)
+	assert.Equal(t, 4, config.Quality.HealthyWarmSamples)
+	assert.Equal(t, 7, config.Quality.FastCanaryMinSamples)
+	assert.Equal(t, int64(820_000), config.Quality.FastCanaryMinReliabilityPPM)
+	require.NotEmpty(t, config.Quality.WarmingStages)
+	assert.Equal(t, int64(200_000), config.Quality.WarmingStages[0].TrafficPPM)
+}

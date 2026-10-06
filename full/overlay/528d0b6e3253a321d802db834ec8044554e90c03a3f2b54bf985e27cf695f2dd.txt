@@ -1,0 +1,1056 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSmartContractIdentityUsesOnlyModelAndProtocol(t *testing.T) {
+	chatID, chatFingerprint, err := BuildSmartContractIdentity("gpt-5.6", SmartEndpointChat)
+	require.NoError(t, err)
+	require.NotEmpty(t, chatID)
+	assert.Equal(t, SmartEndpointChat, chatFingerprint)
+
+	repeatedID, repeatedFingerprint, err := BuildSmartContractIdentity(" gpt-5.6 ", SmartEndpointChat)
+	require.NoError(t, err)
+	assert.Equal(t, chatID, repeatedID)
+	assert.Equal(t, chatFingerprint, repeatedFingerprint)
+
+	responsesID, _, err := BuildSmartContractIdentity("gpt-5.6", SmartEndpointResponses)
+	require.NoError(t, err)
+	assert.NotEqual(t, chatID, responsesID)
+
+	otherModelID, _, err := BuildSmartContractIdentity("gpt-5.6-mini", SmartEndpointChat)
+	require.NoError(t, err)
+	assert.NotEqual(t, chatID, otherModelID)
+
+	_, _, err = BuildSmartContractIdentity("gpt-5.6", "openai-chat-v2")
+	assert.ErrorIs(t, err, ErrUnsupportedSmartRouteEndpoint)
+}
+
+func TestBuildSmartRouteRequestSupportedTextContracts(t *testing.T) {
+	tests := []struct {
+		name         string
+		path         string
+		model        string
+		body         string
+		endpoint     string
+		replay       smartrouter.ReplayClass
+		capabilities uint64
+		warmingKey   string
+	}{
+		{
+			name:         "plain chat",
+			path:         "/v1/chat/completions",
+			model:        "gpt-5.6",
+			body:         `{"model":"gpt-5.6","messages":[{"role":"user","content":"hello"}]}`,
+			endpoint:     SmartEndpointChat,
+			replay:       smartrouter.ReplaySafeText,
+			capabilities: SmartCapabilityText,
+		},
+		{
+			name:     "Codex responses request",
+			path:     "/v1/responses",
+			model:    "gpt-5.6-codex",
+			body:     `{"model":"gpt-5.6-codex","input":"fix this repo","stream":true,"store":false,"tools":[{"type":"function","name":"read_file"}],"reasoning":{"effort":"high"},"prompt_cache_key":"codex-session-7"}`,
+			endpoint: SmartEndpointResponses,
+			replay:   smartrouter.ReplaySafeText,
+			capabilities: SmartCapabilityText | SmartCapabilityStream | SmartCapabilityTools |
+				SmartCapabilityReasoning | SmartCapabilityPromptCache,
+			warmingKey: "codex-session-7",
+		},
+		{
+			name:     "Claude messages vision tools and cache",
+			path:     "/v1/messages",
+			model:    "claude-opus-4-8",
+			body:     `{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},{"type":"text","text":"inspect","cache_control":{"type":"ephemeral"}}]}],"tools":[{"name":"lookup","description":"lookup","input_schema":{"type":"object"}}],"thinking":{"type":"adaptive"}}`,
+			endpoint: SmartEndpointMessages,
+			replay:   smartrouter.ReplaySafeText,
+			capabilities: SmartCapabilityText | SmartCapabilityStream | SmartCapabilityTools |
+				SmartCapabilityVision | SmartCapabilityReasoning | SmartCapabilityPromptCache,
+		},
+		{
+			name:         "legacy completions",
+			path:         "/v1/completions",
+			model:        "gpt-3.5-turbo-instruct",
+			body:         `{"model":"gpt-3.5-turbo-instruct","prompt":"hello","stream":true}`,
+			endpoint:     SmartEndpointCompletions,
+			replay:       smartrouter.ReplaySafeText,
+			capabilities: SmartCapabilityText | SmartCapabilityStream,
+		},
+		{
+			name:         "structured output",
+			path:         "/v1/chat/completions",
+			model:        "gpt-5.6",
+			body:         `{"model":"gpt-5.6","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}}`,
+			endpoint:     SmartEndpointChat,
+			replay:       smartrouter.ReplaySafeText,
+			capabilities: SmartCapabilityText | SmartCapabilityStructuredOutput,
+		},
+		{
+			name:     "tool schema image field is not vision input",
+			path:     "/v1/responses",
+			model:    "gpt-5.6-codex",
+			body:     `{"model":"gpt-5.6-codex","input":"inspect a URL","tools":[{"type":"function","name":"inspect_url","parameters":{"type":"object","properties":{"image_url":{"type":"string"}}}}]}`,
+			endpoint: SmartEndpointResponses,
+			replay:   smartrouter.ReplaySafeText,
+			capabilities: SmartCapabilityText |
+				SmartCapabilityTools,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newSmartRequestContext(t, http.MethodPost, test.path, test.body)
+			request, err := BuildSmartRouteRequest(c, test.model, 12_345)
+			require.NoError(t, err)
+			assert.Equal(t, test.model, request.CanonicalModel)
+			assert.Equal(t, test.endpoint, request.Endpoint)
+			assert.Equal(t, test.endpoint, request.CapabilityFingerprint)
+			assert.NotEmpty(t, request.ContractID)
+			assert.Equal(t, 12_345, request.EstimatedContext)
+			assert.Equal(t, test.replay, request.ReplayClass)
+			assert.Equal(t, test.capabilities, request.RequiredCapabilities)
+			assert.Equal(t, test.warmingKey, request.WarmingKey)
+		})
+	}
+}
+
+func TestBuildSmartRouteRequestStandaloneSearchIsSideEffecting(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/alpha/search", `{"id":"search-1","model":"gpt-5.6-sol","input":"latest","settings":{"external_web_access":"live"}}`)
+	request, err := BuildSmartRouteRequest(c, "gpt-5.6-sol", 0)
+	require.NoError(t, err)
+	assert.Equal(t, SmartEndpointStandaloneSearch, request.Endpoint)
+	assert.Equal(t, smartrouter.ReplaySideEffecting, request.ReplayClass)
+	assert.Equal(t, SmartCapabilityText|SmartCapabilityTools, request.RequiredCapabilities)
+}
+
+func TestBuildSmartRouteRequestReplayBoundaries(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		replay smartrouter.ReplayClass
+	}{
+		{
+			name:   "previous response binds upstream state",
+			body:   `{"model":"gpt-5.6","previous_response_id":"resp_123","input":"continue"}`,
+			replay: smartrouter.ReplayStateBound,
+		},
+		{
+			name:   "conversation object binds upstream state",
+			body:   `{"model":"gpt-5.6","conversation":{"id":"conv_123"},"input":"continue"}`,
+			replay: smartrouter.ReplayStateBound,
+		},
+		{
+			name:   "empty state references remain replay safe",
+			body:   `{"model":"gpt-5.6","previous_response_id":"","conversation":null,"input":"hello"}`,
+			replay: smartrouter.ReplaySafeText,
+		},
+		{
+			name:   "store true is side effecting",
+			body:   `{"model":"gpt-5.6","store":true,"input":"hello"}`,
+			replay: smartrouter.ReplaySideEffecting,
+		},
+		{
+			name:   "background is side effecting",
+			body:   `{"model":"gpt-5.6","background":true,"input":"hello"}`,
+			replay: smartrouter.ReplaySideEffecting,
+		},
+		{
+			name:   "hosted tool is side effecting",
+			body:   `{"model":"gpt-5.6","tools":[{"type":"web_search_preview"}],"input":"latest news"}`,
+			replay: smartrouter.ReplaySideEffecting,
+		},
+		{
+			name:   "versioned hosted tool is side effecting",
+			body:   `{"model":"gpt-5.6","tools":[{"type":"web_search_20250305"}],"input":"latest news"}`,
+			replay: smartrouter.ReplaySideEffecting,
+		},
+		{
+			name:   "future hosted tool fails closed",
+			body:   `{"model":"gpt-5.6","tools":[{"type":"future_hosted_tool_v2"}],"input":"do work"}`,
+			replay: smartrouter.ReplaySideEffecting,
+		},
+		{
+			name:   "custom client tool remains replay safe",
+			body:   `{"model":"gpt-5.6","tools":[{"type":"custom","name":"local_tool"}],"input":"do work"}`,
+			replay: smartrouter.ReplaySafeText,
+		},
+		{
+			name:   "embedded audio is unsupported in phase one",
+			body:   `{"model":"gpt-5.6","input":[{"type":"input_audio","audio":"AA=="}]}`,
+			replay: smartrouter.ReplayUnsupported,
+		},
+		{
+			name:   "provider file id is unsupported in phase one",
+			body:   `{"model":"gpt-5.6","input":[{"type":"input_file","file_id":"file_123"}]}`,
+			replay: smartrouter.ReplayUnsupported,
+		},
+		{
+			name:   "state binding wins over side effect",
+			body:   `{"model":"gpt-5.6","store":true,"previous_response_id":"resp_123","input":"continue"}`,
+			replay: smartrouter.ReplayStateBound,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newSmartRequestContext(t, http.MethodPost, "/v1/responses", test.body)
+			request, err := BuildSmartRouteRequest(c, "gpt-5.6", 100)
+			require.NoError(t, err)
+			assert.Equal(t, test.replay, request.ReplayClass)
+		})
+	}
+}
+
+func TestBuildSmartRouteRequestRejectsUnsupportedEndpoints(t *testing.T) {
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/v1/responses/compact"},
+		{http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent"},
+		{http.MethodGet, "/v1/realtime"},
+		{http.MethodPost, "/v1/embeddings"},
+		{http.MethodPost, "/v1/tasks"},
+		{http.MethodGet, "/v1/chat/completions"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			c := newSmartRequestContext(t, test.method, test.path, `{"model":"gpt-5.6"}`)
+			request, err := BuildSmartRouteRequest(c, "gpt-5.6", 10)
+			require.NoError(t, err)
+			assert.Equal(t, smartrouter.ReplayUnsupported, request.ReplayClass)
+			assert.Empty(t, request.ContractID)
+		})
+	}
+}
+
+func TestBuildSmartRouteRequestClassifiesMediaContracts(t *testing.T) {
+	tests := []struct {
+		path         string
+		model        string
+		body         string
+		endpoint     string
+		replay       smartrouter.ReplayClass
+		capabilities uint64
+	}{
+		{path: "/v1/images/generations", model: "gpt-image-1", body: `{"model":"gpt-image-1","prompt":"a cat"}`, endpoint: SmartEndpointImages, replay: smartrouter.ReplaySafeImage, capabilities: SmartCapabilityImageGeneration},
+		{path: "/v1/images/edits", model: "gpt-image-1", body: `{"model":"gpt-image-1","prompt":"remove the background"}`, endpoint: SmartEndpointImageEdits, replay: smartrouter.ReplaySafeImage, capabilities: SmartCapabilityImageGeneration | SmartCapabilityReferenceImage},
+		{path: "/v1/videos", model: "sora-2", body: `{"model":"sora-2","prompt":"a cat"}`, endpoint: SmartEndpointVideos, replay: smartrouter.ReplaySafeVideo, capabilities: SmartCapabilityVideoGeneration | SmartCapabilityAsyncTask},
+		{path: "/v1/video/generations", model: "sora-2", body: `{"model":"sora-2","prompt":"a cat"}`, endpoint: SmartEndpointVideoTasks, replay: smartrouter.ReplaySafeVideo, capabilities: SmartCapabilityVideoGeneration | SmartCapabilityAsyncTask},
+		{path: "/v1/audio/speech", model: "tts-1", body: `{"model":"tts-1","input":"hello","voice":"alloy"}`, endpoint: SmartEndpointAudioSpeech, replay: smartrouter.ReplaySafeAudio, capabilities: SmartCapabilityAudioSpeech},
+		{path: "/v1/audio/transcriptions", model: "whisper-1", body: `{"model":"whisper-1"}`, endpoint: SmartEndpointAudioTranscription, replay: smartrouter.ReplaySafeAudio, capabilities: SmartCapabilityAudioTranscript},
+		{path: "/v1/audio/translations", model: "whisper-1", body: `{"model":"whisper-1"}`, endpoint: SmartEndpointAudioTranslation, replay: smartrouter.ReplaySafeAudio, capabilities: SmartCapabilityAudioTranscript},
+	}
+	for _, test := range tests {
+		t.Run(test.path, func(t *testing.T) {
+			c := newSmartRequestContext(t, http.MethodPost, test.path, test.body)
+			request, err := BuildSmartRouteRequest(c, test.model, 0)
+			require.NoError(t, err)
+			assert.Equal(t, test.endpoint, request.Endpoint)
+			assert.Equal(t, test.replay, request.ReplayClass)
+			assert.Equal(t, test.capabilities, request.RequiredCapabilities)
+			assert.NotEmpty(t, request.ContractID)
+		})
+	}
+
+	c, videoBody := newSmartMultipartRequestContext(t, "/v1/videos", map[string]string{
+		"model": "sora-2", "prompt": "a cat", "duration": "10", "resolution": "720p", "n": "2",
+	}, map[string]string{"input_reference": "reference-image"})
+	request, err := BuildSmartRouteRequest(c, "sora-2", 0)
+	require.NoError(t, err)
+	assert.Equal(t, SmartEndpointVideos, request.Endpoint)
+	assert.Equal(t, smartrouter.ReplaySafeVideo, request.ReplayClass)
+	require.NotNil(t, request.Media)
+	assert.Equal(t, int64(10), request.Media.DurationSeconds)
+	assert.True(t, request.Media.DurationKnown)
+	assert.Equal(t, int64(2), request.Media.OutputCount)
+	assert.Equal(t, "720p", request.Media.Resolution)
+	require.Len(t, request.Media.References, 1)
+	assert.Equal(t, smartrouter.MediaKindImage, request.Media.References[0].Type)
+	assert.True(t, request.Media.References[0].MetadataTrusted)
+	assert.Equal(t, SmartCapabilityVideoGeneration|SmartCapabilityAsyncTask|SmartCapabilityReferenceImage, request.RequiredCapabilities)
+	assertSmartRequestBodyReusable(t, c, videoBody)
+
+	c, imageBody := newSmartMultipartRequestContext(t, "/v1/images/edits", map[string]string{
+		"model": "gpt-image-1", "prompt": "remove the background", "size": "1024x1024",
+	}, map[string]string{"image": "multipart image bytes remain reusable"})
+	request, err = BuildSmartRouteRequest(c, "gpt-image-1", 0)
+	require.NoError(t, err)
+	assert.Equal(t, SmartEndpointImageEdits, request.Endpoint)
+	assert.Equal(t, smartrouter.ReplaySafeImage, request.ReplayClass)
+	assert.Equal(t, SmartCapabilityImageGeneration|SmartCapabilityReferenceImage, request.RequiredCapabilities)
+	require.NotNil(t, request.Media)
+	require.Len(t, request.Media.References, 1)
+	assert.Equal(t, smartrouter.MediaKindImage, request.Media.References[0].Type)
+	assertSmartRequestBodyReusable(t, c, imageBody)
+
+	c, audioBody := newSmartMultipartRequestContext(t, "/v1/audio/transcriptions", map[string]string{
+		"model": "whisper-1",
+	}, map[string]string{"file": "audio bytes remain reusable"})
+	request, err = BuildSmartRouteRequest(c, "whisper-1", 0)
+	require.NoError(t, err)
+	assert.Equal(t, SmartEndpointAudioTranscription, request.Endpoint)
+	assert.Equal(t, smartrouter.ReplaySafeAudio, request.ReplayClass)
+	require.NotNil(t, request.Media)
+	assert.Equal(t, int64(1), request.Media.OutputCount)
+	assertSmartRequestBodyReusable(t, c, audioBody)
+}
+
+func TestSmartMediaAttemptReplayBoundary(t *testing.T) {
+	transport := types.NewErrorWithStatusCode(errors.New("dial tcp timeout"), types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+	assert.Equal(t, SmartMediaAttemptAcceptanceUnknown, ClassifySmartMediaAttempt(transport))
+	parsed := types.NewErrorWithStatusCode(errors.New("invalid successful response"), types.ErrorCodeBadResponseBody, http.StatusOK)
+	assert.Equal(t, SmartMediaAttemptAcceptanceUnknown, ClassifySmartMediaAttempt(parsed))
+	rejected := types.NewErrorWithStatusCode(errors.New("upstream rejected"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
+	assert.Equal(t, SmartMediaAttemptNotAccepted, ClassifySmartMediaAttempt(rejected))
+	assert.True(t, ClassifySmartRouteOutcome(rejected, nil).CanTryNextRoute())
+	marked := MarkSmartMediaSubmissionAmbiguous(transport)
+	assert.ErrorIs(t, marked, ErrSmartMediaSubmissionAmbiguous)
+	assert.False(t, ClassifySmartRouteOutcome(marked, nil).CanTryNextRoute())
+
+	dnsFailure := types.NewOpenAIError(&net.OpError{
+		Op: "dial", Net: "tcp", Err: &net.DNSError{Name: "provider.example", Err: "server misbehaving"},
+	}, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+	assert.Equal(t, SmartMediaAttemptNotAccepted, ClassifySmartMediaAttempt(dnsFailure))
+	assert.True(t, IsSmartMediaRoutePreparationFailure(dnsFailure))
+	dnsMarked := MarkSmartMediaRouteNotAccepted(dnsFailure)
+	assert.ErrorIs(t, dnsMarked, ErrSmartMediaRouteNotAccepted)
+	assert.True(t, ClassifySmartRouteOutcome(dnsMarked, nil).CanTryNextRoute())
+
+	postConnectFailure := types.NewOpenAIError(&net.OpError{
+		Op: "read", Net: "tcp", Err: errors.New("connection reset by peer"),
+	}, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+	assert.Equal(t, SmartMediaAttemptAcceptanceUnknown, ClassifySmartMediaAttempt(postConnectFailure))
+	assert.False(t, IsSmartMediaRoutePreparationFailure(postConnectFailure))
+}
+
+func TestBuildSmartRouteRequestInvalidJSONPreservesBodyStorage(t *testing.T) {
+	body := `{"model":"gpt-5.6","messages":[}`
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", body)
+
+	request, err := BuildSmartRouteRequest(c, "gpt-5.6", 10)
+	assert.ErrorIs(t, err, ErrInvalidSmartRouteRequest)
+	assert.Equal(t, smartrouter.ReplayUnsupported, request.ReplayClass)
+
+	storage, storageErr := common.GetBodyStorage(c)
+	require.NoError(t, storageErr)
+	storedBody, storageErr := io.ReadAll(storage)
+	require.NoError(t, storageErr)
+	assert.Equal(t, body, string(storedBody))
+}
+
+func TestBuildSmartRouteRequestLeavesBodyReusableAfterSuccess(t *testing.T) {
+	body := `{"model":"gpt-5.6","messages":[{"role":"user","content":"hello"}]}`
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", body)
+
+	_, err := BuildSmartRouteRequest(c, "gpt-5.6", 10)
+	require.NoError(t, err)
+	firstRead, err := io.ReadAll(c.Request.Body)
+	require.NoError(t, err)
+	assert.Equal(t, body, string(firstRead))
+
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	secondRead, err := io.ReadAll(storage)
+	require.NoError(t, err)
+	assert.Equal(t, body, string(secondRead))
+}
+
+func TestBuildSmartRouteRequestLeavesDiskBodyReusableOnSuccessAndFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantError bool
+	}{
+		{
+			name: "success",
+			body: `{"model":"gpt-5.6","messages":[{"role":"user","content":"hello"}]}`,
+		},
+		{
+			name:      "invalid JSON",
+			body:      `{"model":"gpt-5.6","messages":[}`,
+			wantError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", test.body)
+			storage := installSmartDiskBodyStorage(t, c, test.body)
+			require.True(t, storage.IsDisk())
+
+			_, err := BuildSmartRouteRequest(c, "gpt-5.6", 10)
+			if test.wantError {
+				assert.ErrorIs(t, err, ErrInvalidSmartRouteRequest)
+			} else {
+				require.NoError(t, err)
+			}
+			storedBody, readErr := io.ReadAll(c.Request.Body)
+			require.NoError(t, readErr)
+			assert.Equal(t, test.body, string(storedBody))
+
+			common.CleanupBodyStorage(c)
+			_, closedErr := storage.Bytes()
+			assert.ErrorIs(t, closedErr, common.ErrStorageClosed)
+		})
+	}
+}
+
+func TestBuildSmartRouteRequestValidatesModelAndContext(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", `{"model":"other-model"}`)
+	_, err := BuildSmartRouteRequest(c, "gpt-5.6", 10)
+	assert.ErrorIs(t, err, ErrInvalidSmartRouteRequest)
+
+	c = newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", `{"model":"gpt-5.6"}`)
+	_, err = BuildSmartRouteRequest(c, "gpt-5.6", -1)
+	assert.ErrorIs(t, err, ErrInvalidSmartRouteRequest)
+}
+
+func TestBuildSmartRouteRequestCopiesRequestDeadline(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", `{"model":"gpt-5.6"}`)
+	deadline := time.Now().Add(time.Minute).Truncate(time.Millisecond)
+	ctx, cancel := context.WithDeadline(c.Request.Context(), deadline)
+	t.Cleanup(cancel)
+	c.Request = c.Request.WithContext(ctx)
+
+	request, err := BuildSmartRouteRequest(c, "gpt-5.6", 10)
+	require.NoError(t, err)
+	assert.Equal(t, deadline.UnixMilli(), request.DeadlineMS)
+}
+
+func TestClassifySmartRouteOutcome(t *testing.T) {
+	tests := []struct {
+		name          string
+		apiErr        *types.NewAPIError
+		contextErr    error
+		outcome       smartrouter.QualityOutcome
+		scope         SmartRouteFailureScope
+		retry         bool
+		affectsHealth bool
+		quarantineMS  int64
+	}{
+		{
+			name:          "success",
+			outcome:       smartrouter.OutcomeSuccess,
+			scope:         SmartFailureNone,
+			affectsHealth: true,
+		},
+		{
+			name: "model not found retries another certified route without degrading channel",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "model not found", Type: "invalid_request_error", Code: "model_not_found",
+			}, http.StatusNotFound),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteModel, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "unsupported parameter retries matching contract",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "unsupported parameter response_format", Type: "invalid_request_error", Code: "unsupported_parameter",
+			}, http.StatusBadRequest),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "unsupported parameter text wins over generic invalid request code",
+			apiErr: types.NewOpenAIError(
+				errors.New("unsupported_parameter: response_format"),
+				types.ErrorCodeInvalidRequest,
+				http.StatusBadRequest,
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "skip retry does not suppress explicit model route fallback",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("model not found"), types.ErrorCodeModelNotFound, http.StatusNotFound,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteModel, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "skip retry does not suppress explicit unsupported contract fallback",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("unsupported_parameter response_format"), types.ErrorCodeInvalidRequest, http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "Responses single route overrides generic upstream 502",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("ambiguous malformed stream"), types.ErrorCodeSmartResponsesSingleRoute, http.StatusBadGateway,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure,
+		},
+		{
+			name: "Responses single route overrides capacity classification",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("ambiguous capacity event"), types.ErrorCodeSmartResponsesSingleRoute, http.StatusTooManyRequests,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure,
+		},
+		{
+			name: "Responses single route overrides credential classification",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("ambiguous authentication event"), types.ErrorCodeSmartResponsesSingleRoute, http.StatusUnauthorized,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure,
+		},
+		{
+			name: "Responses single route overrides model failure text",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("model_not_found: model not found"), types.ErrorCodeSmartResponsesSingleRoute, http.StatusNotFound,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure,
+		},
+		{
+			name: "Responses single route overrides unsupported contract text",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("unsupported_parameter response_format"), types.ErrorCodeSmartResponsesSingleRoute, http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure,
+		},
+		{
+			name: "capacity 429 retries and temporarily opens this physical route",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "rate limit reached", Type: "rate_limit_error", Code: "rate_limit_exceeded",
+			}, http.StatusTooManyRequests),
+			outcome: smartrouter.OutcomeCapacityLimited, scope: SmartFailureCapacity, retry: true, affectsHealth: true,
+		},
+		{
+			name: "too many pending text is capacity retryable even without 429",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "Too many pending requests, please retry later",
+				Type:    "upstream_error", Code: "upstream_capacity",
+			}, http.StatusBadGateway),
+			outcome: smartrouter.OutcomeCapacityLimited, scope: SmartFailureCapacity, retry: true, affectsHealth: true,
+		},
+		{
+			name: "upstream context canceled inside 502 remains retryable",
+			apiErr: types.NewErrorWithStatusCode(
+				fmt.Errorf("upstream transport: %w", context.Canceled),
+				types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway,
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "credential failure retries and opens route health",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "invalid api key", Type: "authentication_error", Code: "invalid_api_key",
+			}, http.StatusUnauthorized),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "upstream account balance phrase retries another route and opens credential health",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "Insufficient account balance", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "upstream inverse account balance phrase is case insensitive",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "ACCOUNT BALANCE IS INSUFFICIENT", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "structured upstream account balance code retries without relying on message",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "payment required", Type: "billing_error", Code: "insufficient_account_balance",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "short structured upstream balance code retries without relying on message",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "payment required", Type: "billing_error", Code: "insufficient_balance",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "inverse structured upstream balance code retries without relying on message",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "payment required", Type: "billing_error", Code: "account_balance_insufficient",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "local user quota remains terminal before upstream balance classification",
+			apiErr: types.NewErrorWithStatusCode(
+				errors.New("insufficient user quota"), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
+			),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "generic insufficient balance text remains a user error",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "insufficient balance", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "403 model access denial quarantines only this model route",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "account does not have access to model gpt-test", Type: "permission_denied", Code: "model_access_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteModel, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "generic 403 permission denial is neutral and does not poison credential domain",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "permission denied", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "image generation disabled for upstream group retries another exact route contract",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "Image generation is not enabled for this group",
+				Type:    "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "upstream affinity channel disabled retries another route and quarantines this contract",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "The channel selected by channel affinity has been disabled, and retry was stopped by rule.",
+				Type:    "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "local conversion failure retries another route and quarantines this contract",
+			apiErr: types.NewError(
+				errors.New("adapter conversion is not implemented"),
+				types.ErrorCodeConvertRequestFailed,
+			),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "deleted upstream key group retries another route and quarantines this contract",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "API Key 所属分组已删除", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "english deleted group refusal retries another route",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "No permission to access this group: legacy-pro",
+				Type:    "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteContract, retry: true,
+			affectsHealth: true,
+		},
+		{
+			name: "generic group permission denial remains a user error",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "permission denied", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "403 explicit invalid key remains a credential failure",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "invalid api key", Type: "authentication_error", Code: "invalid_api_key",
+			}, http.StatusForbidden),
+			outcome: smartrouter.OutcomeCredential, scope: SmartFailureCredential, retry: true, affectsHealth: true,
+		},
+		{
+			name: "upstream 503 is retryable infrastructure failure",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "temporarily unavailable", Type: "server_error", Code: "server_error",
+			}, http.StatusServiceUnavailable),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure, retry: true, affectsHealth: true,
+		},
+		{
+			name: "upstream explicit field 400 remains retryable for another certified route",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "max_tokens is invalid", Type: "invalid_request_error", Code: "invalid_request",
+			}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived()),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser, retry: true,
+		},
+		{
+			name:    "local invalid request code remains neutral despite default 500 status",
+			apiErr:  types.NewError(errors.New("request payload is invalid"), types.ErrorCodeInvalidRequest),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "upstream 422 is retryable for another certified route",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "unprocessable request", Type: "invalid_request_error", Code: "unprocessable_entity",
+			}, http.StatusUnprocessableEntity, types.ErrOptionWithUpstreamResponseReceived()),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser, retry: true,
+		},
+		{
+			name:    "upstream prompt blocked can try another certified route",
+			apiErr:  types.NewOpenAIError(errors.New("prompt blocked"), types.ErrorCodePromptBlocked, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived()),
+			outcome: smartrouter.OutcomeContentRejected, scope: SmartFailureContent, retry: true,
+		},
+		{
+			name: "client cancellation wins over upstream error",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "upstream unavailable", Type: "server_error", Code: "server_error",
+			}, http.StatusServiceUnavailable),
+			contextErr: context.Canceled,
+			outcome:    smartrouter.OutcomeClientCancelled, scope: SmartFailureCancellation,
+		},
+		{
+			name: "generic 404 is a user error rather than an automatic route failure",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "resource not found", Type: "invalid_request_error", Code: "not_found",
+			}, http.StatusNotFound),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "unknown provider 400 retries neutrally",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "provider-specific transient condition", Type: "provider_error", Code: "vendor_busy_17",
+			}, http.StatusBadRequest),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure, retry: true,
+		},
+		{
+			name: "explicit skip retry wins over unknown provider 4xx fallback",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "provider-specific terminal response", Type: "provider_error", Code: "vendor_terminal",
+			}, http.StatusBadRequest, types.ErrOptionWithSkipRetry()),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser,
+		},
+		{
+			name: "overloaded wording is capacity neutral",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "our servers are currently overloaded", Type: "provider_error", Code: "capacity_error",
+			}, http.StatusTooManyRequests),
+			outcome: smartrouter.OutcomeCapacityLimited, scope: SmartFailureCapacity, retry: true, affectsHealth: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := ClassifySmartRouteOutcome(test.apiErr, test.contextErr)
+			assert.Equal(t, test.outcome, result.Outcome)
+			assert.Equal(t, test.scope, result.FailureScope)
+			assert.Equal(t, test.retry, result.CanTryNextRoute())
+			assert.Equal(t, test.affectsHealth, result.AffectsRouteHealth)
+			assert.Equal(t, test.quarantineMS, result.RouteQuarantineMS)
+			assert.Equal(t, test.quarantineMS > 0, result.ShouldQuarantineRoute())
+			if result.RetryNextRoute {
+				assert.True(t, result.RouteFailure, "retry authority must require a route failure")
+			}
+		})
+	}
+}
+
+func TestClassifySmartRouteOutcomePreservesReceivedUpstreamErrorAcrossCancellation(t *testing.T) {
+	tests := []struct {
+		name    string
+		apiErr  *types.NewAPIError
+		outcome smartrouter.QualityOutcome
+		scope   SmartRouteFailureScope
+		retry   bool
+	}{
+		{
+			name: "provider 400 is not relabeled as client cancellation",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "provider is temporarily busy while preparing request",
+				Type:    "provider_error",
+				Code:    "provider_busy",
+			}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived()),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure, retry: true,
+		},
+		{
+			name: "received upstream 503 remains retryable",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "temporarily unavailable",
+				Type:    "server_error",
+				Code:    "server_error",
+			}, http.StatusServiceUnavailable, types.ErrOptionWithUpstreamResponseReceived()),
+			outcome: smartrouter.OutcomeInfrastructure, scope: SmartFailureInfrastructure, retry: true,
+		},
+		{
+			name: "received explicit input validation remains retryable",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "Invalid 'input[0].type': expected message",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived()),
+			outcome: smartrouter.OutcomeUserRejected, scope: SmartFailureUser, retry: true,
+		},
+		{
+			name: "unmarked local error still honors client cancellation",
+			apiErr: types.WithOpenAIError(types.OpenAIError{
+				Message: "temporarily unavailable",
+				Type:    "server_error",
+				Code:    "server_error",
+			}, http.StatusServiceUnavailable),
+			outcome: smartrouter.OutcomeClientCancelled, scope: SmartFailureCancellation,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := ClassifySmartRouteOutcome(test.apiErr, context.Canceled)
+			assert.Equal(t, test.outcome, result.Outcome)
+			assert.Equal(t, test.scope, result.FailureScope)
+			assert.Equal(t, test.retry, result.CanTryNextRoute())
+		})
+	}
+}
+
+func TestIsSmartExplicitUserRequestErrorSeparatesProvider400(t *testing.T) {
+	provider400 := types.WithOpenAIError(types.OpenAIError{
+		Message: "provider-specific transient condition",
+		Type:    "provider_error",
+		Code:    "vendor_busy_17",
+	}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+	assert.False(t, IsSmartExplicitUserRequestError(provider400))
+
+	field400 := types.WithOpenAIError(types.OpenAIError{
+		Message: "Invalid 'input[0].type': expected message",
+		Type:    "invalid_request_error",
+		Code:    "invalid_request",
+	}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+	assert.True(t, IsSmartExplicitUserRequestError(field400))
+}
+
+func TestIsSmartResponsesConversationStateError(t *testing.T) {
+	stateErr := types.WithOpenAIError(types.OpenAIError{
+		Message: "Invalid 'input[175].id': 'item_6138e68675e85bce3cf31ebd'. Expected an ID that begins with 'rs'.",
+		Type:    "invalid_request_error", Code: "invalid_request",
+	}, http.StatusBadRequest)
+	assert.True(t, IsSmartResponsesConversationStateError(stateErr))
+
+	ordinary := types.WithOpenAIError(types.OpenAIError{
+		Message: "Invalid 'input[0].type': expected message",
+		Type:    "invalid_request_error", Code: "invalid_request",
+	}, http.StatusBadRequest)
+	assert.False(t, IsSmartResponsesConversationStateError(ordinary))
+
+	indexedType := types.WithOpenAIError(types.OpenAIError{
+		Message: "Invalid 'input[0].type'. Expected an ID that begins with 'rs'.",
+		Type:    "invalid_request_error", Code: "invalid_request",
+	}, http.StatusBadRequest)
+	assert.False(t, IsSmartResponsesConversationStateError(indexedType))
+
+	proseOnly := types.WithOpenAIError(types.OpenAIError{
+		Message: "The input item id is invalid. Expected an ID that begins with 'rs'.",
+		Type:    "invalid_request_error", Code: "invalid_request",
+	}, http.StatusBadRequest)
+	assert.False(t, IsSmartResponsesConversationStateError(proseOnly))
+}
+
+func TestClassifySmartRouteOutcomeUsesUpstreamStatusAfterMapping(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		code   types.ErrorCode
+		body   types.OpenAIError
+		want   smartrouter.QualityOutcome
+		scope  SmartRouteFailureScope
+	}{
+		{
+			name: "mapped 429 remains capacity failure", status: http.StatusTooManyRequests,
+			code: types.ErrorCodeBadResponseStatusCode,
+			body: types.OpenAIError{Message: "rate limit", Type: "rate_limit_error", Code: "rate_limit_exceeded"},
+			want: smartrouter.OutcomeCapacityLimited, scope: SmartFailureCapacity,
+		},
+		{
+			name: "mapped 403 remains model access failure", status: http.StatusForbidden,
+			code: types.ErrorCodeBadResponseStatusCode,
+			body: types.OpenAIError{Message: "account does not have access to model", Type: "permission_denied", Code: "model_access_denied"},
+			want: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteModel,
+		},
+		{
+			name: "mapped 404 remains model mismatch", status: http.StatusNotFound,
+			code: types.ErrorCodeModelNotFound,
+			body: types.OpenAIError{Message: "model not found", Type: "invalid_request_error", Code: "model_not_found"},
+			want: smartrouter.OutcomeInfrastructure, scope: SmartFailureRouteModel,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			apiErr := types.WithOpenAIError(test.body, test.status)
+			if test.code != types.ErrorCodeBadResponseStatusCode {
+				apiErr = types.NewOpenAIError(errors.New(test.body.Message), test.code, test.status)
+			}
+			ResetStatusCode(apiErr, fmt.Sprintf(`{"%d": 200}`, test.status))
+			require.Equal(t, http.StatusOK, apiErr.StatusCode)
+			result := ClassifySmartRouteOutcome(apiErr, nil)
+			assert.Equal(t, test.want, result.Outcome)
+			assert.Equal(t, test.scope, result.FailureScope)
+			assert.Equal(t, test.status, result.HTTPStatus)
+		})
+	}
+}
+
+func newSmartRequestContext(t *testing.T, method, path, body string) *gin.Context {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	t.Cleanup(func() { common.CleanupBodyStorage(c) })
+	return c
+}
+
+func TestPreserveSmartRouteUpstreamResponseEvidence(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", `{}`)
+	common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, true)
+	common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, http.StatusBadRequest)
+
+	apiErr := types.NewOpenAIError(errors.New("provider transient 400"), types.ErrorCodeBadResponse, http.StatusBadGateway)
+	apiErr = PreserveSmartRouteUpstreamResponseEvidence(c, apiErr)
+	require.True(t, apiErr.HasUpstreamResponse())
+	assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+	assert.Equal(t, http.StatusBadRequest, apiErr.GetOriginalStatusCode())
+
+	outcome := ClassifySmartRouteOutcome(apiErr, context.Canceled)
+	assert.NotEqual(t, smartrouter.OutcomeClientCancelled, outcome.Outcome)
+	assert.True(t, outcome.CanTryNextRoute())
+}
+
+func TestPreserveSmartRouteUpstreamRequestIDFromStructuredError(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", `{}`)
+	common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, true)
+	common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, http.StatusTooManyRequests)
+	apiErr := types.WithOpenAIError(types.OpenAIError{Message: "rate limit", Code: "rate_limit", RequestID: "up-req-123"}, http.StatusTooManyRequests)
+	PreserveSmartRouteUpstreamResponseEvidence(c, apiErr)
+	assert.Equal(t, "up-req-123", c.GetString(common.UpstreamRequestIdKey))
+	assert.Equal(t, "", c.GetString(common.RequestIdKey))
+}
+
+func TestPreserveSmartRouteUpstreamResponseEvidenceKeepsClientGoneNeutral(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/chat/completions", `{}`)
+	downstreamCtx, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(downstreamCtx)
+	cancel()
+
+	// Receiving a successful response header does not prove that a subsequent
+	// write failure came from the provider. Once the original downstream is
+	// cancelled, a wrapped cancellation must remain client_gone and health
+	// neutral rather than becoming a retryable 502.
+	common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, true)
+	common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, http.StatusOK)
+	apiErr := types.NewErrorWithStatusCode(
+		context.Canceled,
+		types.ErrorCodeDoRequestFailed,
+		http.StatusBadGateway,
+	)
+
+	apiErr = PreserveSmartRouteUpstreamResponseEvidence(c, apiErr)
+	require.False(t, apiErr.HasUpstreamResponse())
+	outcome := ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+	assert.Equal(t, smartrouter.OutcomeClientCancelled, outcome.Outcome)
+	assert.Equal(t, SmartFailureCancellation, outcome.FailureScope)
+	assert.False(t, outcome.CanTryNextRoute())
+	assert.False(t, outcome.AffectsRouteHealth)
+}
+
+func TestPreserveSmartRouteUpstreamResponseEvidenceDoesNotLoseReal400OnJoinedCancellation(t *testing.T) {
+	c := newSmartRequestContext(t, http.MethodPost, "/v1/responses", `{}`)
+	downstreamCtx, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(downstreamCtx)
+	common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, true)
+	common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, http.StatusBadRequest)
+
+	apiErr := types.NewErrorWithStatusCode(
+		errors.Join(errors.New("provider rejected response_format"), context.Canceled),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	)
+	cancel()
+	apiErr = PreserveSmartRouteUpstreamResponseEvidence(c, apiErr)
+
+	require.True(t, apiErr.HasUpstreamResponse())
+	assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+	assert.Equal(t, http.StatusBadRequest, apiErr.GetOriginalStatusCode())
+	outcome := ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+	assert.NotEqual(t, smartrouter.OutcomeClientCancelled, outcome.Outcome)
+	assert.True(t, outcome.CanTryNextRoute())
+}
+
+func newSmartMultipartRequestContext(
+	t *testing.T,
+	path string,
+	fields map[string]string,
+	files map[string]string,
+) (*gin.Context, []byte) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		require.NoError(t, writer.WriteField(key, value))
+	}
+	for field, value := range files {
+		part, err := writer.CreateFormFile(field, field+".bin")
+		require.NoError(t, err)
+		_, err = io.WriteString(part, value)
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	raw := append([]byte(nil), body.Bytes()...)
+	c := newSmartRequestContext(t, http.MethodPost, path, string(raw))
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	return c, raw
+}
+
+func assertSmartRequestBodyReusable(t *testing.T, c *gin.Context, expected []byte) {
+	t.Helper()
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	actual, err := storage.Bytes()
+	require.NoError(t, err)
+	assert.Equal(t, expected, actual)
+}
+
+func installSmartDiskBodyStorage(t *testing.T, c *gin.Context, body string) common.BodyStorage {
+	t.Helper()
+	previous := common.GetDiskCacheConfig()
+	common.SetDiskCacheConfig(common.DiskCacheConfig{
+		Enabled: true, ThresholdMB: 0, MaxSizeMB: 16, Path: t.TempDir(),
+	})
+	storage, err := common.CreateBodyStorage([]byte(body))
+	common.SetDiskCacheConfig(previous)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = storage.Close() })
+	c.Set(common.KeyBodyStorage, storage)
+	return storage
+}

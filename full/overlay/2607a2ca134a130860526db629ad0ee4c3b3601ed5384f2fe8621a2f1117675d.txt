@@ -1,0 +1,26 @@
+package model
+
+import (
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestMediaProbeSafetyCombinesExplicitMetadataAndInference(t *testing.T) {
+	modelSupportEndpointsLock.Lock()
+	before := modelExplicitEndpointTypes
+	modelExplicitEndpointTypes = map[string][]constant.EndpointType{
+		"custom-generation": {constant.EndpointTypeImageGeneration, constant.EndpointTypeOpenAIResponse},
+		"gpt-image-2":       {constant.EndpointTypeOpenAIResponse},
+	}
+	modelSupportEndpointsLock.Unlock()
+	defer func() {
+		modelSupportEndpointsLock.Lock()
+		modelExplicitEndpointTypes = before
+		modelSupportEndpointsLock.Unlock()
+	}()
+	require.True(t, ModelRequiresPassiveRecovery(constant.ChannelTypeOpenAI, "custom-generation"))
+	require.True(t, ModelRequiresPassiveRecovery(constant.ChannelTypeOpenAI, "gpt-image-2"), "text endpoint does not grant synthetic generation permission")
+	require.True(t, ModelRequiresPassiveRecovery(constant.ChannelTypeOpenAI, "opaque", "sora-2"))
+	require.False(t, ModelRequiresPassiveRecovery(constant.ChannelTypeOpenAI, "gpt-4o"), "image understanding alone is safe text")
+}

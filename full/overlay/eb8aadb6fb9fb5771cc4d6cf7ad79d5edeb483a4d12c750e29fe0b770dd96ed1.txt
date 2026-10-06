@@ -1,0 +1,398 @@
+package service
+
+// The downstream outbox worker is deliberately optional and asynchronous. It
+// can publish immutable cost events to a configured tenant sink without adding
+// any network dependency to the user-facing /v1 request path.
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+)
+
+const (
+	tenantCostWorkerDefaultInterval = 30 * time.Second
+	tenantCostWorkerDefaultBatch    = 100
+	tenantCostWorkerMaxBatch        = 500
+	tenantCostWorkerMaxBodyBytes    = 2 << 20
+)
+
+type TenantCostOutboxPublisher func(context.Context, model.TenantCostEvent) error
+type TenantCostOutboxPublisherResolver func(context.Context, string) (TenantCostOutboxPublisher, error)
+
+var ErrTenantCostSinkUnavailable = errors.New("tenant cost sink unavailable")
+
+type TenantCostOutboxWorker struct {
+	interval  time.Duration
+	batch     int
+	publish   TenantCostOutboxPublisher
+	resolve   TenantCostOutboxPublisherResolver
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	startOnce sync.Once
+	started   atomic.Bool
+}
+
+type TenantCostOutboxRunStats struct {
+	Claimed int
+	Sent    int
+	Failed  int
+	Skipped int
+}
+
+func NewTenantCostOutboxWorker(interval time.Duration, batch int, publish TenantCostOutboxPublisher) (*TenantCostOutboxWorker, error) {
+	if publish == nil {
+		return nil, errors.New("tenant cost outbox publisher is required")
+	}
+	worker := newTenantCostOutboxWorkerBase(interval, batch)
+	worker.publish = publish
+	return worker, nil
+}
+
+// NewTenantCostOutboxWorkerWithResolver routes each event by its registered
+// tenant. The resolver is the only code allowed to choose a sink; a missing or
+// disabled tenant configuration is skipped and retried later, never sent to a
+// default downstream.
+func NewTenantCostOutboxWorkerWithResolver(interval time.Duration, batch int, resolve TenantCostOutboxPublisherResolver) (*TenantCostOutboxWorker, error) {
+	if resolve == nil {
+		return nil, errors.New("tenant cost outbox resolver is required")
+	}
+	worker := newTenantCostOutboxWorkerBase(interval, batch)
+	worker.resolve = resolve
+	return worker, nil
+}
+
+func newTenantCostOutboxWorkerBase(interval time.Duration, batch int) *TenantCostOutboxWorker {
+	if interval <= 0 {
+		interval = tenantCostWorkerDefaultInterval
+	}
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	if interval > 10*time.Minute {
+		interval = 10 * time.Minute
+	}
+	if batch <= 0 || batch > tenantCostWorkerMaxBatch {
+		batch = tenantCostWorkerDefaultBatch
+	}
+	return &TenantCostOutboxWorker{interval: interval, batch: batch, stop: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (worker *TenantCostOutboxWorker) Start() {
+	if worker == nil {
+		return
+	}
+	worker.startOnce.Do(func() {
+		worker.started.Store(true)
+		go worker.loop()
+	})
+}
+
+func (worker *TenantCostOutboxWorker) loop() {
+	defer close(worker.done)
+	worker.runAndLog(context.Background())
+	ticker := time.NewTicker(worker.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			worker.runAndLog(context.Background())
+		case <-worker.stop:
+			return
+		}
+	}
+}
+
+func (worker *TenantCostOutboxWorker) runAndLog(ctx context.Context) {
+	stats, err := worker.RunOnce(ctx, time.Now().UTC())
+	if err != nil {
+		common.SysLog("tenant cost outbox pass failed: " + err.Error())
+		return
+	}
+	if stats.Failed > 0 || stats.Skipped > 0 {
+		common.SysLog(fmt.Sprintf("tenant cost outbox pass: claimed=%d sent=%d failed=%d skipped=%d", stats.Claimed, stats.Sent, stats.Failed, stats.Skipped))
+	}
+}
+
+// RunOnce claims at most batch rows and never retries inline. Failed rows are
+// marked with bounded exponential backoff by the model layer; this keeps one
+// broken partner endpoint from monopolizing the worker.
+func (worker *TenantCostOutboxWorker) RunOnce(ctx context.Context, now time.Time) (TenantCostOutboxRunStats, error) {
+	var stats TenantCostOutboxRunStats
+	if worker == nil || (worker.publish == nil && worker.resolve == nil) {
+		return stats, errors.New("tenant cost outbox worker is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rows, err := model.ClaimTenantCostOutboxFair(worker.batch, now.UnixNano())
+	if err != nil {
+		return stats, err
+	}
+	stats.Claimed = len(rows)
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			// Leave unprocessed claims recoverable immediately; the database
+			// lease still provides the crash safety net for a hard stop.
+			_ = model.ReleaseTenantCostOutboxClaim(row.TenantID, row.EventID, now.Add(worker.interval).UnixNano())
+			return stats, err
+		}
+		paused, pauseErr := model.IsTenantCostWorkerPausedForTenant(row.TenantID)
+		if pauseErr != nil {
+			stats.Skipped++
+			_ = model.MarkTenantCostOutboxFailedForTenant(row.TenantID, row.EventID,
+				fmt.Errorf("tenant worker state unavailable: %w", pauseErr), now.UnixNano())
+			continue
+		}
+		if paused {
+			stats.Skipped++
+			_ = model.MarkTenantCostOutboxFailedForTenant(row.TenantID, row.EventID,
+				errors.New("tenant cost publishing is paused"), now.UnixNano())
+			continue
+		}
+		publish := worker.publish
+		if worker.resolve != nil {
+			publish, err = worker.resolve(ctx, row.TenantID)
+			if err != nil || publish == nil {
+				stats.Skipped++
+				if err == nil {
+					err = ErrTenantCostSinkUnavailable
+				}
+				_ = model.MarkTenantCostOutboxFailedForTenant(row.TenantID, row.EventID, err, now.UnixNano())
+				continue
+			}
+		}
+		event, err := model.GetTenantCostEvent(row.TenantID, row.EventID)
+		if err == nil && event != nil {
+			err = publish(ctx, *event)
+		} else if err == nil {
+			err = errors.New("tenant cost event is missing")
+		}
+		if err != nil {
+			stats.Failed++
+			_ = model.MarkTenantCostOutboxFailedForTenant(row.TenantID, row.EventID, err, now.UnixNano())
+			continue
+		}
+		if err := model.MarkTenantCostOutboxSentForTenant(row.TenantID, row.EventID, now.UnixNano()); err != nil {
+			stats.Failed++
+			_ = model.MarkTenantCostOutboxFailedForTenant(row.TenantID, row.EventID, err, now.UnixNano())
+			continue
+		}
+		stats.Sent++
+	}
+	return stats, nil
+}
+
+func (worker *TenantCostOutboxWorker) Close() {
+	if worker == nil {
+		return
+	}
+	worker.closeOnce.Do(func() {
+		if !worker.started.Load() {
+			return
+		}
+		close(worker.stop)
+		<-worker.done
+	})
+}
+
+const tenantCostDefaultTenantHeader = "X-Gateway-Tenant"
+
+// NewTenantCostHTTPPublisher creates a sink adapter for one registered
+// downstream. The URL and bearer are deployment configuration; neither is
+// embedded in the binary or exported manifest.
+func NewTenantCostHTTPPublisher(endpoint, bearer string, client *http.Client) (TenantCostOutboxPublisher, error) {
+	return NewTenantCostHTTPPublisherWithTenantHeader(endpoint, bearer, client, tenantCostDefaultTenantHeader)
+}
+
+func NewTenantCostHTTPPublisherWithTenantHeader(endpoint, bearer string, client *http.Client, tenantHeader string) (TenantCostOutboxPublisher, error) {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.User != nil {
+		return nil, errors.New("tenant cost outbox endpoint must be an http(s) URL without userinfo")
+	}
+	bearer = strings.TrimSpace(bearer)
+	if bearer == "" || strings.ContainsAny(bearer, "\r\n") {
+		return nil, errors.New("tenant cost outbox bearer token is required")
+	}
+	tenantHeader = strings.TrimSpace(tenantHeader)
+	if tenantHeader == "" {
+		tenantHeader = tenantCostDefaultTenantHeader
+	}
+	if !validTenantCostTenantHeader(tenantHeader) {
+		return nil, errors.New("tenant cost outbox tenant header is invalid")
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 8 * time.Second}
+	}
+	return func(ctx context.Context, event model.TenantCostEvent) error {
+		payload := []byte(event.Payload)
+		if len(payload) == 0 || len(payload) > tenantCostWorkerMaxBodyBytes {
+			return errors.New("tenant cost event payload size is invalid")
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, parsed.String(), bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Authorization", "Bearer "+bearer)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", event.EventID)
+		request.Header.Set(tenantHeader, event.TenantID)
+		response, err := client.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, tenantCostWorkerMaxBodyBytes))
+		if response.StatusCode >= 200 && response.StatusCode < 300 || response.StatusCode == http.StatusConflict {
+			return nil
+		}
+		return fmt.Errorf("downstream sink returned status %d", response.StatusCode)
+	}, nil
+}
+
+// validTenantCostTenantHeader prevents a deployment typo from overwriting an
+// authentication or transport header. Tenant routing metadata is deliberately
+// carried in an X-* header; credentials and idempotency remain owned by this
+// publisher and cannot be replaced by configuration.
+func validTenantCostTenantHeader(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\r\n") || strings.TrimSpace(http.CanonicalHeaderKey(value)) == "" {
+		return false
+	}
+	for index, r := range value {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
+			return false
+		}
+		if (index == 0 || index == len(value)-1) && r == '-' {
+			return false
+		}
+	}
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "x-") {
+		return true
+	}
+	// Keep compatibility for a conventional non-X tenant header, but never
+	// permit headers that could replace auth, body identity, or hop-by-hop
+	// transport semantics.
+	switch lower {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie", "host",
+		"content-length", "content-type", "transfer-encoding", "connection", "upgrade",
+		"idempotency-key":
+		return false
+	default:
+		return true
+	}
+}
+
+func tenantCostSinkEnvSuffix(configKey string) string {
+	configKey = strings.TrimSpace(configKey)
+	if configKey == "" {
+		return ""
+	}
+	var builder strings.Builder
+	for _, r := range configKey {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r - ('a' - 'A'))
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return strings.Trim(builder.String(), "_")
+}
+
+func tenantCostSinkEnvResolver(ctx context.Context, tenantID string) (TenantCostOutboxPublisher, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	downstream, err := model.RequireActiveTenantCostDownstream(tenantID)
+	if err != nil || downstream == nil {
+		return nil, ErrTenantCostSinkUnavailable
+	}
+	// RequireActiveTenantCostDownstream validates the persisted config key. The
+	// explicit check here documents the resolver boundary and keeps a legacy
+	// malformed row from collapsing into another tenant's environment suffix.
+	if !model.IsValidTenantCostTenantID(downstream.TenantID) || strings.TrimSpace(downstream.ConfigKey) == "" {
+		return nil, ErrTenantCostSinkUnavailable
+	}
+	suffix := tenantCostSinkEnvSuffix(downstream.ConfigKey)
+	if suffix == "" {
+		return nil, ErrTenantCostSinkUnavailable
+	}
+	endpoint := strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_" + suffix + "_URL"))
+	token := strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_" + suffix + "_TOKEN"))
+	header := strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_" + suffix + "_TENANT_HEADER"))
+	// A single legacy pair remains accepted only for the default seed. It is
+	// never used as a fallback for any other registered tenant.
+	if endpoint == "" && token == "" && tenantID == model.DefaultTenantCostTenantID {
+		endpoint = strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_URL"))
+		token = strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_TOKEN"))
+		header = strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_TENANT_HEADER"))
+	}
+	if endpoint == "" || token == "" {
+		return nil, ErrTenantCostSinkUnavailable
+	}
+	return NewTenantCostHTTPPublisherWithTenantHeader(endpoint, token, nil, header)
+}
+
+// StartTenantCostOutboxWorkerFromEnv is opt-in. Each registered downstream is
+// resolved independently from TENANT_COST_OUTBOX_<CONFIGKEY>_URL/TOKEN. An
+// absent configuration leaves durable outbox rows available for pull-based
+// reporting and never redirects them to another tenant's sink.
+func StartTenantCostOutboxWorkerFromEnv() (func(), error) {
+	hasConfig := strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_URL")) != "" || strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_TOKEN")) != ""
+	if rows, err := model.ListTenantCostDownstreams(500); err == nil {
+		for _, row := range rows {
+			suffix := tenantCostSinkEnvSuffix(row.ConfigKey)
+			if suffix != "" && (strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_"+suffix+"_URL")) != "" || strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_"+suffix+"_TOKEN")) != "") {
+				hasConfig = true
+			}
+		}
+	}
+	if !hasConfig {
+		return func() {}, nil
+	}
+	if (strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_URL")) == "") != (strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_TOKEN")) == "") {
+		return nil, errors.New("TENANT_COST_OUTBOX_URL and TENANT_COST_OUTBOX_TOKEN must be configured together")
+	}
+	interval := tenantCostWorkerDefaultInterval
+	if raw := strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_INTERVAL_SECONDS")); raw != "" {
+		if seconds, parseErr := strconv.Atoi(raw); parseErr == nil {
+			interval = time.Duration(seconds) * time.Second
+		}
+	}
+	batch := tenantCostWorkerDefaultBatch
+	if raw := strings.TrimSpace(os.Getenv("TENANT_COST_OUTBOX_BATCH")); raw != "" {
+		if parsedBatch, parseErr := strconv.Atoi(raw); parseErr == nil {
+			batch = parsedBatch
+		}
+	}
+	worker, err := NewTenantCostOutboxWorkerWithResolver(interval, batch, tenantCostSinkEnvResolver)
+	if err != nil {
+		return nil, err
+	}
+	worker.Start()
+	return worker.Close, nil
+}

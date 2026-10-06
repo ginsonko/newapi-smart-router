@@ -1,0 +1,195 @@
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  buildLeaderboardEvidence,
+  defaultLeaderboardSelection,
+  leaderboardConfidence,
+  leaderboardConfidencePercent,
+  leaderboardSampleCount,
+  sortLeaderboardModels,
+} from './leaderboard-evidence.ts'
+import type {
+  SmartRouterStatusItem,
+  SmartRouterStatusModelIndexItem,
+} from './types.ts'
+
+describe('smart-router global leaderboard defaults', () => {
+  test('opens the Codex-first model, Responses contract, and real cost metric', () => {
+    assert.deepEqual(defaultLeaderboardSelection(), {
+      model: 'gpt-5.6-sol',
+      endpoint: 'openai-responses-v1',
+      metric: 'cost',
+    })
+  })
+
+  test('orders the Codex-first model and Responses contract before other contracts', () => {
+    const models: SmartRouterStatusModelIndexItem[] = [
+      { model: 'gpt-5.6-sol', endpoint: 'openai-responses-v1' },
+      { model: 'gpt-5.6-luna', endpoint: 'anthropic-messages-v1' },
+      { model: 'gpt-5.6-sol', endpoint: 'anthropic-messages-v1' },
+    ]
+    assert.deepEqual(
+      sortLeaderboardModels(models).map(
+        (item) => `${item.model}/${item.endpoint}`
+      ),
+      [
+        'gpt-5.6-sol/openai-responses-v1',
+        'gpt-5.6-sol/anthropic-messages-v1',
+        'gpt-5.6-luna/anthropic-messages-v1',
+      ]
+    )
+  })
+})
+
+describe('smart-router leaderboard evidence fallbacks', () => {
+  const emptyRoute: SmartRouterStatusItem = {
+    model: 'gpt-5.6-sol',
+    group: 'new-route',
+    endpoint: 'anthropic-messages-v1',
+    effective_ratio_ppm: 30_000,
+    price_known: true,
+    model_price_known: true,
+    primary_state: 'unknown',
+    availability: 'available_unproven',
+    decision: 'eligible',
+    reason_code: 'available_after_selected_route',
+    secondary_reason_codes: [],
+    constraints: {
+      group_authorized: true,
+      group_selected: true,
+      within_key_price_limit: true,
+      endpoint_supported: true,
+      capabilities_supported: true,
+      context_supported: true,
+      ttft_acceptable: true,
+    },
+    evidence: {
+      total_successes: 0,
+      total_hard_failures: 0,
+      real_successes: 0,
+      real_hard_failures: 0,
+      probe_successes: 0,
+      total_probe_failures: 0,
+      current_probe_failures: 0,
+      reliability_ppm: 0,
+      sample_count: 0,
+      freshness: 'none',
+      confidence: 'none',
+      historical: false,
+    },
+    recovery: {
+      probe_state: 'not_needed',
+      next_action: 'natural_traffic',
+      next_action_actor: 'next_request',
+      automatic_candidate_reentry: 'not_needed',
+      can_become_preferred_after_entry: 'yes',
+      requires_admin_review: false,
+    },
+    price: {
+      billing_mode: 'ratio',
+      billing_unit: 'per_token',
+      score_ppm: 30_000,
+      static_comparable: true,
+      cache_pricing_known: true,
+      cache_read_ratio_ppm: 100_000,
+      cache_creation_5m_ratio_ppm: 1_250_000,
+      cache_creation_1h_ratio_ppm: 2_000_000,
+    },
+    cheaper_than_preference: false,
+    mixed_evidence: false,
+    capacity_limited: false,
+    quarantined: false,
+    requires_admin_review: false,
+    selected: false,
+  }
+
+  test('uses explicit references instead of No data or a fabricated zero', () => {
+    const evidence = buildLeaderboardEvidence([emptyRoute]).get(emptyRoute)
+    assert.equal(evidence?.cache.value, 900_000)
+    assert.equal(evidence?.cache.observed, false)
+    assert.ok((evidence?.cost.value ?? 0) > 0)
+    assert.equal(evidence?.ttft.value, 10_000)
+    assert.equal(evidence?.stability.value, 0.95)
+    assert.equal(leaderboardConfidence(emptyRoute), 'reference')
+  })
+
+  test('one real observation is shown with low confidence rather than discarded', () => {
+    const observed = {
+      ...emptyRoute,
+      routing_cache_weight_ppm: 720_000,
+      recent_cache_rate_ppm: 650_000,
+      actual_input_cost_samples: 1,
+      evidence: { ...emptyRoute.evidence, sample_count: 1 },
+    }
+    const evidence = buildLeaderboardEvidence([observed]).get(observed)
+    assert.equal(evidence?.cache.value, 720_000)
+    assert.equal(leaderboardConfidence(observed), 'low')
+    assert.equal(leaderboardConfidencePercent(observed), 1)
+  })
+
+  test('uses the server recent weighted TTFT and stability when one sample exists', () => {
+    const observed = {
+      ...emptyRoute,
+      recent_ttft_average_ms: 4_321,
+      recent_ttft_samples: 1,
+      recent_stability_rate: 0.4,
+      recent_stability_samples: 1,
+    }
+    const evidence = buildLeaderboardEvidence([observed]).get(observed)
+    assert.equal(evidence?.ttft.value, 4_321)
+    assert.equal(evidence?.stability.value, 0.4)
+    assert.equal(evidence?.ttft.observed, true)
+    assert.equal(evidence?.stability.observed, true)
+    assert.equal(leaderboardConfidence(observed), 'low')
+  })
+
+  test('does not present long-term health evidence as recent leaderboard samples', () => {
+    const historicalHealthOnly = {
+      ...emptyRoute,
+      evidence: {
+        ...emptyRoute.evidence,
+        sample_count: 64,
+        real_successes: 60,
+        real_hard_failures: 4,
+      },
+      successes: 60,
+      failures: 4,
+    }
+    assert.equal(leaderboardSampleCount(historicalHealthOnly), undefined)
+    assert.equal(leaderboardConfidence(historicalHealthOnly), 'reference')
+    assert.equal(leaderboardConfidencePercent(historicalHealthOnly), undefined)
+  })
+
+  test('does not turn a missing recent stability sample into a real zero', () => {
+    const cacheOnlyEvidence = {
+      ...emptyRoute,
+      actual_input_cost_samples: 37,
+      success_rate: 0,
+      evidence: {
+        ...emptyRoute.evidence,
+        success_rate: 0,
+      },
+    }
+    const evidence = buildLeaderboardEvidence([cacheOnlyEvidence]).get(
+      cacheOnlyEvidence
+    )
+    assert.equal(evidence?.stability.value, 0.95)
+    assert.equal(evidence?.stability.source, 'Default reference')
+    assert.equal(evidence?.stability.observed, false)
+    assert.equal(leaderboardSampleCount(cacheOnlyEvidence), 37)
+  })
+
+  test('preserves a real zero when recent failure samples exist', () => {
+    const failedRoute = {
+      ...emptyRoute,
+      recent_stability_rate: 0,
+      recent_stability_samples: 4,
+      success_rate: 1,
+    }
+    const evidence = buildLeaderboardEvidence([failedRoute]).get(failedRoute)
+    assert.equal(evidence?.stability.value, 0)
+    assert.equal(evidence?.stability.source, 'Recent weighted route evidence')
+    assert.equal(evidence?.stability.observed, true)
+  })
+})

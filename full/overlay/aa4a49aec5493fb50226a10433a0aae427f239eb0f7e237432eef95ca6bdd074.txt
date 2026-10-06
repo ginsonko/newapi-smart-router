@@ -1,0 +1,77 @@
+package media
+
+import (
+	"net/url"
+	"strings"
+
+	"github.com/QuantumNous/new-api/model"
+)
+
+// ResolveVideoTaskContentURL binds an authenticated content/download endpoint
+// to the frozen origin and provider task. Relative URLs never inherit a host
+// from the caller, and escaped/traversing paths never gain authorization.
+func ResolveVideoTaskContentURL(source, base, taskID string) (string, bool) {
+	baseURL, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || baseURL.User != nil || baseURL.Host == "" ||
+		(baseURL.Scheme != "https" && baseURL.Scheme != "http") {
+		return "", false
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" || strings.ContainsAny(taskID, "/\\%?#") || taskID == "." || taskID == ".." {
+		return "", false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(source))
+	if err != nil || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
+		return "", false
+	}
+	if parsed.Scheme == "" {
+		if parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/") {
+			return "", false
+		}
+		parsed.Scheme, parsed.Host = baseURL.Scheme, baseURL.Host
+	}
+	if !strings.EqualFold(parsed.Scheme, baseURL.Scheme) || !strings.EqualFold(parsed.Host, baseURL.Host) {
+		return "", false
+	}
+	prefix := strings.TrimSuffix(strings.TrimRight(baseURL.EscapedPath(), "/"), "/v1")
+	endpoint := prefix + "/v1/videos/" + taskID
+	if parsed.EscapedPath() != endpoint+"/content" && parsed.EscapedPath() != endpoint+"/download" {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+// ExtractPrimaryVideoURLForTask also understands relative task endpoints.
+// Without a frozen snapshot only the historical absolute/public path remains.
+func ExtractPrimaryVideoURLForTask(task *model.Task, raw []byte) string {
+	return extractPrimaryVideoURL(raw, videoSourceResolver(task))
+}
+
+// ResolveVideoResultURLForTask covers adaptors whose parsed result URL is not
+// also exposed under a standard completion field in the raw payload.
+func ResolveVideoResultURLForTask(task *model.Task, source string) string {
+	return videoSourceResolver(task)(source)
+}
+
+func videoSourceResolver(task *model.Task) func(string) string {
+	if task == nil || task.ID <= 0 {
+		return func(source string) string { return primaryVideoSource(source) }
+	}
+	snapshot, err := model.GetTaskDeliverySnapshot(task.ID)
+	if err != nil {
+		return func(source string) string { return primaryVideoSource(source) }
+	}
+	upstreamID := strings.TrimSpace(task.PrivateData.UpstreamTaskID)
+	if upstreamID == "" {
+		upstreamID = strings.TrimSpace(snapshot.UpstreamTaskID)
+	}
+	return func(source string) string {
+		if resolved, ok := ResolveVideoTaskContentURL(source, snapshot.UpstreamBaseURL, upstreamID); ok {
+			return resolved
+		}
+		if IsVideoTaskContentURL(source) {
+			return ""
+		}
+		return primaryVideoSource(source)
+	}
+}

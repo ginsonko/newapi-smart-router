@@ -1,0 +1,18 @@
+package media
+
+import (
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestManagedMinimumImagesAndSubmissionIdempotency(t *testing.T) {
+	cap := CapabilityFromModelContract(model.ModelCapabilityContract{RuntimeEnforced: true, Provider: model.CapabilityProvider{SubmitIdempotency: true}, References: model.CapabilityReferences{MinImages: 1, Images: model.CapabilityReferenceLimit{Max: 3}, MaxTotal: 3}})
+	assert.True(t, cap.SubmitIdempotency)
+	assert.ErrorContains(t, cap.Validate(nil), "至少需要 1 张参考图片")
+	require.NoError(t, cap.Validate([]ReferenceDescriptor{{Type: "image"}}))
+	legacy := CapabilityFromModelContract(model.ModelCapabilityContract{})
+	assert.False(t, legacy.SubmitIdempotency)
+	require.NoError(t, legacy.Validate(nil))
+}

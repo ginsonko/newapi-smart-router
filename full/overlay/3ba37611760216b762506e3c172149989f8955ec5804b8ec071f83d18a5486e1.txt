@@ -1,0 +1,90 @@
+package service
+
+import (
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStandaloneSearchFixedRouteSuccessSettlesAndProjectsOnce(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 8121, 1_000)
+	seedToken(t, 8221, 8121, "standalone-search-success-token", 1_000)
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id: 8321, Key: `{"access_token":"test","account_id":"test"}`,
+		Name: "standalone-search-success", Status: common.ChannelStatusEnabled,
+	}).Error)
+
+	c := smartRouteBillingContext()
+	c.Set(common.RequestIdKey, "standalone-search-success-request")
+	c.Set("token_name", "standalone-search-token")
+	info := directBillingInfo("standalone-search-success-request", 8121, 8221)
+	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 8321}
+	info.OriginModelName = "gpt-5.6-sol"
+	info.UsingGroup = "default"
+	info.StartTime = time.Now()
+	info.PriceData = types.PriceData{
+		PricingScope: "standalone_search", PricingGroup: "default",
+		PricingModel: "gpt-5.6-sol", BillingMode: "per_call",
+		ModelPrice: 0.01, UsePrice: true, QuotaToPreConsume: 10,
+		GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+	}
+	session, apiErr := NewBillingSession(c, info, 10)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+
+	require.NoError(t, PostStandaloneSearchConsume(c, info))
+	assert.Equal(t, 990, smartRouteWalletQuota(t, 8121))
+	remain, used := smartRouteTokenQuota(t, 8221)
+	assert.Equal(t, 990, remain)
+	assert.Equal(t, 10, used)
+
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 8121).First(&user).Error)
+	assert.Equal(t, 10, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", 8321).First(&channel).Error)
+	assert.EqualValues(t, 10, channel.UsedQuota)
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("type = ? AND request_id = ?", model.LogTypeConsume, "standalone-search-success-request").Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Equal(t, 10, logs[0].Quota)
+	assert.Contains(t, logs[0].Other, `"standalone_search":true`)
+}
+
+func TestStandaloneSearchFixedRouteFailureRefundsWithoutUsage(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 8122, 1_000)
+	seedToken(t, 8222, 8122, "standalone-search-failure-token", 1_000)
+
+	c := smartRouteBillingContext()
+	c.Set(common.RequestIdKey, "standalone-search-failure-request")
+	info := directBillingInfo("standalone-search-failure-request", 8122, 8222)
+	session, apiErr := NewBillingSession(c, info, 10)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	assert.Equal(t, 990, smartRouteWalletQuota(t, 8122))
+
+	// This is the outer relay failure path used for an explicit non-2xx
+	// provider rejection. No success settlement or consume log is emitted.
+	session.Refund(c)
+	assert.Equal(t, 1_000, smartRouteWalletQuota(t, 8122))
+	remain, used := smartRouteTokenQuota(t, 8222)
+	assert.Equal(t, 1_000, remain)
+	assert.Zero(t, used)
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 8122).First(&user).Error)
+	assert.Zero(t, user.UsedQuota)
+	assert.Zero(t, user.RequestCount)
+	var count int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).
+		Where("type = ? AND request_id = ?", model.LogTypeConsume, "standalone-search-failure-request").Count(&count).Error)
+	assert.Zero(t, count)
+}

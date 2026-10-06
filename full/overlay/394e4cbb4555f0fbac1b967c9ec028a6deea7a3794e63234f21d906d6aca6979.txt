@@ -1,0 +1,154 @@
+package model
+
+import (
+	"context"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func tenantTokenCacheRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
+	t.Helper()
+	server, err := miniredis.Run()
+	require.NoError(t, err)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	require.NoError(t, client.Ping(context.Background()).Err())
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	common.RDB = client
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		common.RDB = previousClient
+		common.RedisEnabled = previousEnabled
+		_ = client.Close()
+		server.Close()
+	})
+	return server, client
+}
+
+func TestTenantTokenCacheDisabledIsSafeNoop(t *testing.T) {
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	common.RDB = nil
+	common.RedisEnabled = false
+	t.Cleanup(func() {
+		common.RDB = previousClient
+		common.RedisEnabled = previousEnabled
+	})
+
+	token := Token{Key: "disabled-cache-key", TenantCostBindingID: 11}
+	require.NoError(t, cacheSetToken(token))
+	require.NoError(t, cacheFenceAndDeleteToken(token.Key, tokenCacheFenceRotated))
+	require.NoError(t, cacheClearTokenFence(token.Key, tokenCacheFenceRotated))
+	require.NoError(t, cacheDeleteToken(token.Key))
+	require.NoError(t, cacheIncrTokenQuota(token.Key, 1))
+	require.NoError(t, cacheSetTokenField(token.Key, "Status", "1"))
+}
+
+func TestTenantTokenCacheEnabledWithoutClientFailsClosed(t *testing.T) {
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	common.RDB = nil
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		common.RDB = previousClient
+		common.RedisEnabled = previousEnabled
+	})
+
+	token := Token{Key: "nil-client-key", TenantCostBindingID: 12}
+	_, err := tokenCacheFenceState(token.Key)
+	assert.ErrorIs(t, err, errTenantCostTokenCacheUnavailable)
+	assert.ErrorIs(t, cacheSetToken(token), errTenantCostTokenCacheUnavailable)
+	assert.ErrorIs(t, cacheFenceAndDeleteToken(token.Key, tokenCacheFenceRotated), errTenantCostTokenCacheUnavailable)
+	assert.ErrorIs(t, cacheClearTokenFence(token.Key, tokenCacheFenceRotated), errTenantCostTokenCacheUnavailable)
+	assert.ErrorIs(t, cacheDeleteToken(token.Key), errTenantCostTokenCacheUnavailable)
+	assert.ErrorIs(t, cacheIncrTokenQuota(token.Key, 1), errTenantCostTokenCacheUnavailable)
+	assert.ErrorIs(t, cacheSetTokenField(token.Key, "Status", "1"), errTenantCostTokenCacheUnavailable)
+	_, err = cacheGetTokenByKey(token.Key)
+	assert.ErrorIs(t, err, errTenantCostTokenCacheUnavailable)
+}
+
+func TestTenantTokenCacheRedisErrorsAreObservable(t *testing.T) {
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	require.NoError(t, client.Close())
+	common.RDB = client
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		common.RDB = previousClient
+		common.RedisEnabled = previousEnabled
+	})
+
+	token := Token{Key: "redis-error-key", TenantCostBindingID: 13}
+	var err error
+	_, err = tokenCacheFenceState(token.Key)
+	assert.Error(t, err)
+	assert.Error(t, cacheSetToken(token))
+	assert.Error(t, cacheFenceAndDeleteToken(token.Key, tokenCacheFenceRotated))
+	assert.Error(t, cacheDeleteToken(token.Key))
+}
+
+func TestTenantTokenCacheFenceRejectsStaleWriterAndPreservesFence(t *testing.T) {
+	_, client := tenantTokenCacheRedis(t)
+	ctx := context.Background()
+	rawKey := "stale-writer-key"
+	cacheKey, fenceKey := tokenCacheKeys(rawKey)
+	require.NoError(t, client.Set(ctx, fenceKey, tokenCacheFenceRotated, 0).Err())
+
+	err := cacheSetToken(Token{Key: rawKey, TenantCostBindingID: 21, Status: 1})
+	assert.ErrorIs(t, err, errTenantCostTokenCacheFenced)
+	exists, existsErr := client.Exists(ctx, cacheKey).Result()
+	require.NoError(t, existsErr)
+	assert.Zero(t, exists)
+	fence, fenceErr := client.Get(ctx, fenceKey).Result()
+	require.NoError(t, fenceErr)
+	assert.Equal(t, tokenCacheFenceRotated, fence)
+}
+
+func TestTenantTokenCacheBindingFenceAllowsCurrentWriterAndRejectsOtherBinding(t *testing.T) {
+	_, client := tenantTokenCacheRedis(t)
+	ctx := context.Background()
+	rawKey := "binding-fence-key"
+	cacheKey, fenceKey := tokenCacheKeys(rawKey)
+	require.NoError(t, client.Set(ctx, fenceKey, tokenCacheFenceModeForBinding(31), 0).Err())
+
+	err := cacheSetToken(Token{Key: rawKey, TenantCostBindingID: 32, Status: 1})
+	assert.ErrorIs(t, err, errTenantCostTokenCacheFenced)
+	require.NoError(t, cacheSetToken(Token{Key: rawKey, TenantCostBindingID: 31, Status: 1, RemainQuota: 9}))
+	got, err := cacheGetTokenByKey(rawKey)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.EqualValues(t, 31, got.TenantCostBindingID)
+	assert.EqualValues(t, 9, got.RemainQuota)
+
+	// A fence change between the two reads must invalidate the snapshot rather
+	// than returning a token associated with the previous binding.
+	require.NoError(t, client.Set(ctx, fenceKey, tokenCacheFenceModeForBinding(32), 0).Err())
+	_, err = cacheGetTokenByKey(rawKey)
+	assert.ErrorIs(t, err, errTenantCostTokenCacheFenced)
+	cacheExists, existsErr := client.Exists(ctx, cacheKey).Result()
+	require.NoError(t, existsErr)
+	assert.EqualValues(t, 1, cacheExists)
+}
+
+func TestTenantTokenCacheFenceCleanupIsCompareAndDelete(t *testing.T) {
+	_, client := tenantTokenCacheRedis(t)
+	ctx := context.Background()
+	rawKey := "fence-cleanup-key"
+	_, fenceKey := tokenCacheKeys(rawKey)
+	require.NoError(t, client.Set(ctx, fenceKey, tokenCacheFenceRotated, 0).Err())
+
+	err := cacheClearTokenFence(rawKey, tokenCacheFenceModeForBinding(41))
+	assert.ErrorIs(t, err, errTenantCostTokenCacheFenceMismatch)
+	fence, getErr := client.Get(ctx, fenceKey).Result()
+	require.NoError(t, getErr)
+	assert.Equal(t, tokenCacheFenceRotated, fence)
+
+	require.NoError(t, cacheClearTokenFence(rawKey, tokenCacheFenceRotated))
+	_, getErr = client.Get(ctx, fenceKey).Result()
+	assert.ErrorIs(t, getErr, redis.Nil)
+
+	// Clearing an already-absent fence is an idempotent no-op.
+	require.NoError(t, cacheClearTokenFence(rawKey, tokenCacheFenceRotated))
+}

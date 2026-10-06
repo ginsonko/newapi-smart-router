@@ -1,0 +1,129 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var parameterPricingUpdateMu sync.Mutex
+
+type ParameterPricingRevisionConflictError struct {
+	Expected string
+	Actual   string
+}
+
+func (err *ParameterPricingRevisionConflictError) Error() string {
+	return fmt.Sprintf("parameter pricing revision conflict: expected %s, current %s", err.Expected, err.Actual)
+}
+
+func IsParameterPricingRevisionConflict(err error) (*ParameterPricingRevisionConflictError, bool) {
+	var conflict *ParameterPricingRevisionConflictError
+	return conflict, errors.As(err, &conflict)
+}
+
+func defaultParameterPricingOption() (string, string) {
+	return billing_setting.ParameterPricingOptionKey, billing_setting.GetParameterPricingJSONString()
+}
+
+func isDedicatedParameterPricingOption(key string) bool {
+	return key == billing_setting.ParameterPricingOptionKey
+}
+
+func applyParameterPricingOption(value string) error {
+	_, normalized, err := billing_setting.UpdateParameterPricingFromJSONString(value)
+	if err != nil {
+		return err
+	}
+	common.OptionMapRWMutex.Lock()
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMap[billing_setting.ParameterPricingOptionKey] = normalized
+	common.OptionMapRWMutex.Unlock()
+	InvalidatePricingCache()
+	ratio_setting.InvalidateExposedDataCache()
+	return nil
+}
+
+func UpdateParameterPricingOption(expectedRevision, raw string) (billing_setting.ParameterPricingContract, bool, error) {
+	desired, normalized, err := billing_setting.NormalizeParameterPricingContract(raw)
+	if err != nil {
+		return billing_setting.ParameterPricingContract{}, false, err
+	}
+	expectedRevision = strings.TrimSpace(expectedRevision)
+	if expectedRevision == "" {
+		return billing_setting.ParameterPricingContract{}, false, fmt.Errorf("expected_revision is required")
+	}
+
+	parameterPricingUpdateMu.Lock()
+	defer parameterPricingUpdateMu.Unlock()
+
+	changed := false
+	valueToPublish := normalized
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var current Option
+		queryErr := tx.Where("key = ?", billing_setting.ParameterPricingOptionKey).Take(&current).Error
+		if queryErr != nil && !errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			return queryErr
+		}
+
+		currentRaw := ""
+		if queryErr == nil {
+			currentRaw = current.Value
+		}
+		currentContract, currentNormalized, normalizeErr := billing_setting.NormalizeParameterPricingContract(currentRaw)
+		if normalizeErr != nil {
+			return fmt.Errorf("stored parameter pricing contract is invalid: %w", normalizeErr)
+		}
+		if currentContract.Revision != expectedRevision {
+			if currentContract.Revision == desired.Revision {
+				valueToPublish = currentNormalized
+				return nil
+			}
+			return &ParameterPricingRevisionConflictError{Expected: expectedRevision, Actual: currentContract.Revision}
+		}
+		if currentContract.Revision == desired.Revision {
+			valueToPublish = currentNormalized
+			return nil
+		}
+
+		if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&Option{
+				Key: billing_setting.ParameterPricingOptionKey, Value: normalized,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return &ParameterPricingRevisionConflictError{Expected: expectedRevision, Actual: "concurrent-update"}
+			}
+		} else {
+			result := tx.Model(&Option{}).
+				Where(map[string]any{"key": billing_setting.ParameterPricingOptionKey, "value": currentRaw}).
+				Update("value", normalized)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return &ParameterPricingRevisionConflictError{Expected: expectedRevision, Actual: "concurrent-update"}
+			}
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return billing_setting.ParameterPricingContract{}, false, err
+	}
+	if err := applyParameterPricingOption(valueToPublish); err != nil {
+		return billing_setting.ParameterPricingContract{}, false, fmt.Errorf("publish parameter pricing contract: %w", err)
+	}
+	return billing_setting.GetParameterPricingContract(), changed, nil
+}

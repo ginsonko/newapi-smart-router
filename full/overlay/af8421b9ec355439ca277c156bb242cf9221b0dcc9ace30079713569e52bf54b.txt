@@ -1,0 +1,646 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AxiosError } from 'axios'
+import {
+  Download,
+  Eye,
+  FileUp,
+  LoaderCircle,
+  Plus,
+  RefreshCw,
+  Search,
+} from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+import { ZodError } from 'zod'
+
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+
+import { FormNavigationGuard } from '../components/form-navigation-guard'
+import {
+  SettingsPageFormActions,
+  SettingsPageTitleStatusPortal,
+} from '../components/settings-page-context'
+import { SettingsSection } from '../components/settings-section'
+import {
+  diffParameterPricingContracts,
+  importParameterPricingContract,
+  newParameterPricingRuleForm,
+  parameterPricingContractSchema,
+  parameterPricingFormToRule,
+  parameterPricingRuleToForm,
+  rebaseParameterPricingContract,
+  type ParameterPricingConflict,
+  type ParameterPricingContract,
+  type ParameterPricingRuleForm,
+} from './parameter-pricing-contract'
+import { ParameterPricingEntryEditor } from './parameter-pricing-entry-editor'
+import {
+  getParameterPricing,
+  PARAMETER_PRICING_QUERY_KEY,
+  previewParameterPricing,
+  updateParameterPricing,
+  type ParameterPricingData,
+  type ParameterPricingResponse,
+} from './parameter-pricing-query'
+
+type ParameterPricingSectionProps = {
+  groupCandidates: string[]
+  modelCandidates: string[]
+}
+type PreviewState = {
+  data: ParameterPricingData
+  diff: ReturnType<typeof diffParameterPricingContracts>
+}
+
+function pricingResponseContract(
+  response: ParameterPricingResponse
+): ParameterPricingContract {
+  if (!response.success || !response.data?.supported) {
+    throw new Error(response.message || 'Parameter pricing is unavailable')
+  }
+  return importParameterPricingContract(response.data.contract)
+}
+
+function pricingError(error: unknown): string {
+  if (error instanceof ZodError) {
+    return error.issues
+      .slice(0, 5)
+      .map((issue) => `${issue.path.join('.') || 'contract'}: ${issue.message}`)
+      .join('\n')
+  }
+  if (error instanceof AxiosError) {
+    const response = error.response?.data as
+      | { message?: string; error?: { message?: string } }
+      | undefined
+    return response?.message || response?.error?.message || error.message
+  }
+  return error instanceof Error
+    ? error.message
+    : 'Unable to save pricing contract'
+}
+
+export function ParameterPricingSection(props: ParameterPricingSectionProps) {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const importInput = useRef<HTMLInputElement>(null)
+  const [base, setBase] = useState<ParameterPricingContract | null>(null)
+  const [draft, setDraft] = useState<ParameterPricingRuleForm[]>([])
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [error, setError] = useState('')
+  const [preview, setPreview] = useState<PreviewState | null>(null)
+  const [conflicts, setConflicts] = useState<ParameterPricingConflict[]>([])
+  const [readbackPending, setReadbackPending] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const pricingQuery = useQuery({
+    queryKey: PARAMETER_PRICING_QUERY_KEY,
+    queryFn: getParameterPricing,
+    staleTime: 15_000,
+  })
+  const dirty =
+    base !== null &&
+    JSON.stringify(draft) !==
+      JSON.stringify(base.rules.map(parameterPricingRuleToForm))
+  const selected = draft.find((rule) => rule.id === selectedId)
+  const groupCandidates = useMemo(
+    () =>
+      [
+        ...new Set([
+          '*',
+          ...props.groupCandidates,
+          ...draft.map((rule) => rule.group).filter(Boolean),
+        ]),
+      ].sort(),
+    [draft, props.groupCandidates]
+  )
+  const modelCandidates = useMemo(
+    () =>
+      [
+        ...new Set([
+          ...props.modelCandidates,
+          ...draft.map((rule) => rule.model).filter(Boolean),
+        ]),
+      ].sort(),
+    [draft, props.modelCandidates]
+  )
+  const filtered = useMemo(() => {
+    const needle = search.trim().toLocaleLowerCase()
+    return draft.filter((rule) =>
+      `${rule.model}\n${rule.group}\n${rule.resolution}\n${rule.quality}\n${rule.channel_id}`
+        .toLocaleLowerCase()
+        .includes(needle)
+    )
+  }, [draft, search])
+
+  useEffect(() => {
+    if (!pricingQuery.data || dirty || conflicts.length > 0) return
+    try {
+      const contract = pricingResponseContract(pricingQuery.data)
+      if (base?.revision === contract.revision) return
+      setBase(contract)
+      setDraft(contract.rules.map(parameterPricingRuleToForm))
+      setSelectedId((current) =>
+        contract.rules.some((rule) => rule.id === current)
+          ? current
+          : (contract.rules[0]?.id ?? null)
+      )
+      setReadbackPending(false)
+    } catch (reason) {
+      setError(pricingError(reason))
+    }
+  }, [base?.revision, conflicts.length, dirty, pricingQuery.data])
+
+  const draftContract = (): ParameterPricingContract =>
+    parameterPricingContractSchema.parse({
+      schema_version: 1,
+      revision: base?.revision ?? '',
+      rules: draft.map(parameterPricingFormToRule),
+    })
+
+  const reconcile = async (candidate: ParameterPricingContract) => {
+    if (!base) return
+    const response = await getParameterPricing()
+    const latest = pricingResponseContract(response)
+    const result = rebaseParameterPricingContract(base, candidate, latest)
+    queryClient.setQueryData(PARAMETER_PRICING_QUERY_KEY, response)
+    setBase(latest)
+    setDraft(result.contract.rules.map(parameterPricingRuleToForm))
+    setConflicts(result.conflicts)
+    setPreview(null)
+    if (result.conflicts.length) {
+      setError(t('Resolve concurrent edits before saving'))
+    } else {
+      toast.info(
+        t(
+          'Server changes were merged without losing your edits. Review the draft and save again.'
+        )
+      )
+    }
+  }
+
+  const mutation = useMutation({
+    mutationFn: async (action: 'preview' | 'save' | 'reload') => {
+      setError('')
+      await queryClient.cancelQueries({ queryKey: PARAMETER_PRICING_QUERY_KEY })
+      if (action === 'reload') {
+        const response = await getParameterPricing()
+        const latest = pricingResponseContract(response)
+        queryClient.setQueryData(PARAMETER_PRICING_QUERY_KEY, response)
+        setBase(latest)
+        setDraft(latest.rules.map(parameterPricingRuleToForm))
+        setReadbackPending(false)
+        return
+      }
+      if (!base) return
+      const candidate = draftContract()
+      const checked = await previewParameterPricing(base.revision, candidate)
+      const normalized = pricingResponseContract(checked)
+      if (checked.data.expected_revision_matches === false) {
+        await reconcile(candidate)
+        return
+      }
+      setPreview({
+        data: checked.data,
+        diff: diffParameterPricingContracts(base, normalized),
+      })
+      if (action === 'preview') {
+        toast.success(t('Pricing contract is valid'))
+        return
+      }
+      let response: ParameterPricingResponse
+      try {
+        response = await updateParameterPricing(base.revision, normalized)
+      } catch (reason) {
+        if (reason instanceof AxiosError && reason.response?.status === 409) {
+          await reconcile(candidate)
+          return
+        }
+        throw reason
+      }
+      const saved = pricingResponseContract(response)
+      queryClient.setQueryData(PARAMETER_PRICING_QUERY_KEY, response)
+      setBase(saved)
+      setDraft(saved.rules.map(parameterPricingRuleToForm))
+      setConflicts([])
+      setReadbackPending(true)
+      try {
+        const readback = await getParameterPricing()
+        const latest = pricingResponseContract(readback)
+        queryClient.setQueryData(PARAMETER_PRICING_QUERY_KEY, readback)
+        setBase(latest)
+        setDraft(latest.rules.map(parameterPricingRuleToForm))
+        setReadbackPending(false)
+        if (latest.revision === saved.revision) {
+          toast.success(t('Parameter pricing saved and verified'))
+        } else {
+          toast.info(
+            t(
+              'Saved successfully. Another administrator has since updated the contract; the latest version is shown.'
+            )
+          )
+        }
+      } catch {
+        setError(
+          t(
+            'The server accepted the save, but read-back failed. Reload the server version to verify it.'
+          )
+        )
+      }
+    },
+    onError: (reason) => setError(pricingError(reason)),
+  })
+
+  const updateRule = (rule: ParameterPricingRuleForm) => {
+    setDraft((current) =>
+      current.map((existing) => (existing.id === rule.id ? rule : existing))
+    )
+    setPreview(null)
+  }
+
+  const addRule = (copy?: ParameterPricingRuleForm) => {
+    const rule = copy
+      ? { ...copy, id: crypto.randomUUID() }
+      : newParameterPricingRuleForm(crypto.randomUUID())
+    setDraft((current) => [...current, rule])
+    setSelectedId(rule.id)
+    setSearch('')
+    setPreview(null)
+  }
+
+  const resetDraft = () => {
+    if (!base) return
+    setDraft(base.rules.map(parameterPricingRuleToForm))
+    setSelectedId(base.rules[0]?.id ?? null)
+    setConflicts([])
+    setPreview(null)
+    setError('')
+  }
+
+  const importContract = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || !base) return
+    if (dirty || conflicts.length > 0) {
+      setError(t('Save or reset the current draft before importing'))
+      return
+    }
+    if (file.size > 9 * 1024 * 1024) {
+      setError(t('Pricing contract file must not exceed 9 MB'))
+      return
+    }
+    setImporting(true)
+    try {
+      const imported = importParameterPricingContract(
+        JSON.parse(await file.text())
+      )
+      setDraft(imported.rules.map(parameterPricingRuleToForm))
+      setSelectedId(imported.rules[0]?.id ?? null)
+      setPreview(null)
+      setError('')
+      toast.success(t('Pricing contract imported into draft'))
+    } catch (reason) {
+      setError(pricingError(reason))
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const exportContract = () => {
+    try {
+      const contract = draftContract()
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify(contract, null, 2)], {
+          type: 'application/json',
+        })
+      )
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'parameter-pricing.json'
+      document.body.append(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (reason) {
+      setError(pricingError(reason))
+    }
+  }
+
+  const resolveConflict = (
+    conflict: ParameterPricingConflict,
+    keepLocal: boolean
+  ) => {
+    const rule = keepLocal ? conflict.local : conflict.remote
+    setDraft((current) => {
+      const remaining = current.filter((entry) => entry.id !== conflict.id)
+      return rule ? [...remaining, parameterPricingRuleToForm(rule)] : remaining
+    })
+    setConflicts((current) =>
+      current.filter((entry) => entry.id !== conflict.id)
+    )
+    setError('')
+  }
+
+  if (pricingQuery.isLoading) {
+    return (
+      <div className='text-muted-foreground flex min-h-48 items-center justify-center gap-2 text-sm'>
+        <LoaderCircle className='size-4 animate-spin' />
+        {t('Loading parameter pricing...')}
+      </div>
+    )
+  }
+  if (!base) {
+    return (
+      <Alert variant='destructive'>
+        <AlertTitle>{t('Parameter pricing is unavailable')}</AlertTitle>
+        <AlertDescription>
+          {error || pricingError(pricingQuery.error)}
+        </AlertDescription>
+        <Button
+          type='button'
+          variant='outline'
+          className='mt-3 w-fit'
+          onClick={() => pricingQuery.refetch()}
+        >
+          {t('Try again')}
+        </Button>
+      </Alert>
+    )
+  }
+
+  return (
+    <SettingsSection title={t('Parameter Pricing')}>
+      <FormNavigationGuard when={dirty || conflicts.length > 0} />
+      <SettingsPageTitleStatusPortal>
+        <Badge variant={dirty ? 'secondary' : 'outline'}>
+          {dirty
+            ? t('Unsaved')
+            : t('{{count}} entries', { count: draft.length })}
+        </Badge>
+      </SettingsPageTitleStatusPortal>
+      <SettingsPageFormActions
+        onSave={() => mutation.mutate('save')}
+        onReset={resetDraft}
+        isSaving={mutation.isPending || importing}
+        isSaveDisabled={!dirty || conflicts.length > 0}
+        isResetDisabled={!dirty && conflicts.length === 0}
+      />
+      <p className='text-muted-foreground text-sm'>
+        {t(
+          'Set image and video prices by group, model, supply, resolution and quality. Empty configuration preserves existing pricing.'
+        )}
+      </p>
+      <p className='text-muted-foreground text-xs'>
+        {t(
+          'Rules are not matched by row order. The server rejects ambiguous overlaps; a model with parameter pricing cannot fall back to an unrelated price when no rule matches.'
+        )}
+      </p>
+      <div className='flex flex-wrap gap-2'>
+        <Button
+          type='button'
+          size='sm'
+          disabled={mutation.isPending || importing || conflicts.length > 0}
+          onClick={() => addRule()}
+        >
+          <Plus data-icon='inline-start' />
+          {t('New price rule')}
+        </Button>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          disabled={mutation.isPending || importing || conflicts.length > 0}
+          onClick={() => mutation.mutate('preview')}
+        >
+          <Eye data-icon='inline-start' />
+          {t('Validate draft')}
+        </Button>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          disabled={
+            mutation.isPending || importing || dirty || conflicts.length > 0
+          }
+          onClick={() => importInput.current?.click()}
+        >
+          <FileUp data-icon='inline-start' />
+          {t('Import')}
+        </Button>
+        <input
+          ref={importInput}
+          type='file'
+          accept='application/json,.json'
+          className='hidden'
+          onChange={importContract}
+        />
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          disabled={mutation.isPending || importing}
+          onClick={exportContract}
+        >
+          <Download data-icon='inline-start' />
+          {t('Export')}
+        </Button>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          disabled={
+            mutation.isPending || importing || dirty || conflicts.length > 0
+          }
+          onClick={() => mutation.mutate('reload')}
+        >
+          <RefreshCw data-icon='inline-start' />
+          {t('Reload server')}
+        </Button>
+      </div>
+      {error ? (
+        <Alert variant='destructive'>
+          <AlertTitle>{t('Pricing changes need attention')}</AlertTitle>
+          <AlertDescription className='break-words whitespace-pre-wrap'>
+            {t(error)}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {readbackPending && !error ? (
+        <Alert>
+          <AlertTitle>
+            {t(
+              'The server accepted the save, but read-back failed. Reload the server version to verify it.'
+            )}
+          </AlertTitle>
+        </Alert>
+      ) : null}
+      {conflicts.length > 0 ? (
+        <Alert variant='destructive'>
+          <AlertTitle>{t('Resolve concurrent edits before saving')}</AlertTitle>
+          <AlertDescription className='w-full'>
+            {conflicts.map((conflict) => (
+              <div
+                key={conflict.id}
+                className='mt-3 w-full min-w-0 space-y-2 rounded-lg border p-3'
+              >
+                <p className='font-mono text-xs break-all'>
+                  {conflict.local?.model || conflict.remote?.model} ·{' '}
+                  {conflict.id}
+                </p>
+                <div className='grid min-w-0 gap-3 md:grid-cols-2'>
+                  <div className='min-w-0'>
+                    <p className='font-medium'>{t('Your draft')}</p>
+                    <pre className='mt-1 max-h-48 overflow-auto text-xs break-all whitespace-pre-wrap'>
+                      {conflict.local
+                        ? JSON.stringify(conflict.local, null, 2)
+                        : t('Deleted')}
+                    </pre>
+                  </div>
+                  <div className='min-w-0'>
+                    <p className='font-medium'>{t('Server version')}</p>
+                    <pre className='mt-1 max-h-48 overflow-auto text-xs break-all whitespace-pre-wrap'>
+                      {conflict.remote
+                        ? JSON.stringify(conflict.remote, null, 2)
+                        : t('Deleted')}
+                    </pre>
+                  </div>
+                </div>
+                <div className='flex gap-2'>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    onClick={() => resolveConflict(conflict, false)}
+                  >
+                    {t('Use server')}
+                  </Button>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    onClick={() => resolveConflict(conflict, true)}
+                  >
+                    {t('Keep mine')}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {preview ? (
+        <Alert>
+          <AlertTitle>{t('Latest validation')}</AlertTitle>
+          <AlertDescription>
+            {t(
+              '{{added}} added, {{updated}} updated, {{removed}} removed',
+              preview.diff
+            )}{' '}
+            · {t('Revision')}:{' '}
+            <span className='font-mono text-xs break-all'>
+              {preview.data.revision}
+            </span>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      <div className='grid min-h-[32rem] min-w-0 overflow-hidden rounded-lg border lg:grid-cols-[19rem_minmax(0,1fr)]'>
+        <aside className='bg-muted/10 flex min-h-0 flex-col border-b lg:border-r lg:border-b-0'>
+          <div className='relative border-b p-3'>
+            <Search className='text-muted-foreground pointer-events-none absolute top-1/2 left-5 size-4 -translate-y-1/2' />
+            <Input
+              aria-label={t('Search group or model')}
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={t('Search group or model')}
+              className='pl-8'
+            />
+          </div>
+          <div className='max-h-80 overflow-y-auto lg:max-h-[48rem]'>
+            {filtered.length === 0 ? (
+              <p className='text-muted-foreground px-4 py-10 text-center text-sm'>
+                {t('No matching price rules')}
+              </p>
+            ) : (
+              filtered.map((rule) => (
+                <button
+                  key={rule.id}
+                  type='button'
+                  data-selected={selectedId === rule.id}
+                  className='hover:bg-muted/40 data-[selected=true]:bg-muted flex w-full min-w-0 flex-col gap-1 border-b px-3 py-3 text-left focus-visible:ring-2 focus-visible:ring-inset'
+                  onClick={() => setSelectedId(rule.id)}
+                >
+                  <span className='truncate text-sm font-medium'>
+                    {rule.model || t('New price rule')}
+                  </span>
+                  <span className='text-muted-foreground w-full truncate text-xs'>
+                    {rule.group} · {rule.resolution || t('Any resolution')} ·{' '}
+                    {rule.quality || t('Any quality')}
+                  </span>
+                  <span className='font-mono text-xs'>
+                    USD {rule.unit_price || '—'} ·{' '}
+                    {t(
+                      {
+                        per_request: 'Per request',
+                        per_image: 'Per image',
+                        per_second: 'Per second',
+                        fixed_duration: 'Fixed duration',
+                      }[rule.unit]
+                    )}
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+        </aside>
+        <div className='min-w-0 p-4 lg:max-h-[48rem] lg:overflow-y-auto'>
+          {selected ? (
+            <ParameterPricingEntryEditor
+              key={selected.id}
+              value={selected}
+              groupCandidates={groupCandidates}
+              modelCandidates={modelCandidates}
+              disabled={mutation.isPending || importing || conflicts.length > 0}
+              onChange={updateRule}
+              onCopy={() => addRule(selected)}
+              onRemove={() => {
+                const remaining = draft.filter(
+                  (rule) => rule.id !== selected.id
+                )
+                setDraft(remaining)
+                setSelectedId(remaining[0]?.id ?? null)
+                setPreview(null)
+              }}
+            />
+          ) : (
+            <p className='text-muted-foreground py-10 text-center text-sm'>
+              {t(
+                'Add a rule or select one to edit. No model or price is added automatically.'
+              )}
+            </p>
+          )}
+        </div>
+      </div>
+    </SettingsSection>
+  )
+}

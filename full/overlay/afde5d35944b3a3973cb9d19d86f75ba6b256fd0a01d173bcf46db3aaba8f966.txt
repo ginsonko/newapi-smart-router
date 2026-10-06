@@ -1,0 +1,78 @@
+package model
+
+import (
+	"testing"
+	"time"
+
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestCapabilityRuntimeConfigurationRejectsAmbiguousContracts(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		alter func(*ModelCapabilityContract)
+		want  string
+	}{
+		{"alias conflict", func(c *ModelCapabilityContract) {
+			c.Generation.ResolutionAliases = map[string]string{"1280x720": "720p", "1280X720": "480p"}
+			c.Generation.Resolutions = []string{"480p", "720p"}
+		}, "conflicting"},
+		{"unlisted default", func(c *ModelCapabilityContract) { c.Generation.DefaultResolution = "4k" }, "default_resolution"},
+		{"invalid template", func(c *ModelCapabilityContract) {
+			c.References.PromptReference = &CapabilityPromptReference{Required: true, Templates: map[string]string{"image": "image"}}
+		}, "{index}"},
+		{"field collision", func(c *ModelCapabilityContract) { c.Provider.ReferenceFields = map[string]string{"image": "prompt"} }, "overwrite"},
+		{"route identity", func(c *ModelCapabilityContract) { c.Source.ChannelIDs = []int{0} }, "positive"},
+		{"mode conflict", func(c *ModelCapabilityContract) {
+			c.Generation.AllowedModes = []string{"reference"}
+			c.Generation.ForbiddenModes = []string{"REFERENCE"}
+		}, "both allowed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundle := capabilityFixtureBundle()
+			test.alter(&bundle.Contracts[0])
+			_, err := NormalizeModelCapabilityBundle(bundle)
+			assert.ErrorContains(t, err, test.want)
+		})
+	}
+	bundle := capabilityFixtureBundle()
+	bundle.Contracts[0].RuntimeEnforced = true
+	bundle.Contracts[0].References.PromptReference = &CapabilityPromptReference{Required: true}
+	// Unknown syntax remains explicit and is rejected at a referenced request,
+	// while administrators can stage the still-incomplete contract for review.
+	normalized, err := NormalizeModelCapabilityBundle(bundle)
+	require.NoError(t, err)
+	assert.True(t, normalized.Contracts[0].RuntimeEnforced)
+	assert.Empty(t, normalized.Contracts[0].References.PromptReference.Templates)
+}
+
+func TestCapabilityReaderRefreshesActivationFromAnotherProcess(t *testing.T) {
+	previousDB, previousCache := DB, activeCapability.Load()
+	db, err := gorm.Open(sqlite.Open("file:capability-cross-process?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	activeCapability.Store(nil)
+	t.Cleanup(func() { DB = previousDB; activeCapability.Store(previousCache) })
+	require.NoError(t, db.AutoMigrate(&ModelCapabilityBundleRecord{}, &ModelCapabilityCatalogHead{}, &ModelCapabilityChangeSet{}))
+	first, err := NormalizeModelCapabilityBundle(capabilityFixtureBundle())
+	require.NoError(t, err)
+	_, _, err = StageModelCapabilityBundle("cross-process-first", first)
+	require.NoError(t, err)
+	_, err = ActivateModelCapabilityBundle("cross-process-first", "", "")
+	require.NoError(t, err)
+	secondFixture := capabilityFixtureBundle()
+	secondFixture.Contracts[0].References.MaxTotal = 40
+	second, err := NormalizeModelCapabilityBundle(secondFixture)
+	require.NoError(t, err)
+	record, _, err := StageModelCapabilityBundle("cross-process-second", second)
+	require.NoError(t, err)
+	// Another process updates the durable head without touching this reader's cache.
+	require.NoError(t, db.Model(&ModelCapabilityCatalogHead{}).Where("id = ?", 1).Updates(map[string]interface{}{"active_bundle_id": record.ID, "revision": second.Revision}).Error)
+	refreshed, err := getActiveModelCapabilityBundleAt(time.Now().Add(2 * time.Second))
+	require.NoError(t, err)
+	assert.Equal(t, second.Revision, refreshed.Revision)
+	assert.Equal(t, 40, refreshed.Contracts[0].References.MaxTotal)
+}

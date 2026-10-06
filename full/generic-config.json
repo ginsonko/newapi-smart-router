@@ -1,0 +1,14 @@
+{
+  "profile": "generic-reference",
+  "system_name": "New API",
+  "server_address": "",
+  "channels": [],
+  "users": [],
+  "site_content": {},
+  "smart_router_setting": {
+    "enabled": false,
+    "image_failure_window_seconds": 3600,
+    "image_failure_threshold": 11
+  },
+  "instructions": "Configure routes, allowed groups and secrets using the host administrator interface. This example is not an exported runtime settings database."
+}

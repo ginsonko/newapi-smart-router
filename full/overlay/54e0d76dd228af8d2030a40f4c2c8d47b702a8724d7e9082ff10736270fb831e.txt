@@ -1,0 +1,180 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { Textarea } from '@/components/ui/textarea'
+import { api } from '@/lib/api'
+
+type Contract = {
+  contract_id: string
+  revision?: string
+  target: { model: string; group: string }
+  [key: string]: unknown
+}
+type Bundle = {
+  schema_version: string
+  revision: string
+  contracts: Contract[]
+}
+const path = '/api/option/model-capabilities'
+async function readBundle(): Promise<Bundle> {
+  return (await api.get(path)).data.data
+}
+
+/** Edits the authoritative model contract; storage overrides use a different API. */
+export function ModelCapabilityEditor() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const catalog = useQuery({
+    queryKey: ['model-capability-admin'],
+    queryFn: readBundle,
+  })
+  const [selected, setSelected] = useState('')
+  const [draft, setDraft] = useState<{ identity: string; text: string } | null>(
+    null
+  )
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const contracts = catalog.data?.contracts ?? []
+  const current =
+    contracts.find((item) => item.contract_id === selected) ?? contracts[0]
+  const identity = `${current?.contract_id}:${current?.revision}`
+  const initialText = current ? JSON.stringify(current, null, 2) : ''
+  const text = draft?.identity === identity ? draft.text : initialText
+  const save = async () => {
+    if (!catalog.data || !current) return
+    setSaving(true)
+    setError('')
+    try {
+      const edited = JSON.parse(text) as Contract
+      if (
+        edited.contract_id !== current.contract_id ||
+        JSON.stringify(edited.target) !== JSON.stringify(current.target)
+      ) {
+        throw new Error(
+          t('Keep the contract identity and target unchanged when editing')
+        )
+      }
+      const bundle = {
+        ...catalog.data,
+        revision: '',
+        contracts: contracts.map((item) =>
+          item.contract_id === current.contract_id
+            ? { ...edited, revision: '' }
+            : item
+        ),
+      }
+      const preview = (
+        await api.post(`${path}/preview`, {
+          expected_revision: catalog.data.revision,
+          bundle,
+        })
+      ).data.data
+      if (!preview.expected_revision_matches)
+        {throw new Error(t('Configuration changed. Reload before saving.'))}
+      if (preview.changed) {
+        // Deterministic operation identity allows safe recovery after a lost response.
+        const operation = `capability-editor-${preview.bundle.revision}`
+        await api.post(`${path}/stage`, {
+          operation_key: operation,
+          bundle: preview.bundle,
+        })
+        try {
+          await api.post(`${path}/activate`, {
+            operation_key: operation,
+            expected_catalog_revision: catalog.data.revision,
+          })
+        } catch (cause) {
+          const actual = await readBundle()
+          if (actual.revision !== preview.bundle.revision) throw cause
+        }
+      }
+      const actual = await readBundle()
+      if (actual.revision !== preview.bundle.revision)
+        {throw new Error(t('Configuration changed. Reload before saving.'))}
+      queryClient.setQueryData(['model-capability-admin'], actual)
+      toast.success(t('Model capability saved'))
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <section className='space-y-3 rounded-lg border p-4'>
+      <h3 className='text-sm font-semibold'>
+        {t('Model capability contract')}
+      </h3>
+      <p className='text-muted-foreground text-xs'>
+        {t(
+          'Edit duration, resolutions, reference limits and provider fields here. Prices are managed in group model pricing.'
+        )}
+      </p>
+      {catalog.isError && (
+        <p role='alert'>{t('Failed to load configuration')}</p>
+      )}
+      <NativeSelect
+        aria-label={t('Model capability contract')}
+        disabled={saving}
+        value={current?.contract_id ?? ''}
+        onChange={(event) => setSelected(event.target.value)}
+      >
+        {contracts.map((item) => (
+          <NativeSelectOption key={item.contract_id} value={item.contract_id}>
+            {item.target.group} · {item.target.model}
+          </NativeSelectOption>
+        ))}
+      </NativeSelect>
+      <Textarea
+        aria-label={t('Capability JSON')}
+        className='min-h-80 font-mono text-xs'
+        disabled={saving || !current}
+        value={text}
+        onChange={(event) => setDraft({ identity, text: event.target.value })}
+      />
+      {error && (
+        <p className='text-destructive text-sm' role='alert'>
+          {error}
+        </p>
+      )}
+      <div className='flex gap-2'>
+        <Button
+          type='button'
+          disabled={saving || !current}
+          onClick={() => void save()}
+        >
+          {t('Save')}
+        </Button>
+        <Button
+          type='button'
+          variant='outline'
+          disabled={saving}
+          onClick={() => void catalog.refetch()}
+        >
+          {t('Reload')}
+        </Button>
+      </div>
+    </section>
+  )
+}

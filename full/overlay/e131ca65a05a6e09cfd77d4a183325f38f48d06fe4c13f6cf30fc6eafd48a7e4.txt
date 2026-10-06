@@ -1,0 +1,84 @@
+package dto
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+// StandaloneSearchRequest keeps the experimental Codex search contract open
+// ended. Known routing fields are validated, while every unknown field is
+// retained byte-for-byte at the JSON-value level for upstream compatibility.
+type StandaloneSearchRequest struct {
+	ID     string
+	Model  string
+	Fields map[string]json.RawMessage
+}
+
+func (r *StandaloneSearchRequest) UnmarshalJSON(data []byte) error {
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if err := decodeStandaloneSearchString(fields, "id", &r.ID); err != nil {
+		return err
+	}
+	if err := decodeStandaloneSearchString(fields, "model", &r.Model); err != nil {
+		return err
+	}
+	r.Fields = fields
+	return nil
+}
+
+func decodeStandaloneSearchString(fields map[string]json.RawMessage, name string, target *string) error {
+	raw, ok := fields[name]
+	if !ok {
+		return nil
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return errors.New(name + " must be a string")
+	}
+	return nil
+}
+
+func (r StandaloneSearchRequest) MarshalJSON() ([]byte, error) {
+	fields := make(map[string]json.RawMessage, len(r.Fields)+2)
+	for key, value := range r.Fields {
+		fields[key] = append(json.RawMessage(nil), value...)
+	}
+	if r.ID != "" {
+		fields["id"], _ = json.Marshal(r.ID)
+	}
+	if r.Model != "" {
+		fields["model"], _ = json.Marshal(r.Model)
+	}
+	return json.Marshal(fields)
+}
+
+func (r *StandaloneSearchRequest) GetTokenCountMeta() *types.TokenCountMeta {
+	meta := &types.TokenCountMeta{TokenType: types.TokenTypeTokenizer}
+	if raw := r.Fields["max_output_tokens"]; len(raw) > 0 {
+		var value int
+		if json.Unmarshal(raw, &value) == nil && value > 0 {
+			meta.MaxTokens = value
+		}
+	}
+	return meta
+}
+
+func (r *StandaloneSearchRequest) IsStream(*gin.Context) bool { return false }
+
+func (r *StandaloneSearchRequest) SetModelName(modelName string) {
+	if strings.TrimSpace(modelName) != "" {
+		r.Model = modelName
+	}
+}
+
+type StandaloneSearchResponse struct {
+	EncryptedOutput json.RawMessage `json:"encrypted_output,omitempty"`
+	Output          string          `json:"output"`
+	Results         json.RawMessage `json:"results,omitempty"`
+}

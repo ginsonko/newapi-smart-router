@@ -1,0 +1,63 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestParameterChannelExclusionPreservesDBStrategy(t *testing.T) {
+	oldDB, oldCache, oldGroupCol := DB, common.MemoryCacheEnabled, commonGroupCol
+	oldKeyCol, oldTrueVal, oldFalseVal := commonKeyCol, commonTrueVal, commonFalseVal
+	oldLogKeyCol, oldLogGroupCol := logKeyCol, logGroupCol
+	oldMainDB, oldLogDB := common.MainDatabaseType(), common.LogDatabaseType()
+	db, err := gorm.Open(sqlite.Open("file:parameter-channel-exclusion?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB, common.MemoryCacheEnabled = db, false
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	initCol()
+	t.Cleanup(func() {
+		DB, common.MemoryCacheEnabled, commonGroupCol = oldDB, oldCache, oldGroupCol
+		commonKeyCol, commonTrueVal, commonFalseVal = oldKeyCol, oldTrueVal, oldFalseVal
+		logKeyCol, logGroupCol = oldLogKeyCol, oldLogGroupCol
+		common.SetDatabaseTypes(oldMainDB, oldLogDB)
+		sqlDB, e := db.DB()
+		require.NoError(t, e)
+		require.NoError(t, sqlDB.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+	for _, id := range []int{30, 31, 32} {
+		priority := int64(100)
+		if id == 32 {
+			priority = 90
+		}
+		require.NoError(t, db.Create(&Channel{Id: id, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}).Error)
+		require.NoError(t, db.Create(&Ability{Group: "default", Model: "parameter-image", ChannelId: id, Enabled: true, Priority: &priority, Weight: 100}).Error)
+	}
+	legacy, err := GetRandomSatisfiedChannel("default", "parameter-image", 1, "/v1/images/generations")
+	require.NoError(t, err)
+	require.Equal(t, 32, legacy.Id)
+	for _, tc := range []struct {
+		excluded map[int]bool
+		want     int
+	}{
+		{map[int]bool{30: true}, 31},
+		{map[int]bool{30: true, 31: true}, 32},
+		{map[int]bool{30: true, 31: true, 32: true}, 0},
+	} {
+		ch, err := GetRandomSatisfiedChannel("default", "parameter-image", 0, "/v1/images/generations", tc.excluded)
+		require.NoError(t, err)
+		if tc.want == 0 {
+			require.Nil(t, ch)
+		} else {
+			require.Equal(t, tc.want, ch.Id)
+		}
+	}
+	foreign, err := GetRandomSatisfiedChannel("foreign", "parameter-image", 0, "/v1/images/generations", map[int]bool{30: true})
+	require.NoError(t, err)
+	require.Nil(t, foreign, "candidate filtering must not expand group authorization")
+}

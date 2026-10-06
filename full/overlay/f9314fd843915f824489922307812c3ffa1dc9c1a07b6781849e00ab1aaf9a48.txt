@@ -1,0 +1,46 @@
+package model
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestGroupRatioOptionDatabaseFailureKeepsLastActiveRevision(t *testing.T) {
+	originalDB := DB
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		DB = originalDB
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+	})
+
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"stable":0.2}`))
+	activeRevision := ratio_setting.GetGroupRatioContentRevision()
+	activeRatios := ratio_setting.GroupRatio2JSONString()
+
+	dsn := fmt.Sprintf("file:missing-option-table-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	brokenDB, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	DB = brokenDB // Option table is deliberately absent, so persistence fails.
+
+	require.Error(t, UpdateOption("GroupRatio", `{"stable":0.9}`))
+	require.JSONEq(t, activeRatios, ratio_setting.GroupRatio2JSONString())
+	require.Equal(t, activeRevision, ratio_setting.GetGroupRatioContentRevision())
+}
+
+func TestStructuredGroupRatioOptionUsesSameStableRevision(t *testing.T) {
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+	})
+
+	require.NoError(t, updateOptionMap("group_ratio_setting.group_ratio", `{"route":0.2}`))
+	revision := ratio_setting.GetGroupRatioContentRevision()
+	require.NoError(t, updateOptionMap("group_ratio_setting.group_ratio", `{"route":0.2000}`))
+	require.Equal(t, revision, ratio_setting.GetGroupRatioContentRevision())
+}

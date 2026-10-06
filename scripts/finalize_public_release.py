@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 
-RELEASE_NAME = "newapi-smart-router-v0.3.0-alpha.1"
+from build_release import MARKER_NAME, RELEASE_NAME, RELEASE_VERSION
 
 
 def sha256_file(path: Path) -> str:
@@ -28,7 +28,7 @@ def main() -> int:
     args = parser.parse_args()
 
     root = args.release_root.resolve(strict=True)
-    marker = root / ".smart-router-release-root"
+    marker = root / MARKER_NAME
     commit = args.repository_commit.lower()
     if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != RELEASE_NAME:
         raise RuntimeError("release root marker is missing or unexpected")
@@ -38,6 +38,8 @@ def main() -> int:
     artifacts = root / "artifacts"
     manifest_path = artifacts / "RELEASE-MANIFEST.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("release") != RELEASE_VERSION:
+        raise RuntimeError("release manifest version does not match the builder")
     repository = manifest.setdefault("repository", {})
     if repository.get("url") != "https://github.com/ginsonko/newapi-smart-router":
         raise RuntimeError("unexpected public repository origin")

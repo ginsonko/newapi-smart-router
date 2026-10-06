@@ -1,0 +1,492 @@
+package media
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"gorm.io/gorm"
+)
+
+type SynchronousArchiveInput struct {
+	UserID       int
+	Username     string
+	TaskPublicID string
+	RequestID    string
+	ChannelID    int
+	Model        string
+	Group        string
+	Kind         string
+	ContentType  string
+	Filename     string
+	Prompt       string
+}
+
+const maxStoredRequestPromptRunes = 4096
+
+const synchronousArchiveFailureSourceKind = "provider_archive_failure"
+
+func CreateResponseCapture() (*os.File, error) {
+	if !mediasetting.Get().Enabled {
+		return nil, ErrMediaDisabled
+	}
+	root, err := storageRoot()
+	if err != nil {
+		return nil, err
+	}
+	temporaryRoot := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(temporaryRoot, 0o750); err != nil {
+		return nil, err
+	}
+	return os.CreateTemp(temporaryRoot, "response-archive-*")
+}
+
+func ArchiveSynchronousResponse(ctx context.Context, input SynchronousArchiveInput, reader io.Reader) ([]model.MediaBlob, error) {
+	if input.UserID <= 0 || reader == nil {
+		return nil, fmt.Errorf("invalid synchronous media response")
+	}
+	contentType := strings.TrimSpace(strings.SplitN(input.ContentType, ";", 2)[0])
+	if input.Kind == "audio" && strings.HasPrefix(contentType, "audio/") {
+		filename := responseFilename(input.Filename, contentType, "audio")
+		blob, err := SaveUpload(ctx, UploadInput{
+			UserID: input.UserID, Username: input.Username,
+			Filename: filename,
+			Purpose:  "generated", Role: "primary", Reader: reader,
+			SourceKind: "provider_response", TaskPublicID: input.TaskPublicID,
+			ChannelID: input.ChannelID,
+			Model:     input.Model, Group: input.Group, DeclaredMimeType: contentType,
+			TTLHours: mediasetting.Get().AssetTTLHours,
+		})
+		if err != nil {
+			if recordErr := persistSynchronousArchiveCapacityFailure(input, ArtifactCandidate{
+				Type: "audio", Role: "primary", MimeType: contentType,
+				Filename: filename,
+				Identity: "audio-response",
+				Source:   "audio-response",
+			}, 0, err); recordErr != nil {
+				common.SysLog("media archive capacity failure record failed: " + recordErr.Error())
+			}
+			return nil, err
+		}
+		return []model.MediaBlob{*blob}, nil
+	}
+
+	limit := mediasetting.Get().MaxRequestBytes
+	if limit < 1 {
+		return nil, ErrMediaFileTooLarge
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, ErrMediaFileTooLarge
+	}
+	if input.Kind == "audio" && strings.Contains(contentType, "text/event-stream") {
+		audio, mimeType := extractAudioEventStream(raw)
+		if len(audio) == 0 {
+			return nil, fmt.Errorf("audio event stream contains no final audio")
+		}
+		filename := responseFilename(input.Filename, mimeType, "audio")
+		blob, saveErr := SaveUpload(ctx, UploadInput{
+			UserID: input.UserID, Username: input.Username,
+			Filename: filename,
+			Purpose:  "generated", Role: "primary", Reader: bytes.NewReader(audio),
+			SizeHint: int64(len(audio)), SourceKind: "provider_response",
+			ChannelID: input.ChannelID, Model: input.Model, Group: input.Group,
+			DeclaredMimeType: mimeType, TTLHours: mediasetting.Get().AssetTTLHours,
+		})
+		if saveErr != nil {
+			if recordErr := persistSynchronousArchiveCapacityFailure(input, ArtifactCandidate{
+				Type: "audio", Role: "primary", MimeType: mimeType,
+				Filename: filename,
+				Identity: "audio-event-stream",
+				Source:   "audio-event-stream",
+			}, 0, saveErr); recordErr != nil {
+				common.SysLog("media archive capacity failure record failed: " + recordErr.Error())
+			}
+			return nil, saveErr
+		}
+		return []model.MediaBlob{*blob}, nil
+	}
+
+	candidates := ExtractArtifactCandidates(raw)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("media response contains no archivable output")
+	}
+	user, _ := model.GetUserById(input.UserID, false)
+	if user != nil && input.Username == "" {
+		input.Username = user.Username
+	}
+	archived := make([]model.MediaBlob, 0, len(candidates))
+	var firstErr error
+	for index, candidate := range candidates {
+		role := candidate.Role
+		if index == 0 {
+			role = "primary"
+		}
+		metadata := synchronousArchiveMetadata(candidate.Metadata, input.Prompt)
+		var blob *model.MediaBlob
+		if strings.HasPrefix(candidate.Source, "data:") {
+			mimeType, dataReader, sizeHint, openErr := openDataURL(candidate.Source)
+			if openErr == nil {
+				blob, err = SaveUpload(ctx, UploadInput{
+					UserID: input.UserID, Username: input.Username,
+					Filename: candidate.Filename, Purpose: "generated", Role: role,
+					Reader: dataReader, SizeHint: sizeHint, SourceKind: "provider_inline",
+					TaskPublicID: input.TaskPublicID,
+					ChannelID:    input.ChannelID, Model: input.Model, Group: input.Group,
+					Metadata: metadata, DeclaredMimeType: mimeType,
+					TTLHours: mediasetting.Get().AssetTTLHours,
+				})
+			} else {
+				err = openErr
+			}
+		} else {
+			blob, err = SaveRemoteBlob(RemoteBlobInput{
+				UserID: input.UserID, Username: input.Username, TaskPublicID: input.TaskPublicID,
+				ChannelID: input.ChannelID,
+				Model:     input.Model, Group: input.Group, SourceURL: candidate.Source,
+				Type: candidate.Type, Role: role, MimeType: candidate.MimeType,
+				Filename: candidate.Filename, Metadata: metadata,
+			})
+		}
+		if err != nil {
+			if recordErr := persistSynchronousArchiveCapacityFailure(input, candidate, index, err); recordErr != nil {
+				common.SysLog("media archive capacity failure record failed: " + recordErr.Error())
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		archived = append(archived, *blob)
+	}
+	if len(archived) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return archived, firstErr
+}
+
+// persistSynchronousArchiveCapacityFailure leaves an auditable, zero-byte
+// MediaBlob row when a provider response was valid but the durable archive was
+// rejected by a configured capacity guard. It never reserves storage, calls a
+// provider, changes billing, or makes the row downloadable. The request and
+// candidate identity are hashed into the unique public ID so duplicate archive
+// delivery, retries, or concurrent workers converge on one record.
+func persistSynchronousArchiveCapacityFailure(input SynchronousArchiveInput, candidate ArtifactCandidate, index int, archiveErr error) error {
+	code, message, ok := synchronousArchiveCapacityFailureDetails(archiveErr)
+	if !ok {
+		return nil
+	}
+	requestID := strings.TrimSpace(input.RequestID)
+	taskID := strings.TrimSpace(input.TaskPublicID)
+	if requestID == "" && taskID == "" {
+		return errors.New("archive failure record requires request identity")
+	}
+	if len(requestID) > 256 {
+		requestID = requestID[:256]
+	}
+	if len(taskID) > 256 {
+		taskID = taskID[:256]
+	}
+	candidateIdentity := strings.TrimSpace(candidate.Identity)
+	if candidateIdentity == "" {
+		sourceDigest := sha256.Sum256([]byte(candidate.Type + "\n" + candidate.Source))
+		candidateIdentity = hex.EncodeToString(sourceDigest[:])
+	}
+	if len(candidateIdentity) > 256 {
+		candidateIdentity = candidateIdentity[:256]
+	}
+	seed := fmt.Sprintf(
+		"synchronous-archive-failure:v1\x00user=%d\x00request=%s\x00task=%s\x00index=%d\x00kind=%s\x00candidate=%s",
+		input.UserID, requestID, taskID, index, input.Kind, candidateIdentity,
+	)
+	digest := sha256.Sum256([]byte(seed))
+	publicID := "archive_failed_" + hex.EncodeToString(digest[:])
+
+	metadataValues := map[string]any{
+		"archive_failure_code":    code,
+		"archive_identity":        publicID,
+		"archive_candidate_index": index,
+		"archive_kind":            input.Kind,
+		"archive_source_kind":     candidate.Type,
+	}
+	if requestID != "" {
+		metadataValues["request_id"] = requestID
+	}
+	if taskID != "" {
+		metadataValues["task_id"] = taskID
+	}
+	if sourcePath, sourcePathOK := candidate.Metadata["source_path"].(string); sourcePathOK && strings.TrimSpace(sourcePath) != "" {
+		metadataValues["source_path"] = sourcePath
+	}
+	metadata, err := common.Marshal(metadataValues)
+	if err != nil {
+		return err
+	}
+	filename := strings.TrimSpace(candidate.Filename)
+	if filename == "" {
+		filename = "unarchived-" + strings.TrimSpace(candidate.Type)
+	}
+	filename = normalizeMediaFilename(filename, candidate.MimeType, candidate.Type)
+	contentDigest := sha256.Sum256([]byte(candidate.Type + "\n" + candidate.Source))
+	blob := &model.MediaBlob{
+		PublicID:             publicID,
+		UserID:               input.UserID,
+		UsernameSnapshot:     input.Username,
+		Filename:             filename,
+		Purpose:              "generated",
+		MediaType:            candidate.Type,
+		Role:                 candidate.Role,
+		SourceKind:           synchronousArchiveFailureSourceKind,
+		ContentHash:          hex.EncodeToString(contentDigest[:]),
+		MimeType:             candidate.MimeType,
+		Status:               model.MediaBlobStatusFailed,
+		TaskPublicID:         taskID,
+		ChannelID:            input.ChannelID,
+		Model:                input.Model,
+		Group:                input.Group,
+		Metadata:             metadata,
+		ModerationStatus:     model.MediaModerationApproved,
+		MaterializeStatus:    model.MediaMaterializeDisabled,
+		MaterializeLastError: message,
+	}
+	if model.DB == nil {
+		return errors.New("media database is unavailable")
+	}
+	var existing model.MediaBlob
+	lookup := model.DB.Where("public_id = ?", publicID).First(&existing)
+	if lookup.Error == nil {
+		if existing.UserID != blob.UserID || existing.SourceKind != synchronousArchiveFailureSourceKind || existing.Status != model.MediaBlobStatusFailed {
+			return fmt.Errorf("archive failure identity collision for %s", publicID)
+		}
+		return nil
+	}
+	if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+		return lookup.Error
+	}
+	if err := model.DB.Create(blob).Error; err != nil {
+		// A concurrent writer may have won the unique public_id race. Read it
+		// back and accept only the same failure identity; never overwrite it.
+		if racedErr := model.DB.Where("public_id = ?", publicID).First(&existing).Error; racedErr == nil {
+			if existing.UserID != blob.UserID || existing.SourceKind != synchronousArchiveFailureSourceKind || existing.Status != model.MediaBlobStatusFailed {
+				return fmt.Errorf("archive failure identity collision for %s", publicID)
+			}
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func synchronousArchiveCapacityFailureDetails(err error) (string, string, bool) {
+	switch {
+	case errors.Is(err, ErrUserMediaCapacity):
+		return "user_capacity_exceeded", "archive skipped: user media capacity exceeded", true
+	case errors.Is(err, ErrMediaCapacity):
+		return "global_capacity_exceeded", "archive skipped: global media capacity exceeded", true
+	default:
+		return "", "", false
+	}
+}
+
+func synchronousArchiveMetadata(candidate map[string]any, prompt string) []byte {
+	if strings.TrimSpace(prompt) == "" {
+		metadata, _ := common.Marshal(candidate)
+		return metadata
+	}
+	metadata := make(map[string]any, len(candidate)+2)
+	for key, value := range candidate {
+		metadata[key] = value
+	}
+	stored, truncated := truncateStoredRequestPrompt(prompt)
+	metadata["request_prompt"] = stored
+	delete(metadata, "request_prompt_truncated")
+	if truncated {
+		metadata["request_prompt_truncated"] = true
+	}
+	encoded, _ := common.Marshal(metadata)
+	return encoded
+}
+
+func truncateStoredRequestPrompt(prompt string) (string, bool) {
+	runes := 0
+	for index := range prompt {
+		if runes == maxStoredRequestPromptRunes {
+			return prompt[:index], true
+		}
+		runes++
+	}
+	return prompt, false
+}
+
+// DecorateOpenAIImageResponse preserves the OpenAI data[] contract while
+// replacing provider-temporary URL results with this site's signed delivery
+// URLs. Base64 results remain Base64, and every archived item receives an
+// additive asset_id plus a complete top-level artifacts list.
+func DecorateOpenAIImageResponse(raw []byte, blobs []model.MediaBlob) ([]byte, error) {
+	var response map[string]any
+	if err := common.Unmarshal(raw, &response); err != nil {
+		return raw, err
+	}
+	data, ok := response["data"].([]any)
+	if !ok {
+		return raw, fmt.Errorf("image response contains no data array")
+	}
+	images := make([]model.MediaBlob, 0, len(blobs))
+	bySource := make(map[string]int, len(blobs))
+	byDataIndex := make(map[int]int, len(blobs))
+	for index := range blobs {
+		if blobs[index].MediaType != "image" {
+			continue
+		}
+		imageIndex := len(images)
+		if blobs[index].PrivateSource != "" {
+			bySource[blobs[index].PrivateSource] = imageIndex
+		}
+		if dataIndex, ok := responseDataIndex(blobs[index].Metadata); ok {
+			byDataIndex[dataIndex] = imageIndex
+		}
+		images = append(images, blobs[index])
+	}
+	if len(images) == 0 {
+		return raw, fmt.Errorf("image response has no archived images")
+	}
+	artifacts := make([]map[string]any, 0, len(images))
+	for index := range images {
+		contentURL, downloadURL := PublicMediaURLs(images[index].PublicID, false)
+		artifacts = append(artifacts, map[string]any{
+			"id": images[index].PublicID, "type": images[index].MediaType,
+			"role": images[index].Role, "mime_type": images[index].MimeType,
+			"filename": images[index].Filename, "size_bytes": images[index].SizeBytes,
+			"content_url": contentURL, "download_url": downloadURL,
+		})
+	}
+	for index := range data {
+		item, itemOK := data[index].(map[string]any)
+		if !itemOK {
+			continue
+		}
+		blobIndex, matched := byDataIndex[index]
+		if source, sourceOK := item["url"].(string); sourceOK {
+			if sourceIndex, exists := bySource[source]; exists {
+				blobIndex = sourceIndex
+				matched = true
+			}
+		}
+		// Positional fallback is safe only when every response item archived.
+		// With a partial archive, an unmatched item must retain its provider URL
+		// instead of being associated with a different successful sibling.
+		if !matched && len(images) == len(data) {
+			blobIndex = index
+			matched = true
+		}
+		if !matched || blobIndex < 0 || blobIndex >= len(images) {
+			continue
+		}
+		item["asset_id"] = images[blobIndex].PublicID
+		if _, hasURL := item["url"]; hasURL {
+			item["url"] = artifacts[blobIndex]["download_url"]
+		}
+	}
+	response["artifacts"] = artifacts
+	return common.Marshal(response)
+}
+
+func responseDataIndex(metadata []byte) (int, bool) {
+	if len(metadata) == 0 {
+		return 0, false
+	}
+	var value map[string]any
+	if err := common.Unmarshal(metadata, &value); err != nil {
+		return 0, false
+	}
+	path, _ := value["source_path"].(string)
+	parts := strings.Split(path, ".")
+	for index := 0; index+1 < len(parts); index++ {
+		if parts[index] != "data" {
+			continue
+		}
+		dataIndex, err := strconv.Atoi(parts[index+1])
+		return dataIndex, err == nil && dataIndex >= 0
+	}
+	return 0, false
+}
+
+func responseFilename(requested, mimeType, kind string) string {
+	if strings.TrimSpace(requested) != "" {
+		return sanitizeFilename(requested, "result")
+	}
+	extension := ""
+	if extensions, _ := mime.ExtensionsByType(mimeType); len(extensions) > 0 {
+		extension = extensions[0]
+	}
+	if extension == "" {
+		extension = extensionForMediaType(kind)
+	}
+	return fmt.Sprintf("%s-%d%s", kind, time.Now().Unix(), extension)
+}
+
+func extractAudioEventStream(raw []byte) ([]byte, string) {
+	result := bytes.NewBuffer(nil)
+	mimeType := "audio/mpeg"
+	for len(raw) > 0 {
+		line := raw
+		if newline := bytes.IndexByte(raw, '\n'); newline >= 0 {
+			line = raw[:newline]
+			raw = raw[newline+1:]
+		} else {
+			raw = nil
+		}
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		line = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		var event map[string]any
+		if common.Unmarshal(line, &event) != nil {
+			continue
+		}
+		typeName, _ := event["type"].(string)
+		if !strings.Contains(strings.ToLower(typeName), "audio") {
+			continue
+		}
+		if declared, _ := event["mime_type"].(string); strings.HasPrefix(declared, "audio/") {
+			mimeType = declared
+		}
+		chunk := ""
+		for _, key := range []string{"audio", "delta", "b64_json"} {
+			if value, ok := event[key].(string); ok && value != "" {
+				chunk = value
+				break
+			}
+		}
+		if chunk == "" {
+			continue
+		}
+		encoding := base64.StdEncoding
+		if len(chunk)%4 != 0 {
+			encoding = base64.RawStdEncoding
+		}
+		decoded, decodeErr := encoding.DecodeString(chunk)
+		if decodeErr == nil {
+			_, _ = result.Write(decoded)
+		}
+	}
+	return result.Bytes(), mimeType
+}

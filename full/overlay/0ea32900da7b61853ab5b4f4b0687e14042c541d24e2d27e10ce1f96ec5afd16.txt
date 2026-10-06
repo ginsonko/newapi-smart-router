@@ -1,0 +1,107 @@
+package controller
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRelaySmartAuditRecordsOneEntryPerDispatch(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 1_000)
+	ctx, _, routeRequest := h.newRequest(t, "audit-one-entry-per-dispatch")
+	var channels []int
+
+	resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+		channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+		channels = append(channels, channelID)
+		if channelID == smartRelayTestCheapChannel {
+			return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+		}
+		require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+		return nil
+	})
+	require.Nil(t, resultErr, "channels=%v", channels)
+	require.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+
+	adminInfo := make(map[string]interface{})
+	service.AppendSmartRouterAdminInfo(ctx, adminInfo)
+	attempts, ok := adminInfo["smart_router_attempts"].([]service.SmartRouteAttemptAudit)
+	require.True(t, ok)
+	require.Len(t, attempts, 3)
+	require.Equal(t, 1, attempts[0].Attempt)
+	require.Equal(t, 2, attempts[1].Attempt)
+	require.Equal(t, 3, attempts[2].Attempt)
+}
+
+func TestRelaySmartWritesOnlyTerminalFailureToUserErrorLog(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	constant.ErrorLogEnabled = true
+
+	t.Run("fallback success has no red error", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		require.NoError(t, h.db.AutoMigrate(&model.Log{}))
+		ctx, _, routeRequest := h.newRequest(t, "audit-fallback-success")
+		resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			if common.GetContextKeyInt(c, constant.ContextKeyChannelId) == smartRelayTestCheapChannel {
+				return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+			}
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		})
+		require.Nil(t, resultErr)
+		var errorCount int64
+		require.NoError(t, h.db.Model(&model.Log{}).
+			Where("request_id = ? AND type = ?", "audit-fallback-success", model.LogTypeError).
+			Count(&errorCount).Error)
+		require.Zero(t, errorCount, "a recovered internal attempt must not appear as a red user error")
+	})
+
+	t.Run("terminal failure has one row with attempt audit", func(t *testing.T) {
+		h := newSmartRelayTestHarness(t, 1_000)
+		require.NoError(t, h.db.AutoMigrate(&model.Log{}))
+		ctx, _, routeRequest := h.newRequest(t, "audit-terminal-failure")
+		resultErr := h.relay(ctx, routeRequest, func(*gin.Context, types.RelayFormat, *relaycommon.RelayInfo) *types.NewAPIError {
+			return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+		})
+		require.NotNil(t, resultErr)
+		require.True(t, constant.ErrorLogEnabled)
+		require.True(t, types.IsRecordErrorLog(resultErr))
+		var logs []model.Log
+		require.NoError(t, h.db.
+			Where("request_id = ? AND type = ?", "audit-terminal-failure", model.LogTypeError).
+			Find(&logs).Error)
+		require.Len(t, logs, 1, "one logical request must produce one terminal user error row")
+		other, err := common.StrToMap(logs[0].Other)
+		require.NoError(t, err)
+		adminInfo, ok := other["admin_info"].(map[string]interface{})
+		require.True(t, ok)
+		attempts, ok := adminInfo["smart_router_attempts"].([]interface{})
+		require.True(t, ok)
+		require.Len(t, attempts, 4, "administrator audit retains both confirmation retries on both routes")
+		receipt, ok := other["smart_router_receipt"].(map[string]interface{})
+		require.True(t, ok)
+		require.Equal(t, "actual_request", receipt["kind"])
+		userAttempts, ok := receipt["attempts"].([]interface{})
+		require.True(t, ok)
+		require.Len(t, userAttempts, 4, "the log owner sees every real upstream dispatch")
+		for _, raw := range userAttempts {
+			item, itemOK := raw.(map[string]interface{})
+			require.True(t, itemOK)
+			require.NotEmpty(t, item["group"])
+			require.NotContains(t, item, "route_id")
+			require.NotContains(t, item, "channel_id")
+			require.NotContains(t, item, "last_error")
+		}
+	})
+}

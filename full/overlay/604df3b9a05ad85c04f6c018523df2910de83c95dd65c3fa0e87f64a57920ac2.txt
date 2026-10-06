@@ -1,0 +1,472 @@
+package media
+
+import (
+	"context"
+	"errors"
+	"io"
+	"sync"
+	"time"
+
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+)
+
+var ErrMediaSafetyCapacity = errors.New("media safety queue capacity exceeded")
+
+type AdmissionSnapshot struct {
+	QueueAhead     int
+	QueuePosition  int
+	ActiveCount    int
+	ActiveCapacity int
+	UserActive     int
+	Waited         time.Duration
+}
+
+type generationAdmissionContextKey struct{}
+type clientUploadBandwidthContextKey struct{}
+
+type fairMediaWaiter struct {
+	userID    int
+	ready     chan struct{}
+	granted   bool
+	enqueued  time.Time
+	queueHead int
+}
+
+// fairMediaGate keeps a bounded FIFO per authenticated user and schedules one
+// waiter from each user in turn. It is deliberately process-local for the
+// synchronous emergency guard; the database-backed queue remains an R62 task.
+type fairMediaGate struct {
+	mu           sync.Mutex
+	active       int
+	activeByUser map[int]int
+	queues       map[int][]*fairMediaWaiter
+	userOrder    []int
+	queued       int
+}
+
+func (gate *fairMediaGate) acquire(
+	ctx context.Context,
+	userID int,
+	globalLimit int,
+	userLimit int,
+	globalQueueLimit int,
+	userQueueLimit int,
+) (AdmissionSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return AdmissionSnapshot{}, err
+	}
+	globalLimit = max(globalLimit, 1)
+	userLimit = max(min(userLimit, globalLimit), 1)
+	globalQueueLimit = max(globalQueueLimit, globalLimit)
+	userQueueLimit = max(min(userQueueLimit, globalQueueLimit), userLimit)
+	gate.mu.Lock()
+	gate.ensureLocked()
+	if gate.queued == 0 && gate.active < globalLimit && gate.activeByUser[userID] < userLimit {
+		gate.active++
+		gate.activeByUser[userID]++
+		snapshot := gate.snapshotLocked(userID)
+		snapshot.QueueAhead = 0
+		snapshot.QueuePosition = 0
+		gate.mu.Unlock()
+		return snapshot, nil
+	}
+	if gate.queued >= globalQueueLimit || len(gate.queues[userID]) >= userQueueLimit {
+		snapshot := gate.snapshotLocked(userID)
+		gate.mu.Unlock()
+		return snapshot, ErrMediaSafetyCapacity
+	}
+	waiter := &fairMediaWaiter{
+		userID: userID, ready: make(chan struct{}), enqueued: time.Now(), queueHead: gate.queued,
+	}
+	if len(gate.queues[userID]) == 0 {
+		gate.userOrder = append(gate.userOrder, userID)
+	}
+	gate.queues[userID] = append(gate.queues[userID], waiter)
+	gate.queued++
+	gate.dispatchLocked(globalLimit, userLimit)
+	gate.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		gate.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			gate.releaseLocked(userID, globalLimit, userLimit)
+			gate.mu.Unlock()
+			return AdmissionSnapshot{}, err
+		}
+		snapshot := gate.snapshotLocked(userID)
+		snapshot.QueueAhead = waiter.queueHead
+		snapshot.QueuePosition = waiter.queueHead + 1
+		snapshot.Waited = time.Since(waiter.enqueued)
+		gate.mu.Unlock()
+		return snapshot, nil
+	case <-ctx.Done():
+		gate.mu.Lock()
+		if waiter.granted {
+			gate.releaseLocked(userID, globalLimit, userLimit)
+			gate.mu.Unlock()
+			return AdmissionSnapshot{}, ctx.Err()
+		}
+		gate.removeWaiterLocked(waiter)
+		gate.dispatchLocked(globalLimit, userLimit)
+		gate.mu.Unlock()
+		return AdmissionSnapshot{}, ctx.Err()
+	}
+}
+
+func (gate *fairMediaGate) release(userID int, globalLimit int, userLimit int) {
+	gate.mu.Lock()
+	gate.ensureLocked()
+	gate.releaseLocked(userID, max(globalLimit, 1), max(userLimit, 1))
+	gate.mu.Unlock()
+}
+
+func (gate *fairMediaGate) releaseLocked(userID int, globalLimit int, userLimit int) {
+	if gate.activeByUser[userID] <= 0 || gate.active <= 0 {
+		return
+	}
+	gate.active--
+	gate.activeByUser[userID]--
+	if gate.activeByUser[userID] == 0 {
+		delete(gate.activeByUser, userID)
+	}
+	gate.dispatchLocked(globalLimit, userLimit)
+}
+
+func (gate *fairMediaGate) ensureLocked() {
+	if gate.activeByUser == nil {
+		gate.activeByUser = make(map[int]int)
+	}
+	if gate.queues == nil {
+		gate.queues = make(map[int][]*fairMediaWaiter)
+	}
+}
+
+func (gate *fairMediaGate) dispatchLocked(globalLimit int, userLimit int) {
+	for gate.active < globalLimit && gate.queued > 0 {
+		selected := -1
+		for index, userID := range gate.userOrder {
+			if len(gate.queues[userID]) > 0 && gate.activeByUser[userID] < userLimit {
+				selected = index
+				break
+			}
+		}
+		if selected < 0 {
+			return
+		}
+		userID := gate.userOrder[selected]
+		queue := gate.queues[userID]
+		waiter := queue[0]
+		queue = queue[1:]
+		gate.queued--
+		gate.active++
+		gate.activeByUser[userID]++
+		waiter.granted = true
+		if len(queue) == 0 {
+			delete(gate.queues, userID)
+			gate.userOrder = append(gate.userOrder[:selected], gate.userOrder[selected+1:]...)
+		} else {
+			gate.queues[userID] = queue
+			gate.userOrder = append(gate.userOrder[:selected], gate.userOrder[selected+1:]...)
+			gate.userOrder = append(gate.userOrder, userID)
+		}
+		close(waiter.ready)
+	}
+}
+
+func (gate *fairMediaGate) removeWaiterLocked(target *fairMediaWaiter) {
+	queue := gate.queues[target.userID]
+	for index, waiter := range queue {
+		if waiter != target {
+			continue
+		}
+		queue = append(queue[:index], queue[index+1:]...)
+		gate.queued--
+		break
+	}
+	if len(queue) > 0 {
+		gate.queues[target.userID] = queue
+		return
+	}
+	delete(gate.queues, target.userID)
+	for index, userID := range gate.userOrder {
+		if userID == target.userID {
+			gate.userOrder = append(gate.userOrder[:index], gate.userOrder[index+1:]...)
+			break
+		}
+	}
+}
+
+func (gate *fairMediaGate) snapshot(userID int) AdmissionSnapshot {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.ensureLocked()
+	return gate.snapshotLocked(userID)
+}
+
+func (gate *fairMediaGate) snapshotLocked(userID int) AdmissionSnapshot {
+	return AdmissionSnapshot{
+		QueueAhead: gate.queued, QueuePosition: gate.queued + 1,
+		ActiveCount: gate.active, UserActive: gate.activeByUser[userID],
+	}
+}
+
+var (
+	generationAdmissionGate fairMediaGate
+	uploadConnectionGate    fairMediaGate
+	downloadConnectionGate  fairMediaGate
+)
+
+func AcquireGeneration(ctx context.Context, userID int) (func(), AdmissionSnapshot, error) {
+	setting := mediasetting.Get()
+	snapshot, err := generationAdmissionGate.acquire(
+		ctx, userID, setting.GenerationActiveGlobal, setting.GenerationActivePerUser,
+		setting.GenerationQueueGlobalMax, setting.GenerationQueuePerUserMax,
+	)
+	snapshot.ActiveCapacity = setting.GenerationActiveGlobal
+	if err != nil {
+		return nil, snapshot, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			current := mediasetting.Get()
+			generationAdmissionGate.release(userID, current.GenerationActiveGlobal, current.GenerationActivePerUser)
+		})
+	}, snapshot, nil
+}
+
+func GenerationAdmissionSnapshot(userID int) AdmissionSnapshot {
+	setting := mediasetting.Get()
+	snapshot := generationAdmissionGate.snapshot(userID)
+	snapshot.ActiveCapacity = setting.GenerationActiveGlobal
+	return snapshot
+}
+
+// WithGenerationAdmission records that the authenticated request obtained the
+// generation permit before distribution, route selection, or billing. The
+// marker is also the narrow authority for applying the outbound media bandwidth
+// class; text requests never receive it.
+func WithGenerationAdmission(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, generationAdmissionContextKey{}, true)
+}
+
+func HasGenerationAdmission(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(generationAdmissionContextKey{}) == true
+}
+
+type mediaBandwidthClass int
+
+const (
+	bandwidthClientUpload mediaBandwidthClass = iota + 1
+	bandwidthUpstreamArchive
+	bandwidthClientDownload
+	bandwidthUpstreamForward
+)
+
+type serialByteLimiter struct {
+	mu   sync.Mutex
+	next time.Time
+}
+
+func (limiter *serialByteLimiter) reserve(now time.Time, bytes int, bytesPerSecond int64, burstBytes int64) time.Duration {
+	if bytes <= 0 || bytesPerSecond <= 0 {
+		return 0
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	burstDuration := time.Duration(float64(max(burstBytes, 0)) / float64(bytesPerSecond) * float64(time.Second))
+	earliest := now.Add(-burstDuration)
+	if limiter.next.IsZero() || limiter.next.Before(earliest) {
+		limiter.next = earliest
+	}
+	start := limiter.next
+	duration := time.Duration(float64(bytes) / float64(bytesPerSecond) * float64(time.Second))
+	limiter.next = start.Add(duration)
+	if !start.After(now) {
+		return 0
+	}
+	return start.Sub(now)
+}
+
+var (
+	ingressParentLimiter   serialByteLimiter
+	clientUploadLimiter    serialByteLimiter
+	upstreamArchiveLimiter serialByteLimiter
+	egressParentLimiter    serialByteLimiter
+	clientDownloadLimiter  serialByteLimiter
+	upstreamForwardLimiter serialByteLimiter
+)
+
+func mediaMbpsBytesPerSecond(value int) int64 {
+	if value <= 0 {
+		return 0
+	}
+	return int64(value) * 1_000_000 / 8
+}
+
+func waitMediaBandwidth(ctx context.Context, class mediaBandwidthClass, bytes int) error {
+	if bytes <= 0 {
+		return nil
+	}
+	setting := mediasetting.Get()
+	now := time.Now()
+	burst := setting.RateBurstBytes
+	var parent *serialByteLimiter
+	var child *serialByteLimiter
+	var parentRate int64
+	var childRate int64
+	switch class {
+	case bandwidthClientUpload:
+		parent, child = &ingressParentLimiter, &clientUploadLimiter
+		parentRate = mediaMbpsBytesPerSecond(setting.IngressTotalMbps)
+		childRate = mediaMbpsBytesPerSecond(setting.ClientUploadMaxMbps)
+	case bandwidthUpstreamArchive:
+		parent, child = &ingressParentLimiter, &upstreamArchiveLimiter
+		parentRate = mediaMbpsBytesPerSecond(setting.IngressTotalMbps)
+		childRate = mediaMbpsBytesPerSecond(setting.UpstreamArchiveMaxMbps)
+	case bandwidthClientDownload:
+		parent, child = &egressParentLimiter, &clientDownloadLimiter
+		parentRate = mediaMbpsBytesPerSecond(setting.EgressTotalMbps)
+		childRate = mediaMbpsBytesPerSecond(setting.ClientDownloadMaxMbps)
+	case bandwidthUpstreamForward:
+		parent, child = &egressParentLimiter, &upstreamForwardLimiter
+		parentRate = mediaMbpsBytesPerSecond(setting.EgressTotalMbps)
+		childRate = mediaMbpsBytesPerSecond(setting.UpstreamForwardMaxMbps)
+	default:
+		return nil
+	}
+	delay := max(
+		parent.reserve(now, bytes, parentRate, burst),
+		child.reserve(now, bytes, childRate, burst),
+	)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+type rateLimitedReader struct {
+	ctx   context.Context
+	inner io.Reader
+	class mediaBandwidthClass
+}
+
+func (reader *rateLimitedReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > 64*1024 {
+		buffer = buffer[:64*1024]
+	}
+	count, err := reader.inner.Read(buffer)
+	if count > 0 {
+		if waitErr := waitMediaBandwidth(reader.ctx, reader.class, count); waitErr != nil {
+			return 0, waitErr
+		}
+	}
+	return count, err
+}
+
+type rateLimitedReadCloser struct {
+	*rateLimitedReader
+	closer io.Closer
+}
+
+func (reader *rateLimitedReadCloser) Close() error { return reader.closer.Close() }
+
+// WrapClientUploadBody installs the client-upload limiter once even when a
+// Studio request later adds its spool reservation and MaxBytesReader wrappers.
+func WrapClientUploadBody(ctx context.Context, body io.ReadCloser) (context.Context, io.ReadCloser) {
+	if body == nil {
+		return ctx, body
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Value(clientUploadBandwidthContextKey{}) == true {
+		return ctx, body
+	}
+	managedContext := context.WithValue(ctx, clientUploadBandwidthContextKey{}, true)
+	return managedContext, &rateLimitedReadCloser{
+		rateLimitedReader: &rateLimitedReader{ctx: managedContext, inner: body, class: bandwidthClientUpload},
+		closer:            body,
+	}
+}
+
+func WrapUpstreamArchiveReader(ctx context.Context, reader io.Reader) io.Reader {
+	if reader == nil {
+		return reader
+	}
+	return &rateLimitedReader{ctx: ctx, inner: reader, class: bandwidthUpstreamArchive}
+}
+
+type rateLimitedWriter struct {
+	ctx   context.Context
+	inner io.Writer
+	class mediaBandwidthClass
+}
+
+func (writer *rateLimitedWriter) Write(buffer []byte) (int, error) {
+	written := 0
+	for len(buffer) > 0 {
+		chunk := buffer
+		if len(chunk) > 64*1024 {
+			chunk = chunk[:64*1024]
+		}
+		if err := waitMediaBandwidth(writer.ctx, writer.class, len(chunk)); err != nil {
+			return written, err
+		}
+		count, err := writer.inner.Write(chunk)
+		written += count
+		buffer = buffer[count:]
+		if err != nil {
+			return written, err
+		}
+		if count == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+func WrapClientDownloadWriter(ctx context.Context, writer io.Writer) io.Writer {
+	if writer == nil {
+		return writer
+	}
+	return &rateLimitedWriter{ctx: ctx, inner: writer, class: bandwidthClientDownload}
+}
+
+func WrapUpstreamForwardReader(ctx context.Context, reader io.Reader) io.Reader {
+	if reader == nil {
+		return reader
+	}
+	if !HasGenerationAdmission(ctx) {
+		return reader
+	}
+	return &rateLimitedReader{ctx: ctx, inner: reader, class: bandwidthUpstreamForward}
+}
+
+func WrapUpstreamForwardBody(ctx context.Context, body io.ReadCloser) io.ReadCloser {
+	if body == nil || !HasGenerationAdmission(ctx) {
+		return body
+	}
+	if managed, ok := body.(*rateLimitedReadCloser); ok &&
+		managed.rateLimitedReader.class == bandwidthUpstreamForward {
+		return body
+	}
+	return &rateLimitedReadCloser{
+		rateLimitedReader: &rateLimitedReader{ctx: ctx, inner: body, class: bandwidthUpstreamForward},
+		closer:            body,
+	}
+}

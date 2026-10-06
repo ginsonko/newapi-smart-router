@@ -1,0 +1,538 @@
+package common
+
+import (
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	basecommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	taskMediaReferenceStateKey    = "task_media_reference_state"
+	TaskMediaModeContextKey       = "task_media_mode"
+	maxTaskSnapshotPromptRunes    = 8192
+	taskMediaExplicitSizeKey      = "task_media_explicit_size"
+	TaskMediaCapabilityContextKey = "task_media_capability"
+)
+
+type taskMediaReferenceState struct {
+	bindings []model.TaskMediaInputBinding
+	acquired map[int64]struct{}
+	bound    bool
+}
+
+type taskMediaCapabilityRoute struct {
+	channelID      int
+	group          string
+	requestedModel string
+	upstreamModel  string
+}
+
+func NormalizeTaskMediaReferences(c *gin.Context, info *RelayInfo, req *TaskSubmitReq) error {
+	if c == nil || info == nil || req == nil {
+		return fmt.Errorf("media reference normalization requires request context")
+	}
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]interface{})
+	}
+	if err := NormalizeNativeMediaArrays(req); err != nil {
+		return err
+	}
+	if _, present := c.Get(taskMediaExplicitSizeKey); !present {
+		c.Set(taskMediaExplicitSizeKey, req.Size)
+	}
+	state := getTaskMediaReferenceState(c)
+	for index := range req.References {
+		reference := &req.References[index]
+		reference.Type = strings.ToLower(strings.TrimSpace(reference.Type))
+		reference.Role = strings.ToLower(strings.TrimSpace(reference.Role))
+		if reference.Role == "" {
+			reference.Role = "reference"
+		}
+		if reference.Type != mediaservice.ReferenceTypeImage && reference.Type != mediaservice.ReferenceTypeVideo &&
+			reference.Type != mediaservice.ReferenceTypeAudio {
+			return fmt.Errorf("references[%d].type must be image, video, or audio", index)
+		}
+		sources := 0
+		if strings.TrimSpace(reference.FileID) != "" {
+			sources++
+		}
+		if strings.TrimSpace(reference.URL) != "" {
+			sources++
+		}
+		if strings.TrimSpace(reference.DataURL) != "" {
+			sources++
+		}
+		if sources != 1 {
+			return fmt.Errorf("references[%d] must contain exactly one of file_id, url, or data_url", index)
+		}
+
+		switch {
+		case strings.TrimSpace(reference.FileID) != "":
+			blob, err := resolveOwnedReferenceBlob(info.UserId, strings.TrimSpace(reference.FileID))
+			if err != nil {
+				return fmt.Errorf("references[%d].file_id is unavailable: %w", index, err)
+			}
+			if !mimeMatchesReferenceType(blob.MimeType, reference.Type) {
+				return fmt.Errorf("references[%d] type %s does not match file MIME %s", index, reference.Type, blob.MimeType)
+			}
+			if _, acquired := state.acquired[blob.ID]; !acquired {
+				if err := model.AcquireMediaTaskLease(blob.ID); err != nil {
+					return fmt.Errorf("references[%d] could not be retained: %w", index, err)
+				}
+				state.acquired[blob.ID] = struct{}{}
+			}
+			reference.MediaBlobID = blob.ID
+			reference.SizeBytes = blob.SizeBytes
+			reference.DurationSeconds = blob.DurationSeconds
+			reference.MetadataTrusted = true
+			reference.ResolvedURL, err = signedReferenceURL(reference.FileID)
+			if err != nil {
+				return fmt.Errorf("references[%d].file_id cannot be published: %w", index, err)
+			}
+			metadata, _ := basecommon.Marshal(map[string]any{"file_id": reference.FileID})
+			state.bindings = append(state.bindings, model.TaskMediaInputBinding{
+				MediaBlobID: blob.ID, Type: reference.Type, Role: reference.Role,
+				Position: index, Metadata: metadata,
+			})
+		case strings.TrimSpace(reference.URL) != "":
+			parsed, err := url.Parse(strings.TrimSpace(reference.URL))
+			if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+				return fmt.Errorf("references[%d].url must be an absolute HTTP(S) URL", index)
+			}
+			reference.URL = parsed.String()
+			reference.ResolvedURL = reference.URL
+		case strings.TrimSpace(reference.DataURL) != "":
+			dataURLLower := strings.ToLower(reference.DataURL)
+			if reference.Type == mediaservice.ReferenceTypeImage {
+				if !strings.HasPrefix(dataURLLower, "data:image/") || !strings.Contains(reference.DataURL, ";base64,") {
+					return fmt.Errorf("references[%d].data_url must be a base64 image data URL", index)
+				}
+			} else if reference.Type == mediaservice.ReferenceTypeVideo {
+				if !strings.HasPrefix(dataURLLower, "data:video/") || !strings.Contains(reference.DataURL, ";base64,") {
+					return fmt.Errorf("references[%d].data_url must be a base64 video data URL", index)
+				}
+			} else if reference.Type == mediaservice.ReferenceTypeAudio {
+				if !strings.HasPrefix(dataURLLower, "data:audio/") || !strings.Contains(reference.DataURL, ";base64,") {
+					return fmt.Errorf("references[%d].data_url must be a base64 audio data URL", index)
+				}
+			}
+			if int64(len(reference.DataURL)) > mediasetting.Get().MaxFileBytes*2 {
+				return fmt.Errorf("references[%d].data_url exceeds the configured file limit", index)
+			}
+			reference.SizeBytes = decodedDataURLSize(reference.DataURL)
+			reference.MetadataTrusted = true
+			reference.ResolvedURL = reference.DataURL
+		}
+	}
+	applyReferencesToLegacyTaskFields(req)
+	c.Set(taskMediaReferenceStateKey, state)
+	return nil
+}
+
+func ValidateTaskMediaCapability(c *gin.Context, info *RelayInfo) error {
+	req, err := GetTaskRequest(c)
+	if err != nil {
+		return err
+	}
+	descriptors := make([]mediaservice.ReferenceDescriptor, 0)
+	if len(req.References) > 0 {
+		for _, reference := range req.References {
+			descriptors = append(descriptors, mediaservice.ReferenceDescriptor{
+				Type: reference.Type, Role: reference.Role,
+				SizeBytes: reference.SizeBytes, DurationSeconds: reference.DurationSeconds,
+				MetadataTrusted: reference.MetadataTrusted,
+			})
+		}
+	} else if req.InputReference != "" || req.Image != "" || len(req.Images) > 0 || multipartHasInputReference(c) {
+		count := len(req.Images)
+		if count == 0 {
+			count = 1
+		}
+		for index := 0; index < count; index++ {
+			descriptors = append(descriptors, mediaservice.ReferenceDescriptor{Type: mediaservice.ReferenceTypeImage, Role: "reference"})
+		}
+	}
+	capability, err := ResolveTaskMediaCapability(c, info)
+	if err != nil {
+		return err
+	}
+	if err := capability.Validate(descriptors); err != nil {
+		return err
+	}
+	duration := req.Duration
+	if duration <= 0 && strings.TrimSpace(req.Seconds) != "" {
+		duration, _ = strconv.Atoi(strings.TrimSpace(req.Seconds))
+	}
+	if capability.RuntimeEnforced {
+		if req.Seconds != "" {
+			seconds, parseErr := strconv.Atoi(strings.TrimSpace(req.Seconds))
+			if parseErr != nil || seconds <= 0 || (req.Duration > 0 && seconds != req.Duration) {
+				return fmt.Errorf("seconds and duration must describe the same integer generation duration")
+			}
+		}
+		explicitSize := req.Size
+		if value, found := c.Get(taskMediaExplicitSizeKey); found {
+			explicitSize, _ = value.(string)
+		}
+		req.Resolution, err = capability.NormalizeResolution(req.Resolution, explicitSize)
+		if err != nil {
+			return err
+		}
+		// Generic aspect-ratio normalization may have inserted a legacy 720p
+		// size. It is not a user selection or a declared provider default.
+		req.Size = explicitSize
+		if duration == 0 {
+			duration = capability.Duration.Default
+		}
+		req.Duration = duration
+		if duration > 0 {
+			req.Seconds = strconv.Itoa(duration)
+		}
+		if err := capability.ValidateMode(req.Mode); err != nil {
+			return err
+		}
+		if err := capability.ValidatePromptReferences(req.Prompt, descriptors); err != nil {
+			return err
+		}
+		if err := ValidateTaskMediaPayloadFields(capability, req.Metadata); err != nil {
+			return err
+		}
+	}
+	if err := capability.ValidateGeneration(duration, req.AspectRatio, req.Resolution); err != nil {
+		return err
+	}
+	c.Set("task_request", req)
+	c.Set(TaskMediaCapabilityContextKey, capability)
+	c.Set(TaskMediaCapabilityContextKey+"_route", taskMediaCapabilityRoute{info.ChannelId, info.UsingGroup, info.OriginModelName, info.UpstreamModelName})
+	return nil
+}
+
+// GetTaskMediaCapability reuses a validated snapshot only for the same route;
+// a retry selecting another channel must resolve and validate its own contract.
+// TaskSubmissionIdempotencyContextKey is set only by an opted-in provider adapter.
+const TaskSubmissionIdempotencyContextKey = "task_submission_idempotency"
+
+func GetTaskMediaCapability(c *gin.Context, info *RelayInfo) (mediaservice.Capability, error) {
+	if c != nil && info != nil {
+		route := taskMediaCapabilityRoute{info.ChannelId, info.UsingGroup, info.OriginModelName, info.UpstreamModelName}
+		if savedRoute, exists := c.Get(TaskMediaCapabilityContextKey + "_route"); exists && savedRoute == route {
+			if saved, exists := c.Get(TaskMediaCapabilityContextKey); exists {
+				if capability, ok := saved.(mediaservice.Capability); ok {
+					return capability, nil
+				}
+			}
+		}
+	}
+	return ResolveTaskMediaCapability(c, info)
+}
+
+// ResolveTaskMediaCapability binds catalog enforcement to the same group and
+// public model used by billing, and to the actual selected provider route.
+func ResolveTaskMediaCapability(c *gin.Context, info *RelayInfo) (mediaservice.Capability, error) {
+	if c == nil || info == nil {
+		return mediaservice.Capability{}, fmt.Errorf("media capability resolution requires request context")
+	}
+	req, err := GetTaskRequest(c)
+	if err != nil {
+		return mediaservice.Capability{}, err
+	}
+	requestedModel := info.OriginModelName
+	if requestedModel == "" {
+		requestedModel = req.Model
+	}
+	endpoint := "newapi-video-generations-v1"
+	if c.Request != nil && c.Request.URL.Path == "/v1/videos" {
+		endpoint = "openai-videos-v1"
+	}
+	return mediaservice.ResolveCapabilityForRequest(info.ChannelId, info.ChannelType, requestedModel, info.UpstreamModelName, info.UsingGroup, endpoint, info.ChannelBaseUrl)
+}
+
+// ValidateTaskMediaPayloadFields closes the existing first/last-frame aliases
+// which provider passthrough would otherwise accept outside references[]. It
+// examines only small fields; no media payload is decoded or duplicated.
+func ValidateTaskMediaPayloadFields(capability mediaservice.Capability, fields map[string]interface{}) error {
+	if !capability.RuntimeEnforced {
+		return nil
+	}
+	for kind, field := range capability.ReferenceFields {
+		// The inline image adapter normalizes the public legacy images alias
+		// through the same validation as references before encoding it.
+		if kind == "image" && capability.ReferenceEncoding[kind] == "data_url" && field == "images" {
+			continue
+		}
+		if _, exists := fields[field]; exists {
+			return fmt.Errorf("use references instead of provider-specific field %q", field)
+		}
+	}
+	for field, kind := range map[string]string{"video_url": "video", "audio_url": "audio", "referenceVideos": "video", "referenceAudios": "audio"} {
+		if value, exists := fields[field]; exists && value != nil && value != "" {
+			if err := capability.Validate([]mediaservice.ReferenceDescriptor{{Type: kind, Role: "reference"}}); err != nil {
+				return err
+			}
+		}
+	}
+	if mode, ok := fields["mode"].(string); ok {
+		if err := capability.ValidateMode(mode); err != nil {
+			return err
+		}
+	}
+	for field, role := range map[string]string{
+		"first_frame_image": "first_frame", "first_frame_url": "first_frame",
+		"last_frame_image": "last_frame", "last_frame_url": "last_frame",
+	} {
+		value, exists := fields[field]
+		if !exists || value == nil {
+			continue
+		}
+		if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
+			continue
+		}
+		if err := capability.Validate([]mediaservice.ReferenceDescriptor{{Type: "image", Role: role}}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func BindTaskMediaReferences(c *gin.Context, taskRowID int64) error {
+	state := getTaskMediaReferenceState(c)
+	if state.bound || len(state.bindings) == 0 {
+		return nil
+	}
+	if err := model.BindTaskMediaInputs(taskRowID, state.bindings); err != nil {
+		return err
+	}
+	state.bound = true
+	c.Set(taskMediaReferenceStateKey, state)
+	return nil
+}
+
+// PersistTaskWithMediaReferences commits the task row and every durable input
+// binding in one transaction. The request-scoped leases are released by the
+// caller only when this atomic persistence fails.
+func PersistTaskWithMediaReferences(c *gin.Context, task *model.Task) error {
+	state := getTaskMediaReferenceState(c)
+	if state.bound {
+		return fmt.Errorf("task media references are already bound")
+	}
+	applyTaskMediaSnapshot(c, task)
+	snapshot := taskDeliverySnapshot(c, task)
+	if err := model.InsertTaskWithMediaInputsAndSnapshot(task, state.bindings, snapshot); err != nil {
+		return err
+	}
+	state.bound = true
+	c.Set(taskMediaReferenceStateKey, state)
+	return nil
+}
+
+func applyTaskMediaSnapshot(c *gin.Context, task *model.Task) {
+	if c == nil || task == nil || c.Request == nil {
+		return
+	}
+	mode := strings.TrimSpace(c.GetString(TaskMediaModeContextKey))
+	if mode == "" && c.Request.URL.Path == "/v1/videos" {
+		mode = "videos"
+	}
+	if mode == "" {
+		return
+	}
+	req, err := GetTaskRequest(c)
+	if err != nil {
+		return
+	}
+	prompt := []rune(strings.TrimSpace(req.Prompt))
+	if len(prompt) > maxTaskSnapshotPromptRunes {
+		prompt = prompt[:maxTaskSnapshotPromptRunes]
+	}
+	duration := req.Duration
+	if duration == 0 && req.Seconds != "" {
+		duration, _ = strconv.Atoi(req.Seconds)
+	}
+	referenceCount := len(req.References)
+	if referenceCount == 0 {
+		referenceCount = len(req.Images)
+		if referenceCount == 0 && (req.Image != "" || req.InputReference != "") {
+			referenceCount = 1
+		}
+	}
+	task.Properties.Input = string(prompt)
+	task.Properties.MediaMode = mode
+	task.Properties.MediaSize = strings.TrimSpace(req.Size)
+	task.Properties.MediaDuration = duration
+	task.Properties.MediaReferenceCount = referenceCount
+}
+
+func ReleaseUnboundTaskMediaReferences(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	state := getTaskMediaReferenceState(c)
+	if state.bound {
+		return
+	}
+	for blobID := range state.acquired {
+		model.ReleaseMediaTaskLease(blobID)
+	}
+	state.acquired = make(map[int64]struct{})
+	state.bindings = nil
+	c.Set(taskMediaReferenceStateKey, state)
+}
+
+func taskDeliverySnapshot(c *gin.Context, task *model.Task) *model.TaskDeliverySnapshot {
+	if c == nil || task == nil {
+		return nil
+	}
+	if task.PrivateData.Key == "" {
+		task.PrivateData.Key = basecommon.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	}
+	baseURL := basecommon.GetContextKeyString(c, constant.ContextKeyChannelBaseUrl)
+	channelType := basecommon.GetContextKeyInt(c, constant.ContextKeyChannelType)
+	proxy := ""
+	if setting, ok := basecommon.GetContextKeyType[dto.ChannelSettings](c, constant.ContextKeyChannelSetting); ok {
+		proxy = setting.Proxy
+	}
+	if (baseURL == "" || channelType == 0) && task.ChannelId > 0 {
+		if channel, err := model.CacheGetChannel(task.ChannelId); err == nil && channel != nil {
+			if baseURL == "" {
+				baseURL = channel.GetBaseURL()
+			}
+			if channelType == 0 {
+				channelType = channel.Type
+			}
+			if proxy == "" {
+				proxy = channel.GetSetting().Proxy
+			}
+		}
+	}
+	mode := strings.TrimSpace(c.GetString(TaskMediaModeContextKey))
+	if mode == "" {
+		mode = "videos"
+	}
+	credentialRef := ""
+	if task.PrivateData.Key != "" {
+		credentialRef = "task.private_data.key"
+	}
+	return &model.TaskDeliverySnapshot{
+		ChannelID: task.ChannelId, ChannelType: channelType,
+		UpstreamBaseURL: baseURL, UpstreamProxy: proxy,
+		UpstreamTaskID: task.GetUpstreamTaskID(), CredentialRef: credentialRef,
+		ProviderContractVersion: "media-v1:" + mode,
+	}
+}
+
+func getTaskMediaReferenceState(c *gin.Context) *taskMediaReferenceState {
+	if c != nil {
+		if existing, ok := c.Get(taskMediaReferenceStateKey); ok {
+			if state, valid := existing.(*taskMediaReferenceState); valid && state != nil {
+				return state
+			}
+		}
+	}
+	return &taskMediaReferenceState{acquired: make(map[int64]struct{})}
+}
+
+func resolveOwnedReferenceBlob(userID int, publicID string) (*model.MediaBlob, error) {
+	if blob, _, err := model.GetMediaBlobByAssetID(userID, publicID, false); err == nil {
+		return blob, nil
+	}
+	return model.GetMediaBlobForUser(userID, publicID)
+}
+
+func signedReferenceURL(publicID string) (string, error) {
+	ttl := mediasetting.Get().ReferenceURLTTLSeconds
+	expires := time.Now().Add(time.Duration(ttl) * time.Second).Unix()
+	audience := "reference"
+	base := strings.TrimRight(system_setting.ServerAddress, "/")
+	if parsed, err := url.Parse(base); err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("the site public server address must be configured before file_id references can be used")
+	}
+	contentURL := fmt.Sprintf("%s/v1/assets/%s/content", base, url.PathEscape(publicID))
+	return contentURL + "?expires=" + strconv.FormatInt(expires, 10) + "&audience=" + audience +
+		"&signature=" + url.QueryEscape(basecommon.GenerateMediaSignature(publicID, expires, audience)), nil
+}
+
+func mimeMatchesReferenceType(mimeType, referenceType string) bool {
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	return strings.HasPrefix(mimeType, referenceType+"/")
+}
+
+func decodedDataURLSize(value string) int64 {
+	comma := strings.IndexByte(value, ',')
+	if comma < 0 || comma == len(value)-1 {
+		return 0
+	}
+	payload := strings.TrimSpace(value[comma+1:])
+	padding := 0
+	if strings.HasSuffix(payload, "=") {
+		padding++
+	}
+	if strings.HasSuffix(payload, "==") {
+		padding++
+	}
+	size := int64(len(payload)/4*3 - padding)
+	if size < 0 {
+		return 0
+	}
+	return size
+}
+
+func applyReferencesToLegacyTaskFields(req *TaskSubmitReq) {
+	if req == nil || len(req.References) == 0 {
+		return
+	}
+	images := req.ReferenceURLs(mediaservice.ReferenceTypeImage)
+	if len(images) > 0 {
+		if req.Image == "" {
+			req.Image = req.ReferenceURL(mediaservice.ReferenceTypeImage, "first_frame", "reference")
+		}
+		if req.InputReference == "" {
+			req.InputReference = req.Image
+		}
+		if len(req.Images) == 0 {
+			req.Images = images
+		}
+	}
+	for _, reference := range req.References {
+		if !strings.EqualFold(reference.Type, mediaservice.ReferenceTypeImage) {
+			continue
+		}
+		value := strings.TrimSpace(reference.SourceURL())
+		if value == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(reference.Role)) {
+		case "first_frame":
+			req.Metadata["first_frame_image"] = value
+			req.Metadata["first_frame_url"] = value
+		case "last_frame":
+			req.Metadata["last_frame_image"] = value
+			req.Metadata["last_frame_url"] = value
+		}
+	}
+	if value := req.ReferenceURL(mediaservice.ReferenceTypeAudio, "driving_audio", "reference"); value != "" {
+		req.Metadata["audio_url"] = value
+	}
+	if value := req.ReferenceURL(mediaservice.ReferenceTypeVideo, "source", "reference"); value != "" {
+		req.Metadata["video_url"] = value
+	}
+}
+
+func multipartHasInputReference(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.MultipartForm == nil {
+		return false
+	}
+	form := c.Request.MultipartForm
+	return len(form.File["input_reference"]) > 0 || len(form.Value["input_reference"]) > 0
+}

@@ -1,0 +1,940 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type taskPollingFetchAdaptor struct {
+	mu           sync.Mutex
+	taskIDs      []string
+	fetched      chan string
+	blockTaskID  string
+	blockStarted chan struct{}
+	releaseBlock chan struct{}
+	blockOnce    sync.Once
+	baseURLs     []string
+	keys         []string
+	proxies      []string
+	adjustCalls  int
+	adjustQuota  int
+}
+
+type unrecognizedPollingAdaptor struct{}
+
+func (a *unrecognizedPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *unrecognizedPollingAdaptor) FetchTask(_ string, _ string, _ map[string]any, _ string) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"message":"provider is assigning the task"}`)),
+	}, nil
+}
+
+func (a *unrecognizedPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return &relaycommon.TaskInfo{}, nil
+}
+
+func (a *unrecognizedPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+func (a *taskPollingFetchAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *taskPollingFetchAdaptor) FetchTask(baseURL string, key string, body map[string]any, proxy string) (*http.Response, error) {
+	taskID, _ := body["task_id"].(string)
+	if taskID == a.blockTaskID && a.releaseBlock != nil {
+		a.blockOnce.Do(func() {
+			if a.blockStarted != nil {
+				close(a.blockStarted)
+			}
+		})
+		<-a.releaseBlock
+	}
+
+	a.mu.Lock()
+	a.taskIDs = append(a.taskIDs, taskID)
+	a.baseURLs = append(a.baseURLs, baseURL)
+	a.keys = append(a.keys, key)
+	a.proxies = append(a.proxies, proxy)
+	a.mu.Unlock()
+	if a.fetched != nil {
+		select {
+		case a.fetched <- taskID:
+		default:
+		}
+	}
+
+	response := dto.TaskResponse[model.Task]{
+		Code: dto.TaskSuccessCode,
+		Data: model.Task{
+			TaskID:   taskID,
+			Status:   model.TaskStatusInProgress,
+			Progress: "30%",
+		},
+	}
+	responseBody, err := common.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}, nil
+}
+
+func TestUpdateVideoTasksUsesSnapshotAfterChannelDeletion(t *testing.T) {
+	truncate(t)
+
+	const channelID = 401
+	seedTaskPollingChannel(t, channelID, true)
+	task := seedPollingTask(t, channelID, "task_snapshot_public", "task_snapshot_upstream")
+	task.PrivateData.Key = "snapshot-secret"
+	require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	require.NoError(t, model.DB.Create(&model.TaskDeliverySnapshot{
+		TaskRowID: task.ID, ChannelID: channelID, ChannelType: constant.ChannelTypeKling,
+		UpstreamBaseURL: "https://historical-provider.example", UpstreamProxy: "http://historical-proxy.example:8080",
+		UpstreamTaskID: task.GetUpstreamTaskID(), CredentialRef: "task.private_data.key",
+		ProviderContractVersion: "media-v1:videos",
+	}).Error)
+	require.NoError(t, model.DB.Delete(&model.Channel{}, channelID).Error)
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), map[int][]string{
+		channelID: {task.GetUpstreamTaskID()},
+	}, map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+
+	adaptor.mu.Lock()
+	defer adaptor.mu.Unlock()
+	require.Equal(t, []string{"https://historical-provider.example"}, adaptor.baseURLs)
+	require.Equal(t, []string{"snapshot-secret"}, adaptor.keys)
+	require.Equal(t, []string{"http://historical-proxy.example:8080"}, adaptor.proxies)
+}
+
+func TestTaskPollingDeliveryNeverFallsBackFromExplicitFrozenCredential(t *testing.T) {
+	truncate(t)
+	const channelID = 403
+	seedTaskPollingChannel(t, channelID, true)
+	task := seedPollingTask(t, channelID, "task_frozen_missing_public", "task_frozen_missing_upstream")
+	require.NoError(t, model.DB.Create(&model.TaskDeliverySnapshot{
+		TaskRowID: task.ID, ChannelID: channelID, ChannelType: constant.ChannelTypeKling,
+		UpstreamBaseURL: "https://historical-provider.example",
+		UpstreamTaskID:  task.GetUpstreamTaskID(), CredentialRef: "task.private_data.key",
+		ProviderContractVersion: "media-v1:videos",
+	}).Error)
+	channel, err := model.GetChannelById(channelID, true)
+	require.NoError(t, err)
+
+	_, key, _, _, deliveryErr := taskPollingDelivery(task, channel)
+	assert.ErrorContains(t, deliveryErr, "frozen delivery credential is unavailable")
+	assert.Empty(t, key)
+}
+
+func TestUpdateVideoSingleTaskDoesNotRefundUnrecognizedPollingResponse(t *testing.T) {
+	truncate(t)
+	seedUser(t, 1, 1_000_000)
+	const channelID = 402
+	seedTaskPollingChannel(t, channelID, true)
+	task := seedPollingTask(t, channelID, "task_unknown_public", "task_unknown_upstream")
+	task.Quota = 50_000
+	require.NoError(t, model.DB.Model(task).Update("quota", task.Quota).Error)
+
+	channel, err := model.GetChannelById(channelID, true)
+	require.NoError(t, err)
+	before, err := model.GetUserQuota(task.UserId, true)
+	require.NoError(t, err)
+
+	err = updateVideoSingleTask(context.Background(), &unrecognizedPollingAdaptor{}, channel,
+		task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task})
+	require.ErrorContains(t, err, "upstream task status unavailable")
+
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusInProgress, reloaded.Status)
+	assert.Equal(t, "30%", reloaded.Progress)
+	after, err := model.GetUserQuota(task.UserId, true)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "an unrecognized poll must never refund an accepted task")
+}
+
+func (a *taskPollingFetchAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}, nil
+}
+
+func (a *taskPollingFetchAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.adjustCalls++
+	return a.adjustQuota
+}
+
+func (a *taskPollingFetchAdaptor) fetchCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.taskIDs)
+}
+
+func (a *taskPollingFetchAdaptor) fetchedTaskIDs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.taskIDs...)
+}
+
+func (a *taskPollingFetchAdaptor) adjustmentCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.adjustCalls
+}
+
+func configureTaskPollingFinancialTables(t *testing.T) {
+	t.Helper()
+	require.NoError(t, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	require.NoError(t, model.DB.Exec("DELETE FROM quota_reservations").Error)
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Exec("DELETE FROM quota_reservations").Error)
+	})
+}
+
+func configureTaskTimeout(t *testing.T, minutes int) {
+	t.Helper()
+	previous := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = minutes
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previous })
+}
+
+func seedTaskPollingReservation(t *testing.T, reservationID, requestID string, userID, reserved, final int, status string) {
+	t.Helper()
+	now := time.Now().Unix()
+	finalizedAt := now
+	if status == model.QuotaReservationStatusActive {
+		finalizedAt = 0
+	}
+	require.NoError(t, model.DB.Create(&model.QuotaReservation{
+		ReservationId: reservationID, RequestId: requestID, UserId: userID,
+		FundingSource: model.QuotaReservationFundingWallet,
+		ReservedQuota: reserved, FinalQuota: final, PendingFinalQuota: final,
+		SettlementQuotaKnown: status == model.QuotaReservationStatusSettled,
+		Status:               status, CreatedAt: now, UpdatedAt: now, FinalizedAt: finalizedAt,
+	}).Error)
+}
+
+func TestSweepTimedOutUnknownTaskFinalizesOnlyAfterVerifiedReservationRefund(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	configureTaskTimeout(t, 1)
+
+	const userID = 51
+	const reservationID = "smart:unknown-refunded"
+	const requestID = "unknown-refunded"
+	seedUser(t, userID, 1_000)
+	seedTaskPollingReservation(t, reservationID, requestID, userID, 200, 0, model.QuotaReservationStatusRefunded)
+	old := time.Now().Add(-2 * time.Minute).Unix()
+	task := &model.Task{
+		TaskID: "task_unknown_refunded", Platform: constant.TaskPlatform("sora"), UserId: userID,
+		Quota: 200, BillingReservationID: reservationID, Status: model.TaskStatusUnknown,
+		Progress: "0%", SubmitTime: old, CreatedAt: old, UpdatedAt: old,
+		PrivateData: model.TaskPrivateData{
+			BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: requestID,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(task).Updates(map[string]any{"submit_time": old, "updated_at": old}).Error)
+
+	sweepTimedOutTasks(context.Background())
+
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusFailure, reloaded.Status)
+	assert.Equal(t, 0, reloaded.Quota)
+	assert.Equal(t, "100%", reloaded.Progress)
+	assert.Equal(t, 1_000, getUserQuota(t, userID), "already-refunded UNKNOWN tasks must not refund twice")
+
+	var reservation model.QuotaReservation
+	require.NoError(t, model.DB.Where("reservation_id = ?", reservationID).First(&reservation).Error)
+	assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+	assert.Zero(t, reservation.FinalQuota)
+	assert.False(t, reservation.SettlementPending)
+}
+
+func TestSweepTimedOutUnknownTaskWaitsForDurableReservationRefund(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	configureTaskTimeout(t, 1)
+
+	const userID = 52
+	const reservationID = "smart:unknown-pending"
+	const requestID = "unknown-pending"
+	seedUser(t, userID, 800)
+	seedTaskPollingReservation(t, reservationID, requestID, userID, 200, 0, model.QuotaReservationStatusActive)
+	require.NoError(t, model.DB.Model(&model.QuotaReservation{}).Where("reservation_id = ?", reservationID).Updates(map[string]any{
+		"settlement_pending": true, "settlement_quota_known": false,
+	}).Error)
+	old := time.Now().Add(-2 * time.Minute).Unix()
+	task := &model.Task{
+		TaskID: "task_unknown_pending", Platform: constant.TaskPlatform("sora"), UserId: userID,
+		Quota: 200, BillingReservationID: reservationID, Status: model.TaskStatusUnknown,
+		Progress: "0%", SubmitTime: old, CreatedAt: old, UpdatedAt: old,
+		PrivateData: model.TaskPrivateData{
+			BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: requestID,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(task).Updates(map[string]any{"submit_time": old, "updated_at": old}).Error)
+
+	sweepTimedOutTasks(context.Background())
+
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusUnknown, reloaded.Status)
+	assert.Equal(t, 200, reloaded.Quota)
+	assert.Equal(t, 800, getUserQuota(t, userID))
+}
+
+func TestSweepExpiredFinalizingReplaysFrozenSuccessReceipt(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	configureTaskTimeout(t, 1)
+
+	const userID = 61
+	const reservationID = "direct:finalizing-success"
+	const requestID = "finalizing-success"
+	seedUser(t, userID, 850)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+		"used_quota": 150, "request_count": 1,
+	}).Error)
+	seedTaskPollingReservation(t, reservationID, requestID, userID, 150, 150, model.QuotaReservationStatusSettled)
+	old := time.Now().Add(-2 * time.Minute).Unix()
+	task := &model.Task{
+		TaskID: "task_finalizing_frozen_success", Platform: constant.TaskPlatform("kling"), UserId: userID,
+		Quota: 150, BillingReservationID: reservationID, Status: model.TaskStatusFinalizing,
+		Progress: "99%", SubmitTime: old, CreatedAt: old, UpdatedAt: old,
+		PrivateData: model.TaskPrivateData{
+			BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: requestID,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(task).Update("updated_at", old).Error)
+	require.NoError(t, model.DB.Create(&model.TaskBillingReceipt{
+		TaskRowID: task.ID, ReservationID: &[]string{reservationID}[0], RequestID: requestID,
+		UserID: userID, FundingSource: model.QuotaReservationFundingWallet,
+		SubmissionQuota: 150, PreConsumedQuota: 150, AppliedQuota: 150, UsageAppliedQuota: 150,
+		TargetQuota: 100, TerminalTargetStatus: model.TaskStatusSuccess,
+		State: model.TaskBillingReceiptTerminalPending, RequestCountApplied: true,
+		Version: 2, CreatedAt: old, UpdatedAt: old,
+	}).Error)
+
+	sweepTimedOutTasks(context.Background())
+
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusSuccess, reloaded.Status)
+	assert.Equal(t, 100, reloaded.Quota)
+	assert.Equal(t, 900, getUserQuota(t, userID))
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	receipt, err := model.GetTaskBillingReceipt(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingReceiptApplied, receipt.State)
+	assert.EqualValues(t, model.TaskStatusSuccess, receipt.TerminalTargetStatus)
+}
+
+func TestSweepExpiredFinalizingWithoutFrozenTargetWaitsForSameTaskSuccess(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	configureTaskTimeout(t, 1)
+
+	const userID = 62
+	const reservationID = "direct:finalizing-timeout"
+	const requestID = "finalizing-timeout"
+	seedUser(t, userID, 900)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+		"used_quota": 100, "request_count": 1,
+	}).Error)
+	seedTaskPollingReservation(t, reservationID, requestID, userID, 100, 100, model.QuotaReservationStatusSettled)
+	old := time.Now().Add(-2 * time.Minute).Unix()
+	task := &model.Task{
+		TaskID: "task_finalizing_without_target", Platform: constant.TaskPlatform("kling"), UserId: userID,
+		Quota: 100, BillingReservationID: reservationID, Status: model.TaskStatusFinalizing,
+		Progress: "99%", SubmitTime: old, CreatedAt: old, UpdatedAt: old,
+		PrivateData: model.TaskPrivateData{
+			BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: requestID,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(task).Update("updated_at", old).Error)
+	require.NoError(t, model.DB.Create(&model.TaskBillingReceipt{
+		TaskRowID: task.ID, ReservationID: &[]string{reservationID}[0], RequestID: requestID,
+		UserID: userID, FundingSource: model.QuotaReservationFundingWallet,
+		SubmissionQuota: 100, PreConsumedQuota: 100, AppliedQuota: 100, UsageAppliedQuota: 100,
+		TargetQuota: 100, State: model.TaskBillingReceiptTracking, RequestCountApplied: true,
+		Version: 1, CreatedAt: old, UpdatedAt: old,
+	}).Error)
+
+	sweepTimedOutTasks(context.Background())
+
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusFinalizing, reloaded.Status)
+	assert.Positive(t, reloaded.ReconcileSince)
+	assert.Equal(t, 100, reloaded.Quota)
+	assert.Equal(t, 900, getUserQuota(t, userID))
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	receipt, err := model.GetTaskBillingReceipt(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingReceiptTracking, receipt.State)
+	for attempt := 0; attempt < 2; attempt++ {
+		handled, err := applyTaskBillingTerminal(context.Background(), reloaded, model.TaskStatusSuccess, 100, "上游原任务确认成功")
+		require.NoError(t, err)
+		require.True(t, handled)
+	}
+	assert.Equal(t, 900, getUserQuota(t, userID), "late success must not consume a second time")
+	receipt, err = model.GetTaskBillingReceipt(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingReceiptApplied, receipt.State)
+	assert.EqualValues(t, model.TaskStatusSuccess, receipt.TerminalTargetStatus)
+	assert.Equal(t, 100, receipt.AppliedQuota)
+}
+
+func TestSunoMissingChannelDoesNotBypassFailedBillingSettlement(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	seedUser(t, 71, 1_000)
+
+	task := &model.Task{
+		TaskID: "task_suno_missing_channel", Platform: constant.TaskPlatformSuno, UserId: 71,
+		ChannelId: 987654, Quota: 100, BillingReservationID: "direct:missing-reservation",
+		Status: model.TaskStatusInProgress, Progress: "30%", SubmitTime: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			UpstreamTaskID: "suno-upstream-missing-channel",
+			BillingSource:  model.QuotaReservationFundingWallet, BillingRequestID: "suno-missing-channel",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := updateSunoTasks(context.Background(), task.ChannelId,
+		[]string{task.GetUpstreamTaskID()}, map[string]*model.Task{task.GetUpstreamTaskID(): task})
+	require.Error(t, err)
+
+	reloaded, exists, err := model.GetTaskByRowID(task.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.EqualValues(t, model.TaskStatusInProgress, reloaded.Status)
+	assert.Equal(t, "30%", reloaded.Progress)
+	assert.EqualValues(t, model.TaskStatusInProgress, task.Status, "the in-memory task must remain retryable too")
+}
+
+func configureTaskFinalizationMedia(t *testing.T) {
+	t.Helper()
+	previous := mediasetting.Get()
+	next := previous
+	next.StoragePath = t.TempDir()
+	next.RemoteMaterializeEnabled = false
+	next.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(next))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previous)) })
+}
+
+func seedFinalizationTask(t *testing.T, taskID string, status model.TaskStatus) *model.Task {
+	t.Helper()
+	seedUser(t, 1, 1_000_000)
+	task := &model.Task{
+		TaskID: taskID, Platform: constant.TaskPlatform("kling"), UserId: 1,
+		ChannelId: 901, Action: constant.TaskActionGenerate, Status: status,
+		Progress: "30%", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(),
+		Properties: model.Properties{OriginModelName: "video-model", MediaMode: "videos"},
+	}
+	if status == model.TaskStatusFinalizing {
+		task.Progress = "99%"
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	return task
+}
+
+func TestApplyVideoTaskResultKeepsFinalizingUntilEveryArtifactArchives(t *testing.T) {
+	truncate(t)
+	configureTaskFinalizationMedia(t)
+	task := seedFinalizationTask(t, "task_finalization_retry", model.TaskStatusInProgress)
+	adaptor := &taskPollingFetchAdaptor{}
+	result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
+	partialRaw := []byte(`{
+		"a_image_url":"data:image/png;base64,%%%",
+		"z_video_url":"data:video/mp4;base64,AAAAFGZ0eXBpc29tAAAAAGlzb20="
+	}`)
+
+	err := ApplyVideoTaskResult(context.Background(), adaptor, task, result, partialRaw)
+	require.ErrorIs(t, err, ErrTaskArtifactsNotReady)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFinalizing, task.Status)
+	assert.Equal(t, "99%", task.Progress)
+	assert.Equal(t, 0, adaptor.adjustmentCount())
+
+	recoveredRaw := []byte(`{
+		"a_image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zs2AAAAAASUVORK5CYII=",
+		"z_video_url":"data:video/mp4;base64,AAAAFGZ0eXBpc29tAAAAAGlzb20="
+	}`)
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task, result, recoveredRaw))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, task.Status)
+	assert.Equal(t, "100%", task.Progress)
+	assert.Positive(t, task.FinishTime)
+	assert.Equal(t, 1, adaptor.adjustmentCount())
+
+	artifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+	require.NoError(t, err)
+	require.Len(t, artifacts, 2)
+}
+
+func TestApplyVideoTaskResultPublishesFiveArtifactsAndSettlesOnlyOnce(t *testing.T) {
+	truncate(t)
+	configureTaskFinalizationMedia(t)
+	task := seedFinalizationTask(t, "task_finalization_five", model.TaskStatusInProgress)
+	stale := *task
+	adaptor := &taskPollingFetchAdaptor{}
+	result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, TotalTokens: 1}
+	raw := []byte(`{"outputs":[
+		{"video_url":"data:video/mp4;base64,AAAAFGZ0eXBpc29tAAAAAGlzb20="},
+		{"video_url":"data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDI="},
+		{"video_url":"data:video/mp4;base64,AAAAFGZ0eXBhdjAxAAAAAGF2MDE="},
+		{"audio_url":"data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA="},
+		{"thumbnail_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zs2AAAAAASUVORK5CYII="}
+	]}`)
+
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task, result, raw))
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, &stale, result, raw))
+	assert.Equal(t, 1, adaptor.adjustmentCount(), "a stale completion must not settle twice")
+
+	artifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+	require.NoError(t, err)
+	require.Len(t, artifacts, 5)
+	counts := map[string]int{}
+	for _, artifact := range artifacts {
+		counts[artifact.Type]++
+	}
+	assert.Equal(t, 3, counts["video"])
+	assert.Equal(t, 1, counts["audio"])
+	assert.Equal(t, 1, counts["image"])
+}
+
+func TestApplyVideoTaskResultWaitsForSignedVideoURLMaterialization(t *testing.T) {
+	truncate(t)
+	configureTaskFinalizationMedia(t)
+	task := seedFinalizationTask(t, "task_signed_video_url", model.TaskStatusInProgress)
+	adaptor := &taskPollingFetchAdaptor{}
+	const signedURL = "https://assets.example.test/download?expires=1784900000&signature=opaque"
+
+	err := ApplyVideoTaskResult(context.Background(), adaptor, task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Url: signedURL},
+		[]byte(`{"id":"task_upstream","status":"completed","metadata":{"url":"`+signedURL+`"}}`))
+	require.ErrorIs(t, err, ErrTaskArtifactsNotReady)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFinalizing, task.Status)
+	assert.Equal(t, signedURL, task.GetResultURL())
+	assert.Zero(t, adaptor.adjustmentCount())
+
+	artifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, "video", artifacts[0].Type)
+	assert.Equal(t, "primary", artifacts[0].Role)
+	assert.Equal(t, model.MediaBlobStatusReady, artifacts[0].Status)
+}
+
+func TestApplyVideoTaskResultPublishesAfterSignedMetadataURLIsLocal(t *testing.T) {
+	truncate(t)
+	configureTaskFinalizationMedia(t)
+	task := seedFinalizationTask(t, "task_signed_metadata_url", model.TaskStatusInProgress)
+	adaptor := &taskPollingFetchAdaptor{}
+	const signedURL = "https://assets.example.test/download?expires=1784900000&signature=opaque"
+
+	err := ApplyVideoTaskResult(context.Background(), adaptor, task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusSuccess},
+		[]byte(`{"id":"task_upstream","status":"completed","metadata":{"url":"`+signedURL+`"}}`))
+	require.ErrorIs(t, err, ErrTaskArtifactsNotReady)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFinalizing, task.Status)
+	assert.Equal(t, signedURL, task.GetResultURL())
+
+	artifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	blob, _, err := model.GetMediaBlobByAssetID(task.UserId, artifacts[0].PublicAssetID, false)
+	require.NoError(t, err)
+	assert.Equal(t, model.MediaStorageBackendRemote, blob.StorageBackend)
+	assert.Equal(t, signedURL, blob.PrivateSource)
+	require.NoError(t, model.DB.Model(&model.MediaBlob{}).Where("id = ?", blob.ID).Updates(map[string]any{
+		"storage_backend":    model.MediaStorageBackendLocal,
+		"object_key":         "generated/task_signed_metadata_url/result.mp4",
+		"size_bytes":         int64(2048),
+		"materialize_status": model.MediaMaterializeComplete,
+	}).Error)
+
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusSuccess},
+		[]byte(`{"id":"task_upstream","status":"completed","metadata":{"url":"`+signedURL+`"}}`)))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, task.Status)
+	assert.Equal(t, 1, adaptor.adjustmentCount())
+}
+
+func TestTaskProxyPlaceholderDoesNotSatisfyDeliverableArtifactGate(t *testing.T) {
+	truncate(t)
+	task := seedFinalizationTask(t, "task_proxy_not_deliverable", model.TaskStatusFinalizing)
+	blob := &model.MediaBlob{
+		PublicID: "blob_task_proxy", UserID: task.UserId, Filename: "result.mp4",
+		MediaType: "video", Role: "primary", SourceKind: "provider",
+		StorageBackend: model.MediaStorageBackendRemote,
+		PrivateSource:  "task://" + task.TaskID, MimeType: "video/mp4",
+		Status: model.MediaBlobStatusReady, TaskPublicID: task.TaskID,
+	}
+	require.NoError(t, model.DB.Create(blob).Error)
+	artifact := model.TaskArtifact{
+		PublicAssetID: "asset_task_proxy", TaskRowID: task.ID, TaskPublicID: task.TaskID,
+		MediaBlobID: blob.ID, UserID: task.UserId, Type: "video", Role: "primary",
+		Status: model.MediaBlobStatusReady, MimeType: "video/mp4",
+	}
+	require.NoError(t, model.DB.Create(&artifact).Error)
+
+	assert.False(t, taskHasDeliverableArtifacts(task, []model.TaskArtifact{artifact}))
+}
+
+func TestApplyVideoTaskResultRecoversDurableFinalizingTask(t *testing.T) {
+	truncate(t)
+	configureTaskFinalizationMedia(t)
+	task := seedFinalizationTask(t, "task_finalization_resume", model.TaskStatusFinalizing)
+	adaptor := &taskPollingFetchAdaptor{}
+	raw := []byte(`{"video_url":"data:video/mp4;base64,AAAAFGZ0eXBpc29tAAAAAGlzb20="}`)
+
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, raw))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, task.Status)
+	assert.Equal(t, 1, adaptor.adjustmentCount())
+}
+
+func TestApplyVideoTaskResultDoesNotRegressFinalizingOnStaleFailure(t *testing.T) {
+	truncate(t)
+	task := seedFinalizationTask(t, "task_finalization_stale_failure", model.TaskStatusFinalizing)
+	adaptor := &taskPollingFetchAdaptor{}
+
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "stale provider replica"}, []byte(`{"status":"FAILURE"}`)))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFinalizing, task.Status)
+	assert.Equal(t, "99%", task.Progress)
+}
+
+func TestApplyVideoTaskResultCapsNonTerminalProgressBelowComplete(t *testing.T) {
+	truncate(t)
+	task := seedFinalizationTask(t, "task_progress_cap", model.TaskStatusInProgress)
+	adaptor := &taskPollingFetchAdaptor{}
+
+	require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task,
+		&relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "100%"}, []byte(`{"status":"IN_PROGRESS"}`)))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, task.Status)
+	assert.Equal(t, "99%", task.Progress)
+}
+
+func TestReloadTaskAfterLostTransitionUsesDatabaseRowID(t *testing.T) {
+	truncate(t)
+	seedUser(t, 1, 1_000_000)
+	const sharedPublicID = "task_shared_provider_id"
+	first := &model.Task{
+		TaskID: sharedPublicID, Platform: constant.TaskPlatform("kling"), UserId: 1,
+		ChannelId: 901, Status: model.TaskStatusFailure, Progress: "100%",
+	}
+	target := &model.Task{
+		TaskID: sharedPublicID, Platform: constant.TaskPlatform("kling"), UserId: 1,
+		ChannelId: 902, Status: model.TaskStatusInProgress, Progress: "30%",
+	}
+	require.NoError(t, model.DB.Create(first).Error)
+	require.NoError(t, model.DB.Create(target).Error)
+
+	stale := *target
+	require.NoError(t, model.DB.Model(target).Updates(map[string]any{
+		"status": model.TaskStatusFinalizing, "progress": "99%",
+	}).Error)
+	require.NoError(t, reloadTaskAfterLostTransition(&stale))
+
+	assert.Equal(t, target.ID, stale.ID)
+	assert.Equal(t, 902, stale.ChannelId)
+	assert.EqualValues(t, model.TaskStatusFinalizing, stale.Status)
+	assert.Equal(t, "99%", stale.Progress)
+}
+
+func seedTaskPollingChannel(t *testing.T, id int, disableSleep bool) {
+	t.Helper()
+	ch := &model.Channel{
+		Id:     id,
+		Type:   constant.ChannelTypeKling,
+		Name:   "polling_channel",
+		Key:    "sk-test",
+		Status: common.ChannelStatusEnabled,
+	}
+	if disableSleep {
+		ch.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	}
+	require.NoError(t, model.DB.Create(ch).Error)
+}
+
+func seedPollingTask(t *testing.T, channelID int, publicID string, upstreamID string) *model.Task {
+	t.Helper()
+	task := &model.Task{
+		TaskID:    publicID,
+		Platform:  constant.TaskPlatform("kling"),
+		UserId:    1,
+		ChannelId: channelID,
+		Action:    constant.TaskActionGenerate,
+		Status:    model.TaskStatusInProgress,
+		Progress:  "30%",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			UpstreamTaskID: upstreamID,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	return task
+}
+
+func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {
+	truncate(t)
+
+	const channelID = 101
+	seedTaskPollingChannel(t, channelID, false)
+	first := seedPollingTask(t, channelID, "task_public_1", "upstream_1")
+	second := seedPollingTask(t, channelID, "task_public_2", "upstream_2")
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
+		channelID: {
+			first.GetUpstreamTaskID(),
+			second.GetUpstreamTaskID(),
+		},
+	}, map[string]*model.Task{
+		first.GetUpstreamTaskID():  first,
+		second.GetUpstreamTaskID(): second,
+	})
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Equal(t, 1, adaptor.fetchCount())
+}
+
+func TestUpdateVideoTasksCanSkipPollingSleepPerChannel(t *testing.T) {
+	truncate(t)
+
+	const channelID = 102
+	seedTaskPollingChannel(t, channelID, true)
+	first := seedPollingTask(t, channelID, "task_public_3", "upstream_3")
+	second := seedPollingTask(t, channelID, "task_public_4", "upstream_4")
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	err := UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
+		channelID: {
+			first.GetUpstreamTaskID(),
+			second.GetUpstreamTaskID(),
+		},
+	}, map[string]*model.Task{
+		first.GetUpstreamTaskID():  first,
+		second.GetUpstreamTaskID(): second,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, adaptor.fetchCount())
+}
+
+func TestUpdateVideoTasksDefaultSleepDoesNotBlockOtherChannels(t *testing.T) {
+	truncate(t)
+
+	const firstChannelID = 201
+	const secondChannelID = 202
+	seedTaskPollingChannel(t, firstChannelID, false)
+	seedTaskPollingChannel(t, secondChannelID, false)
+	firstChannelFirst := seedPollingTask(t, firstChannelID, "task_public_5", "upstream_a_1")
+	firstChannelSecond := seedPollingTask(t, firstChannelID, "task_public_6", "upstream_a_2")
+	secondChannelFirst := seedPollingTask(t, secondChannelID, "task_public_7", "upstream_b_1")
+	secondChannelSecond := seedPollingTask(t, secondChannelID, "task_public_8", "upstream_b_2")
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
+		firstChannelID: {
+			firstChannelFirst.GetUpstreamTaskID(),
+			firstChannelSecond.GetUpstreamTaskID(),
+		},
+		secondChannelID: {
+			secondChannelFirst.GetUpstreamTaskID(),
+			secondChannelSecond.GetUpstreamTaskID(),
+		},
+	}, map[string]*model.Task{
+		firstChannelFirst.GetUpstreamTaskID():   firstChannelFirst,
+		firstChannelSecond.GetUpstreamTaskID():  firstChannelSecond,
+		secondChannelFirst.GetUpstreamTaskID():  secondChannelFirst,
+		secondChannelSecond.GetUpstreamTaskID(): secondChannelSecond,
+	})
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.ElementsMatch(t, []string{"upstream_a_1", "upstream_b_1"}, adaptor.fetchedTaskIDs())
+}
+
+func TestUpdateVideoTasksSlowChannelDoesNotBlockOtherChannels(t *testing.T) {
+	truncate(t)
+
+	const slowChannelID = 251
+	const fastChannelID = 252
+	seedTaskPollingChannel(t, slowChannelID, false)
+	seedTaskPollingChannel(t, fastChannelID, true)
+	slowTask := seedPollingTask(t, slowChannelID, "task_public_slow", "upstream_slow_1")
+	fastFirst := seedPollingTask(t, fastChannelID, "task_public_fast_1", "upstream_fast_parallel_1")
+	fastSecond := seedPollingTask(t, fastChannelID, "task_public_fast_2", "upstream_fast_parallel_2")
+	slowUpstreamID := slowTask.GetUpstreamTaskID()
+	fastFirstUpstreamID := fastFirst.GetUpstreamTaskID()
+	fastSecondUpstreamID := fastSecond.GetUpstreamTaskID()
+
+	adaptor := &taskPollingFetchAdaptor{
+		fetched:      make(chan string, 4),
+		blockTaskID:  slowUpstreamID,
+		blockStarted: make(chan struct{}),
+		releaseBlock: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseBlockedTask := func() {
+		releaseOnce.Do(func() {
+			close(adaptor.releaseBlock)
+		})
+	}
+	t.Cleanup(releaseBlockedTask)
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	errCh := make(chan error, 1)
+	gopool.Go(func() {
+		errCh <- UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), map[int][]string{
+			slowChannelID: {
+				slowUpstreamID,
+			},
+			fastChannelID: {
+				fastFirstUpstreamID,
+				fastSecondUpstreamID,
+			},
+		}, map[string]*model.Task{
+			slowUpstreamID:       slowTask,
+			fastFirstUpstreamID:  fastFirst,
+			fastSecondUpstreamID: fastSecond,
+		})
+	})
+
+	select {
+	case <-adaptor.blockStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("slow channel did not start blocking")
+	}
+
+	require.Eventually(t, func() bool {
+		fetchedTaskIDs := adaptor.fetchedTaskIDs()
+		return len(fetchedTaskIDs) == 2 &&
+			fetchedTaskIDs[0] == fastFirstUpstreamID &&
+			fetchedTaskIDs[1] == fastSecondUpstreamID
+	}, 500*time.Millisecond, 10*time.Millisecond)
+
+	releaseBlockedTask()
+	require.NoError(t, <-errCh)
+	assert.ElementsMatch(t, []string{
+		slowUpstreamID,
+		fastFirstUpstreamID,
+		fastSecondUpstreamID,
+	}, adaptor.fetchedTaskIDs())
+}
+
+func TestUpdateVideoTasksMixedChannelSleepSettings(t *testing.T) {
+	truncate(t)
+
+	const sleepyChannelID = 301
+	const fastChannelID = 302
+	seedTaskPollingChannel(t, sleepyChannelID, false)
+	seedTaskPollingChannel(t, fastChannelID, true)
+	sleepyFirst := seedPollingTask(t, sleepyChannelID, "task_public_9", "upstream_sleepy_1")
+	sleepySecond := seedPollingTask(t, sleepyChannelID, "task_public_10", "upstream_sleepy_2")
+	fastFirst := seedPollingTask(t, fastChannelID, "task_public_11", "upstream_fast_1")
+	fastSecond := seedPollingTask(t, fastChannelID, "task_public_12", "upstream_fast_2")
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
+		sleepyChannelID: {
+			sleepyFirst.GetUpstreamTaskID(),
+			sleepySecond.GetUpstreamTaskID(),
+		},
+		fastChannelID: {
+			fastFirst.GetUpstreamTaskID(),
+			fastSecond.GetUpstreamTaskID(),
+		},
+	}, map[string]*model.Task{
+		sleepyFirst.GetUpstreamTaskID():  sleepyFirst,
+		sleepySecond.GetUpstreamTaskID(): sleepySecond,
+		fastFirst.GetUpstreamTaskID():    fastFirst,
+		fastSecond.GetUpstreamTaskID():   fastSecond,
+	})
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.ElementsMatch(t, []string{"upstream_sleepy_1", "upstream_fast_1", "upstream_fast_2"}, adaptor.fetchedTaskIDs())
+}

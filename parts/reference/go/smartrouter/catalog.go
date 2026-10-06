@@ -48,10 +48,12 @@ type CertifiedRoute struct {
 	// only for recovery coverage; dispatch and billing still operate on the
 	// exact physical route. When omitted, RouteFailureDomain falls back to the
 	// credential/channel identity so old catalogs remain safe.
-	FailureDomain  string                   `json:"failure_domain,omitempty"`
-	MaxInflight    int                      `json:"max_inflight"`
-	StableFallback bool                     `json:"stable_fallback"`
-	Media          *MediaCapabilityContract `json:"media,omitempty"`
+	FailureDomain  string `json:"failure_domain,omitempty"`
+	MaxInflight    int    `json:"max_inflight"`
+	StableFallback bool   `json:"stable_fallback"`
+	// PassiveRecovery forbids synthetic generation, independent of endpoint.
+	PassiveRecovery bool                     `json:"passive_recovery,omitempty"`
+	Media           *MediaCapabilityContract `json:"media,omitempty"`
 }
 
 func (route CertifiedRoute) CacheNamespaceIdentity() string {

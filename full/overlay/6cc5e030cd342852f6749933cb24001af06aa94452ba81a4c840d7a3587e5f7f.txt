@@ -1,0 +1,49 @@
+package types
+
+import "errors"
+
+// ErrParameterCandidateUnavailable rejects a supply before any provider send;
+// it does not mean the user's request is invalid on every authorized supply.
+var ErrParameterCandidateUnavailable = errors.New("candidate cannot honor parameter pricing")
+
+// ParameterPriceSnapshot freezes a priced request. Monetary values are decimal
+// strings; SourceAmount is a catalog estimate, never a provider payment fact.
+type ParameterPriceSnapshot struct {
+	SchemaVersion   int               `json:"schema_version"`
+	Revision        string            `json:"revision"`
+	RuleID          string            `json:"rule_id"`
+	SupplyRevision  string            `json:"supply_revision,omitempty"`
+	SupplyRuleID    string            `json:"supply_rule_id,omitempty"`
+	SupplyGroup     string            `json:"supply_group,omitempty"`
+	Group           string            `json:"group"`
+	Model           string            `json:"model"`
+	ChannelID       int               `json:"channel_id"`
+	UpstreamModel   string            `json:"upstream_model,omitempty"`
+	MappingRevision string            `json:"mapping_revision,omitempty"`
+	Unit            string            `json:"unit"`
+	Currency        string            `json:"currency"`
+	UnitPrice       string            `json:"unit_price"`
+	Quantity        string            `json:"quantity"`
+	Amount          string            `json:"amount"`
+	SourceUnitPrice string            `json:"source_unit_price,omitempty"`
+	SourceCurrency  string            `json:"source_currency,omitempty"`
+	SourceAmount    string            `json:"source_amount,omitempty"`
+	Source          string            `json:"source,omitempty"`
+	SourceRevision  string            `json:"source_revision,omitempty"`
+	Parameters      map[string]string `json:"parameters"`
+	Quota           int               `json:"quota"`
+}
+
+// ConsumerOffer excludes physical routes and procurement data from all public
+// quotes, logs and catalogs. A map is intentional: the private snapshot is never
+// serialized wholesale through a consumer response.
+func (s *ParameterPriceSnapshot) ConsumerOffer() map[string]any {
+	if s == nil {
+		return nil
+	}
+	params := make(map[string]string, len(s.Parameters))
+	for k, v := range s.Parameters {
+		params[k] = v
+	}
+	return map[string]any{"revision": s.Revision, "model": s.Model, "group": s.Group, "unit": s.Unit, "currency": s.Currency, "unit_price": s.UnitPrice, "quantity": s.Quantity, "amount": s.Amount, "parameters": params, "quota": s.Quota}
+}

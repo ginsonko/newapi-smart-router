@@ -1,0 +1,331 @@
+package service
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+)
+
+const ImageTaskOwnedContextKey = "image_task_billing_owned"
+const ImageRouteJobContextKey = "image_route_job_id"
+
+func RejectImageTask(ctx context.Context, task *model.Task, reason string) error {
+	if task == nil || task.PrivateData.ImageTask == nil {
+		return errors.New("图片任务交付快照缺失")
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return reloadTaskAfterLostTransition(task)
+	}
+	if task.PrivateData.ImageTask.TerminalAtMS == 0 {
+		task.PrivateData.ImageTask.TerminalAtMS = time.Now().UnixMilli()
+	}
+	if task.PrivateData.ImageTask.HealthOutcome == "" {
+		task.PrivateData.ImageTask.HealthOutcome = string(ClassifyImageTaskFailure(0, nil, reason))
+	}
+	if err := failTaskWithBilling(ctx, task, reason); err != nil {
+		return err
+	}
+	return reloadTaskAfterLostTransition(task)
+}
+
+type ImageTaskResult struct {
+	TaskID  string          `json:"task_id"`
+	Status  string          `json:"status"`
+	Created int64           `json:"created"`
+	Data    []dto.ImageData `json:"data"`
+	Error   json.RawMessage `json:"error"`
+	Message string          `json:"message"`
+}
+
+// ImageTaskAdaptor uses the existing scheduler and task billing receipts.
+// Its polling protocol has no provider-specific model names or credentials.
+type ImageTaskAdaptor struct{}
+
+func (*ImageTaskAdaptor) Init(*relaycommon.RelayInfo)                                    {}
+func (*ImageTaskAdaptor) AdjustBillingOnComplete(*model.Task, *relaycommon.TaskInfo) int { return 0 }
+
+func (*ImageTaskAdaptor) FetchTask(baseURL, key string, body map[string]any, proxy string) (*http.Response, error) {
+	id, _ := body["task_id"].(string)
+	if strings.TrimSpace(id) == "" {
+		return nil, errors.New("图片任务尚未取得上游任务编号，等待对账")
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/images/generations/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	if ctx, ok := body["context"].(context.Context); ok {
+		req = req.WithContext(ctx)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	client, err := GetHttpClientWithProxy(proxy)
+	if err != nil {
+		return nil, err
+	}
+	pollClient := *client
+	// This bounds one status lookup, never the time allowed for image generation.
+	pollClient.Timeout = 45 * time.Second
+	pollClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return pollClient.Do(req)
+}
+
+func (*ImageTaskAdaptor) ParseTaskResult(raw []byte) (*relaycommon.TaskInfo, error) {
+	var result ImageTaskResult
+	if err := common.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	info := &relaycommon.TaskInfo{TaskID: result.TaskID}
+	switch strings.ToLower(strings.TrimSpace(result.Status)) {
+	case "failed", "failure", "error", "cancelled", "canceled":
+		info.Status = string(model.TaskStatusFailure)
+		info.Reason = result.Message
+	case "pending", "queued", "submitted":
+		info.Status = string(model.TaskStatusQueued)
+	case "processing", "running", "in_progress", "generating":
+		info.Status = string(model.TaskStatusInProgress)
+	case "completed", "succeeded", "success", "":
+		if len(imageTaskURLData(result.Data, "")) > 0 {
+			info.Status = string(model.TaskStatusSuccess)
+		}
+	}
+	if info.Status == "" {
+		return nil, errors.New("上游尚未返回可确认的图片任务状态或图片网址")
+	}
+	return info, nil
+}
+
+func imageTaskURLData(items []dto.ImageData, key string) []dto.ImageData {
+	clean := make([]dto.ImageData, 0, len(items))
+	for _, item := range items {
+		parsed, err := url.Parse(strings.TrimSpace(item.Url))
+		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+			continue
+		}
+		if key != "" && strings.Contains(item.Url, key) {
+			continue
+		}
+		secret := false
+		for name := range parsed.Query() {
+			switch strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(name)) {
+			case "apikey", "authorization", "accesstoken", "password", "secret":
+				secret = true
+			}
+		}
+		if !secret {
+			clean = append(clean, dto.ImageData{Url: parsed.String()})
+		}
+	}
+	return clean
+}
+
+func PollImageTask(ctx context.Context, task *model.Task) error {
+	if task == nil || task.Platform != constant.TaskPlatformOpenAIImage {
+		return errors.New("图片任务类型不匹配")
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return nil
+	}
+	if task.Status == model.TaskStatusFinalizing {
+		return ApplyImageTaskResult(ctx, task, task.Data)
+	}
+	// A create with an unknown outcome must never query the public ID as if it
+	// were a provider ID, or submit a second paid generation.
+	if strings.TrimSpace(task.PrivateData.UpstreamTaskID) == "" {
+		return nil
+	}
+	defer deferMediaTaskReconciliation(task)
+	base, key, proxy, _, err := taskPollingDelivery(task, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&ImageTaskAdaptor{}).FetchTask(base, key, map[string]any{"task_id": task.PrivateData.UpstreamTaskID, "context": ctx}, proxy)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("图片状态查询暂时失败（%d），继续保留原任务", resp.StatusCode)
+	}
+	// Async image channels request URL results. A status document cannot require
+	// an unbounded inline image allocation on the polling worker.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return err
+	}
+	return ApplyImageTaskResult(ctx, task, raw)
+}
+
+func ApplyImageTaskResult(ctx context.Context, task *model.Task, raw []byte) error {
+	if task == nil || task.PrivateData.ImageTask == nil {
+		return errors.New("图片任务交付快照缺失")
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return nil
+	}
+	adaptor := &ImageTaskAdaptor{}
+	result, err := adaptor.ParseTaskResult(raw)
+	if err != nil {
+		return err
+	}
+	var parsed ImageTaskResult
+	if err := common.Unmarshal(raw, &parsed); err != nil {
+		return err
+	}
+	if parsed.TaskID != "" && task.PrivateData.UpstreamTaskID != "" && parsed.TaskID != task.PrivateData.UpstreamTaskID {
+		return errors.New("上游返回的图片任务编号与已受理任务不一致")
+	}
+	before := task.Status
+	if before == model.TaskStatusFinalizing && model.TaskStatus(result.Status) != model.TaskStatusSuccess {
+		return nil
+	}
+	if model.TaskStatus(result.Status) == model.TaskStatusFailure {
+		reason := mediaservice.VideoFailureDetails(parsed.Message, raw, task.PrivateData.Key, task.Properties.Input).Message
+		task.PrivateData.ImageTask.RetryableFailure = true
+		task.PrivateData.ImageTask.HealthOutcome = string(ClassifyImageTaskFailure(0, raw, parsed.Message))
+		if err := RejectImageTask(ctx, task, reason); err != nil {
+			return err
+		}
+		ObserveImageTaskTerminal(task, false)
+		return nil
+	}
+	if model.TaskStatus(result.Status) != model.TaskStatusSuccess {
+		task.Status = model.TaskStatus(result.Status)
+		task.Progress = "10%"
+		won, err := task.UpdateWithStatus(before)
+		if err == nil && !won {
+			return reloadTaskAfterLostTransition(task)
+		}
+		return err
+	}
+	items := imageTaskURLData(parsed.Data, task.PrivateData.Key)
+	if len(items) == 0 {
+		return errors.New("上游已结束但未提供可交付图片，继续核对原任务")
+	}
+	if parsed.Created == 0 {
+		parsed.Created = task.SubmitTime
+	}
+	// Persist only the deliverable URL response, never prompts, reference data,
+	// arbitrary provider fields, base64 payloads or credential-bearing poll URLs.
+	task.Data, err = common.Marshal(map[string]any{"created": parsed.Created, "status": "completed", "data": items})
+	if err != nil {
+		return err
+	}
+	task.Status, task.Progress, task.FailReason = model.TaskStatusFinalizing, "99%", ""
+	won, err := task.UpdateWithStatus(before)
+	if err != nil {
+		return err
+	}
+	if !won {
+		if err := reloadTaskAfterLostTransition(task); err != nil {
+			return err
+		}
+		if task.Status != model.TaskStatusFinalizing {
+			return nil
+		}
+	}
+	if !task.PrivateData.ImageTask.NoRetention {
+		artifacts, err := mediaservice.EnsureTaskArtifactsFromRaw(ctx, task, task.Data)
+		if err != nil {
+			return err
+		}
+		if !taskHasDeliverableArtifacts(task, artifacts) {
+			return ErrTaskArtifactsNotReady
+		}
+	}
+	if err := model.ReleaseTaskMediaInputs(task.ID); err != nil {
+		return err
+	}
+	if task.PrivateData.ImageTask.TerminalAtMS == 0 {
+		task.PrivateData.ImageTask.TerminalAtMS = time.Now().UnixMilli()
+	}
+	task.PrivateData.ImageTask.HealthOutcome = string(smartrouter.OutcomeSuccess)
+	task.Status, task.Progress, task.FinishTime = model.TaskStatusSuccess, "100%", task.PrivateData.ImageTask.TerminalAtMS/1000
+	handled, err := applySuccessfulTaskBillingTerminal(ctx, adaptor, task, result)
+	if err == nil && !handled {
+		_, err = task.UpdateWithStatus(model.TaskStatusFinalizing)
+	}
+	if err == nil {
+		if err = reloadTaskAfterLostTransition(task); err != nil {
+			return err
+		}
+		ObserveImageTaskTerminal(task, true)
+	}
+	return err
+}
+
+func ImageTaskURLArtifacts(task *model.Task) []map[string]any {
+	artifacts := []map[string]any{}
+	if task == nil || task.Status != model.TaskStatusSuccess {
+		return artifacts
+	}
+	var response dto.ImageResponse
+	if common.Unmarshal(task.Data, &response) != nil {
+		return artifacts
+	}
+	for i, item := range imageTaskURLData(response.Data, task.PrivateData.Key) {
+		artifacts = append(artifacts, map[string]any{"id": fmt.Sprintf("%s-%d", task.TaskID, i), "type": "image", "role": "result", "status": "ready", "content_url": item.Url, "download_url": item.Url, "filename": "图片"})
+	}
+	return artifacts
+}
+
+// ImageTaskResponse preserves the OpenAI image response shape. Converting a
+// completed URL to base64 only retrieves the same image; it never generates.
+func ImageTaskResponse(task *model.Task) ([]byte, error) {
+	if task == nil || task.PrivateData.ImageTask == nil || task.Status != model.TaskStatusSuccess {
+		return nil, errors.New("图片任务尚未完成")
+	}
+	var response dto.ImageResponse
+	if err := common.Unmarshal(task.Data, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Data) == 0 {
+		return nil, errors.New("图片任务结果暂不可用")
+	}
+	if !task.PrivateData.ImageTask.NoRetention && task.PrivateData.ImageTask.ResponseFormat != "b64_json" {
+		artifacts, err := mediaservice.ListDeliverableTaskArtifacts(task.UserId, task.TaskID)
+		if err != nil {
+			return nil, err
+		}
+		public := mediaservice.PublicArtifacts(artifacts, false)
+		if len(public) == len(response.Data) {
+			for i := range public {
+				response.Data[i].Url = public[i].DownloadURL
+			}
+		}
+	}
+	if task.PrivateData.ImageTask.ResponseFormat == "b64_json" {
+		for i := range response.Data {
+			resp, err := DoDownloadRequest(response.Data[i].Url, "异步图片原结果交付")
+			if err != nil {
+				return nil, err
+			}
+			limit := mediasetting.Get().MaxRequestBytes
+			data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+			resp.Body.Close()
+			if readErr != nil {
+				return nil, readErr
+			}
+			if resp.StatusCode != http.StatusOK || int64(len(data)) > limit || !strings.HasPrefix(http.DetectContentType(data), "image/") {
+				return nil, errors.New("图片已生成，但原图下载暂时不可用，请查询原任务重取")
+			}
+			response.Data[i].B64Json = base64.StdEncoding.EncodeToString(data)
+			response.Data[i].Url = ""
+		}
+	}
+	return common.Marshal(response)
+}

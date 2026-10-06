@@ -1,0 +1,155 @@
+package common
+
+import (
+	"fmt"
+	"math"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// 与五秒监控周期对应。失效的采样不能无限期阻断所有请求。
+const protectionMaxSampleAge = 20 * time.Second
+
+type ResourceProtectionStatus struct {
+	Name      string  `json:"name"`
+	Label     string  `json:"label"`
+	Usage     float64 `json:"usage"`
+	Threshold int     `json:"threshold"`
+	Valid     bool    `json:"valid"`
+	Blocked   bool    `json:"blocked"`
+	Rejected  uint64  `json:"rejected"`
+}
+
+type SystemProtectionStatus struct {
+	Enabled   bool                        `json:"enabled"`
+	Fresh     bool                        `json:"fresh"`
+	Active    bool                        `json:"active"`
+	SampledAt time.Time                   `json:"sampled_at"`
+	Resources [3]ResourceProtectionStatus `json:"resources"`
+}
+
+func (s SystemProtectionStatus) Summary() string {
+	var active []string
+	for _, r := range s.Resources {
+		if r.Blocked {
+			active = append(active, fmt.Sprintf("%s %.1f%%", r.Label, r.Usage))
+		}
+	}
+	if len(active) == 0 {
+		return "已恢复接收请求"
+	}
+	return strings.Join(active, "，")
+}
+
+type resourcePressure struct {
+	blocked             bool
+	highSince, lowSince time.Time
+}
+
+// 所有时间由采样推进，与请求数量无关。三个资源固定占用，不保留请求内容。
+type systemProtectionMonitor struct {
+	mu         sync.Mutex
+	config     PerformanceMonitorConfig
+	sample     SystemStatus
+	pressure   [3]resourcePressure
+	rejections [3]atomic.Uint64
+}
+
+var systemProtection systemProtectionMonitor
+
+func (m *systemProtectionMonitor) reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sample = SystemStatus{}
+	m.pressure = [3]resourcePressure{}
+}
+
+func (m *systemProtectionMonitor) update(s SystemStatus, cfg PerformanceMonitorConfig) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before := [3]bool{m.pressure[0].blocked, m.pressure[1].blocked, m.pressure[2].blocked}
+	gap := s.SampledAt.Sub(m.sample.SampledAt)
+	if cfg != m.config || gap > protectionMaxSampleAge || gap <= 0 || !cfg.Enabled {
+		m.pressure = [3]resourcePressure{}
+	}
+	m.config, m.sample = cfg, s
+	values := [3]float64{s.CPUUsage, s.MemoryUsage, s.DiskUsage}
+	valid := [3]bool{s.CPUValid, s.MemoryValid, s.DiskValid}
+	thresholds := [3]int{cfg.CPUThreshold, cfg.MemoryThreshold, cfg.DiskThreshold}
+	critical := [3]int{0, cfg.CriticalMemoryThreshold, cfg.CriticalDiskThreshold}
+	confirm := time.Duration(max(0, min(cfg.ConfirmSeconds, 300))) * time.Second
+	recovery := time.Duration(max(0, min(cfg.RecoverySeconds, 300))) * time.Second
+	margin := float64(max(0, min(cfg.HysteresisPercent, 20)))
+	changed := false
+	for i := range m.pressure {
+		p := &m.pressure[i]
+		v, limit := values[i], float64(thresholds[i])
+		if !cfg.Enabled || limit <= 0 || !valid[i] || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
+			*p = resourcePressure{}
+		} else if v > limit || (critical[i] > 0 && v >= float64(critical[i])) {
+			p.lowSince = time.Time{}
+			if p.highSince.IsZero() {
+				p.highSince = s.SampledAt
+			}
+			if (critical[i] > 0 && v >= float64(critical[i])) || s.SampledAt.Sub(p.highSince) >= confirm {
+				p.blocked = true
+			}
+		} else {
+			p.highSince = time.Time{}
+			if p.blocked && v <= math.Max(0, limit-margin) {
+				if p.lowSince.IsZero() {
+					p.lowSince = s.SampledAt
+				}
+				if s.SampledAt.Sub(p.lowSince) >= recovery {
+					*p = resourcePressure{}
+				}
+			} else {
+				p.lowSince = time.Time{}
+			}
+		}
+		changed = changed || before[i] != p.blocked
+	}
+	return changed
+}
+
+func (m *systemProtectionMonitor) status(now time.Time, cfg PerformanceMonitorConfig) SystemProtectionStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sample
+	age := now.Sub(s.SampledAt)
+	fresh := !s.SampledAt.IsZero() && age >= 0 && age <= protectionMaxSampleAge && cfg == m.config
+	out := SystemProtectionStatus{Enabled: cfg.Enabled, Fresh: fresh, SampledAt: s.SampledAt}
+	out.Resources = [3]ResourceProtectionStatus{
+		{Name: "cpu", Label: "处理器", Usage: s.CPUUsage, Threshold: cfg.CPUThreshold, Valid: s.CPUValid},
+		{Name: "memory", Label: "内存", Usage: s.MemoryUsage, Threshold: cfg.MemoryThreshold, Valid: s.MemoryValid},
+		{Name: "disk", Label: "磁盘", Usage: s.DiskUsage, Threshold: cfg.DiskThreshold, Valid: s.DiskValid},
+	}
+	for i := range out.Resources {
+		r := &out.Resources[i]
+		r.Valid = fresh && r.Valid && !math.IsNaN(r.Usage) && !math.IsInf(r.Usage, 0) && r.Usage >= 0 && r.Usage <= 100
+		if math.IsNaN(r.Usage) || math.IsInf(r.Usage, 0) {
+			r.Usage = 0
+		}
+		r.Blocked = cfg.Enabled && r.Valid && m.pressure[i].blocked
+		r.Rejected = m.rejections[i].Load()
+		out.Active = out.Active || r.Blocked
+	}
+	return out
+}
+
+func GetSystemProtectionStatus() SystemProtectionStatus {
+	return systemProtection.status(time.Now(), GetPerformanceMonitorConfig())
+}
+
+func RecordSystemProtectionRejection(resource string) {
+	switch resource {
+	case "cpu":
+		systemProtection.rejections[0].Add(1)
+	case "memory":
+		systemProtection.rejections[1].Add(1)
+	case "disk":
+		systemProtection.rejections[2].Add(1)
+	}
+}

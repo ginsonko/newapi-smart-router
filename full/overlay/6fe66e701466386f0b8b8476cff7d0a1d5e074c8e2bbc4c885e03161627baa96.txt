@@ -1,0 +1,1538 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  Activity,
+  ArrowDown,
+  ArrowUp,
+  BadgeDollarSign,
+  BrainCircuit,
+  ChevronDown,
+  Coins,
+  Gauge,
+  GripVertical,
+  ListOrdered,
+  Plus,
+  Scale,
+  Settings2,
+  ShieldCheck,
+  SlidersHorizontal,
+  Trash2,
+} from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { useFieldArray, type UseFormReturn } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+
+import { GroupBadge } from '@/components/group-badge'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
+import { Input } from '@/components/ui/input'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
+import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
+import {
+  MAX_SMART_ROUTER_EFFECTIVE_RATIO,
+  MAX_SMART_ROUTER_TTFT_MS,
+  MAX_SMART_ROUTER_TTFT_SAMPLES,
+  type SmartRouterGroupOption,
+  type SmartRouterStrategy,
+} from '@/features/smart-routing'
+import {
+  groupVisualClasses,
+  resolveGroupVisualColor,
+  sortGroupNames,
+} from '@/lib/group-visuals'
+import { cn } from '@/lib/utils'
+import { useSystemConfigStore } from '@/stores/system-config-store'
+
+import type { ApiKeyFormValues } from '../lib'
+import {
+  indexGroupModels,
+  filterRoutingGroups,
+} from '../lib/group-model-search'
+
+type ApiKeySmartPolicyEditorProps = {
+  form: UseFormReturn<ApiKeyFormValues>
+  groups: SmartRouterGroupOption[]
+  catalogUpdatedAt?: number
+  attemptLimitEnabled?: boolean
+  maxAttempts?: number
+  maxFailureThreshold?: number
+  defaultMaxRatioPPM?: number
+  absoluteMaxRatioPPM?: number
+  maxQueueWaitMs?: number
+}
+
+const strategyOptions: Array<{
+  value: SmartRouterStrategy
+  label: string
+  description: string
+  icon: typeof BadgeDollarSign
+}> = [
+  {
+    value: 'price',
+    label: 'Lowest cost',
+    description: 'Prefer the lowest current effective price',
+    icon: BadgeDollarSign,
+  },
+  {
+    value: 'stability',
+    label: 'Most stable',
+    description: 'Prefer recent success rate and route health',
+    icon: ShieldCheck,
+  },
+  {
+    value: 'latency',
+    label: 'Fastest response',
+    description: 'Prefer recent p95 time to first token',
+    icon: Gauge,
+  },
+  {
+    value: 'balanced',
+    label: 'Balanced',
+    description: 'Balance stability, price, and first-token speed',
+    icon: Scale,
+  },
+  {
+    value: 'custom_weighted',
+    label: 'Custom weighted ranking',
+    description:
+      'Use your saved cache, cost, first-token speed, and stability weights',
+    icon: SlidersHorizontal,
+  },
+  {
+    value: 'manual',
+    label: 'Manual order',
+    description: 'Try groups in the order you arrange',
+    icon: ListOrdered,
+  },
+]
+
+function formatRatio(ratioPPM: number) {
+  return (ratioPPM / 1_000_000).toLocaleString(undefined, {
+    maximumFractionDigits: 6,
+  })
+}
+
+function normalizeManualOrder(
+  current: string[],
+  selected: string[],
+  options: SmartRouterGroupOption[]
+) {
+  const selectedSet = new Set(selected)
+  const result = current.filter((group) => selectedSet.has(group))
+  for (const option of options) {
+    if (selectedSet.has(option.group) && !result.includes(option.group)) {
+      result.push(option.group)
+    }
+  }
+  return result
+}
+
+function formatCatalogTime(value?: number) {
+  if (!value) return null
+  const milliseconds = value > 10_000_000_000 ? value : value * 1000
+  return new Date(milliseconds).toLocaleString()
+}
+
+function getHealthBadge(group: SmartRouterGroupOption) {
+  if (group.health_status) return group.health_status
+  if ((group.healthy_route_count ?? 0) > 0) return 'healthy'
+  return 'unknown'
+}
+
+function getHealthLabelKey(status: string) {
+  if (status === 'healthy') return 'Healthy'
+  if (status === 'degraded') return 'Degraded'
+  if (status === 'unavailable') return 'Temporarily unavailable'
+  if (status === 'quarantined') return 'Long-term isolated'
+  return 'Health unknown'
+}
+
+function getHealthBadgeVariant(status: string) {
+  if (status === 'quarantined' || status === 'unavailable') {
+    return 'destructive' as const
+  }
+  if (status === 'healthy') return 'secondary' as const
+  return 'outline' as const
+}
+
+export function ApiKeySmartPolicyEditor(props: ApiKeySmartPolicyEditorProps) {
+  const { t } = useTranslation()
+  const groupColors = useSystemConfigStore(
+    (state) => state.config.groupColors ?? {}
+  )
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [groupSearch, setGroupSearch] = useState('')
+  const {
+    models,
+    isLoading: modelsLoading,
+    error: modelsError,
+  } = usePricingData()
+  const groupModels = useMemo(() => indexGroupModels(models), [models])
+  const [draggingGroup, setDraggingGroup] = useState<string | null>(null)
+  const selectedGroups = props.form.watch('smart_policy.selected_groups')
+  const allowFutureGroups = props.form.watch('smart_policy.allow_future_groups')
+  const strategy = props.form.watch('smart_policy.strategy')
+  const manualOrder = props.form.watch('smart_policy.manual_group_order')
+  const maxRatio = props.form.watch('smart_policy.max_effective_ratio')
+  const inheritedMaxRatioPPM =
+    props.defaultMaxRatioPPM ?? props.absoluteMaxRatioPPM ?? 0
+  const effectiveKeyCapPPM =
+    maxRatio > 0 ? maxRatio * 1_000_000 : inheritedMaxRatioPPM
+  const ttftEnabled = props.form.watch('smart_policy.ttft_enabled')
+  const affinityEnabled = props.form.watch('smart_policy.affinity_enabled')
+  const affinityMode = props.form.watch('smart_policy.affinity_mode')
+  const queueMode = props.form.watch('smart_policy.queue_mode')
+  const compressionThresholds = useFieldArray({
+    control: props.form.control,
+    name: 'smart_policy.compression_thresholds',
+  })
+  const orderedGroups = normalizeManualOrder(
+    manualOrder,
+    selectedGroups,
+    props.groups
+  )
+  const displayGroups = useMemo(() => {
+    const byName = new Map(props.groups.map((group) => [group.group, group]))
+    const names = sortGroupNames(
+      props.groups.map((group) => group.group),
+      groupColors,
+      (group) => byName.get(group)?.effective_ratio_ppm
+    )
+    return names.flatMap((name) => {
+      const group = byName.get(name)
+      return group ? [group] : []
+    })
+  }, [groupColors, props.groups])
+  const matchingGroups = useMemo(
+    () => filterRoutingGroups(displayGroups, groupModels, groupSearch),
+    [displayGroups, groupModels, groupSearch]
+  )
+  const allSelected =
+    props.groups.length > 0 &&
+    selectedGroups.length === props.groups.length &&
+    props.groups.every((group) => selectedGroups.includes(group.group))
+  const catalogTime = formatCatalogTime(props.catalogUpdatedAt)
+  let groupScopeDescription = t(
+    'This custom scope stays fixed. Newly discovered groups will wait for you to select them.'
+  )
+  if (allowFutureGroups) {
+    groupScopeDescription = t(
+      'New groups will be included automatically while your unchecked groups stay excluded.'
+    )
+  }
+  if (allSelected && allowFutureGroups) {
+    groupScopeDescription = t(
+      'All current groups are selected. New groups discovered later will join this key automatically.'
+    )
+  }
+
+  const updateSelectedGroups = (next: string[], futureGroups?: boolean) => {
+    const shouldFollowFutureGroups =
+      futureGroups ?? (allowFutureGroups && next.length === props.groups.length)
+    props.form.setValue('smart_policy.selected_groups', next, {
+      shouldDirty: true,
+      shouldValidate: true,
+    })
+    props.form.setValue(
+      'smart_policy.allow_future_groups',
+      shouldFollowFutureGroups,
+      { shouldDirty: true, shouldValidate: true }
+    )
+    props.form.setValue(
+      'smart_policy.manual_group_order',
+      normalizeManualOrder(manualOrder, next, props.groups),
+      { shouldDirty: true, shouldValidate: true }
+    )
+  }
+
+  const setManualOrder = (next: string[]) => {
+    props.form.setValue('smart_policy.manual_group_order', next, {
+      shouldDirty: true,
+      shouldValidate: true,
+    })
+  }
+
+  const moveGroup = (index: number, direction: -1 | 1) => {
+    const target = index + direction
+    if (target < 0 || target >= orderedGroups.length) return
+    const next = [...orderedGroups]
+    ;[next[index], next[target]] = [next[target], next[index]]
+    setManualOrder(next)
+  }
+
+  const dropGroup = (targetGroup: string, sourceGroup: string | null) => {
+    if (!sourceGroup || sourceGroup === targetGroup) return
+    const sourceIndex = orderedGroups.indexOf(sourceGroup)
+    const targetIndex = orderedGroups.indexOf(targetGroup)
+    if (sourceIndex < 0 || targetIndex < 0) return
+    const next = [...orderedGroups]
+    next.splice(sourceIndex, 1)
+    next.splice(targetIndex, 0, sourceGroup)
+    setManualOrder(next)
+  }
+
+  return (
+    <div className='flex min-w-0 flex-col gap-5'>
+      <div className='space-y-3'>
+        <div className='flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between'>
+          <div>
+            <h4 className='text-sm font-medium'>{t('Allowed group scope')}</h4>
+            <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>
+              {t(
+                'This key can automatically choose only from the groups selected here. Each request also filters out groups that do not support its model.'
+              )}
+            </p>
+          </div>
+          <div className='flex shrink-0 gap-2'>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() =>
+                updateSelectedGroups(
+                  groupSearch.trim()
+                    ? [
+                        ...new Set([
+                          ...selectedGroups,
+                          ...matchingGroups.map((group) => group.group),
+                        ]),
+                      ]
+                    : props.groups.map((group) => group.group),
+                  groupSearch.trim() ? allowFutureGroups : true
+                )
+              }
+            >
+              {groupSearch.trim()
+                ? t('Select matching groups')
+                : t('Select all')}
+            </Button>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() =>
+                updateSelectedGroups(
+                  groupSearch.trim()
+                    ? selectedGroups.filter(
+                        (group) =>
+                          !matchingGroups.some((match) => match.group === group)
+                      )
+                    : [],
+                  false
+                )
+              }
+            >
+              {groupSearch.trim()
+                ? t('Clear matching groups')
+                : t('Clear selection')}
+            </Button>
+          </div>
+        </div>
+
+        <Input
+          value={groupSearch}
+          onChange={(event) => setGroupSearch(event.target.value)}
+          placeholder={t('Search groups or model IDs')}
+          aria-label={t('Search groups or model IDs')}
+        />
+        <p className='text-muted-foreground text-xs'>
+          {t('{{matching}} matching groups · {{selected}} selected', {
+            matching: matchingGroups.length,
+            selected: selectedGroups.length,
+          })}
+          {' · '}
+          {t('Searching keeps your existing selections.')}
+        </p>
+        {modelsLoading && (
+          <p className='text-muted-foreground text-xs' role='status'>
+            {t('Loading model catalog…')}
+          </p>
+        )}
+        {modelsError && (
+          <p className='text-destructive text-xs' role='alert'>
+            {t(
+              'Model catalog unavailable. Group name search is still available.'
+            )}
+          </p>
+        )}
+        {props.groups.length > 0 && matchingGroups.length === 0 && (
+          <p className='text-muted-foreground p-3 text-xs'>
+            {t('No matching groups')}
+          </p>
+        )}
+        <FormField
+          control={props.form.control}
+          name='smart_policy.selected_groups'
+          render={({ field }) => (
+            <FormItem>
+              {props.groups.length === 0 ? (
+                <div className='text-muted-foreground rounded-lg border border-dashed p-4 text-center text-xs'>
+                  {t('No automatically discovered groups are available yet.')}
+                </div>
+              ) : (
+                <div className='grid gap-2 sm:grid-cols-2'>
+                  {matchingGroups.map((group) => {
+                    const checked = field.value.includes(group.group)
+                    const aboveCap =
+                      effectiveKeyCapPPM > 0 &&
+                      group.effective_ratio_ppm > effectiveKeyCapPPM
+                    const health = getHealthBadge(group)
+                    return (
+                      <div
+                        key={group.group}
+                        onClick={(event) => {
+                          if (
+                            (event.target as HTMLElement).closest(
+                              'button, input, summary, details, [role=checkbox]'
+                            )
+                          ) {
+                            return
+                          }
+                          updateSelectedGroups(
+                            checked
+                              ? field.value.filter(
+                                  (value) => value !== group.group
+                                )
+                              : [...field.value, group.group]
+                          )
+                        }}
+                        className={cn(
+                          'hover:bg-muted/30 flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors',
+                          groupVisualClasses(
+                            resolveGroupVisualColor(group.group, groupColors)
+                          ).surface,
+                          checked && 'border-primary/50 bg-primary/5'
+                        )}
+                      >
+                        <Checkbox
+                          aria-label={group.group}
+                          checked={checked}
+                          onCheckedChange={(nextChecked) => {
+                            const next = nextChecked
+                              ? [...field.value, group.group]
+                              : field.value.filter(
+                                  (value) => value !== group.group
+                                )
+                            updateSelectedGroups(next)
+                          }}
+                          className='mt-0.5'
+                        />
+                        <span className='min-w-0 flex-1'>
+                          <span className='flex flex-wrap items-center gap-1.5'>
+                            <GroupBadge
+                              group={group.group}
+                              size='sm'
+                              copyable={false}
+                            />
+                            <Badge variant='outline' className='text-[10px]'>
+                              {formatRatio(group.effective_ratio_ppm)}x
+                            </Badge>
+                            <Badge
+                              variant={getHealthBadgeVariant(health)}
+                              className='text-[10px]'
+                            >
+                              {t(getHealthLabelKey(health))}
+                            </Badge>
+                            {aboveCap ? (
+                              <Badge variant='outline' className='text-[10px]'>
+                                {t('Above this key cap')}
+                              </Badge>
+                            ) : null}
+                          </span>
+                          <span className='text-muted-foreground mt-1 block text-xs leading-relaxed'>
+                            {t(
+                              '{{models}} models · {{healthy}} / {{routes}} healthy routes',
+                              {
+                                models: group.supported_model_count ?? 0,
+                                healthy: group.healthy_route_count ?? 0,
+                                routes: group.route_count ?? 0,
+                              }
+                            )}
+                          </span>
+                          {(groupModels.get(group.group)?.length ?? 0) > 0 && (
+                            <details className='mt-2 text-xs'>
+                              <summary className='text-primary w-fit cursor-pointer rounded focus-visible:ring-2'>
+                                {t('View {{count}} models', {
+                                  count:
+                                    groupModels.get(group.group)?.length ?? 0,
+                                })}
+                              </summary>
+                              <span className='mt-1 flex max-h-40 flex-wrap gap-1 overflow-y-auto'>
+                                {groupModels.get(group.group)?.map((name) => (
+                                  <code
+                                    key={name}
+                                    className={cn(
+                                      'bg-muted text-foreground max-w-full rounded px-1.5 py-0.5 break-all',
+                                      groupSearch.trim() &&
+                                        name
+                                          .toLowerCase()
+                                          .includes(
+                                            groupSearch.trim().toLowerCase()
+                                          ) &&
+                                        'bg-primary/10 text-primary font-semibold'
+                                    )}
+                                  >
+                                    {name}
+                                  </code>
+                                ))}
+                              </span>
+                            </details>
+                          )}
+                          {groupSearch.trim() &&
+                            groupModels
+                              .get(group.group)
+                              ?.some((name) =>
+                                name
+                                  .toLowerCase()
+                                  .includes(groupSearch.trim().toLowerCase())
+                              ) && (
+                              <span className='text-foreground mt-1 block text-xs break-all'>
+                                {groupModels
+                                  .get(group.group)
+                                  ?.filter((name) =>
+                                    name
+                                      .toLowerCase()
+                                      .includes(
+                                        groupSearch.trim().toLowerCase()
+                                      )
+                                  )
+                                  .slice(0, 4)
+                                  .join(' · ')}
+                              </span>
+                            )}
+                          {group.description ? (
+                            <span className='text-muted-foreground mt-1 block text-xs leading-relaxed'>
+                              {group.description}
+                            </span>
+                          ) : null}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+              <FormField
+                control={props.form.control}
+                name='smart_policy.allow_future_groups'
+                render={({ field }) => (
+                  <FormItem className='bg-muted/20 flex items-center justify-between gap-3 rounded-lg border p-3'>
+                    <div className='min-w-0'>
+                      <FormLabel>
+                        {t('Automatically include future groups')}
+                      </FormLabel>
+                      <FormDescription>
+                        {field.value
+                          ? t(
+                              'Newly discovered groups will be added to this key automatically; groups you excluded remain excluded.'
+                            )
+                          : t(
+                              'Only the groups selected above can be used. You can turn this on later when you want new groups included.'
+                            )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                        disabled={props.groups.length === 0}
+                        aria-label={t('Automatically include future groups')}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+              <FormDescription>
+                {groupScopeDescription}
+                {catalogTime
+                  ? ` ${t('Catalog updated {{time}}', { time: catalogTime })}`
+                  : ''}
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+      </div>
+
+      <Separator />
+
+      <FormField
+        control={props.form.control}
+        name='smart_policy.strategy'
+        render={({ field }) => (
+          <FormItem>
+            <FormLabel>{t('Routing preference')}</FormLabel>
+            <FormDescription>
+              {t(
+                'The preference belongs only to this key. Unhealthy, incompatible, and blocked routes are always filtered first.'
+              )}
+            </FormDescription>
+            <div className='grid gap-2 sm:grid-cols-2'>
+              {strategyOptions.map((option) => {
+                const Icon = option.icon
+                const selected = field.value === option.value
+                return (
+                  <button
+                    key={option.value}
+                    type='button'
+                    aria-pressed={selected}
+                    className={cn(
+                      'hover:bg-muted/30 flex min-w-0 items-start gap-3 rounded-lg border p-3 text-left transition-colors',
+                      selected &&
+                        'border-primary/50 bg-primary/5 ring-primary/15 ring-2',
+                      option.value === 'manual' && 'sm:col-span-2'
+                    )}
+                    onClick={() => {
+                      field.onChange(option.value)
+                      if (option.value === 'latency') {
+                        props.form.setValue('smart_policy.ttft_enabled', true, {
+                          shouldDirty: true,
+                        })
+                      }
+                      if (option.value === 'manual') {
+                        setManualOrder(orderedGroups)
+                      }
+                    }}
+                  >
+                    <Icon className='text-primary mt-0.5 size-4 shrink-0' />
+                    <span className='min-w-0'>
+                      <span className='block text-sm font-medium'>
+                        {t(option.label)}
+                      </span>
+                      <span className='text-muted-foreground mt-0.5 block text-xs leading-relaxed'>
+                        {t(option.description)}
+                      </span>
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+            <FormMessage />
+          </FormItem>
+        )}
+      />
+
+      <FormField
+        control={props.form.control}
+        name='smart_policy.actual_input_cost_ranking'
+        render={({ field }) => (
+          <FormItem className='bg-muted/20 flex items-center justify-between gap-3 rounded-lg border p-3'>
+            <div className='min-w-0'>
+              <FormLabel>{t('Sort by recent actual input cost')}</FormLabel>
+              <FormDescription>
+                {t(
+                  'Use the shared recent cache/input-cost snapshot for ordering. Without reliable samples, static price ordering is used; billing is unchanged.'
+                )}
+              </FormDescription>
+            </div>
+            <FormControl>
+              <Switch
+                checked={field.value !== false}
+                onCheckedChange={field.onChange}
+                aria-label={t('Sort by recent actual input cost')}
+              />
+            </FormControl>
+          </FormItem>
+        )}
+      />
+
+      {strategy === 'manual' ? (
+        <FormField
+          control={props.form.control}
+          name='smart_policy.manual_group_order'
+          render={() => (
+            <FormItem>
+              <FormLabel>{t('Manual group order')}</FormLabel>
+              <div className='grid gap-2'>
+                {orderedGroups.map((group, index) => {
+                  const option = props.groups.find(
+                    (candidate) => candidate.group === group
+                  )
+                  return (
+                    <div
+                      key={group}
+                      draggable
+                      onDragStart={(event) => {
+                        setDraggingGroup(group)
+                        event.dataTransfer.effectAllowed = 'move'
+                        event.dataTransfer.setData('text/plain', group)
+                      }}
+                      onDragEnd={() => setDraggingGroup(null)}
+                      onDragOver={(event) => {
+                        event.preventDefault()
+                        event.dataTransfer.dropEffect = 'move'
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        dropGroup(
+                          group,
+                          event.dataTransfer.getData('text/plain') ||
+                            draggingGroup
+                        )
+                        setDraggingGroup(null)
+                      }}
+                      className={cn(
+                        'bg-muted/20 flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2',
+                        draggingGroup === group && 'opacity-50'
+                      )}
+                    >
+                      <GripVertical className='text-muted-foreground size-4 shrink-0 cursor-grab' />
+                      <span className='w-6 shrink-0 text-center text-xs tabular-nums'>
+                        {index + 1}
+                      </span>
+                      <span className='min-w-0 flex-1 truncate'>
+                        <GroupBadge group={group} size='sm' copyable={false} />
+                      </span>
+                      {option ? (
+                        <Badge variant='outline' className='text-[10px]'>
+                          {formatRatio(option.effective_ratio_ppm)}x
+                        </Badge>
+                      ) : null}
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        size='icon-sm'
+                        disabled={index === 0}
+                        aria-label={t('Move {{group}} up', { group })}
+                        title={t('Move up')}
+                        onClick={() => moveGroup(index, -1)}
+                      >
+                        <ArrowUp />
+                      </Button>
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        size='icon-sm'
+                        disabled={index === orderedGroups.length - 1}
+                        aria-label={t('Move {{group}} down', { group })}
+                        title={t('Move down')}
+                        onClick={() => moveGroup(index, 1)}
+                      >
+                        <ArrowDown />
+                      </Button>
+                    </div>
+                  )
+                })}
+              </div>
+              <FormDescription>
+                {t(
+                  'Drag to reorder. The router tries the first eligible healthy group, then continues downward when needed.'
+                )}
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+      ) : null}
+
+      <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+        <div className='rounded-lg border'>
+          <CollapsibleTrigger
+            render={
+              <button
+                type='button'
+                className='hover:bg-muted/30 flex w-full items-center gap-3 px-3 py-3 text-left transition-colors'
+              />
+            }
+          >
+            <Settings2 className='text-muted-foreground size-4 shrink-0' />
+            <span className='min-w-0 flex-1'>
+              <span className='block text-sm font-medium'>
+                {t('Smart routing advanced settings')}
+              </span>
+              <span className='text-muted-foreground mt-0.5 block text-xs'>
+                {t('The defaults are suitable for most users.')}
+              </span>
+            </span>
+            <ChevronDown
+              className={cn(
+                'text-muted-foreground size-4 shrink-0 transition-transform',
+                advancedOpen && 'rotate-180'
+              )}
+            />
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className='flex flex-col gap-5 border-t p-3'>
+              <div className='grid min-w-0 gap-4 sm:grid-cols-2'>
+                <FormField
+                  control={props.form.control}
+                  name='smart_policy.failure_threshold'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('Consecutive failure threshold')}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          type='number'
+                          min={1}
+                          max={props.maxFailureThreshold ?? 100}
+                          step={1}
+                          value={field.value}
+                          onChange={(event) =>
+                            Number.isFinite(event.target.valueAsNumber) &&
+                            field.onChange(event.target.valueAsNumber)
+                          }
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'After this many shared hard failures, this key temporarily skips the route.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                {props.attemptLimitEnabled !== true ? (
+                  <FormItem>
+                    <FormLabel>{t('Automatic retry coverage')}</FormLabel>
+                    <FormDescription>
+                      {t(
+                        'Replay-safe text requests try every eligible channel in this key group scope, one at a time.'
+                      )}
+                    </FormDescription>
+                  </FormItem>
+                ) : (
+                  <FormField
+                    control={props.form.control}
+                    name='smart_policy.max_attempts'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          {t('Maximum attempts per request')}
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={1}
+                            max={props.maxAttempts ?? 8}
+                            step={1}
+                            value={field.value}
+                            onChange={(event) =>
+                              Number.isFinite(event.target.valueAsNumber) &&
+                              field.onChange(event.target.valueAsNumber)
+                            }
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t(
+                            'Limits total upstream attempts before the first byte.'
+                          )}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+              </div>
+
+              <FormField
+                control={props.form.control}
+                name='smart_policy.max_effective_ratio'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Group ratio ceiling')}</FormLabel>
+                    <FormControl>
+                      <div className='relative'>
+                        <Gauge className='text-muted-foreground absolute top-1/2 left-3 size-4 -translate-y-1/2' />
+                        <Input
+                          type='number'
+                          min={0}
+                          max={Math.min(
+                            MAX_SMART_ROUTER_EFFECTIVE_RATIO,
+                            props.absoluteMaxRatioPPM
+                              ? props.absoluteMaxRatioPPM / 1_000_000
+                              : MAX_SMART_ROUTER_EFFECTIVE_RATIO
+                          )}
+                          step={0.01}
+                          className='pl-9'
+                          value={field.value}
+                          onChange={(event) => {
+                            const value = event.target.valueAsNumber
+                            if (Number.isFinite(value)) field.onChange(value)
+                          }}
+                        />
+                      </div>
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Use 0 to inherit the site group-ratio ceiling. A positive value may lower or raise this key limit up to the site absolute ceiling.'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={props.form.control}
+                name='smart_policy.health_guard'
+                render={() => (
+                  <FormItem className='bg-muted/20 flex items-center justify-between gap-3 rounded-lg border p-3'>
+                    <div className='min-w-0'>
+                      <FormLabel>{t('Shared health protection')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Use server-wide failures, recovery samples, and quarantine state before routing.'
+                        )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked
+                        disabled
+                        aria-label={t(
+                          'Shared health protection is always enabled'
+                        )}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={props.form.control}
+                name='smart_policy.affinity_enabled'
+                render={({ field }) => (
+                  <FormItem className='bg-muted/20 flex items-center justify-between gap-3 rounded-lg border p-3'>
+                    <div className='min-w-0'>
+                      <FormLabel>{t('Cache affinity')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Keep a healthy route when the small price premium can improve prompt-cache reuse.'
+                        )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+
+              {affinityEnabled ? (
+                <div className='flex min-w-0 flex-col gap-4'>
+                  <FormField
+                    control={props.form.control}
+                    name='smart_policy.affinity_mode'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Cache cost strategy')}</FormLabel>
+                        <FormControl>
+                          <RadioGroup
+                            value={field.value}
+                            onValueChange={field.onChange}
+                            className='grid min-w-0 gap-2 sm:grid-cols-2'
+                          >
+                            <label
+                              className={cn(
+                                'border-input hover:bg-muted/35 flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors',
+                                field.value === 'economic_break_even' &&
+                                  'border-primary bg-primary/5 ring-primary/20 ring-2'
+                              )}
+                            >
+                              <RadioGroupItem
+                                value='economic_break_even'
+                                aria-label={t('Smart cost calculation')}
+                                className='mt-0.5'
+                              />
+                              <BrainCircuit className='text-primary mt-0.5 size-4 shrink-0' />
+                              <span className='min-w-0 space-y-1'>
+                                <span className='flex flex-wrap items-center gap-1.5'>
+                                  <span className='font-medium'>
+                                    {t('Smart cost calculation')}
+                                  </span>
+                                  <Badge
+                                    variant='secondary'
+                                    className='text-[10px]'
+                                  >
+                                    {t('Recommended')}
+                                  </Badge>
+                                </span>
+                                <span className='text-muted-foreground block text-xs leading-relaxed'>
+                                  {t(
+                                    'Compare the expected cache rebuild cost with future route savings, then keep or switch automatically.'
+                                  )}
+                                </span>
+                              </span>
+                            </label>
+
+                            <label
+                              className={cn(
+                                'border-input hover:bg-muted/35 flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors',
+                                field.value === 'fixed_premium' &&
+                                  'border-primary bg-primary/5 ring-primary/20 ring-2'
+                              )}
+                            >
+                              <RadioGroupItem
+                                value='fixed_premium'
+                                aria-label={t('Fixed price premium')}
+                                className='mt-0.5'
+                              />
+                              <Coins className='text-muted-foreground mt-0.5 size-4 shrink-0' />
+                              <span className='min-w-0 space-y-1'>
+                                <span className='font-medium'>
+                                  {t('Fixed price premium')}
+                                </span>
+                                <span className='text-muted-foreground block text-xs leading-relaxed'>
+                                  {t(
+                                    'Keep the current healthy cache route while its price stays within your fixed premium.'
+                                  )}
+                                </span>
+                              </span>
+                            </label>
+                          </RadioGroup>
+                        </FormControl>
+                        <FormDescription>
+                          {affinityMode === 'economic_break_even'
+                            ? t(
+                                'Learning happens automatically. Until enough reliable samples exist, the fixed premium remains the fallback.'
+                              )
+                            : t(
+                                'This preserves the original cache-affinity behavior without statistical learning.'
+                              )}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <div className='grid min-w-0 gap-4 sm:grid-cols-2'>
+                    {affinityMode === 'fixed_premium' ? (
+                      <FormField
+                        control={props.form.control}
+                        name='smart_policy.affinity_max_premium_percent'
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              {t('Affinity price premium (%)')}
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={field.value}
+                                onChange={(event) =>
+                                  Number.isFinite(event.target.valueAsNumber) &&
+                                  field.onChange(event.target.valueAsNumber)
+                                }
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    ) : null}
+
+                    <FormField
+                      control={props.form.control}
+                      name='smart_policy.affinity_ttl_seconds'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Affinity lifetime (seconds)')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={0}
+                              max={604800}
+                              step={1}
+                              value={field.value}
+                              onChange={(event) =>
+                                Number.isFinite(event.target.valueAsNumber) &&
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+
+                  {affinityMode === 'economic_break_even' ? (
+                    <div className='rounded-lg border p-3'>
+                      <div className='flex flex-wrap items-start justify-between gap-2'>
+                        <div className='min-w-0'>
+                          <p className='text-sm font-medium'>
+                            {t('Known context compaction points')}
+                          </p>
+                          <p className='text-muted-foreground mt-1 text-xs leading-relaxed'>
+                            {t(
+                              'Optional. Add a model only when you know its compaction point; all other models learn automatically from real usage.'
+                            )}
+                          </p>
+                        </div>
+                        <Button
+                          type='button'
+                          size='sm'
+                          variant='outline'
+                          onClick={() =>
+                            compressionThresholds.append({
+                              model: '',
+                              tokens: 200000,
+                            })
+                          }
+                        >
+                          <Plus data-icon='inline-start' />
+                          {t('Add model')}
+                        </Button>
+                      </div>
+
+                      {compressionThresholds.fields.length > 0 ? (
+                        <div className='mt-3 space-y-3'>
+                          {compressionThresholds.fields.map(
+                            (threshold, index) => (
+                              <div
+                                key={threshold.id}
+                                className='grid min-w-0 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(10rem,0.65fr)_2.25rem] sm:items-start'
+                              >
+                                <FormField
+                                  control={props.form.control}
+                                  name={`smart_policy.compression_thresholds.${index}.model`}
+                                  render={({ field }) => (
+                                    <FormItem>
+                                      <FormLabel>{t('Model')}</FormLabel>
+                                      <FormControl>
+                                        <Input
+                                          placeholder='gpt-5.6-sol'
+                                          {...field}
+                                        />
+                                      </FormControl>
+                                      <FormMessage />
+                                    </FormItem>
+                                  )}
+                                />
+                                <FormField
+                                  control={props.form.control}
+                                  name={`smart_policy.compression_thresholds.${index}.tokens`}
+                                  render={({ field }) => (
+                                    <FormItem>
+                                      <FormLabel>
+                                        {t('Context tokens')}
+                                      </FormLabel>
+                                      <FormControl>
+                                        <Input
+                                          type='number'
+                                          min={1}
+                                          max={100000000}
+                                          step={1000}
+                                          value={field.value}
+                                          onChange={(event) =>
+                                            Number.isFinite(
+                                              event.target.valueAsNumber
+                                            ) &&
+                                            field.onChange(
+                                              event.target.valueAsNumber
+                                            )
+                                          }
+                                        />
+                                      </FormControl>
+                                      <FormMessage />
+                                    </FormItem>
+                                  )}
+                                />
+                                <Button
+                                  type='button'
+                                  size='icon'
+                                  variant='ghost'
+                                  className='mt-6'
+                                  aria-label={t('Remove model threshold')}
+                                  title={t('Remove model threshold')}
+                                  onClick={() =>
+                                    compressionThresholds.remove(index)
+                                  }
+                                >
+                                  <Trash2 />
+                                </Button>
+                              </div>
+                            )
+                          )}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <FormField
+                control={props.form.control}
+                name='smart_policy.ttft_enabled'
+                render={({ field }) => (
+                  <FormItem className='bg-muted/20 flex items-center justify-between gap-3 rounded-lg border p-3'>
+                    <div className='min-w-0'>
+                      <FormLabel>{t('First-token target')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Apply a p95 latency target and hard limit to eligible routes.'
+                        )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+
+              {ttftEnabled ? (
+                <div className='grid min-w-0 gap-3 sm:grid-cols-3'>
+                  {(
+                    [
+                      ['ttft_target_ms', 'Target p95 (ms)'],
+                      ['ttft_hard_max_ms', 'Hard maximum (ms)'],
+                      ['ttft_min_samples', 'Minimum samples'],
+                    ] as const
+                  ).map(([name, label]) => (
+                    <FormField
+                      key={name}
+                      control={props.form.control}
+                      name={`smart_policy.${name}`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t(label)}</FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={1}
+                              max={
+                                name === 'ttft_min_samples'
+                                  ? MAX_SMART_ROUTER_TTFT_SAMPLES
+                                  : MAX_SMART_ROUTER_TTFT_MS
+                              }
+                              step={1}
+                              value={field.value}
+                              onChange={(event) =>
+                                Number.isFinite(event.target.valueAsNumber) &&
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  ))}
+                </div>
+              ) : null}
+
+              <FormField
+                control={props.form.control}
+                name='smart_policy.recovery_profile'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Recovery pace')}</FormLabel>
+                    <FormDescription>
+                      {t(
+                        'Choose how quickly a recovered route may rejoin this key after health samples succeed.'
+                      )}
+                    </FormDescription>
+                    <Select
+                      value={field.value}
+                      onValueChange={field.onChange}
+                      items={[
+                        {
+                          value: 'fast',
+                          label: t('Fast recovery'),
+                        },
+                        {
+                          value: 'balanced',
+                          label: t('Balanced recovery'),
+                        },
+                        {
+                          value: 'stable',
+                          label: t('Cautious recovery'),
+                        },
+                      ]}
+                    >
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent alignItemWithTrigger={false}>
+                        <SelectGroup>
+                          <SelectItem value='fast'>
+                            {t('Fast recovery')}
+                          </SelectItem>
+                          <SelectItem value='balanced'>
+                            {t('Balanced recovery')}
+                          </SelectItem>
+                          <SelectItem value='stable'>
+                            {t('Cautious recovery')}
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <div className='grid min-w-0 gap-4 sm:grid-cols-2'>
+                <FormField
+                  control={props.form.control}
+                  name='smart_policy.queue_mode'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('When a cheap route is full')}</FormLabel>
+                      <Select
+                        value={field.value}
+                        onValueChange={(value) => {
+                          field.onChange(value)
+                          if (
+                            value === 'short_wait' &&
+                            props.form.getValues(
+                              'smart_policy.queue_max_wait_ms'
+                            ) <= 0
+                          ) {
+                            props.form.setValue(
+                              'smart_policy.queue_max_wait_ms',
+                              Math.min(500, props.maxQueueWaitMs ?? 500),
+                              { shouldDirty: true, shouldValidate: true }
+                            )
+                          }
+                        }}
+                        items={[
+                          {
+                            value: 'no_queue',
+                            label: t('Try the next route immediately'),
+                          },
+                          {
+                            value: 'short_wait',
+                            label: t('Wait briefly for a slot'),
+                          },
+                        ]}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent alignItemWithTrigger={false}>
+                          <SelectGroup>
+                            <SelectItem value='no_queue'>
+                              {t('Try the next route immediately')}
+                            </SelectItem>
+                            <SelectItem value='short_wait'>
+                              {t('Wait briefly for a slot')}
+                            </SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                {queueMode === 'short_wait' ? (
+                  <div className='grid min-w-0 gap-4 sm:col-span-2 sm:grid-cols-2'>
+                    <FormField
+                      control={props.form.control}
+                      name='smart_policy.queue_max_wait_ms'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Maximum queue wait (ms)')}</FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={1}
+                              max={props.maxQueueWaitMs ?? 60000}
+                              step={1}
+                              value={field.value}
+                              onChange={(event) =>
+                                Number.isFinite(event.target.valueAsNumber) &&
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={props.form.control}
+                      name='smart_policy.queue_min_saving_percent'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Minimum saving before waiting (%)')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={0}
+                              max={100}
+                              step={1}
+                              value={field.value}
+                              onChange={(event) =>
+                                Number.isFinite(event.target.valueAsNumber) &&
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              'Wait only when the cheaper route saves at least this percentage.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                ) : null}
+              </div>
+
+              {strategy === 'balanced' ? (
+                <div className='space-y-3'>
+                  <div className='flex items-center gap-2'>
+                    <Activity className='text-muted-foreground size-4' />
+                    <p className='text-sm font-medium'>
+                      {t('Balanced weights')}
+                    </p>
+                  </div>
+                  <div className='grid min-w-0 gap-3 sm:grid-cols-3'>
+                    {(
+                      [
+                        ['balanced_stability_weight', 'Stability weight'],
+                        ['balanced_price_weight', 'Price weight'],
+                        ['balanced_ttft_weight', 'First-token weight'],
+                      ] as const
+                    ).map(([name, label]) => (
+                      <FormField
+                        key={name}
+                        control={props.form.control}
+                        name={`smart_policy.${name}`}
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>{t(label)}</FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={field.value}
+                                onChange={(event) =>
+                                  Number.isFinite(event.target.valueAsNumber) &&
+                                  field.onChange(event.target.valueAsNumber)
+                                }
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {strategy === 'custom_weighted' ? (
+                <div className='space-y-3'>
+                  <div className='flex items-center gap-2'>
+                    <SlidersHorizontal className='text-muted-foreground size-4' />
+                    <div>
+                      <p className='text-sm font-medium'>
+                        {t('Custom ranking weights')}
+                      </p>
+                      <p className='text-muted-foreground text-xs'>
+                        {t(
+                          'The four weights must total 100%. They only affect this smart key and never change which routes are eligible.'
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                  <div className='grid min-w-0 gap-3 sm:grid-cols-4'>
+                    {(
+                      [
+                        ['custom_cache_weight', 'Cache weight'],
+                        ['custom_cost_weight', 'Cost weight'],
+                        ['custom_ttft_weight', 'First-token weight'],
+                        ['custom_stability_weight', 'Stability weight'],
+                      ] as const
+                    ).map(([name, label]) => (
+                      <FormField
+                        key={name}
+                        control={props.form.control}
+                        name={`smart_policy.${name}`}
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>{t(label)}</FormLabel>
+                            <FormControl>
+                              <Input
+                                type='number'
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={field.value}
+                                onChange={(event) =>
+                                  Number.isFinite(event.target.valueAsNumber) &&
+                                  field.onChange(event.target.valueAsNumber)
+                                }
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </CollapsibleContent>
+        </div>
+      </Collapsible>
+    </div>
+  )
+}

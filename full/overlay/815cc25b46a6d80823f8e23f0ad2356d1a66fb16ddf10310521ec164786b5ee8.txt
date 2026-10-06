@@ -1,0 +1,306 @@
+package model
+
+// Durable retry records for the small gap between an authoritative billing
+// commit and the append-only partner projection.  This queue is not a second
+// billing ledger: it stores only a redacted event specification and retries
+// AppendTenantCostEvent until the immutable event/outbox row exists.
+
+import (
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+const (
+	TenantCostProjectionPending    = "pending"
+	TenantCostProjectionProcessing = "processing"
+	TenantCostProjectionSent       = "sent"
+	TenantCostProjectionFailed     = "failed"
+	TenantCostProjectionReview     = "review"
+)
+
+type TenantCostProjectionRetry struct {
+	ID            int64  `json:"id" gorm:"primaryKey"`
+	TenantID      string `json:"tenant_id" gorm:"type:varchar(64);index;uniqueIndex:idx_tenant_projection_retry_event;not null"`
+	EventID       string `json:"event_id" gorm:"type:varchar(128);uniqueIndex:idx_tenant_projection_retry_event;not null"`
+	SpecHash      string `json:"spec_hash" gorm:"type:char(71);not null"`
+	SpecJSON      string `json:"-" gorm:"type:text;not null"`
+	State         string `json:"state" gorm:"type:varchar(24);index;not null"`
+	Attempts      int    `json:"attempts" gorm:"not null"`
+	NextAttemptAt int64  `json:"next_attempt_at" gorm:"type:bigint;index;not null"`
+	LastError     string `json:"last_error,omitempty" gorm:"type:text"`
+	CreatedAt     int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt     int64  `json:"updated_at" gorm:"type:bigint;not null"`
+	CompletedAt   int64  `json:"completed_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostProjectionRetry) TableName() string { return "tenant_cost_projection_retries" }
+
+// EnqueueTenantCostProjection persists a redacted, validated event spec.  A
+// repeated enqueue for the same event/spec is idempotent; a different spec
+// under the same event ID is a review conflict and is never overwritten.
+func EnqueueTenantCostProjection(spec TenantCostEventSpec, cause error) error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error { return EnqueueTenantCostProjectionTx(tx, spec, cause) })
+}
+
+func EnqueueTenantCostProjectionTx(tx *gorm.DB, spec TenantCostEventSpec, cause error) error {
+	if tx == nil {
+		return errors.New("database is not initialized")
+	}
+	normalized, err := spec.normalize()
+	if err != nil {
+		return err
+	}
+	if _, err := requireTenantCostDownstreamTx(tx, normalized.TenantID, false); err != nil {
+		return err
+	}
+	specHash, err := tenantCostProjectionSpecHash(normalized)
+	if err != nil {
+		return err
+	}
+	specJSON, err := common.Marshal(normalized)
+	if err != nil {
+		return err
+	}
+	lastError := "projection append failed"
+	if cause != nil {
+		lastError = cause.Error()
+	}
+	if len(lastError) > 2048 {
+		lastError = lastError[:2048]
+	}
+	now := time.Now().UTC().UnixNano()
+	return func() error {
+		var existing TenantCostProjectionRetry
+		lookupErr := lockForUpdate(tx).Where("tenant_id = ? AND event_id = ?", normalized.TenantID, normalized.EventID).First(&existing).Error
+		if lookupErr == nil {
+			if existing.SpecHash != specHash {
+				return ErrTenantCostConflict
+			}
+			if existing.State == TenantCostProjectionSent || existing.State == TenantCostProjectionProcessing {
+				return nil
+			}
+			return tx.Model(&TenantCostProjectionRetry{}).Where("id = ? AND tenant_id = ?", existing.ID, existing.TenantID).Updates(map[string]interface{}{
+				"state": TenantCostProjectionPending, "next_attempt_at": now, "last_error": lastError, "updated_at": now,
+			}).Error
+		}
+		if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return lookupErr
+		}
+		return tx.Create(&TenantCostProjectionRetry{
+			TenantID: normalized.TenantID, EventID: normalized.EventID, SpecHash: specHash,
+			SpecJSON: string(specJSON), State: TenantCostProjectionPending, NextAttemptAt: now,
+			LastError: lastError, CreatedAt: now, UpdatedAt: now,
+		}).Error
+	}()
+}
+
+func DecodeTenantCostProjectionRetry(row TenantCostProjectionRetry) (TenantCostEventSpec, error) {
+	if !IsValidTenantCostTenantID(row.TenantID) || strings.TrimSpace(row.EventID) == "" || strings.TrimSpace(row.SpecJSON) == "" {
+		return TenantCostEventSpec{}, ErrTenantCostScope
+	}
+	var spec TenantCostEventSpec
+	if err := common.Unmarshal([]byte(row.SpecJSON), &spec); err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	normalized, err := spec.normalize()
+	if err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	// The database row owns the retry namespace.  A payload carrying another
+	// tenant must never be appended under that row, nor may a worker later mark
+	// the other tenant's event as sent/failed.  Keep this check before EventID
+	// and hash validation so a forged but otherwise well-formed payload fails
+	// closed on scope rather than being interpreted as a replay.
+	if normalized.TenantID != strings.TrimSpace(row.TenantID) {
+		return TenantCostEventSpec{}, ErrTenantCostScope
+	}
+	if normalized.EventID != row.EventID {
+		return TenantCostEventSpec{}, ErrTenantCostConflict
+	}
+	hash, err := tenantCostProjectionSpecHash(normalized)
+	if err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	if hash != row.SpecHash {
+		return TenantCostEventSpec{}, ErrTenantCostConflict
+	}
+	return normalized, nil
+}
+
+func tenantCostProjectionSpecHash(spec TenantCostEventSpec) (string, error) {
+	semantic := tenantCostSemanticPayload(spec)
+	if spec.OperationID != "" {
+		return tenantCostEventIdentityHash(semantic)
+	}
+	hash, _, err := tenantCostPayloadHash(semantic)
+	return hash, err
+}
+
+// ClaimTenantCostProjectionRetries leases a bounded due batch for processing and
+// reclaims stale rows after a process crash.  The same DB lock strategy as the
+// outbox prevents two workers from processing a row concurrently.
+func ClaimTenantCostProjectionRetries(limit int, now int64) ([]TenantCostProjectionRetry, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	claimed := make([]TenantCostProjectionRetry, 0, limit)
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		staleBefore := now - int64(10*time.Minute)
+		var rows []TenantCostProjectionRetry
+		query := lockForUpdate(tx).Where("((state IN ? AND next_attempt_at <= ?) OR (state = ? AND updated_at <= ?))",
+			[]string{TenantCostProjectionPending, TenantCostProjectionFailed}, now,
+			TenantCostProjectionProcessing, staleBefore).Order("id asc").Limit(limit).Find(&rows)
+		if query.Error != nil {
+			return query.Error
+		}
+		for i := range rows {
+			row := rows[i]
+			row.State = TenantCostProjectionProcessing
+			row.Attempts++
+			row.UpdatedAt = now
+			if err := tx.Model(&TenantCostProjectionRetry{}).Where("id = ? AND tenant_id = ?", row.ID, row.TenantID).Updates(map[string]interface{}{
+				"state": row.State, "attempts": row.Attempts, "updated_at": row.UpdatedAt,
+			}).Error; err != nil {
+				return err
+			}
+			claimed = append(claimed, row)
+		}
+		return nil
+	})
+	return claimed, err
+}
+
+func MarkTenantCostProjectionRetrySent(eventID string, now int64) error {
+	return MarkTenantCostProjectionRetrySentForTenant(DefaultTenantCostTenantID, eventID, now)
+}
+
+func MarkTenantCostProjectionRetrySentForTenant(tenantID, eventID string, now int64) error {
+	if DB == nil || strings.TrimSpace(eventID) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	result := DB.Model(&TenantCostProjectionRetry{}).
+		Where("tenant_id = ? AND event_id = ? AND state IN ?", tenantID, strings.TrimSpace(eventID), []string{TenantCostProjectionPending, TenantCostProjectionProcessing}).
+		Updates(map[string]interface{}{"state": TenantCostProjectionSent, "completed_at": now, "updated_at": now, "last_error": ""})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func MarkTenantCostProjectionRetryFailed(eventID string, cause error, now int64) error {
+	return MarkTenantCostProjectionRetryFailedForTenant(DefaultTenantCostTenantID, eventID, cause, now)
+}
+
+func MarkTenantCostProjectionRetryFailedForTenant(tenantID, eventID string, cause error, now int64) error {
+	if DB == nil || strings.TrimSpace(eventID) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	message := "unknown error"
+	if cause != nil {
+		message = cause.Error()
+	}
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	var row TenantCostProjectionRetry
+	if err := DB.Where("tenant_id = ? AND event_id = ?", tenantID, strings.TrimSpace(eventID)).First(&row).Error; err != nil {
+		return err
+	}
+	backoff := time.Second * time.Duration(1<<minInt(row.Attempts, 10))
+	if backoff > time.Hour {
+		backoff = time.Hour
+	}
+	result := DB.Model(&TenantCostProjectionRetry{}).Where("id = ? AND tenant_id = ? AND state IN ?", row.ID, tenantID, []string{TenantCostProjectionPending, TenantCostProjectionProcessing}).
+		Updates(map[string]interface{}{"state": TenantCostProjectionFailed, "last_error": message,
+			"next_attempt_at": now + backoff.Nanoseconds(), "updated_at": now})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func MarkTenantCostProjectionRetryReview(eventID string, cause error, now int64) error {
+	return MarkTenantCostProjectionRetryReviewForTenant(DefaultTenantCostTenantID, eventID, cause, now)
+}
+
+func MarkTenantCostProjectionRetryReviewForTenant(tenantID, eventID string, cause error, now int64) error {
+	if DB == nil || strings.TrimSpace(eventID) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	message := "projection requires review"
+	if cause != nil {
+		message = cause.Error()
+	}
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	result := DB.Model(&TenantCostProjectionRetry{}).Where("tenant_id = ? AND event_id = ?", tenantID, strings.TrimSpace(eventID)).
+		Updates(map[string]interface{}{"state": TenantCostProjectionReview, "last_error": message, "updated_at": now})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func ListTenantCostProjectionRetries(limit int) ([]TenantCostProjectionRetry, error) {
+	return ListTenantCostProjectionRetriesForTenant(DefaultTenantCostTenantID, limit)
+}
+
+func ListTenantCostProjectionRetriesForTenant(tenantID string, limit int) ([]TenantCostProjectionRetry, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	var rows []TenantCostProjectionRetry
+	err := DB.Where("tenant_id = ?", tenantID).Order("id desc").Limit(limit).Find(&rows).Error
+	return rows, err
+}

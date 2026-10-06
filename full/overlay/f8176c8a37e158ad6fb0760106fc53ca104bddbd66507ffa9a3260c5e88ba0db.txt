@@ -1,0 +1,67 @@
+package model
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRecoverTaskProxyPreservesActiveAndFailedState(t *testing.T) {
+	for _, mode := range []string{"never_attempted", "running", "active_reader", "real_failure", "deleted", "foreign_owner", "repeat_after_failure"} {
+		t.Run(mode, func(t *testing.T) {
+			prepareMediaModelTest(t)
+			task := Task{TaskID: "public", UserId: 7, Status: TaskStatusFinalizing}
+			require.NoError(t, DB.Create(&task).Error)
+			blob := MediaBlob{PublicID: "blob-original", UserID: 7, Status: MediaBlobStatusReady, StorageBackend: MediaStorageBackendRemote, PrivateSource: "task://public", MaterializeStatus: MediaMaterializeDisabled}
+			switch mode {
+			case "running":
+				blob.MaterializeStatus = MediaMaterializeRunning
+				blob.MaterializeLeaseOwner = "other-worker"
+				blob.MaterializeLeaseUntil = time.Now().Add(time.Minute).Unix()
+			case "active_reader":
+				blob.AccessLeaseUntil = time.Now().Add(time.Minute).Unix()
+				blob.AccessLeaseCount = 1
+			case "real_failure":
+				blob.MaterializeAttempts = 3
+				blob.MaterializeStatus = MediaMaterializeAbandoned
+			case "deleted":
+				blob.DeletedAt = time.Now().Unix()
+			case "foreign_owner":
+				blob.UserID = 8
+			}
+			require.NoError(t, DB.Create(&blob).Error)
+			artifact := TaskArtifact{PublicAssetID: "original-asset", TaskRowID: task.ID, TaskPublicID: task.TaskID, UserID: 7, MediaBlobID: blob.ID, Type: "video", ProviderOutputIdentity: "task.result_url"}
+			require.NoError(t, DB.Create(&artifact).Error)
+			before := blob
+			_, err := RecoverTaskProxyArtifact(&task, "https://provider.test/v1/videos/provider/download", "task.completed_url")
+			require.NoError(t, err)
+			require.NoError(t, DB.First(&blob, blob.ID).Error)
+			if mode == "never_attempted" || mode == "repeat_after_failure" {
+				assert.Equal(t, "https://provider.test/v1/videos/provider/download", blob.PrivateSource)
+				assert.Equal(t, MediaMaterializePending, blob.MaterializeStatus)
+			} else {
+				assert.Equal(t, before.PrivateSource, blob.PrivateSource)
+				assert.Equal(t, before.MaterializeStatus, blob.MaterializeStatus)
+				assert.Equal(t, before.MaterializeAttempts, blob.MaterializeAttempts)
+				assert.Equal(t, before.MaterializeLeaseOwner, blob.MaterializeLeaseOwner)
+			}
+			if mode == "repeat_after_failure" {
+				require.NoError(t, DB.Model(&blob).Updates(map[string]any{"materialize_status": MediaMaterializeRetry, "materialize_attempts": 2, "materialize_next_retry_at": time.Now().Add(time.Hour).Unix()}).Error)
+				require.NoError(t, DB.First(&blob, blob.ID).Error)
+				before = blob
+				_, err = RecoverTaskProxyArtifact(&task, blob.PrivateSource, "task.completed_url")
+				require.NoError(t, err)
+				require.NoError(t, DB.First(&blob, blob.ID).Error)
+				assert.Equal(t, before.MaterializeAttempts, blob.MaterializeAttempts)
+				assert.Equal(t, before.MaterializeNextRetryAt, blob.MaterializeNextRetryAt)
+			}
+			require.NoError(t, DB.First(&artifact, artifact.ID).Error)
+			assert.Equal(t, "original-asset", artifact.PublicAssetID)
+			var count int64
+			require.NoError(t, DB.Model(&Task{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+}

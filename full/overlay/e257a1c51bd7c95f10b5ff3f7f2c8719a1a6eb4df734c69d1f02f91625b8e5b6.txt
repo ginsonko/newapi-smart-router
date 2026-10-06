@@ -1,0 +1,737 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/relay"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+func relaySmart(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	baseInfo *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	policy smartrouter.Policy,
+) (resultErr *types.NewAPIError) {
+	if baseInfo == nil {
+		return types.NewError(errors.New("smart router relay info is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	estimatedContext := promptTokens
+	if meta != nil && meta.MaxTokens > 0 {
+		maxInt := int(^uint(0) >> 1)
+		if estimatedContext > maxInt-meta.MaxTokens {
+			estimatedContext = maxInt
+		} else {
+			estimatedContext += meta.MaxTokens
+		}
+	}
+	routeRequest, err := service.BuildSmartRouteRequest(c, baseInfo.OriginModelName, estimatedContext)
+	if err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	if !isSmartTextReplayRoutable(routeRequest.ReplayClass) {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("智能路由无法安全重试此请求（%s）；请改用固定分组 Key", routeRequest.ReplayClass.String()),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	return relaySmartWithEngine(
+		c, relayFormat, baseInfo, promptTokens, meta, policy, routeRequest, engine, dispatchSmartRelay,
+	)
+}
+
+func isSmartTextReplayRoutable(replayClass smartrouter.ReplayClass) bool {
+	return replayClass == smartrouter.ReplaySafeText || replayClass == smartrouter.ReplaySideEffecting
+}
+
+type smartRelayAttemptDispatcher func(*gin.Context, types.RelayFormat, *relaycommon.RelayInfo) *types.NewAPIError
+
+func relaySmartWithEngine(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	baseInfo *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	policy smartrouter.Policy,
+	routeRequest smartrouter.RouteRequest,
+	engine *service.SmartRouterEngine,
+	dispatch smartRelayAttemptDispatcher,
+) (resultErr *types.NewAPIError) {
+	if engine == nil || dispatch == nil {
+		return types.NewError(errors.New("smart router execution dependencies are unavailable"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+	session, err := engine.NewSession(
+		c.Request.Context(), baseInfo.TokenId, baseInfo.UserGroup, routeRequest, policy,
+	)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	policy = session.ResolvedPolicy()
+	if routeRequest.ReplayClass == smartrouter.ReplaySafeImage {
+		if jobID := c.GetInt64(service.ImageRouteJobContextKey); jobID > 0 {
+			job, found, loadErr := model.GetImageRouteJob(c.GetString("image_route_public_id"), baseInfo.UserId)
+			if loadErr != nil || !found || job.ID != jobID {
+				return types.NewError(errors.New("绘图路由作业不可用"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+			}
+			var attempted []int
+			var groups []string
+			if common.UnmarshalJsonStr(job.AttemptedChannelsJSON, &attempted) != nil || common.UnmarshalJsonStr(job.FrozenGroupsJSON, &groups) != nil {
+				return types.NewError(errors.New("绘图路由快照无效"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+			}
+			session.ResumeImageAttempts(attempted, groups)
+			if current, found := c.Get("image_route_current_policy"); found {
+				if current, ok := current.(smartrouter.Policy); ok {
+					session.RestrictImageCurrentPolicy(current)
+				}
+			}
+		}
+	}
+	policy = session.ResolvedPolicy()
+
+	responseHeaders := c.Writer.Header().Clone()
+	requestHeaders := c.Request.Header.Clone()
+	var billing *service.SmartRouteBillingSession
+	var lastRetryableError *types.NewAPIError
+	completed := false
+	attemptNumber := 0
+	eligibleCandidateChannels := make(map[int]struct{})
+	defer func() {
+		if !completed && billing != nil && billing.NeedsRefund() {
+			billing.Refund(c)
+		}
+	}()
+
+routeLoop:
+	for {
+		handle, planErr := session.Next(c.Request.Context())
+		if planErr != nil {
+			if lastRetryableError != nil && c.Request.Context().Err() == nil {
+				finalErr := smartRouteExhaustedAPIErrorWithCandidates(
+					lastRetryableError,
+					attemptNumber,
+					len(eligibleCandidateChannels),
+					smartRouteFailureReason(c, service.ClassifySmartRouteOutcome(lastRetryableError, nil).ErrorSummary),
+					c.GetString(common.RequestIdKey),
+					c.GetString(common.UpstreamRequestIdKey),
+				)
+				recordChannelErrorLog(c, finalErr)
+				return finalErr
+			}
+			return smartRouteControllerError(planErr)
+		}
+		attemptNumber++
+		for _, candidate := range handle.Plan.Candidates {
+			if candidate.Route.ChannelID > 0 {
+				eligibleCandidateChannels[candidate.Route.ChannelID] = struct{}{}
+			}
+		}
+		channel, channelErr := loadCurrentSmartRouteChannel(handle.Route, baseInfo.OriginModelName)
+		if channelErr != nil {
+			engine.Catalogs.Invalidate()
+			engine.Prices.InvalidateAll()
+			outcome := service.ClassifySmartRouteOutcome(channelErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(channelErr), false)
+			if canTryNextSmartRelayAttempt(session, routeRequest.ReplayClass, outcome, false, channelErr, false, 0, c.Request.Context().Err()) {
+				lastRetryableError = channelErr
+				continue
+			}
+			return channelErr
+		}
+
+		routerSetting := smartroutersetting.Normalize(engine.Settings())
+		effectiveMaxRatioPPM := policy.MaxEffectiveRatioPPM
+		if effectiveMaxRatioPPM == 0 {
+			effectiveMaxRatioPPM = routerSetting.DefaultMaxEffectiveRatioPPM
+		}
+		if effectiveMaxRatioPPM > routerSetting.AbsoluteMaxEffectiveRatioPPM {
+			effectiveMaxRatioPPM = routerSetting.AbsoluteMaxEffectiveRatioPPM
+		}
+		if handle.Plan.RatioPPM > effectiveMaxRatioPPM {
+			priceErr := types.NewErrorWithStatusCode(
+				fmt.Errorf("智能路由分组 %s 的最新倍率已超过此 Key 的价格上限", handle.Plan.Group),
+				types.ErrorCodeModelPriceError,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+			outcome := service.SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeUserRejected, FailureScope: service.SmartFailureUser,
+				RouteFailure: true, RetryNextRoute: true,
+			}
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(priceErr), false)
+			if canTryNextSmartRelayAttempt(session, routeRequest.ReplayClass, outcome, false, priceErr, false, 0, c.Request.Context().Err()) {
+				lastRetryableError = priceErr
+				continue
+			}
+			return priceErr
+		}
+
+		confirmationAttempt := 0
+		for {
+			restoreHTTPHeader(c.Writer.Header(), responseHeaders)
+			c.Request.Header = requestHeaders.Clone()
+			resetSmartChannelContext(c)
+			c.Set(string(constant.ContextKeySmartStreamErrorSent), false)
+			common.SetContextKey(c, constant.ContextKeyAutoGroup, handle.Plan.Group)
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, handle.Plan.Group)
+			if setupErr := middleware.SetupContextForSelectedChannel(c, channel, baseInfo.OriginModelName); setupErr != nil {
+				outcome := service.ClassifySmartRouteOutcome(setupErr, c.Request.Context().Err())
+				session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+				appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(setupErr), false)
+				if canTryNextSmartRelayAttempt(session, routeRequest.ReplayClass, outcome, false, setupErr, false, 0, c.Request.Context().Err()) {
+					lastRetryableError = setupErr
+					continue routeLoop
+				}
+				return setupErr
+			}
+			addUsedChannel(c, channel.Id)
+
+			attemptInfo, attemptErr := rebuildSmartRelayInfo(c, relayFormat, promptTokens)
+			if attemptErr != nil {
+				outcome := service.ClassifySmartRouteOutcome(attemptErr, c.Request.Context().Err())
+				session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+				appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(attemptErr), false)
+				return attemptErr
+			}
+			// The regular relay handlers initialize ChannelMeta themselves, but a
+			// smart-route dispatcher (and billing/audit hooks) may inspect the
+			// rebuilt RelayInfo before entering one of those handlers. Initialize it
+			// here after the selected channel context is installed so the object is
+			// complete for every dispatcher and test double.
+			attemptInfo.InitChannelMeta(c)
+			priceData, err := helper.ModelPriceHelper(c, attemptInfo, promptTokens, meta)
+			if err == nil && routeRequest.ReplayClass == smartrouter.ReplaySafeImage && priceData.ParameterPricing == nil {
+				if _, committed := c.Get(types.ParameterCommitmentContextKey); committed {
+					err = fmt.Errorf("%w: 图片候选无法兑现原参数价格承诺", types.ErrParameterCandidateUnavailable)
+				}
+			}
+			if err != nil {
+				priceErr := types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				outcome := service.ClassifySmartRouteOutcome(priceErr, c.Request.Context().Err())
+				session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+				appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(priceErr), false)
+				if routeRequest.ReplayClass == smartrouter.ReplaySafeImage && errors.Is(err, types.ErrParameterCandidateUnavailable) {
+					lastRetryableError = priceErr
+					continue routeLoop
+				}
+				return priceErr
+			}
+			if confirmationAttempt == 0 && relayFormat != types.RelayFormatStandaloneSearch {
+				changed, validateErr := session.ReplanIfPriceQuoteChanged(
+					c.Request.Context(), handle, priceData.PricingRevision,
+				)
+				if validateErr != nil {
+					return smartRouteControllerError(validateErr)
+				}
+				if changed {
+					attemptNumber--
+					continue routeLoop
+				}
+			}
+			helper.FreezeParameterCommitment(c, priceData.ParameterPricing)
+			if err := persistImageRouteCommitment(c); err != nil {
+				return smartRouteControllerError(err)
+			}
+			quote := service.QuotaReservationRouteQuote{
+				RouteId: handle.Plan.RouteID, ChannelId: handle.Plan.ChannelID, Group: handle.Plan.Group,
+				CatalogVersion: handle.Plan.CatalogVersion, PriceVersion: handle.Plan.PriceVersion,
+				RatioPPM: handle.Plan.RatioPPM, QuotedQuota: priceData.QuotaToPreConsume,
+			}
+
+			if billing == nil {
+				billing, resultErr = service.NewSmartRouteBillingSessionWithQuote(
+					c, attemptInfo, priceData.QuotaToPreConsume, quote,
+				)
+				if resultErr != nil {
+					outcome := service.ClassifySmartRouteOutcome(resultErr, c.Request.Context().Err())
+					session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+					appendSmartRouteAudit(c, attemptNumber, handle, priceData.QuotaToPreConsume, outcome, statusCode(resultErr), false)
+					return resultErr
+				}
+			} else {
+				billing.BindRelayInfo(attemptInfo)
+				if err := billing.ReserveAndRecordRouteQuote(priceData.QuotaToPreConsume, quote); err != nil {
+					resultErr = service.SmartRouteBillingError(err)
+					outcome := service.ClassifySmartRouteOutcome(resultErr, c.Request.Context().Err())
+					session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+					appendSmartRouteAudit(c, attemptNumber, handle, priceData.QuotaToPreConsume, outcome, statusCode(resultErr), false)
+					return resultErr
+				}
+			}
+			billing.BindRelayInfo(attemptInfo)
+			session.BindCacheEconomyObservation(c, handle, attemptInfo)
+			session.BindActualInputCostObservation(c, handle, attemptInfo)
+
+			originalRequest := c.Request
+			attemptCtx, cancelAttempt := handle.AttemptContext(originalRequest.Context())
+			c.Request = originalRequest.WithContext(attemptCtx)
+			writerWrittenBefore := c.Writer.Written()
+			writerSizeBefore := c.Writer.Size()
+			appendSmartRouteAudit(c, attemptNumber, handle, priceData.QuotaToPreConsume, service.SmartRouteOutcome{}, 0, false)
+			if jobID := c.GetInt64(service.ImageRouteJobContextKey); jobID > 0 {
+				if recordErr := model.RecordImageRouteJobChannel(jobID, channel.Id); recordErr != nil {
+					cancelAttempt()
+					c.Request = originalRequest
+					session.RecordAttempt(originalRequest.Context(), handle, service.SmartRouteOutcome{Outcome: smartrouter.OutcomeClientCancelled}, 0, 0, false)
+					return types.NewError(recordErr, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+				}
+			}
+			resultErr = dispatch(c, relayFormat, attemptInfo)
+			attemptContextErr := attemptCtx.Err()
+			c.Request = originalRequest
+			cancelAttempt()
+			// Some adaptors parse or convert an already-received provider response
+			// into a fresh NewAPIError, dropping the typed marker. Restore the common
+			// transport evidence before any cancellation/timeout classification.
+			resultErr = service.PreserveSmartRouteUpstreamResponseEvidence(c, resultErr)
+			if resultErr != nil && errors.Is(attemptContextErr, context.DeadlineExceeded) &&
+				originalRequest.Context().Err() == nil &&
+				!service.SmartRouteUpstreamResponseReceived(c) {
+				resultErr = types.NewErrorWithStatusCode(
+					fmt.Errorf("智能路由恢复探测超时: %w", context.DeadlineExceeded),
+					types.ErrorCodeChannelResponseTimeExceeded,
+					http.StatusGatewayTimeout,
+				)
+			}
+			// A media response capture writer keeps ordinary image JSON buffered so
+			// temporary provider URLs can be archived and rewritten. Its buffered
+			// size is therefore non-negative even though no downstream byte was
+			// committed. Only Written reports a response that cannot be replaced.
+			committed := smartRouteAttemptCommitted(c, writerWrittenBefore, writerSizeBefore)
+			if openaichannel.SmartResponsesSemanticBoundaryActive(c) && !openaichannel.SmartResponsesSemanticCommitted(c) {
+				// Responses protocol preludes (created/in_progress/queued) may have
+				// been written, but they are still replaceable before semantic output.
+				committed = false
+			}
+			outcome := service.ClassifySmartRouteOutcome(resultErr, originalRequest.Context().Err())
+			if routeRequest.ReplayClass == smartrouter.ReplaySafeImage && c.GetBool("image_attempt_uncertain") {
+				outcome.Outcome = smartrouter.OutcomeClientCancelled
+				outcome.AffectsRouteHealth = false
+				outcome.RetryNextRoute = false
+			}
+			submissionStarted := true
+			if relayFormat == types.RelayFormatStandaloneSearch {
+				submissionStarted = service.StandaloneSearchSubmissionStarted(c)
+			}
+			ttft, ttftObserved := smartRouteTTFT(handle, attemptInfo)
+			retryAfter := time.Duration(0)
+			if resultErr != nil {
+				retryAfter = resultErr.RetryAfter
+			}
+			appendSmartRouteAudit(c, attemptNumber, handle, priceData.QuotaToPreConsume, outcome, statusCode(resultErr), committed)
+
+			if c.GetBool(service.ImageTaskOwnedContextKey) {
+				session.RecordAttempt(c.Request.Context(), handle, service.SmartRouteOutcome{Outcome: smartrouter.OutcomeClientCancelled}, 0, 0, false)
+				completed = true
+				return resultErr
+			}
+
+			if resultErr == nil {
+				session.RecordAttempt(c.Request.Context(), handle, outcome, retryAfter, ttft, ttftObserved)
+				if !billing.IsSettled() && billing.LastError() == nil {
+					_ = billing.Settle(0)
+				}
+				if settleErr := billing.LastError(); settleErr != nil {
+					logger.LogWarn(c, "smart route response settlement was not confirmed; reservation is held for reconciliation: "+settleErr.Error())
+				} else {
+					// Some clients/adaptors return a successful response without a
+					// terminal usage event. The durable reservation still represents
+					// billable work; close the same accounting projection used by the
+					// committed EOF/503 path rather than leaving a silent missing log.
+					if projectionErr := service.ProjectSmartRouteCommittedSettlement(c, billing, attemptInfo, nil); projectionErr != nil {
+						logger.LogError(c, "smart route successful response accounting projection failed: "+projectionErr.Error())
+					}
+				}
+				completed = true
+				return nil
+			}
+
+			// A multi-key credential failure identifies the exact selected key, not
+			// the physical route. Retire that key immediately before the serial
+			// confirmation dispatch so a healthy sibling key can prove the channel
+			// usable. Route quality is still untouched until the confirmation also
+			// fails. Delaying this until after confirmation would either lose the
+			// first bad-key identity or disable the healthy key selected next.
+			credentialFailureHandled := false
+			if confirmationAttempt == 0 &&
+				outcome.FailureScope == service.SmartFailureCredential &&
+				channel.ChannelInfo.IsMultiKey {
+				channelError := *types.NewChannelError(
+					channel.Id, channel.Type, channel.Name, true,
+					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan(),
+				)
+				processChannelOperationalError(c, channelError, resultErr)
+				credentialFailureHandled = true
+			}
+
+			if confirmationAttempt == 0 && routeRequest.ReplayClass == smartrouter.ReplaySafeText &&
+				canTryNextSmartRelayAttempt(
+					session,
+					routeRequest.ReplayClass,
+					outcome,
+					committed,
+					resultErr,
+					submissionStarted,
+					common.GetContextKeyInt(c, constant.ContextKeyUpstreamStatusCode),
+					originalRequest.Context().Err(),
+				) {
+				// The first retryable failure is request-local evidence only. Do not
+				// publish it to shared route health or legacy auto-ban until the same
+				// physical route fails its one serial confirmation dispatch as well.
+				lastRetryableError = resultErr
+				confirmationAttempt++
+				attemptNumber++
+				handle.BeginConfirmationAttempt()
+				continue
+			}
+
+			session.RecordAttempt(c.Request.Context(), handle, outcome, retryAfter, ttft, ttftObserved)
+
+			// Smart routing owns model/contract/capacity/infrastructure isolation.
+			// Keep legacy auto-ban disabled for those failures so one failed route
+			// cannot disable unrelated models or fixed-group keys. Credential failures
+			// are the exception: the legacy path disables the channel for a single-key
+			// source, or only the exact selected key for a multi-key source.
+			autoBanCredential := outcome.FailureScope == service.SmartFailureCredential && channel.GetAutoBan()
+			channelError := *types.NewChannelError(
+				channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
+				common.GetContextKeyString(c, constant.ContextKeyChannelKey), autoBanCredential,
+			)
+			if !credentialFailureHandled {
+				processChannelOperationalError(c, channelError, resultErr)
+			}
+			if committed {
+				// A downstream commit is not proof of a successful provider request.
+				// When the provider terminates with an error after emitting partial
+				// output, the request is unsuccessful under the current billing
+				// contract: do not settle the quote and do not create a positive
+				// usage projection. The already-written stream is terminated in place
+				// and the durable reservation is refunded exactly once.
+				logger.LogError(c, "smart route upstream failed after the downstream response was committed; retry suppressed; refunding unsuccessful request")
+				recordChannelErrorLog(c, resultErr)
+				relay.EmitSmartStreamTermination(c, attemptInfo, resultErr)
+				billing.Refund(c)
+				if billing.NeedsRefund() {
+					// Refund failures are still recoverable by the durable reservation
+					// worker; never turn the failed request into a positive charge just
+					// because this process could not complete the refund synchronously.
+					logger.LogError(c, "smart route unsuccessful response reservation remains active after refund attempt; durable reconciliation will retry")
+				}
+				completed = true
+				return nil
+			}
+			restoreHTTPHeader(c.Writer.Header(), responseHeaders)
+			if canTryNextSmartRelayAttempt(
+				session,
+				routeRequest.ReplayClass,
+				outcome,
+				committed,
+				resultErr,
+				submissionStarted,
+				common.GetContextKeyInt(c, constant.ContextKeyUpstreamStatusCode),
+				originalRequest.Context().Err(),
+			) {
+				lastRetryableError = resultErr
+				continue routeLoop
+			}
+			// A retryable upstream failure can still be the final attempt when the
+			// model/group/price/ability contract leaves only one eligible physical
+			// route, or when every remaining route has already failed. Do not leak
+			// that provider's raw fallback error to the caller; give the same bounded
+			// Chinese exhaustion summary used after session.Next reports exhaustion.
+			exhausted := false
+			if outcome.CanTryNextRoute() && c.Request.Context().Err() == nil {
+				resultErr = smartRouteExhaustedAPIErrorWithCandidates(
+					resultErr,
+					attemptNumber,
+					len(eligibleCandidateChannels),
+					smartRouteFailureReason(c, outcome.ErrorSummary),
+					c.GetString(common.RequestIdKey),
+					c.GetString(common.UpstreamRequestIdKey),
+				)
+				exhausted = true
+			}
+			if !exhausted && service.IsSmartResponsesConversationStateError(resultErr) {
+				resultErr = smartRouteConversationStateAPIErrorWithRequestID(resultErr, c.GetString(common.RequestIdKey))
+			} else if !exhausted {
+				resultErr = smartRouteUserFacingTerminalErrorWithRequestID(resultErr, c.GetString(common.RequestIdKey))
+			}
+			// All prior failures stay in admin-only attempt audit. Only the terminal
+			// failure becomes the single user-visible error row for this request.
+			recordChannelErrorLog(c, resultErr)
+			return resultErr
+		}
+	}
+}
+
+func canTryNextSmartRelayAttempt(
+	session *service.SmartRoutingSession,
+	replayClass smartrouter.ReplayClass,
+	outcome service.SmartRouteOutcome,
+	committed bool,
+	apiErr *types.NewAPIError,
+	submissionStarted bool,
+	upstreamHTTPStatus int,
+	downstreamErr error,
+) bool {
+	// A client that has already gone away cannot receive a replacement result.
+	// This guard remains authoritative even when an upstream response marker is
+	// present, because the two events can race in the same scheduling window.
+	if errors.Is(downstreamErr, context.Canceled) || errors.Is(downstreamErr, context.DeadlineExceeded) {
+		return false
+	}
+	if replayClass == smartrouter.ReplaySideEffecting && submissionStarted {
+		// Only the actual transport-layer HTTP status can prove that store/
+		// background/hosted-tool work was rejected before acceptance. An HTTP 200
+		// SSE response.failed event may be normalized to a synthetic 4xx/5xx
+		// NewAPIError, but the provider has already accepted that dispatch; never
+		// use the normalized error status to authorize a duplicate submission.
+		if upstreamHTTPStatus < http.StatusMultipleChoices {
+			return false
+		}
+		return session.CanTryNext(outcome, committed)
+	}
+	if replayClass != smartrouter.ReplaySafeImage && replayClass != smartrouter.ReplaySafeVideo &&
+		replayClass != smartrouter.ReplaySafeAudio {
+		return session.CanTryNext(outcome, committed)
+	}
+	disposition := classifySmartMediaControllerAttempt(apiErr, submissionStarted)
+	return session.CanTryNextMedia(outcome, committed, disposition)
+}
+
+func classifySmartMediaControllerAttempt(
+	apiErr *types.NewAPIError,
+	submissionStarted bool,
+) service.SmartMediaAttemptDisposition {
+	if !submissionStarted {
+		return service.SmartMediaAttemptNotAccepted
+	}
+	return service.ClassifySmartMediaAttempt(apiErr)
+}
+
+func dispatchSmartRelay(c *gin.Context, relayFormat types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+	switch relayFormat {
+	case types.RelayFormatClaude:
+		return relay.ClaudeHelper(c, info)
+	case types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses:
+		return relayHandler(c, info)
+	case types.RelayFormatStandaloneSearch:
+		return relay.StandaloneSearchHelper(c, info)
+	default:
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("智能路由不支持 relay format %s", relayFormat),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+}
+
+func rebuildSmartRelayInfo(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	promptTokens int,
+) (*relaycommon.RelayInfo, *types.NewAPIError) {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+	}
+	if _, err := storage.Seek(0, io.SeekStart); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+	}
+	c.Request.Body = io.NopCloser(storage)
+	request, err := helper.GetAndValidateRequest(c, relayFormat)
+	if err != nil {
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeGenRelayInfoFailed, types.ErrOptionWithSkipRetry())
+	}
+	info.SetEstimatePromptTokens(promptTokens)
+	return info, nil
+}
+
+func loadCurrentSmartRouteChannel(
+	route smartrouter.CertifiedRoute,
+	modelName string,
+) (*model.Channel, *types.NewAPIError) {
+	channel, err := model.CacheGetChannel(route.ChannelID)
+	if err != nil || channel == nil {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("智能路由渠道 %d 已不可用", route.ChannelID),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+		)
+	}
+	if channel.Status != common.ChannelStatusEnabled ||
+		!model.IsChannelEnabledForGroupModel(route.Group, modelName, route.ChannelID) {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("智能路由 %s 的渠道或模型能力已变更", route.RouteID),
+			types.ErrorCodeModelNotFound,
+			http.StatusNotFound,
+		)
+	}
+	if currentGeneration := service.SmartRouteChannelGeneration(*channel); currentGeneration == "" ||
+		currentGeneration != route.ChannelGeneration {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("智能路由 %s 的渠道配置已变更，正在刷新目录", route.RouteID),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+		)
+	}
+	return channel, nil
+}
+
+func resetSmartChannelContext(c *gin.Context) {
+	service.ResetSmartRouteAccountingProjection(c)
+	common.SetContextKey(c, constant.ContextKeyChannelOrganization, "")
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "")
+	// Clear every route identity field before installing the next physical
+	// channel. Otherwise a setup failure or a client-visible terminal event can
+	// inherit the prior attempt's channel name/id/type and make api-a appear as
+	// api-b/api-c in logs and errors.
+	common.SetContextKey(c, constant.ContextKeyChannelId, 0)
+	common.SetContextKey(c, constant.ContextKeyChannelName, "")
+	common.SetContextKey(c, constant.ContextKeyChannelType, 0)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "")
+	common.SetContextKey(c, constant.ContextKeyChannelCreateTime, int64(0))
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, 0)
+	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]interface{}{})
+	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, map[string]interface{}{})
+	// The Gin context is reused for fallback attempts. Clear Responses
+	// completion/semantic markers before installing the next physical route so a
+	// prior route cannot suppress a later cancellation or EOF error.
+	openaichannel.ResetSmartResponsesAttemptState(c)
+	// Response evidence belongs to one physical route attempt. Clearing it
+	// before installing the next channel prevents a previous provider's 400/5xx
+	// from leaking into setup failures or client-cancellation classification on
+	// the replacement route.
+	common.SetContextKey(c, constant.ContextKeyUpstreamResponseReceived, false)
+	common.SetContextKey(c, constant.ContextKeyUpstreamStatusCode, 0)
+	common.SetContextKey(c, constant.ContextKeySmartStreamPingBytes, 0)
+	c.Set("api_version", "")
+	c.Set("region", "")
+	c.Set("plugin", "")
+	c.Set("bot_id", "")
+}
+
+// smartRouteAttemptCommitted evaluates only bytes written by the current
+// physical route. A prior failed attempt may already have sent harmless SSE
+// keepalive comments, and Gin's Writer cannot be reset between attempts. Those
+// comments must not block a safe fallback, while any payload byte or a
+// header-only Flush remains a hard commitment boundary.
+func smartRouteAttemptCommitted(c *gin.Context, writtenBefore bool, sizeBefore int) bool {
+	if c == nil || c.Writer == nil {
+		return false
+	}
+	sizeAfter := c.Writer.Size()
+	bytesBefore := sizeBefore
+	if bytesBefore < 0 {
+		bytesBefore = 0
+	}
+	bytesAfter := sizeAfter
+	if bytesAfter < 0 {
+		bytesAfter = 0
+	}
+	if bytesAfter > bytesBefore {
+		attemptBytes := bytesAfter - bytesBefore
+		pingBytes := common.GetContextKeyInt(c, constant.ContextKeySmartStreamPingBytes)
+		return pingBytes <= 0 || attemptBytes != pingBytes
+	}
+	// A Flush can commit response headers without adding body bytes. It is safe
+	// to ignore Written only when it was already true before this attempt (for
+	// example because a previous route emitted keepalive comments).
+	return !writtenBefore && c.Writer.Written()
+}
+
+func restoreHTTPHeader(target, snapshot http.Header) {
+	for key := range target {
+		delete(target, key)
+	}
+	for key, values := range snapshot {
+		target[key] = append([]string(nil), values...)
+	}
+}
+
+func smartRouteTTFT(handle *service.SmartRouteAttemptHandle, info *relaycommon.RelayInfo) (time.Duration, bool) {
+	if handle == nil || info == nil {
+		return 0, false
+	}
+	observedAt, ok := info.FirstTokenTime()
+	if !ok || observedAt.Before(handle.StartedAt()) {
+		return 0, false
+	}
+	return observedAt.Sub(handle.StartedAt()), true
+}
+
+func appendSmartRouteAudit(
+	c *gin.Context,
+	attempt int,
+	handle *service.SmartRouteAttemptHandle,
+	quotedQuota int,
+	outcome service.SmartRouteOutcome,
+	status int,
+	committed bool,
+) {
+	if handle == nil {
+		return
+	}
+	service.AppendSmartRouteAttemptAudit(c, service.SmartRouteAttemptAudit{
+		Attempt: attempt, RouteID: handle.Plan.RouteID, ChannelID: handle.Plan.ChannelID,
+		Group: handle.Plan.Group, RatioPPM: handle.Plan.RatioPPM, Price: handle.Plan.Price, QuotedQuota: quotedQuota,
+		CatalogVersion: handle.Plan.CatalogVersion, PriceVersion: handle.Plan.PriceVersion,
+		Admission: handle.Plan.Admission, Outcome: outcome.Outcome, FailureScope: outcome.FailureScope,
+		StatusCode: status, Committed: committed, ObservationID: handle.ObservationID(),
+	})
+	appendSmartRouteFailureSummary(c, outcome)
+}
+
+func statusCode(err *types.NewAPIError) int {
+	if err == nil {
+		return 0
+	}
+	return err.GetOriginalStatusCode()
+}
+
+func smartRouteControllerError(err error) *types.NewAPIError {
+	if err == nil {
+		return nil
+	}
+	status := http.StatusServiceUnavailable
+	code := types.ErrorCodeGetChannelFailed
+	if errors.Is(err, smartrouter.ErrUnsupportedReplay) || errors.Is(err, smartrouter.ErrContractMismatch) ||
+		errors.Is(err, smartrouter.ErrPolicyDisabled) {
+		status = http.StatusBadRequest
+		code = types.ErrorCodeInvalidRequest
+	}
+	return types.NewErrorWithStatusCode(err, code, status, types.ErrOptionWithSkipRetry())
+}

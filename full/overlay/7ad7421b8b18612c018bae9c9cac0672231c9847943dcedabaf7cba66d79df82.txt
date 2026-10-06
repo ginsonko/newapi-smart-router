@@ -1,0 +1,154 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+// GetTenantCredentialBindingByTokenMarker resolves the exact server-owned
+// token/binding identity. Unlike the legacy optional lookup, not-found is an
+// error because a non-zero token marker declares that the binding must exist.
+func GetTenantCredentialBindingByTokenMarker(tokenID int, bindingID int64) (*TenantCredentialBinding, error) {
+	if DB == nil || tokenID <= 0 || bindingID <= 0 {
+		return nil, ErrTenantCostBindingUnavailable
+	}
+	var binding TenantCredentialBinding
+	if err := DB.Where("id = ? AND token_id = ?", bindingID, tokenID).First(&binding).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostBindingUnavailable
+		}
+		return nil, err
+	}
+	if binding.ID != bindingID || binding.TokenID != tokenID ||
+		binding.CredentialPurpose != TenantCredentialPurposeDataPlane {
+		return nil, ErrTenantCostBindingUnavailable
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(binding.TenantID); err != nil {
+		return nil, err
+	}
+	return &binding, nil
+}
+
+// setTenantCostBindingMarkerTx is shared by audited provisioning and startup
+// reconciliation. The caller must invalidate the token cache after commit.
+func setTenantCostBindingMarkerTx(tx *gorm.DB, tokenID int, bindingID int64) (*Token, error) {
+	if tx == nil || tokenID <= 0 || bindingID <= 0 {
+		return nil, ErrTenantCostInvalidInput
+	}
+	var token Token
+	if err := lockForUpdate(tx).Where("id = ?", tokenID).First(&token).Error; err != nil {
+		return nil, err
+	}
+	if token.TenantCostBindingID != 0 && token.TenantCostBindingID != bindingID {
+		return nil, ErrTenantCostConflict
+	}
+	if token.TenantCostBindingID == 0 {
+		if err := tx.Model(&Token{}).Where("id = ? AND tenant_cost_binding_id = 0", tokenID).
+			Update("tenant_cost_binding_id", bindingID).Error; err != nil {
+			return nil, err
+		}
+		token.TenantCostBindingID = bindingID
+	}
+	return &token, nil
+}
+
+// invalidateTenantCostTokenCache removes a possibly stale legacy view after a
+// binding transaction commits. Redis-disabled deployments already read the
+// durable token row directly.
+func invalidateTenantCostTokenCache(tokenKey string) error {
+	if !common.RedisEnabled || strings.TrimSpace(tokenKey) == "" {
+		return nil
+	}
+	return cacheDeleteToken(tokenKey)
+}
+
+// fenceTenantCostTokenCacheAfterCommit keeps a binding marker from being
+// repopulated by an in-flight legacy cache writer. Provisioning uses a binding
+// fence; rotation uses the stronger rotated fence in its own transaction.
+func fenceTenantCostTokenCacheAfterCommit(tokenKey string, bindingID int64) error {
+	if !common.RedisEnabled || strings.TrimSpace(tokenKey) == "" || bindingID <= 0 {
+		return nil
+	}
+	return cacheFenceAndDeleteToken(tokenKey, tokenCacheFenceModeForBinding(bindingID))
+}
+
+// ReconcileTenantCredentialBindingMarkers upgrades pre-marker bindings and
+// verifies the bidirectional identity before traffic starts. It never creates
+// a binding or changes binding status. Active orphan/conflicting identities
+// fail startup rather than allowing a provisioned key to run as legacy.
+func ReconcileTenantCredentialBindingMarkers() error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	cacheKeys := make([]string, 0)
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var bindings []TenantCredentialBinding
+		if err := tx.Where("credential_purpose = ?", TenantCredentialPurposeDataPlane).
+			Order("id asc").Find(&bindings).Error; err != nil {
+			return err
+		}
+		bindingByID := make(map[int64]TenantCredentialBinding, len(bindings))
+		for _, binding := range bindings {
+			bindingByID[binding.ID] = binding
+			var token Token
+			err := lockForUpdate(tx.Unscoped()).Where("id = ?", binding.TokenID).First(&token).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				if binding.BindingStatus == TenantBindingRevoked {
+					continue
+				}
+				return fmt.Errorf("%w: binding %d token is missing", ErrTenantCostBindingUnavailable, binding.ID)
+			}
+			if err != nil {
+				return err
+			}
+			if token.DeletedAt.Valid {
+				if binding.BindingStatus == TenantBindingRevoked {
+					continue
+				}
+				return fmt.Errorf("%w: binding %d token is deleted", ErrTenantCostBindingUnavailable, binding.ID)
+			}
+			if token.TenantCostBindingID != 0 && token.TenantCostBindingID != binding.ID {
+				return fmt.Errorf("%w: token %d marker conflicts with binding %d", ErrTenantCostConflict, token.Id, binding.ID)
+			}
+			if token.TenantCostBindingID == 0 {
+				result := tx.Model(&Token{}).Where("id = ? AND tenant_cost_binding_id = 0", token.Id).
+					Update("tenant_cost_binding_id", binding.ID)
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return ErrTenantCostConflict
+				}
+			}
+			cacheKeys = append(cacheKeys, token.Key)
+		}
+
+		var marked []Token
+		if err := tx.Unscoped().Where("tenant_cost_binding_id > 0").Find(&marked).Error; err != nil {
+			return err
+		}
+		for _, token := range marked {
+			if token.DeletedAt.Valid {
+				continue
+			}
+			binding, ok := bindingByID[token.TenantCostBindingID]
+			if !ok || binding.TokenID != token.Id || binding.CredentialPurpose != TenantCredentialPurposeDataPlane {
+				return fmt.Errorf("%w: token %d has an orphan binding marker", ErrTenantCostBindingUnavailable, token.Id)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, key := range cacheKeys {
+		if err := invalidateTenantCostTokenCache(key); err != nil {
+			return fmt.Errorf("invalidate bound token cache: %w", err)
+		}
+	}
+	return nil
+}

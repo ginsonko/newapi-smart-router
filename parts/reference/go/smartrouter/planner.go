@@ -109,6 +109,9 @@ type TTFTState struct {
 }
 
 type PlanInput struct {
+	RecoveryFallbackEnabled  bool
+	AutomaticExcludedRoutes  []string
+	TextRecoveryProbeAfterMS int64
 	NowMS                    int64
 	RecoveryEvidenceTTLMS    int64
 	Request                  RouteRequest
@@ -153,6 +156,7 @@ const (
 )
 
 type Candidate struct {
+	RecoveryFallback          bool
 	Route                     CertifiedRoute
 	RatioPPM                  int64
 	Price                     RoutePrice
@@ -165,6 +169,7 @@ type Candidate struct {
 	KeySuppressed             bool
 	StabilityPPM              int64
 	BalancedScorePPM          int64
+	CustomScorePPM            int64
 	TTFTKnowledge             TTFTKnowledge
 	TTFTP95MS                 int64
 	TTFTSlow                  bool
@@ -173,6 +178,8 @@ type Candidate struct {
 	ActualInputCostSource     string
 	ActualInputCostObservedMS int64
 	ActualInputCostComparable bool
+	RoutingCacheWeightPPM     int64
+	RoutingCacheWeightKnown   bool
 	priceClassRank            int
 	mediaQuoteRank            uint8
 }
@@ -221,20 +228,24 @@ type Rejection struct {
 }
 
 type FilterInput struct {
-	NowMS                 int64
-	RecoveryEvidenceTTLMS int64
-	Request               RouteRequest
-	Policy                Policy
-	Catalog               CertifiedRouteCatalog
-	Prices                PriceSnapshot
-	Quality               QualitySnapshot
-	TTFT                  TTFTSnapshot
-	Credentials           CredentialSnapshot
-	AllowedGroups         []string
-	Affinity              *AffinityState
-	ActualInputCosts      ActualInputCostSnapshot
-	Attempt               AttemptState
-	BackgroundRecovery    bool
+	RecoveryFallbackEnabled  bool
+	AutomaticExcludedRoutes  []string
+	RecoveryFallback         bool
+	TextRecoveryProbeAfterMS int64
+	NowMS                    int64
+	RecoveryEvidenceTTLMS    int64
+	Request                  RouteRequest
+	Policy                   Policy
+	Catalog                  CertifiedRouteCatalog
+	Prices                   PriceSnapshot
+	Quality                  QualitySnapshot
+	TTFT                     TTFTSnapshot
+	Credentials              CredentialSnapshot
+	AllowedGroups            []string
+	Affinity                 *AffinityState
+	ActualInputCosts         ActualInputCostSnapshot
+	Attempt                  AttemptState
+	BackgroundRecovery       bool
 }
 
 type FilterResult struct {
@@ -263,6 +274,7 @@ const (
 )
 
 type PlanResult struct {
+	RecoveryFallback    bool
 	Kind                PlanKind
 	ContractID          string
 	PoolID              string
@@ -301,9 +313,14 @@ func Filter(input FilterInput) (FilterResult, error) {
 	if input.Attempt.Committed {
 		return FilterResult{}, ErrAlreadyCommitted
 	}
-	if input.Attempt.MaxAttempts <= 0 || input.Attempt.StartedAttempts < 0 ||
-		(input.Attempt.StartedAttempts >= input.Attempt.MaxAttempts &&
-			!(input.Attempt.ExhaustEligibleChannels && input.Request.ReplayClass == ReplaySafeText)) {
+	// Safe text is replayable until every remaining certified physical channel
+	// has been tried. A legacy numeric attempt cap must not collapse that
+	// candidate set during rolling upgrades. Media/side-effecting requests
+	// retain their explicit bounded dispatch contract.
+	if input.Attempt.StartedAttempts < 0 ||
+		(input.Request.ReplayClass != ReplaySafeText &&
+			(input.Attempt.MaxAttempts <= 0 ||
+				(input.Attempt.StartedAttempts >= input.Attempt.MaxAttempts && !input.Attempt.ExhaustEligibleChannels))) {
 		return FilterResult{}, ErrAttemptBudget
 	}
 	if input.Prices.Version == "" || input.Prices.RatiosPPM == nil {
@@ -339,6 +356,7 @@ func Filter(input FilterInput) (FilterResult, error) {
 	allowedGroups := stringSet(input.AllowedGroups)
 	excludedGroups := stringSet(input.Policy.ExcludedGroups)
 	excludedRoutes := stringSet(input.Policy.ExcludedRoutes)
+	automaticExcluded := stringSet(input.AutomaticExcludedRoutes)
 	attemptedRoutes := stringSet(input.Attempt.AttemptedRoutes)
 	attemptedChannels := intSet(input.Attempt.AttemptedChannels)
 	manualRanks := routeRanks(manualOrder)
@@ -353,8 +371,11 @@ func Filter(input FilterInput) (FilterResult, error) {
 		Rejections: make([]Rejection, 0),
 	}
 	virginBootstrap := make([]Candidate, 0)
+	lastResort := make([]Candidate, 0)
+	lastResortReasons := make([]Rejection, 0)
 
 	for index, route := range pool.Candidates {
+		useLastResort := false
 		reason := RejectReason("")
 		switch {
 		case !allowedGroups[route.Group]:
@@ -369,16 +390,16 @@ func Filter(input FilterInput) (FilterResult, error) {
 			reason = RejectAlreadyAttempted
 		case attemptedChannels[route.ChannelID]:
 			reason = RejectChannelAttempted
+		case route.Capabilities&input.Request.RequiredCapabilities != input.Request.RequiredCapabilities:
+			reason = RejectCapabilityMismatch
+		case input.Request.EstimatedContext < 0 || input.Request.EstimatedContext > route.MaxContext:
+			reason = RejectContextTooLarge
 		case orderMode == OrderManual && !input.Policy.AllowFutureCertifiedRoutes:
 			if len(manualRanks) > 0 && !hasRouteRank(manualRanks, route.RouteID) {
 				reason = RejectUnlistedManualRoute
 			} else if len(manualRanks) == 0 && len(manualGroupRanks) > 0 && !hasRouteRank(manualGroupRanks, route.Group) {
 				reason = RejectUnlistedManualRoute
 			}
-		case route.Capabilities&input.Request.RequiredCapabilities != input.Request.RequiredCapabilities:
-			reason = RejectCapabilityMismatch
-		case input.Request.EstimatedContext < 0 || input.Request.EstimatedContext > route.MaxContext:
-			reason = RejectContextTooLarge
 		}
 		if reason == "" && input.Request.Media != nil {
 			reason = MatchMediaRequest(route.Media, input.Request.Media)
@@ -394,6 +415,13 @@ func Filter(input FilterInput) (FilterResult, error) {
 			result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: reason})
 			continue
 		}
+		if automaticExcluded[route.RouteID] {
+			if !input.RecoveryFallback {
+				result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: RejectRouteExcluded})
+				continue
+			}
+			useLastResort = true
+		}
 		routePrice := routePriceForCandidate(input.Prices, route.RouteID, ratio)
 		if input.Request.Media != nil {
 			var quoteReason RejectReason
@@ -408,11 +436,19 @@ func Filter(input FilterInput) (FilterResult, error) {
 		if !found {
 			quality = InitialQuality(route.StableFallback)
 		}
+		if input.Request.ReplayClass == ReplaySafeImage {
+			quality, _ = NormalizeImageQuality(quality, input.NowMS, QualityConfig{})
+		} else {
+			quality, _ = NormalizeAutomaticRecoveryState(quality, input.NowMS)
+		}
 		credentialDomain := RouteCredentialDomain(route)
 		credential := input.Credentials.Domains[credentialDomain]
 		if credential.BlockedUntilMS > input.NowMS {
-			result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: RejectCredentialBlocked})
-			continue
+			if input.Request.ReplayClass == ReplaySafeImage || !input.RecoveryFallback {
+				result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: RejectCredentialBlocked})
+				continue
+			}
+			useLastResort = true
 		}
 		admission, suppressed, healthRejection := qualityAdmission(route, quality, input)
 		virginUnknown := input.BackgroundRecovery && healthRejection == RejectHealthUnavailable &&
@@ -430,12 +466,35 @@ func Filter(input FilterInput) (FilterResult, error) {
 		}
 		mediaVirginRetry := admission == AdmissionVirginBootstrap &&
 			input.Attempt.VirginMediaRetryAuthorized && isReplaySafeMedia(input.Request.ReplayClass)
-		if healthRejection == "" && isRecoveryAttemptAdmission(admission) && input.Attempt.RecoveryProbeUsed && !mediaVirginRetry {
+		// Safe stateless text may walk every remaining certified physical route.
+		// RecoveryProbeUsed is a single-dispatch guard for media/side-effecting
+		// work, not a global foreground gate: applying it to text was the source
+		// of the R54 "no available channel" collapse after routes entered warming.
+		if healthRejection == "" && isRecoveryAttemptAdmission(admission) &&
+			input.Attempt.RecoveryProbeUsed && (input.Request.ReplayClass != ReplaySafeText || route.PassiveRecovery) && !mediaVirginRetry {
 			healthRejection = RejectRecoveryBudget
 		}
 		if healthRejection != "" {
-			result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: healthRejection})
-			continue
+			// A safe text request may use a route with stale/open health only
+			// after all currently healthy candidates have been consumed. Keep
+			// the route out of the first plan, but do not lose it permanently;
+			// the next planner pass (after healthy failures are recorded) will
+			// expose it as the last-resort candidate.
+			if input.Request.ReplayClass == ReplaySafeImage || input.RecoveryFallback || (!input.RecoveryFallbackEnabled && input.Request.ReplayClass == ReplaySafeText && !route.PassiveRecovery && input.TextRecoveryProbeAfterMS == 0 && !quality.DemandRecovery) {
+				useLastResort = true
+				admission = AdmissionLastResort
+				suppressed = false
+				lastResortReasons = append(lastResortReasons, Rejection{RouteID: route.RouteID, Reason: healthRejection})
+				healthRejection = ""
+			} else {
+				result.Rejections = append(result.Rejections, Rejection{RouteID: route.RouteID, Reason: healthRejection})
+				continue
+			}
+		}
+		if useLastResort {
+			admission = AdmissionLastResort
+			suppressed = false
+			bootstrapUnknown = false
 		}
 		manualIndex := manualCandidateIndex(route, index, len(pool.Candidates), manualRanks, manualGroupRanks)
 		priceClassRank := 0
@@ -461,6 +520,7 @@ func Filter(input FilterInput) (FilterResult, error) {
 			}
 		}
 		candidate := Candidate{
+			RecoveryFallback: input.RecoveryFallback && useLastResort,
 			Route:            route,
 			RatioPPM:         ratio,
 			Price:            routePrice,
@@ -488,10 +548,14 @@ func Filter(input FilterInput) (FilterResult, error) {
 			candidate.ActualInputCostSource = actual.Source
 			candidate.ActualInputCostObservedMS = actual.LastObservedAtMS
 			candidate.ActualInputCostComparable = actual.Comparable
+			candidate.RoutingCacheWeightPPM = actual.CacheReadRatePPM
+			candidate.RoutingCacheWeightKnown = actual.Comparable && actualInputCostCacheWeightKnown(actual.Source)
 		}
 		applyTTFTKnowledge(&candidate, input.TTFT.Routes[route.RouteID], metricPolicy, input.NowMS)
 		if bootstrapUnknown {
 			virginBootstrap = append(virginBootstrap, candidate)
+		} else if useLastResort {
+			lastResort = append(lastResort, candidate)
 		} else {
 			result.Candidates = append(result.Candidates, candidate)
 		}
@@ -507,17 +571,29 @@ func Filter(input FilterInput) (FilterResult, error) {
 			})
 		}
 	}
+	if ((input.RecoveryFallback && input.Request.ReplayClass != ReplaySafeImage) || len(result.Candidates) == 0) && len(lastResort) > 0 {
+		result.Candidates = append(result.Candidates, lastResort...)
+	} else {
+		result.Rejections = append(result.Rejections, lastResortReasons...)
+	}
 
 	result.Candidates, result.TTFTFallback = applyTTFTPolicy(result.Candidates, input.Policy.TTFTPolicy, &result.Rejections)
 	actualCostRanking := input.Policy.EffectiveActualInputCostRanking()
 	assignBalancedScores(result.Candidates, input.Policy.EffectiveBalancedWeights(), actualCostRanking)
+	assignCustomScores(result.Candidates, input.Policy.EffectiveCustomWeights(), actualCostRanking)
 	sortCandidates(result.Candidates, strategy, result.TTFTFallback, input.BackgroundRecovery, actualCostRanking)
 	result.Candidates = promoteUnknownProbeCandidate(result.Candidates, input.Request, strategy)
-	result.Candidates = limitRecoveryProbeCandidates(
-		result.Candidates,
-		&result.Rejections,
-		input.BackgroundRecovery && strategy == StrategyPrice,
-	)
+	// A safe text request can be replayed before semantic output and must try
+	// every remaining eligible physical channel once. Recovery admission remains
+	// single-flight for media/audio, where a second dispatch could duplicate a
+	// task or charge.
+	if input.Request.ReplayClass != ReplaySafeText {
+		result.Candidates = limitRecoveryProbeCandidates(
+			result.Candidates,
+			&result.Rejections,
+			false,
+		)
+	}
 	if len(result.Candidates) == 0 {
 		return result, ErrNoCandidate
 	}
@@ -561,7 +637,7 @@ func promoteUnknownProbeCandidate(candidates []Candidate, request RouteRequest, 
 	// explicit preference with an exploratory route. Latency and balanced modes
 	// opt into a small discovery lane because otherwise an unknown route can
 	// remain unmeasured forever behind known candidates.
-	if strategy != StrategyLatency && strategy != StrategyBalanced {
+	if strategy != StrategyLatency && strategy != StrategyBalanced && strategy != StrategyCustomWeighted {
 		return candidates
 	}
 	if len(candidates) < 2 {
@@ -597,7 +673,7 @@ func promoteUnknownProbeCandidate(candidates []Candidate, request RouteRequest, 
 }
 
 func effectiveTTFTMetricPolicy(policy TTFTPolicy, strategy Strategy) TTFTPolicy {
-	if policy.Enabled || (strategy != StrategyLatency && strategy != StrategyBalanced) {
+	if policy.Enabled || (strategy != StrategyLatency && strategy != StrategyBalanced && strategy != StrategyCustomWeighted) {
 		return policy
 	}
 	policy.Enabled = true
@@ -631,24 +707,52 @@ func manualCandidateIndex(
 }
 
 func Plan(input PlanInput) (PlanResult, error) {
+	result, err := planRecoveryPass(input, false)
+	if err == nil || !input.RecoveryFallbackEnabled ||
+		(!errors.Is(err, ErrNoCandidate) && !errors.Is(err, ErrCapacityConstrained)) {
+		return result, err
+	}
+	// Another media submission requires the controller's existing proof that
+	// the previous attempt was not accepted. Planning never creates that proof.
+	if isReplaySafeMedia(input.Request.ReplayClass) && input.Attempt.StartedAttempts > 0 &&
+		!input.Attempt.VirginMediaRetryAuthorized {
+		return result, err
+	}
+	return planRecoveryPass(input, true)
+}
+
+func planRecoveryPass(input PlanInput, recoveryFallback bool) (PlanResult, error) {
 	filtered, err := Filter(FilterInput{
-		NowMS:                 input.NowMS,
-		RecoveryEvidenceTTLMS: input.RecoveryEvidenceTTLMS,
-		Request:               input.Request,
-		Policy:                input.Policy,
-		Catalog:               input.Catalog,
-		Prices:                input.Prices,
-		Quality:               input.Quality,
-		TTFT:                  input.TTFT,
-		Credentials:           input.Credentials,
-		AllowedGroups:         input.AllowedGroups,
-		Affinity:              input.Affinity,
-		ActualInputCosts:      input.ActualInputCosts,
-		Attempt:               input.Attempt,
-		BackgroundRecovery:    input.BackgroundRecovery,
+		RecoveryFallbackEnabled:  input.RecoveryFallbackEnabled,
+		AutomaticExcludedRoutes:  input.AutomaticExcludedRoutes,
+		RecoveryFallback:         recoveryFallback,
+		TextRecoveryProbeAfterMS: input.TextRecoveryProbeAfterMS,
+		NowMS:                    input.NowMS,
+		RecoveryEvidenceTTLMS:    input.RecoveryEvidenceTTLMS,
+		Request:                  input.Request,
+		Policy:                   input.Policy,
+		Catalog:                  input.Catalog,
+		Prices:                   input.Prices,
+		Quality:                  input.Quality,
+		TTFT:                     input.TTFT,
+		Credentials:              input.Credentials,
+		AllowedGroups:            input.AllowedGroups,
+		Affinity:                 input.Affinity,
+		ActualInputCosts:         input.ActualInputCosts,
+		Attempt:                  input.Attempt,
+		BackgroundRecovery:       input.BackgroundRecovery,
 	})
 	if err != nil {
 		return PlanResult{Candidates: filtered.Candidates, Rejections: filtered.Rejections}, err
+	}
+	if recoveryFallback {
+		for i := range filtered.Candidates {
+			candidate := &filtered.Candidates[i]
+			if input.Capacity.Domains[candidate.Route.CapacityDomain].BlockedUntilMS > input.NowMS {
+				candidate.Admission = AdmissionLastResort
+				candidate.RecoveryFallback = true
+			}
+		}
 	}
 
 	ordered, affinityEligible, economyDecision := applyAffinity(
@@ -667,14 +771,15 @@ func Plan(input PlanInput) (PlanResult, error) {
 	if err != nil {
 		return PlanResult{Candidates: ordered, Rejections: filtered.Rejections}, err
 	}
+	if input.Request.ReplayClass == ReplaySafeImage && choice.Candidate.Admission == AdmissionLastResort &&
+		input.Attempt.StartedAttempts > 0 && !input.Attempt.VirginMediaRetryAuthorized {
+		return PlanResult{Candidates: ordered, Rejections: filtered.Rejections}, ErrUnsupportedReplay
+	}
 	disposition := affinityDisposition(input.Affinity, choice.Candidate, affinityEligible)
 	overflow := input.Affinity != nil && input.Affinity.Strength == AffinityStrong && affinityEligible && choice.Candidate.Route.RouteID != input.Affinity.RouteID
 	maxInflightHint := admissionCapacityLimit(choice.Candidate.Admission)
-	if input.Policy.EffectiveActualInputCostRanking() && choice.Candidate.ActualInputCostSource == ActualInputCostOptimistic &&
-		(maxInflightHint == 0 || maxInflightHint > 1) {
-		maxInflightHint = 1
-	}
 	return PlanResult{
+		RecoveryFallback:    choice.Candidate.RecoveryFallback,
 		Kind:                choice.Kind,
 		ContractID:          filtered.ContractID,
 		PoolID:              filtered.PoolID,
@@ -739,132 +844,60 @@ func resolveContractPolicy(policy Policy, contractID string) (string, OrderMode,
 }
 
 func qualityAdmission(route CertifiedRoute, quality QualityState, input FilterInput) (AdmissionKind, bool, RejectReason) {
+	if input.Request.ReplayClass == ReplaySafeImage {
+		if quality.ImageUnavailable {
+			return "", false, RejectHealthUnavailable
+		}
+		return AdmissionNormal, false, ""
+	}
+	if route.PassiveRecovery || isReplaySafeMedia(input.Request.ReplayClass) {
+		if quality.Phase == QualityHalfOpen {
+			return "", false, RejectHealthUnavailable
+		}
+		if quality.Phase == QualityOpen {
+			if quality.NextProbeAtMS <= input.NowMS {
+				return AdmissionProbe, false, ""
+			}
+			return "", false, RejectHealthUnavailable
+		}
+	}
+	if input.TextRecoveryProbeAfterMS > 0 && !route.PassiveRecovery && !isReplaySafeMedia(input.Request.ReplayClass) {
+		if quality.Phase == QualityHalfOpen {
+			return "", false, RejectHealthUnavailable
+		}
+		if quality.Phase == QualityOpen {
+			started := quality.RecoveryStartedMS
+			if started == 0 {
+				started = quality.FirstFailureMS
+			}
+			if started == 0 {
+				started = quality.LastFailureMS
+			}
+			if started > 0 && input.NowMS < saturatingAdd(started, input.TextRecoveryProbeAfterMS) && quality.NextProbeAtMS <= input.NowMS {
+				return AdmissionProbe, false, ""
+			}
+			return "", false, RejectHealthUnavailable
+		}
+	}
 	if !input.Policy.HealthGuard {
 		return AdmissionNormal, false, ""
 	}
-	if quality.Phase == QualityQuarantined {
-		return "", true, RejectQuarantined
-	}
-	if input.BackgroundRecovery {
-		if quality.Phase == QualityHalfOpen {
-			// A background worker already owns the fenced recovery attempt. Do not
-			// make foreground traffic race that probe for capacity or evidence.
-			return "", false, RejectHealthUnavailable
-		}
-		switch quality.Phase {
-		case QualityHealthy:
-			if recoveredRouteCooling(quality, input) {
-				return "", false, RejectRecoveryCooling
-			}
-			return AdmissionNormal, false, ""
-		case QualityBootstrap:
-			// Bootstrap has no failure evidence. Preserve the one-request cold-start
-			// lane used by legacy stable routes; unknown and known-bad routes are
-			// recovered by the background worker instead.
-			return AdmissionBootstrap, false, ""
-		case QualityDegraded:
-			// A key may explicitly tolerate a small number of failures. Keep that
-			// cheap route usable until its threshold is reached, independent of the
-			// ordering strategy.
-			if KeySuppressed(quality, input.Policy.EffectiveFailureThreshold(), input.NowMS) {
-				return "", true, RejectKeySuppressed
-			}
-			return AdmissionDegraded, false, ""
-		case QualityWarming:
-			if hasFreshSuccessfulEvidence(quality, input.NowMS, input.RecoveryEvidenceTTLMS) {
-				return AdmissionWarming, false, ""
-			}
-			if recoveredRouteCooling(quality, input) {
-				return "", false, RejectRecoveryCooling
-			}
-			admissionKey := input.Request.AdmissionKey
-			if admissionKey == "" {
-				admissionKey = input.Request.WarmingKey
-			}
-			if DeterministicAdmission(admissionKey, route.RouteID, quality.WarmingEpoch, quality.WarmingTrafficPPM) {
-				return AdmissionWarming, false, ""
-			}
-			return "", false, RejectHealthUnavailable
-		case QualityOpen:
-			// Open is shared route evidence, while failure_threshold is a
-			// deliberate per-Key tolerance. A tolerant Key may take the next
-			// degraded attempt until its own threshold is reached; the default
-			// Key is suppressed after the configured consecutive failures.
-			if KeySuppressed(quality, input.Policy.EffectiveFailureThreshold(), input.NowMS) {
-				return "", true, RejectKeySuppressed
-			}
-			return AdmissionDegraded, false, ""
-		default:
-			// With a live background recovery plane, ordinary requests must never
-			// linearly probe open, half-open, unknown, or otherwise known-bad
-			// routes. If no serving candidate remains, Plan fails immediately.
-			return "", KeySuppressed(quality, input.Policy.EffectiveFailureThreshold(), input.NowMS), RejectHealthUnavailable
-		}
-	}
-	suppressed := KeySuppressed(quality, input.Policy.EffectiveFailureThreshold(), input.NowMS)
-	if suppressed {
-		// A first failure from a healthy route enters Degraded and schedules a
-		// warm sample instead of setting NextProbeAtMS. Honour that sample
-		// deadline when this key's lower threshold suppresses the route; without
-		// it, threshold=1 would immediately dispatch the same known-bad route
-		// again on the next request.
-		nextProbeAtMS := quality.NextProbeAtMS
-		if quality.Phase == QualityDegraded || quality.Phase == QualityWarming {
-			nextProbeAtMS = max64(nextProbeAtMS, quality.SampleDueAtMS)
-		}
-		if nextProbeAtMS <= input.NowMS {
-			return AdmissionProbe, true, ""
-		}
-		return "", true, RejectKeySuppressed
-	}
 	switch quality.Phase {
-	case QualityHealthy:
-		if recoveredRouteCooling(quality, input) && !strongAffinityMatches(input.Affinity, input.Request.ContractID, route) {
-			return "", false, RejectRecoveryCooling
-		}
+	case QualityUnknown, QualityBootstrap, QualityHealthy:
 		return AdmissionNormal, false, ""
-	case QualityBootstrap:
-		if route.StableFallback {
-			return AdmissionBootstrap, false, ""
-		}
-		return AdmissionProbe, false, ""
-	case QualityDegraded:
-		if quality.SampleDueAtMS <= input.NowMS {
-			return AdmissionWarmSample, false, ""
-		}
-		return AdmissionDegraded, false, ""
 	case QualityWarming:
-		if hasFreshSuccessfulEvidence(quality, input.NowMS, input.RecoveryEvidenceTTLMS) {
-			return AdmissionWarming, false, ""
+		// Filter normally normalizes this legacy phase. Preserve the same
+		// evidence rule here for direct callers during rolling upgrades.
+		if quality.LastSuccessMS > quality.LastFailureMS {
+			return AdmissionNormal, false, ""
 		}
-		// The single-flight sample lane remains available during the profile
-		// observation period so low-traffic routes can still accumulate evidence.
-		if quality.SampleDueAtMS <= input.NowMS {
-			return AdmissionWarmSample, false, ""
-		}
-		if recoveredRouteCooling(quality, input) {
-			return "", false, RejectRecoveryCooling
-		}
-		admissionKey := input.Request.AdmissionKey
-		if admissionKey == "" {
-			// Preserve compatibility for direct planner callers that predate the
-			// explicit admission key. Runtime sessions always fill it in.
-			admissionKey = input.Request.WarmingKey
-		}
-		if DeterministicAdmission(admissionKey, route.RouteID, quality.WarmingEpoch, quality.WarmingTrafficPPM) {
-			return AdmissionWarming, false, ""
-		}
-		return "", false, RejectHealthUnavailable
-	case QualityUnknown:
-		if quality.NextProbeAtMS <= input.NowMS {
-			return AdmissionProbe, false, ""
-		}
-		return "", false, RejectHealthUnavailable
-	case QualityOpen:
-		// Open is a v3 shared-state encoding. In v4 it is interpreted through
-		// this key's threshold, so a more tolerant key may still use the route.
+		return "", true, RejectHealthUnavailable
+	case QualityDegraded:
+		// One or two distinct confirmed failures lower stability but do not
+		// globally remove a route. The normal request-local confirmation and
+		// fallback sequence still protects the caller if the fluctuation persists.
 		return AdmissionDegraded, false, ""
-	case QualityHalfOpen:
+	case QualityOpen, QualityHalfOpen, QualityQuarantined:
 		return "", false, RejectHealthUnavailable
 	default:
 		return "", false, RejectHealthUnavailable
@@ -879,36 +912,12 @@ func hasFreshSuccessfulEvidence(quality QualityState, nowMS, ttlMS int64) bool {
 }
 
 func recoveredRouteCooling(quality QualityState, input FilterInput) bool {
-	// In strict price mode the canary/health state is the recovery gate. A
-	// second fixed 5/30-minute delay would keep an already admitted cheaper
-	// route hidden and violate the policy's observable price-first contract.
-	if input.Policy.EffectiveStrategy() == StrategyPrice {
-		return false
-	}
-	if quality.WarmingEpoch == 0 {
-		return false
-	}
-	delayMS := recoveryAdmissionDelayMS(input.Policy.RecoveryProfile)
-	if delayMS == 0 {
-		return false
-	}
-	if quality.StableSinceMS <= 0 {
-		return true
-	}
-	return input.NowMS < saturatingAdd(quality.StableSinceMS, delayMS)
-}
-
-func recoveryAdmissionDelayMS(profile RecoveryProfile) int64 {
-	switch profile {
-	case RecoveryFast:
-		return 0
-	case RecoveryBalanced:
-		return 5 * 60 * 1_000
-	case RecoveryStable:
-		return 30 * 60 * 1_000
-	default:
-		return 0
-	}
+	// Recovery profiles are telemetry/ranking hints only. A successful probe
+	// already transitions the route to healthy; no cooling or warm-up timer may
+	// hide it from the next foreground request.
+	_ = quality
+	_ = input
+	return false
 }
 
 func strongAffinityMatches(affinity *AffinityState, contractID string, route CertifiedRoute) bool {
@@ -1017,9 +1026,25 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 			if comparison, comparable := comparableCandidateOrderingPrice(left, right, actualCostRanking); comparable && comparison != 0 {
 				return comparison < 0
 			}
+		case StrategyCustomWeighted:
+			if left.CustomScorePPM != right.CustomScorePPM {
+				return left.CustomScorePPM > right.CustomScorePPM
+			}
+			if comparison, comparable := comparableCandidateOrderingPrice(left, right, actualCostRanking); comparable && comparison != 0 {
+				return comparison < 0
+			}
 		default: // StrategyPrice
 			actualCompared := false
 			if actualCostRanking {
+				leftObserved := candidateHasActualInputCost(left)
+				rightObserved := candidateHasActualInputCost(right)
+				// A measured formula result is preferred to an unobserved
+				// candidate. Static price may still break ties between two
+				// unknown routes for deterministic availability, but it is never
+				// compared against (or exposed as) the real-input prediction.
+				if leftObserved != rightObserved {
+					return leftObserved
+				}
 				if comparison, comparable := comparableCandidateActualInputCost(left, right); comparable {
 					actualCompared = true
 					if comparison != 0 {
@@ -1036,8 +1061,10 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 				}
 			}
 			if actualCompared {
-				if comparison := compareActualInputCostEvidencePriority(left, right); comparison != 0 {
-					return comparison < 0
+				// Evidence priority only distinguishes two otherwise equal
+				// observed values; it cannot manufacture a price for unknown data.
+				if left.ActualInputCostObservedMS != right.ActualInputCostObservedMS {
+					return left.ActualInputCostObservedMS > right.ActualInputCostObservedMS
 				}
 			}
 			if left.StabilityPPM != right.StabilityPPM {
@@ -1061,11 +1088,14 @@ func sortCandidates(candidates []Candidate, strategy Strategy, ttftFallback, bac
 	})
 }
 
+func actualInputCostCacheWeightKnown(source string) bool {
+	return source == ActualInputCostObserved || source == ActualInputCostHistorical ||
+		source == ActualInputCostOptimistic
+}
+
 func comparableCandidateOrderingPrice(left, right Candidate, actualCostRanking bool) (int, bool) {
 	if actualCostRanking {
-		if comparison, comparable := comparableCandidateActualInputCost(left, right); comparable {
-			return comparison, true
-		}
+		return comparableCandidateActualInputCost(left, right)
 	}
 	return comparableCandidatePrice(left, right)
 }
@@ -1073,7 +1103,7 @@ func comparableCandidateOrderingPrice(left, right Candidate, actualCostRanking b
 func comparableCandidateActualInputCost(left, right Candidate) (int, bool) {
 	leftPrice := candidateRoutePrice(left)
 	rightPrice := candidateRoutePrice(right)
-	if left.ActualInputCostComparable && right.ActualInputCostComparable &&
+	if candidateHasActualInputCost(left) && candidateHasActualInputCost(right) &&
 		leftPrice.ActualInputComparisonClass != "" &&
 		leftPrice.ActualInputComparisonClass == rightPrice.ActualInputComparisonClass {
 		switch {
@@ -1088,19 +1118,18 @@ func comparableCandidateActualInputCost(left, right Candidate) (int, bool) {
 	return 0, false
 }
 
+func candidateHasActualInputCost(candidate Candidate) bool {
+	price := candidateRoutePrice(candidate)
+	return candidate.ActualInputCostComparable &&
+		(candidate.ActualInputCostSource == ActualInputCostObserved ||
+			candidate.ActualInputCostSource == ActualInputCostHistorical ||
+			candidate.ActualInputCostSource == ActualInputCostOptimistic) &&
+		candidate.ActualInputCostPPM >= 0 &&
+		price.ActualInputComparisonClass != ""
+}
+
 func compareActualInputCostEvidencePriority(left, right Candidate) int {
-	leftOptimistic := left.ActualInputCostSource == ActualInputCostOptimistic
-	rightOptimistic := right.ActualInputCostSource == ActualInputCostOptimistic
-	if leftOptimistic != rightOptimistic {
-		if leftOptimistic {
-			return -1
-		}
-		return 1
-	}
-	if leftOptimistic {
-		return 0
-	}
-	if left.ActualInputCostSource == ActualInputCostObserved && right.ActualInputCostSource == ActualInputCostObserved &&
+	if candidateHasActualInputCost(left) && candidateHasActualInputCost(right) &&
 		left.ActualInputCostObservedMS != right.ActualInputCostObservedMS {
 		if left.ActualInputCostObservedMS < right.ActualInputCostObservedMS {
 			return -1
@@ -1179,18 +1208,86 @@ func assignBalancedScores(candidates []Candidate, weights BalancedWeights, actua
 	}
 }
 
+func assignCustomScores(candidates []Candidate, weights CustomWeights, actualCostRanking bool) {
+	if len(candidates) == 0 {
+		return
+	}
+	firstPrice, priceComparable := candidateOrderingPrice(candidates[0], actualCostRanking)
+	priceClass := candidateOrderingPriceClass(candidates[0], actualCostRanking)
+	minPrice, maxPrice := firstPrice, firstPrice
+	minCache, maxCache := int64(0), int64(0)
+	cacheKnown := false
+	minTTFT, maxTTFT := int64(0), int64(0)
+	for _, candidate := range candidates {
+		candidatePrice, comparable := candidateOrderingPrice(candidate, actualCostRanking)
+		if !comparable || candidateOrderingPriceClass(candidate, actualCostRanking) != priceClass {
+			priceComparable = false
+		}
+		if candidatePrice < minPrice {
+			minPrice = candidatePrice
+		}
+		if candidatePrice > maxPrice {
+			maxPrice = candidatePrice
+		}
+		if candidate.RoutingCacheWeightKnown {
+			if !cacheKnown || candidate.RoutingCacheWeightPPM < minCache {
+				minCache = candidate.RoutingCacheWeightPPM
+			}
+			if !cacheKnown || candidate.RoutingCacheWeightPPM > maxCache {
+				maxCache = candidate.RoutingCacheWeightPPM
+			}
+			cacheKnown = true
+		}
+		if candidate.TTFTKnowledge == TTFTKnown {
+			if minTTFT == 0 || candidate.TTFTP95MS < minTTFT {
+				minTTFT = candidate.TTFTP95MS
+			}
+			if candidate.TTFTP95MS > maxTTFT {
+				maxTTFT = candidate.TTFTP95MS
+			}
+		}
+	}
+	for index := range candidates {
+		costScore := int64(500_000)
+		if priceComparable {
+			candidatePrice, _ := candidateOrderingPrice(candidates[index], actualCostRanking)
+			costScore = inverseRangeScore(candidatePrice, minPrice, maxPrice)
+		}
+		cacheScore := int64(500_000)
+		if candidates[index].RoutingCacheWeightKnown {
+			cacheScore = directRangeScore(candidates[index].RoutingCacheWeightPPM, minCache, maxCache)
+		}
+		ttftScore := int64(500_000)
+		if candidates[index].TTFTKnowledge == TTFTKnown {
+			ttftScore = inverseRangeScore(candidates[index].TTFTP95MS, minTTFT, maxTTFT)
+		}
+		candidates[index].CustomScorePPM =
+			(cacheScore*int64(weights.Cache) + costScore*int64(weights.Cost) +
+				ttftScore*int64(weights.TTFT) + candidates[index].StabilityPPM*int64(weights.Stability)) / 100
+	}
+}
+
 func candidateOrderingPrice(candidate Candidate, actualCostRanking bool) (int64, bool) {
 	price := candidateRoutePrice(candidate)
-	if actualCostRanking && candidate.ActualInputCostComparable && price.ActualInputComparisonClass != "" {
-		return candidate.ActualInputCostPPM, true
+	if actualCostRanking {
+		if candidateHasActualInputCost(candidate) {
+			return candidate.ActualInputCostPPM, true
+		}
+		// Static route price remains an operational tie-breaker only when the
+		// exact two-price prediction is unavailable. It is never exposed as a
+		// predicted input cost or compared against a measured formula result.
+		return price.ScorePPM, price.StaticComparable
 	}
 	return price.ScorePPM, price.StaticComparable
 }
 
 func candidateOrderingPriceClass(candidate Candidate, actualCostRanking bool) string {
 	price := candidateRoutePrice(candidate)
-	if actualCostRanking && candidate.ActualInputCostComparable && price.ActualInputComparisonClass != "" {
-		return price.ActualInputComparisonClass
+	if actualCostRanking {
+		if candidateHasActualInputCost(candidate) {
+			return price.ActualInputComparisonClass
+		}
+		return ""
 	}
 	return price.ComparisonClass
 }
@@ -1206,6 +1303,19 @@ func inverseRangeScore(value, minimum, maximum int64) int64 {
 		return 0
 	}
 	return (maximum - value) * 1_000_000 / (maximum - minimum)
+}
+
+func directRangeScore(value, minimum, maximum int64) int64 {
+	if maximum <= minimum {
+		return 1_000_000
+	}
+	if value <= minimum {
+		return 0
+	}
+	if value >= maximum {
+		return 1_000_000
+	}
+	return (value - minimum) * 1_000_000 / (maximum - minimum)
 }
 
 func RouteCredentialDomain(route CertifiedRoute) string {

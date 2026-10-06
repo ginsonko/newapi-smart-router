@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import zh from './locales/zh.json'
+
+test('recovery and capability controls are available in the loaded Chinese namespace', () => {
+  const keys = [
+    'Automatic recovery fallback',
+    'Keep the contract identity and target unchanged when editing',
+    'Configuration changed. Reload before saving.',
+    'Model capability saved',
+    'Edit duration, resolutions, reference limits and provider fields here. Prices are managed in group model pricing.',
+    'Capability JSON',
+  ] as const
+  for (const key of keys) {
+    assert.ok(zh.translation[key])
+    assert.doesNotMatch(zh.translation[key], /[A-Za-z]/)
+  }
+})

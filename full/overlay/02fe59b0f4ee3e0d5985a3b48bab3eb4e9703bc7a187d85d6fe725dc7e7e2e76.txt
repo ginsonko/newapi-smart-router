@@ -1,0 +1,1505 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+const (
+	smartRouteWeakAffinityTolerancePPM = 20_000
+	// This is the maximum heartbeat interval. The actual interval is derived
+	// from the shortest active lease TTL so a short probe lease is renewed
+	// before it can expire.
+	smartRouteLeaseHeartbeatInterval = 15 * time.Second
+)
+
+var (
+	ErrSmartRouteQueueUnsupported   = errors.New("smart router short-wait queue is not available in this release")
+	ErrSmartRouteUnsafeCandidateSet = errors.New("smart router policy leaves no eligible route set")
+)
+
+type SmartRouterEngine struct {
+	Catalogs         *CatalogManager
+	Prices           *PriceSnapshotManager
+	State            SmartRouteStateStore
+	Affinity         SmartRouteAffinityStore
+	CacheEconomy     SmartRouteCacheEconomy
+	ActualInputCosts SmartRouteActualInputCost
+	Settings         func() smartroutersetting.Setting
+
+	recoveryHintsMu sync.RWMutex
+	recoveryHints   SmartRouteRecoveryHintSink
+}
+
+func (engine *SmartRouterEngine) SetRecoveryHintSink(sink SmartRouteRecoveryHintSink) {
+	if engine == nil {
+		return
+	}
+	engine.recoveryHintsMu.Lock()
+	engine.recoveryHints = sink
+	engine.recoveryHintsMu.Unlock()
+}
+
+func (engine *SmartRouterEngine) recoveryHintSink() SmartRouteRecoveryHintSink {
+	if engine == nil {
+		return nil
+	}
+	engine.recoveryHintsMu.RLock()
+	defer engine.recoveryHintsMu.RUnlock()
+	return engine.recoveryHints
+}
+
+func (engine *SmartRouterEngine) actualInputCostSnapshot() smartrouter.ActualInputCostSnapshot {
+	if engine == nil || engine.ActualInputCosts == nil {
+		return nil
+	}
+	return engine.ActualInputCosts.Snapshot()
+}
+
+// hintAutomaticRecovery publishes the exact post-attempt health snapshot.
+// The worker remains responsible for due-time, single-flight, budget and
+// protocol-safety checks; this only avoids waiting for another request or the
+// periodic catalog sweep after the shared failure threshold is crossed.
+func (engine *SmartRouterEngine) hintAutomaticRecovery(
+	ctx context.Context,
+	catalogVersion string,
+	scopeKey string,
+	request smartrouter.RouteRequest,
+	policy smartrouter.Policy,
+	userGroup string,
+	allowedGroups []string,
+	routes []smartrouter.CertifiedRoute,
+) {
+	if engine == nil || engine.State == nil || engine.Settings == nil || len(routes) == 0 ||
+		!smartrouter.IsSyntheticProbeSafe(request.ReplayClass) {
+		return
+	}
+	sink := engine.recoveryHintSink()
+	setting := smartroutersetting.Normalize(engine.Settings())
+	if sink == nil || !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return
+	}
+	runtime, err := engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: smartRouteStateRoutes(routes)})
+	if err != nil {
+		return
+	}
+	prices := smartrouter.PriceSnapshot{Version: "recovery-price-unavailable", RatiosPPM: map[string]int64{}}
+	if engine.Prices != nil {
+		if current, priceErr := engine.Prices.GetOrRefresh(ctx, userGroup); priceErr == nil && current != nil {
+			prices = *current
+		}
+	}
+	sink.Hint(SmartRouteRecoveryHint{
+		CatalogVersion: catalogVersion,
+		ScopeKey:       scopeKey,
+		Request:        request,
+		Policy:         policy,
+		UserGroup:      userGroup,
+		AllowedGroups:  append([]string(nil), allowedGroups...),
+		Routes:         append([]smartrouter.CertifiedRoute(nil), routes...),
+		Prices:         prices,
+		Runtime:        runtime,
+	})
+}
+
+func NewSmartRouterEngine(
+	catalogs *CatalogManager,
+	prices *PriceSnapshotManager,
+	state SmartRouteStateStore,
+	affinity SmartRouteAffinityStore,
+	settings func() smartroutersetting.Setting,
+) (*SmartRouterEngine, error) {
+	if catalogs == nil || prices == nil || state == nil || affinity == nil {
+		return nil, errors.New("smart router engine dependencies are incomplete")
+	}
+	if settings == nil {
+		settings = smartroutersetting.GetSmartRouterSettingSnapshot
+	}
+	return &SmartRouterEngine{
+		Catalogs: catalogs, Prices: prices, State: state, Affinity: affinity, Settings: settings,
+	}, nil
+}
+
+var (
+	defaultSmartRouterEngineMu sync.Mutex
+	defaultSmartRouterEngine   *SmartRouterEngine
+	defaultSmartRouterError    error
+)
+
+func GetDefaultSmartRouterEngine() (*SmartRouterEngine, error) {
+	defaultSmartRouterEngineMu.Lock()
+	defer defaultSmartRouterEngineMu.Unlock()
+	if defaultSmartRouterEngine != nil || defaultSmartRouterError != nil {
+		return defaultSmartRouterEngine, defaultSmartRouterError
+	}
+	catalogs := NewDefaultCatalogManager()
+	prices := NewPriceSnapshotManager(catalogs, nil)
+	stateSetting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	state, err := NewSmartRouteStateStore(smartRouteStateConfigFromSetting(stateSetting))
+	if err != nil {
+		catalogs.Close()
+		defaultSmartRouterError = err
+		return nil, err
+	}
+	engine, err := NewSmartRouterEngine(catalogs, prices, state, NewSmartRouteAffinityStore(), nil)
+	if err != nil {
+		catalogs.Close()
+		defaultSmartRouterError = err
+		return nil, err
+	}
+	engine.CacheEconomy = NewSmartRouteCacheEconomy()
+	engine.ActualInputCosts = NewSmartRouteActualInputCost()
+	startSmartRouteRecentEvidenceBackfill(engine)
+	if updater, ok := state.(SmartRouteStateConfigUpdater); ok {
+		smartroutersetting.SubscribeSmartRouterSettingChanges(func() {
+			if updateErr := updater.UpdateConfig(smartRouteStateConfigFromSetting(
+				smartroutersetting.GetSmartRouterSettingSnapshot(),
+			)); updateErr != nil {
+				logger.LogWarn(nil, "smart router state config refresh failed: "+updateErr.Error())
+			}
+		})
+	}
+	defaultSmartRouterEngine = engine
+	if common.RedisEnabled && common.RDB != nil {
+		engine.SetRecoveryHintSink(NewRedisSmartRouteRecoveryHintPublisher(nil))
+	}
+	return engine, nil
+}
+
+func smartRouteStateConfigFromSetting(setting smartroutersetting.Setting) SmartRouteStateConfig {
+	setting = smartroutersetting.Normalize(setting)
+	config := DefaultSmartRouteStateConfig()
+	config.Quality.TextRecoveryProbeAfterMS = setting.TextProbeDelayMS()
+	config.Quality.TextRecoveryInitialBackoffMS = int64(setting.TextRecoveryInitialBackoffSeconds) * 1000
+	config.Quality.TextRecoveryMaxBackoffMS = int64(setting.TextRecoveryMaxBackoffSeconds) * 1000
+	config.Quality.MediaRecoveryInitialBackoffMS = int64(setting.MediaRecoveryInitialBackoffSeconds) * 1000
+	config.Quality.MediaRecoveryMaxBackoffMS = int64(setting.MediaRecoveryMaxBackoffSeconds) * 1000
+	config.Quality.SharedOpenFailureThreshold = setting.SharedHealthOpenFailureThreshold
+	config.Quality.HardFailureWindowMS = int64(setting.HardFailureWindowSeconds) * 1_000
+	config.Quality.ImageFailureWindowMS = int64(setting.ImageFailureWindowSeconds) * 1_000
+	config.Quality.ImageFailureThreshold = setting.ImageFailureThreshold
+	config.Quality.FastRecoveryIntervalMS = int64(setting.RecoveryFastIntervalSeconds) * 1_000
+	config.Quality.FastRecoveryWindowMS = int64(setting.RecoveryFastWindowSeconds) * 1_000
+	config.Quality.SlowRecoveryBackoffMS = make([]int64, len(setting.RecoverySlowBackoffSeconds))
+	for index, seconds := range setting.RecoverySlowBackoffSeconds {
+		config.Quality.SlowRecoveryBackoffMS[index] = int64(seconds) * 1_000
+	}
+	config.Quality.HealthyWarmSamples = setting.RecoveryCanaryHealthySamples
+	config.Quality.CredentialBackoffMS = smartrouter.MaximumRecoveryProbeIntervalMS
+	config.Quality.FastCanaryMinSamples = setting.RecoveryCanaryFastHistorySamples
+	config.Quality.FastCanaryMinReliabilityPPM = setting.RecoveryCanaryFastReliabilityPPM
+	config.Quality.WarmingStages = smartRouteCanaryStages(
+		int64(setting.RecoveryCanaryInitialTrafficPPM),
+		setting.RecoveryCanaryHealthySamples,
+	)
+	config.Quality.OpenBackoffMS = make([]int64, len(setting.RecoveryProbeCadenceSeconds))
+	for index, seconds := range setting.RecoveryProbeCadenceSeconds {
+		config.Quality.OpenBackoffMS[index] = int64(seconds) * 1_000
+	}
+	config.DefaultProbeTTL = time.Duration(setting.EffectiveProbeLeaseTTLSeconds()) * time.Second
+	config.ProbeBudgetLimit = setting.ProbeBudgetPerMinute
+	config.ProbeBudgetWindow = time.Minute
+	config.ProbeMaxConcurrency = setting.ProbeMaxConcurrency
+	config.ProbeSubjectCooldown = time.Duration(setting.RecoveryFastIntervalSeconds) * time.Second
+	config.MaxProbeFailures = setting.MaxProbeFailures
+	config.MaxOutage = time.Duration(setting.MaxOutageSeconds) * time.Second
+	return config
+}
+
+func smartRouteCanaryStages(initialTrafficPPM int64, healthySamples int) []smartrouter.WarmingStage {
+	if initialTrafficPPM < 1 {
+		initialTrafficPPM = 1
+	}
+	if initialTrafficPPM > 1_000_000 {
+		initialTrafficPPM = 1_000_000
+	}
+	if healthySamples < 1 {
+		healthySamples = 1
+	}
+	stages := []smartrouter.WarmingStage{{SuccessfulSamples: 1, TrafficPPM: initialTrafficPPM}}
+	appendStage := func(samples int, traffic int64) {
+		last := stages[len(stages)-1]
+		if samples <= last.SuccessfulSamples || traffic <= last.TrafficPPM {
+			return
+		}
+		if traffic > 1_000_000 {
+			traffic = 1_000_000
+		}
+		if traffic > last.TrafficPPM {
+			stages = append(stages, smartrouter.WarmingStage{SuccessfulSamples: samples, TrafficPPM: traffic})
+		}
+	}
+	if healthySamples > 1 {
+		middleSamples := (healthySamples + 1) / 2
+		appendStage(middleSamples, initialTrafficPPM*2)
+		appendStage(healthySamples, initialTrafficPPM*3)
+	}
+	return stages
+}
+
+func resolveSmartRoutePolicyLimits(
+	policy smartrouter.Policy,
+	setting smartroutersetting.Setting,
+) smartrouter.Policy {
+	setting = smartroutersetting.Normalize(setting)
+	policy = smartrouter.NormalizePolicy(policy)
+	// HealthGuard only decides whether this Key obeys the shared automatic-open
+	// exclusion. It never creates or mutates a Key-local health store; manual
+	// blocks, capability, credentials and side-effect safety remain authoritative.
+	if policy.MaxEffectiveRatioPPM == 0 {
+		policy.MaxEffectiveRatioPPM = setting.DefaultMaxEffectiveRatioPPM
+	}
+	if policy.MaxEffectiveRatioPPM > setting.AbsoluteMaxEffectiveRatioPPM {
+		policy.MaxEffectiveRatioPPM = setting.AbsoluteMaxEffectiveRatioPPM
+	}
+	if policy.FailureThreshold > setting.MaxFailureThreshold {
+		policy.FailureThreshold = setting.MaxFailureThreshold
+	}
+	return policy
+}
+
+// SmartRouterCatalogVisibilityPolicy returns the policy used only to decide
+// whether the smart-routing entry point and catalog model list are visible.
+//
+// A v4 key with max_effective_ratio_ppm=0 inherits the site's default ceiling
+// when dispatching. The catalog picker must still expose routes up to the
+// site's absolute ceiling so a user can deliberately raise that key-level
+// limit. Callers that actually dispatch requests must continue using the
+// original key policy through resolveSmartRoutePolicyLimits.
+func SmartRouterCatalogVisibilityPolicy(
+	policy smartrouter.Policy,
+	setting smartroutersetting.Setting,
+) smartrouter.Policy {
+	setting = smartroutersetting.Normalize(setting)
+	policy = smartrouter.NormalizePolicy(policy)
+	policy.MaxEffectiveRatioPPM = setting.AbsoluteMaxEffectiveRatioPPM
+	return policy
+}
+
+func smartRouteBackoffSchedule(initial, maximum time.Duration) []int64 {
+	hardMaximum := time.Duration(smartrouter.MaximumRecoveryProbeIntervalMS) * time.Millisecond
+	if maximum > hardMaximum {
+		maximum = hardMaximum
+	}
+	if initial > hardMaximum {
+		initial = hardMaximum
+	}
+	if initial <= 0 {
+		initial = time.Minute
+	}
+	if maximum < initial {
+		maximum = initial
+	}
+	result := make([]int64, 0, 16)
+	for delay := initial; ; {
+		result = append(result, delay.Milliseconds())
+		if delay >= maximum {
+			break
+		}
+		if delay > maximum/2 {
+			delay = maximum
+		} else {
+			delay *= 2
+		}
+	}
+	return result
+}
+
+type SmartRoutingSession struct {
+	engine *SmartRouterEngine
+
+	startedAt             time.Time
+	observationID         string
+	tokenID               int
+	request               smartrouter.RouteRequest
+	policy                smartrouter.Policy
+	imageCurrentPolicy    *smartrouter.Policy
+	userGroup             string
+	allowedGroups         []string
+	attempt               smartrouter.AttemptState
+	blockedRoutes         map[string]struct{}
+	recoveryBlockedRoutes map[string]struct{}
+	probeSubject          string
+	affinityKey           string
+	affinity              *smartrouter.AffinityState
+	cacheEconomy          *smartrouter.CacheEconomySnapshot
+	pendingCapacity       *smartRoutePendingCapacity
+	coldStartWaited       bool
+}
+
+type SmartRouteAttemptHandle struct {
+	Plan           smartrouter.PlanResult
+	Route          smartrouter.CertifiedRoute
+	AttemptTimeout time.Duration
+
+	startedAt                          time.Time
+	observationID                      string
+	previousRecoveryProbeUsed          bool
+	previousVirginMediaRetryAuthorized bool
+	probe                              *SmartRouteLease
+	capacity                           *SmartRouteLease
+	stop                               chan struct{}
+	done                               chan struct{}
+	stopOnce                           sync.Once
+}
+
+// ResolvedPolicy returns the immutable, server-clamped policy used by this
+// session. Controllers must use this copy for last-moment price checks instead
+// of the raw token JSON, where v4 zero values can mean "inherit site default".
+func (session *SmartRoutingSession) ResolvedPolicy() smartrouter.Policy {
+	if session == nil {
+		return smartrouter.Policy{}
+	}
+	return session.policy
+}
+
+func (handle *SmartRouteAttemptHandle) StartedAt() time.Time {
+	if handle == nil {
+		return time.Time{}
+	}
+	return handle.startedAt
+}
+
+// ObservationID is the privacy-safe request identity shared by live facts and
+// later log replay. It is intentionally independent from route selection and
+// cache affinity.
+func (handle *SmartRouteAttemptHandle) ObservationID() string {
+	if handle == nil {
+		return ""
+	}
+	return handle.observationID
+}
+
+// BeginConfirmationAttempt starts the one permitted same-physical-route
+// confirmation dispatch without releasing or reacquiring the route leases.
+// Keeping the existing leases makes the retry strictly serial and prevents it
+// from temporarily consuming a second capacity slot.
+func (handle *SmartRouteAttemptHandle) BeginConfirmationAttempt() {
+	if handle == nil {
+		return
+	}
+	handle.startedAt = time.Now()
+}
+
+func (handle *SmartRouteAttemptHandle) AttemptContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if handle == nil || handle.AttemptTimeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, handle.AttemptTimeout)
+}
+
+func (engine *SmartRouterEngine) NewSession(
+	ctx context.Context,
+	tokenID int,
+	userGroup string,
+	request smartrouter.RouteRequest,
+	policy smartrouter.Policy,
+) (*SmartRoutingSession, error) {
+	if engine == nil || engine.Settings == nil {
+		return nil, errors.New("smart router engine is unavailable")
+	}
+	setting := engine.Settings()
+	setting = smartroutersetting.Normalize(setting)
+	if !setting.Enabled {
+		return nil, ErrSmartRouterDisabled
+	}
+	if err := setting.Validate(); err != nil {
+		return nil, err
+	}
+	policy = smartrouter.NormalizePolicy(policy)
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	if !policy.Enabled {
+		return nil, smartrouter.ErrPolicyDisabled
+	}
+	policy = resolveSmartRoutePolicyLimits(policy, setting)
+	if policy.QueuePolicy.Mode == smartrouter.QueueModeShortWait {
+		if policy.QueuePolicy.MaxWaitMS > int64(setting.MaxQueueWaitMS) {
+			policy.QueuePolicy.MaxWaitMS = int64(setting.MaxQueueWaitMS)
+		}
+		if policy.QueuePolicy.MaxWaitMS <= 0 {
+			policy.QueuePolicy = smartrouter.QueuePolicy{Mode: smartrouter.QueueModeNoQueue}
+		}
+	}
+	maxAttempts := strictSmartRouteAttemptLimit(setting.MaxAttempts, policy.EffectiveMaxAttempts())
+	if maxAttempts < 1 {
+		return nil, errors.New("smart router max attempts is not configured")
+	}
+	observationSource := strings.TrimSpace(request.AdmissionKey)
+	request.AdmissionKey = ensureSmartRouteAdmissionKey(tokenID, request)
+	if observationSource == "" {
+		observationSource = request.AdmissionKey
+	}
+	groups := GetUserUsableGroups(userGroup)
+	allowed := make([]string, 0, len(groups))
+	for group := range groups {
+		allowed = append(allowed, group)
+	}
+	sort.Strings(allowed)
+	session := &SmartRoutingSession{
+		engine: engine, startedAt: time.Now(), observationID: smartRouteCanonicalObservationID("request", observationSource),
+		tokenID: tokenID, request: request, policy: policy, userGroup: userGroup,
+		allowedGroups: allowed,
+		attempt: smartrouter.AttemptState{
+			MaxAttempts: maxAttempts,
+			// Every routable class is bounded by its de-duplicated certified
+			// physical-route set, not a numeric retry limit. The controller still
+			// authorizes another media/side-effecting dispatch only after a concrete
+			// upstream rejection proves that the prior route did not accept work.
+			ExhaustEligibleChannels: smartrouter.IsRoutableReplayClass(request.ReplayClass),
+		},
+		blockedRoutes: make(map[string]struct{}),
+		probeSubject:  strconv.Itoa(tokenID),
+	}
+	if key, strength, ok := BuildSmartRouteAffinityKey(tokenID, request, policy); ok {
+		session.affinityKey = key
+		state, found, err := engine.Affinity.Get(ctx, key)
+		if err != nil {
+			logger.LogWarn(nil, "smart router affinity read failed: "+err.Error())
+		}
+		if found && state != nil {
+			state.Strength = strength
+			session.affinity = state
+		}
+		if policy.EffectiveAffinityMode() == smartrouter.AffinityModeEconomicBreakEven && engine.CacheEconomy != nil {
+			snapshot, snapshotErr := engine.CacheEconomy.Snapshot(ctx, tokenID, key, request, policy)
+			if snapshotErr != nil {
+				logger.LogWarn(nil, "smart router cache economy read failed; fixed affinity fallback is active: "+snapshotErr.Error())
+			} else {
+				session.cacheEconomy = snapshot
+			}
+		}
+	}
+	return session, nil
+}
+
+// ensureSmartRouteAdmissionKey supplies a stable, non-sensitive sampling key
+// for every runtime session. A missing prompt_cache_key must not make warming
+// routes unreachable; it is also intentionally kept distinct from the cache
+// affinity key so ordinary requests are never strongly pinned to a route.
+func ensureSmartRouteAdmissionKey(tokenID int, request smartrouter.RouteRequest) string {
+	seed := strings.TrimSpace(request.AdmissionKey)
+	if seed == "" {
+		seed = fmt.Sprintf("token:%d", tokenID)
+	}
+	payload := fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s",
+		seed, tokenID, request.ContractID, request.CanonicalModel, request.Endpoint, request.WarmingKey)
+	digest := sha256.Sum256([]byte(payload))
+	return "smart-admission-" + hex.EncodeToString(digest[:])
+}
+
+func (session *SmartRoutingSession) Next(ctx context.Context) (*SmartRouteAttemptHandle, error) {
+	if session == nil || session.engine == nil {
+		return nil, errors.New("smart routing session is unavailable")
+	}
+	defer session.releasePendingCapacity()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !session.attemptLimitAllowsNext() {
+			return nil, smartrouter.ErrAttemptBudget
+		}
+		setting := session.engine.Settings()
+		coldStartSetting := smartroutersetting.Normalize(setting)
+		if !setting.Enabled {
+			return nil, ErrSmartRouterDisabled
+		}
+		catalog, refreshErr := session.engine.Catalogs.RefreshIfDue(ctx)
+		if catalog == nil {
+			if refreshErr != nil {
+				return nil, refreshErr
+			}
+			return nil, ErrNoCurrentSmartCatalog
+		}
+		prices, err := session.engine.Prices.GetOrRefresh(ctx, session.userGroup)
+		if err != nil {
+			return nil, err
+		}
+		catalog, prices, err = parameterMediaRoutingSnapshot(session.request, catalog, prices)
+		if err != nil {
+			return nil, err
+		}
+		routes, err := session.contractRoutes(*catalog)
+		if err != nil {
+			return nil, err
+		}
+		// v4 discovers every eligible group automatically and deliberately
+		// supports single-route models and user-selected subsets without an
+		// administrator-maintained allow-list or fallback requirement. Keep the old preflight only for
+		// persisted v3 policies; v4 lets the planner apply its ordinary price,
+		// health, protocol and per-Key scope filters.
+		if session.policy.Version == smartrouter.LegacyPolicyVersion && !smartRouteCandidateSetIsSafe(
+			routes,
+			session.request.ContractID,
+			session.policy,
+			*prices,
+			session.allowedGroups,
+			&session.request,
+		) {
+			return nil, ErrSmartRouteUnsafeCandidateSet
+		}
+		runtime, err := session.engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{
+			Routes: smartRouteStateRoutes(routes),
+		})
+		if err != nil {
+			return nil, err
+		}
+		session.adjustCapacityForPendingLease(&runtime)
+		exclusions, err := session.engine.State.RouteExclusions(ctx, SmartRouteExclusionRequest{
+			CatalogVersion: catalog.Version,
+			Routes:         smartRouteStateRoutes(routes),
+			FailureScopes:  []SmartRouteFailureScope{SmartFailureRouteModel, SmartFailureRouteContract},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		policy := session.policy
+		policy.ExcludedRoutes = session.mergedExcludedRoutes(policy.ExcludedRoutes, nil, routes, setting.KillSwitchMode)
+		if session.imageCurrentPolicy != nil {
+			current := resolveSmartRoutePolicyLimits(*session.imageCurrentPolicy, setting)
+			allowed := make(map[string]struct{}, len(session.allowedGroups))
+			for _, group := range session.allowedGroups {
+				allowed[group] = struct{}{}
+			}
+			for _, route := range routes {
+				if !smartRoutePolicyAllowsCandidate(route, session.request.ContractID, current, *prices, allowed, &session.request) {
+					policy.ExcludedRoutes = append(policy.ExcludedRoutes, route.RouteID)
+				}
+			}
+		}
+		automaticExcludedRoutes := append([]string(nil), exclusions.RouteIDs...)
+		for routeID := range session.recoveryBlockedRoutes {
+			automaticExcludedRoutes = append(automaticExcludedRoutes, routeID)
+		}
+		for i := range routes {
+			routes[i].PassiveRecovery = SmartRouteRequiresPassiveRecovery(session.request.CanonicalModel, routes[i])
+		}
+		backgroundRecovery := setting.TextProbeDelayMS() == 0 && setting.BackgroundProbeEnabled && smartrouter.IsSyntheticProbeSafe(session.request.ReplayClass) && SmartRouteSyntheticProbeAllowed(session.request.Endpoint, session.request.CanonicalModel, routes...)
+		var recoveryHint *SmartRouteRecoveryHint
+		if backgroundRecovery {
+			if sink := session.engine.recoveryHintSink(); sink != nil {
+				hint := SmartRouteRecoveryHint{
+					CatalogVersion: catalog.Version,
+					ScopeKey:       session.probeSubject,
+					Request:        session.request,
+					Policy:         policy,
+					UserGroup:      session.userGroup,
+					AllowedGroups:  append([]string(nil), session.allowedGroups...),
+					Routes:         append([]smartrouter.CertifiedRoute(nil), routes...),
+					Prices:         *prices,
+					Runtime:        runtime,
+					ExcludedRoutes: append([]string(nil), exclusions.RouteIDs...),
+				}
+				recoveryHint = &hint
+				sink.Hint(hint)
+			}
+		}
+		planInput := smartrouter.PlanInput{
+			RecoveryFallbackEnabled:  setting.RecoveryFallbackAllowed(),
+			AutomaticExcludedRoutes:  automaticExcludedRoutes,
+			TextRecoveryProbeAfterMS: setting.TextProbeDelayMS(),
+			NowMS:                    time.Now().UnixMilli(),
+			RecoveryEvidenceTTLMS:    int64(setting.RecoveryBackupEvidenceTTLSeconds) * 1_000,
+			Request:                  session.request,
+			Policy:                   policy,
+			Catalog:                  *catalog,
+			Prices:                   *prices,
+			Quality:                  runtime.Quality,
+			TTFT:                     runtime.TTFT,
+			Capacity:                 runtime.Capacity,
+			Credentials:              runtime.Credentials,
+			AllowedGroups:            session.allowedGroups,
+			Affinity:                 session.affinity,
+			CacheEconomy:             session.cacheEconomy,
+			ActualInputCosts:         session.engine.actualInputCostSnapshot(),
+			WeakAffinityTolerancePPM: smartRouteWeakAffinityTolerancePPM,
+			Attempt:                  session.attempt,
+			BackgroundRecovery:       backgroundRecovery,
+		}
+		plan, err := smartrouter.Plan(planInput)
+		if err != nil {
+			if errors.Is(err, smartrouter.ErrNoCandidate) && backgroundRecovery &&
+				!session.coldStartWaited && session.attempt.RecoveryProbeUsed &&
+				session.engine.recoveryHintSink() != nil && smartRouteHasColdStartAlternative(session.request, routes) {
+				session.coldStartWaited = true
+				discovered, waitErr := session.waitForColdStartDiscovery(
+					ctx,
+					routes,
+					coldStartSetting.ColdStartWaitMS,
+					coldStartSetting.ColdStartPollIntervalMS,
+					func(latest SmartRouteRuntimeSnapshot) bool {
+						waitInput := planInput
+						waitInput.NowMS = time.Now().UnixMilli()
+						waitInput.Quality = latest.Quality
+						waitInput.TTFT = latest.TTFT
+						waitInput.Capacity = latest.Capacity
+						waitInput.Credentials = latest.Credentials
+						_, waitPlanErr := smartrouter.Plan(waitInput)
+						if waitPlanErr == nil {
+							return true
+						}
+						virginJobs, _, _ := smartRouteColdStartJobs(SmartRouteRecoveryHint{
+							CatalogVersion: catalog.Version, ScopeKey: session.probeSubject,
+							Request: session.request, Policy: policy, UserGroup: session.userGroup,
+							AllowedGroups: append([]string(nil), session.allowedGroups...),
+							Routes:        routes, Prices: *prices, Runtime: latest,
+							ExcludedRoutes: append([]string(nil), exclusions.RouteIDs...),
+						})
+						return len(virginJobs) == 0
+					},
+				)
+				if waitErr != nil {
+					return nil, waitErr
+				}
+				if discovered {
+					continue
+				}
+			}
+			return nil, err
+		}
+		route, found := findSmartRoute(routes, plan.RouteID, plan.ChannelID)
+		if !found {
+			return nil, errors.New("smart router selected a route outside the current catalog")
+		}
+		if plan.Kind == smartrouter.PlanQueue {
+			acquisition, acquired, waitErr := session.waitForCapacity(ctx, route, plan.MaxQueueWaitMS)
+			session.attempt.Requeued = true
+			if waitErr != nil {
+				return nil, waitErr
+			}
+			if !acquired {
+				session.blockedRoutes[route.RouteID] = struct{}{}
+				continue
+			}
+			session.pendingCapacity = &smartRoutePendingCapacity{
+				routeID: route.RouteID, capacityDomain: route.CapacityDomain, acquisition: acquisition,
+			}
+			continue
+		}
+
+		capacityLimit := strictSmartRouteAttemptLimit(route.MaxInflight, plan.MaxInflightHint)
+		var capacity SmartRouteCapacityAcquisition
+		if session.pendingCapacity != nil && session.pendingCapacity.routeID == route.RouteID {
+			capacity = session.pendingCapacity.acquisition
+			session.pendingCapacity = nil
+		} else {
+			if session.pendingCapacity != nil {
+				session.releasePendingCapacity()
+			}
+			capacity, err = session.engine.State.TryAcquireCapacity(ctx, SmartRouteCapacityRequest{
+				RecoveryFallback: plan.RecoveryFallback,
+				CapacityDomain:   route.CapacityDomain,
+				MaxInflight:      capacityLimit,
+				StableFallback:   route.StableFallback,
+				QueueMode:        smartrouter.QueueModeNoQueue,
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !capacity.Granted() {
+			session.blockedRoutes[route.RouteID] = struct{}{}
+			continue
+		}
+
+		var probeLease *SmartRouteLease
+		if isSmartRouteLeaseAdmission(plan.Admission) {
+			probeRequest := SmartRouteProbeRequest{
+				RouteID: route.RouteID,
+				LeaseKey: smartRoutePhysicalProbeKey(
+					session.request.ContractID,
+					session.request.Endpoint,
+					route,
+				),
+				StableFallback: route.StableFallback,
+				SubjectKey:     session.probeSubject + ":" + route.RouteID, ExpectedEpoch: plan.RouteEpoch,
+				VirginBootstrap: plan.Admission == smartrouter.AdmissionVirginBootstrap,
+			}
+			if plan.Admission == smartrouter.AdmissionVirginBootstrap {
+				probeRequest.BudgetNamespace = SmartRouteProbeBudgetColdStart
+				probeRequest.BudgetLimit = coldStartSetting.ColdStartProbeBudgetPerMinute
+				probeRequest.MaxConcurrency = coldStartSetting.ColdStartWaveMaxConcurrency
+			}
+			if setting.TextProbeDelayMS() > 0 || SmartRouteRequiresPassiveRecovery(session.request.CanonicalModel, route) {
+				// The route's due time governs real-request retries. The synthetic
+				// per-subject cooldown must not stretch a 2s/4s demand cooldown.
+				probeRequest.SubjectCooldown = time.Millisecond
+			}
+			probeLease, found, err = session.engine.State.TryAcquireProbe(ctx, probeRequest)
+			if err != nil {
+				releaseSmartRouteLease(capacity.Lease)
+				return nil, err
+			}
+			if !found {
+				releaseSmartRouteLease(capacity.Lease)
+				if session.recoveryBlockedRoutes == nil {
+					session.recoveryBlockedRoutes = make(map[string]struct{})
+				}
+				session.recoveryBlockedRoutes[route.RouteID] = struct{}{}
+				continue
+			}
+		}
+
+		latestPrices, priceErr := session.engine.Prices.GetOrRefresh(ctx, session.userGroup)
+		if priceErr == nil {
+			_, latestPrices, priceErr = parameterMediaRoutingSnapshot(session.request, catalog, latestPrices)
+		}
+		if priceErr != nil {
+			releaseSmartRouteLease(probeLease)
+			releaseSmartRouteLease(capacity.Lease)
+			return nil, priceErr
+		}
+		latestRatio, stillPriced := latestPrices.RatiosPPM[route.RouteID]
+		if latestPrices.Version != plan.PriceVersion || !stillPriced || latestRatio != plan.RatioPPM {
+			releaseSmartRouteLease(probeLease)
+			releaseSmartRouteLease(capacity.Lease)
+			continue
+		}
+
+		previousRecoveryProbeUsed := session.attempt.RecoveryProbeUsed
+		previousVirginMediaRetryAuthorized := session.attempt.VirginMediaRetryAuthorized
+		session.attempt.StartedAttempts++
+		session.attempt.AttemptedRoutes = append(session.attempt.AttemptedRoutes, route.RouteID)
+		session.attempt.AttemptedChannels = append(session.attempt.AttemptedChannels, route.ChannelID)
+		if session.request.ReplayClass == smartrouter.ReplaySafeImage ||
+			session.request.ReplayClass == smartrouter.ReplaySafeVideo ||
+			session.request.ReplayClass == smartrouter.ReplaySafeAudio {
+			// A media replay grant applies to exactly one subsequently-started
+			// attempt. Consume it for any selected route so it cannot leak past an
+			// intervening healthy route into a later ambiguous submission.
+			session.attempt.VirginMediaRetryAuthorized = false
+		}
+		if plan.Admission == smartrouter.AdmissionProbe || plan.Admission == smartrouter.AdmissionVirginBootstrap {
+			session.attempt.RecoveryProbeUsed = true
+		}
+		if plan.Admission == smartrouter.AdmissionVirginBootstrap && recoveryHint != nil {
+			selectedHint := *recoveryHint
+			selectedHint.ForegroundPhysicalKey = smartRoutePhysicalProbeKey(
+				session.request.ContractID,
+				session.request.Endpoint,
+				route,
+			)
+			if sink := session.engine.recoveryHintSink(); sink != nil {
+				sink.Hint(selectedHint)
+			}
+		}
+		handle := &SmartRouteAttemptHandle{
+			Plan: plan, Route: route, AttemptTimeout: smartRouteRecoveryTimeout(plan, session.request, setting),
+			startedAt: time.Now(), observationID: session.observationID,
+			previousRecoveryProbeUsed:          previousRecoveryProbeUsed,
+			previousVirginMediaRetryAuthorized: previousVirginMediaRetryAuthorized,
+			probe:                              probeLease,
+			capacity:                           capacity.Lease, stop: make(chan struct{}), done: make(chan struct{}),
+		}
+		handle.startHeartbeat(ctx)
+		return handle, nil
+	}
+}
+
+// ReplanIfPriceQuoteChanged is the final pre-dispatch consistency check between
+// the route snapshot selected by the planner and the PriceData built by the
+// billing helper. A hot pricing update that lands in that short interval must
+// release the unused leases and replan before any upstream call or reservation.
+// The discarded plan is not counted as an attempt because no provider work was
+// started and no quota was consumed.
+func (session *SmartRoutingSession) ReplanIfPriceQuoteChanged(
+	ctx context.Context,
+	handle *SmartRouteAttemptHandle,
+	pricingRevision string,
+) (bool, error) {
+	if session == nil || session.engine == nil || session.engine.Prices == nil || handle == nil {
+		return false, errors.New("smart router price quote validation is unavailable")
+	}
+	latest, err := session.engine.Prices.GetOrRefresh(ctx, session.userGroup)
+	if err != nil {
+		session.discardUnstartedAttempt(handle)
+		return false, err
+	}
+	if catalog, ok := session.engine.Catalogs.Current(); ok {
+		_, overlaid, overlayErr := parameterMediaRoutingSnapshot(session.request, catalog, latest)
+		if overlayErr != nil {
+			session.discardUnstartedAttempt(handle)
+			return false, overlayErr
+		}
+		latest = overlaid
+	}
+	latestRatio, priced := latest.RatiosPPM[handle.Plan.RouteID]
+	latestPricingRevision := ""
+	if latest.RoutePrices != nil {
+		price, exists := latest.RoutePrices[handle.Plan.RouteID]
+		if !exists {
+			session.discardUnstartedAttempt(handle)
+			return false, errors.New("smart router selected route has no current price descriptor")
+		}
+		latestPricingRevision = price.Revision
+	}
+	changed := latest.Version != handle.Plan.PriceVersion || !priced ||
+		latestRatio != handle.Plan.RatioPPM || latestPricingRevision != pricingRevision
+	if !changed {
+		return false, nil
+	}
+	session.discardUnstartedAttempt(handle)
+	return true, nil
+}
+
+func (session *SmartRoutingSession) discardUnstartedAttempt(handle *SmartRouteAttemptHandle) {
+	if session == nil || handle == nil {
+		return
+	}
+	handle.stopAndRelease()
+	if session.attempt.StartedAttempts > 0 {
+		session.attempt.StartedAttempts--
+	}
+	if last := len(session.attempt.AttemptedRoutes) - 1; last >= 0 &&
+		session.attempt.AttemptedRoutes[last] == handle.Route.RouteID {
+		session.attempt.AttemptedRoutes = session.attempt.AttemptedRoutes[:last]
+	}
+	if last := len(session.attempt.AttemptedChannels) - 1; last >= 0 &&
+		session.attempt.AttemptedChannels[last] == handle.Route.ChannelID {
+		session.attempt.AttemptedChannels = session.attempt.AttemptedChannels[:last]
+	}
+	session.attempt.RecoveryProbeUsed = handle.previousRecoveryProbeUsed
+	session.attempt.VirginMediaRetryAuthorized = handle.previousVirginMediaRetryAuthorized
+}
+
+func (session *SmartRoutingSession) RecordAttempt(
+	ctx context.Context,
+	handle *SmartRouteAttemptHandle,
+	outcome SmartRouteOutcome,
+	retryAfter time.Duration,
+	ttft time.Duration,
+	ttftObserved bool,
+) {
+	if session == nil || handle == nil {
+		return
+	}
+	handle.stopHeartbeat()
+	setting := smartroutersetting.Normalize(session.engine.Settings())
+	demandRecovery := setting.TextProbeDelayMS() > 0
+	aliases := session.physicalRouteAliases(handle)
+	if outcome.ShouldQuarantineRoute() {
+		quarantineCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		quarantineRoutes := append([]smartrouter.CertifiedRoute{handle.Route}, aliases...)
+		for _, route := range quarantineRoutes {
+			_ = session.engine.State.QuarantineRoute(quarantineCtx, SmartRouteQuarantineRequest{
+				CatalogVersion: handle.Plan.CatalogVersion,
+				RouteID:        route.RouteID,
+				FailureScope:   outcome.FailureScope,
+				TTL:            time.Duration(outcome.RouteQuarantineMS) * time.Millisecond,
+			})
+		}
+		cancel()
+	}
+	recordCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = session.engine.State.RecordAttempt(recordCtx, SmartRouteAttemptRecord{
+		CatalogVersion: handle.Plan.CatalogVersion,
+		RouteID:        handle.Route.RouteID, Group: handle.Route.Group, Model: session.request.CanonicalModel,
+		ChannelID: handle.Route.ChannelID, ContractID: session.request.ContractID, Endpoint: session.request.Endpoint,
+		CapacityDomain:   handle.Route.CapacityDomain,
+		CredentialDomain: smartrouter.RouteCredentialDomain(handle.Route),
+		StableFallback:   handle.Route.StableFallback, Outcome: outcome.Outcome,
+		SkipHealthUpdate: !isSmartRouteRecoveryAdmission(handle.Plan.Admission) &&
+			outcome.RouteFailure && !outcome.AffectsRouteHealth &&
+			outcome.Outcome != smartrouter.OutcomeCapacityLimited,
+		RetryAfter: retryAfter, TTFT: ttft, TTFTObserved: ttftObserved,
+		Warmup:          smartRouteAttemptWarmup(session, handle),
+		Admission:       handle.Plan.Admission,
+		DemandRecovery:  demandRecovery,
+		SyntheticProbe:  !demandRecovery && isSmartRouteRecoveryAdmission(handle.Plan.Admission) && !SmartRouteRequiresPassiveRecovery(session.request.CanonicalModel, handle.Route),
+		PassiveRecovery: SmartRouteRequiresPassiveRecovery(session.request.CanonicalModel, handle.Route),
+		RouteEpoch:      handle.Plan.RouteEpoch,
+		ProbeLeaseID:    smartRouteLeaseID(handle.probe),
+		ObservationID:   handle.observationID,
+		StartedAtMS:     session.startedAt.UnixMilli(),
+		HTTPStatus:      outcome.HTTPStatus,
+		ErrorSummary:    outcome.ErrorSummary,
+	})
+	if outcome.Outcome == smartrouter.OutcomeSuccess ||
+		(outcome.AffectsRouteHealth && (outcome.Outcome == smartrouter.OutcomeInfrastructure ||
+			outcome.Outcome == smartrouter.OutcomeCredential || outcome.Outcome == smartrouter.OutcomeCapacityLimited)) {
+		for _, alias := range aliases {
+			_ = session.engine.State.RecordAttempt(recordCtx, SmartRouteAttemptRecord{
+				CatalogVersion: handle.Plan.CatalogVersion,
+				RouteID:        alias.RouteID, Group: alias.Group, Model: session.request.CanonicalModel,
+				ChannelID: alias.ChannelID, ContractID: session.request.ContractID, Endpoint: session.request.Endpoint,
+				CapacityDomain: alias.CapacityDomain, CredentialDomain: smartrouter.RouteCredentialDomain(alias),
+				StableFallback: alias.StableFallback, Outcome: outcome.Outcome, SkipDomainUpdate: true,
+				RetryAfter: retryAfter, TTFT: ttft, TTFTObserved: ttftObserved,
+				Warmup:          smartRouteAttemptWarmup(session, handle),
+				DemandRecovery:  demandRecovery,
+				PassiveRecovery: SmartRouteRequiresPassiveRecovery(session.request.CanonicalModel, alias),
+				Admission:       smartrouter.AdmissionNormal, HTTPStatus: outcome.HTTPStatus,
+				ObservationID: handle.observationID, StartedAtMS: session.startedAt.UnixMilli(),
+				ErrorSummary: outcome.ErrorSummary,
+			})
+		}
+	}
+	if outcome.AffectsRouteHealth && outcome.Outcome != smartrouter.OutcomeSuccess {
+		recoveryRoutes := append([]smartrouter.CertifiedRoute{handle.Route}, aliases...)
+		session.engine.hintAutomaticRecovery(
+			recordCtx,
+			handle.Plan.CatalogVersion,
+			session.probeSubject,
+			session.request,
+			session.policy,
+			session.userGroup,
+			session.allowedGroups,
+			recoveryRoutes,
+		)
+	}
+	cancel()
+	handle.releaseLeases()
+	if outcome.Outcome == smartrouter.OutcomeSuccess {
+		session.recordAffinity(handle)
+		if handle.Plan.Admission == smartrouter.AdmissionVirginBootstrap {
+			if sink, ok := session.engine.recoveryHintSink().(SmartRouteColdStartSuccessSink); ok {
+				sink.ColdStartSucceeded(
+					session.request,
+					smartRoutePhysicalProbeKey(session.request.ContractID, session.request.Endpoint, handle.Route),
+				)
+			}
+		}
+		notifySmartRouteDiscovery(session.request)
+	}
+}
+
+func smartRouteAttemptWarmup(session *SmartRoutingSession, handle *SmartRouteAttemptHandle) bool {
+	if session == nil || handle == nil {
+		return false
+	}
+	warmup := handle.Plan.Admission == smartrouter.AdmissionVirginBootstrap
+	if session.affinity != nil {
+		warmup = warmup || session.affinity.CacheDomain != handle.Route.CacheDomain ||
+			session.affinity.CacheNamespaceRevision != handle.Route.CacheNamespaceRevision
+	}
+	return warmup
+}
+
+func (session *SmartRoutingSession) physicalRouteAliases(handle *SmartRouteAttemptHandle) []smartrouter.CertifiedRoute {
+	if session == nil || session.engine == nil || session.engine.Catalogs == nil || handle == nil {
+		return nil
+	}
+	catalog, ok := session.engine.Catalogs.Current()
+	if !ok || catalog == nil || catalog.Version != handle.Plan.CatalogVersion {
+		return nil
+	}
+	routes, err := session.contractRoutes(*catalog)
+	if err != nil {
+		return nil
+	}
+	aliases := make([]smartrouter.CertifiedRoute, 0)
+	for _, route := range routes {
+		if route.RouteID == handle.Route.RouteID || route.ChannelID != handle.Route.ChannelID ||
+			route.ChannelGeneration != handle.Route.ChannelGeneration || route.UpstreamModel != handle.Route.UpstreamModel {
+			continue
+		}
+		aliases = append(aliases, route)
+	}
+	return aliases
+}
+
+func (session *SmartRoutingSession) CanTryNext(outcome SmartRouteOutcome, committed bool) bool {
+	return session != nil && !committed && outcome.CanTryNextRoute() && session.attemptLimitAllowsNext()
+}
+
+func (session *SmartRoutingSession) ResumeImageAttempts(channels []int, groups []string) {
+	if session == nil || session.request.ReplayClass != smartrouter.ReplaySafeImage {
+		return
+	}
+	session.attempt.AttemptedChannels = append([]int(nil), channels...)
+	session.attempt.StartedAttempts = len(channels)
+	session.attempt.VirginMediaRetryAuthorized = len(channels) > 0
+	allowed := make(map[string]bool, len(groups))
+	for _, group := range groups {
+		allowed[group] = true
+	}
+	filtered := make([]string, 0, len(session.allowedGroups))
+	for _, group := range session.allowedGroups {
+		if allowed[group] {
+			filtered = append(filtered, group)
+		}
+	}
+	session.allowedGroups = filtered
+}
+
+func (session *SmartRoutingSession) RestrictImageCurrentPolicy(policy smartrouter.Policy) {
+	if session != nil && session.request.ReplayClass == smartrouter.ReplaySafeImage {
+		resolved := resolveSmartRoutePolicyLimits(policy, session.engine.Settings())
+		session.imageCurrentPolicy = &resolved
+		session.policy.MaxEffectiveRatioPPM = min(session.policy.MaxEffectiveRatioPPM, resolved.MaxEffectiveRatioPPM)
+	}
+}
+
+func (session *SmartRoutingSession) attemptLimitAllowsNext() bool {
+	if session == nil {
+		return false
+	}
+	if session.attempt.ExhaustEligibleChannels {
+		return true
+	}
+	return session.attempt.StartedAttempts < session.attempt.MaxAttempts
+}
+
+// CanTryNextMedia is the only authority that opens another virgin media route
+// in the same request. The controller must prove the current submission was
+// not accepted; unknown acceptance, downstream commitment, and exhausted
+// attempt budgets all fail closed.
+func (session *SmartRoutingSession) CanTryNextMedia(
+	outcome SmartRouteOutcome,
+	committed bool,
+	disposition SmartMediaAttemptDisposition,
+) bool {
+	if session == nil || (session.request.ReplayClass != smartrouter.ReplaySafeImage &&
+		session.request.ReplayClass != smartrouter.ReplaySafeVideo &&
+		session.request.ReplayClass != smartrouter.ReplaySafeAudio) {
+		return false
+	}
+	if disposition != SmartMediaAttemptNotAccepted || !session.CanTryNext(outcome, committed) {
+		return false
+	}
+	session.attempt.VirginMediaRetryAuthorized = true
+	return true
+}
+
+func (session *SmartRoutingSession) recordAffinity(handle *SmartRouteAttemptHandle) {
+	if session.affinityKey == "" || handle == nil {
+		return
+	}
+	nowMS := time.Now().UnixMilli()
+	if handle.Plan.AffinityDisposition == smartrouter.AffinityPreserve && session.affinity != nil &&
+		(session.affinity.RouteID != handle.Route.RouteID || session.affinity.ChannelID != handle.Route.ChannelID) {
+		state := *session.affinity
+		state.LastActivityMS = nowMS
+		session.persistAffinity(state)
+		return
+	}
+	lastSwitchMS := nowMS
+	if session.affinity != nil && session.affinity.RouteID == handle.Route.RouteID &&
+		session.affinity.ChannelID == handle.Route.ChannelID {
+		lastSwitchMS = session.affinity.LastSwitchMS
+	}
+	state := smartrouter.AffinityState{
+		Strength: smartrouter.AffinityStrong, ContractID: session.request.ContractID,
+		RouteID: handle.Route.RouteID, ChannelID: handle.Route.ChannelID,
+		CacheDomain: handle.Route.CacheDomain, CacheNamespaceRevision: handle.Route.CacheNamespaceRevision,
+		PolicyID:      session.policy.PolicyID,
+		LastSuccessMS: nowMS, LastSwitchMS: lastSwitchMS, LastActivityMS: nowMS,
+	}
+	session.persistAffinity(state)
+}
+
+func (session *SmartRoutingSession) persistAffinity(state smartrouter.AffinityState) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ttl := time.Duration(session.policy.AffinityTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = defaultSmartRouteAffinityTTL
+	}
+	if err := session.engine.Affinity.Put(ctx, session.affinityKey, state, ttl); err != nil {
+		logger.LogWarn(nil, "smart router affinity write failed: "+err.Error())
+	}
+	cancel()
+	session.affinity = &state
+}
+
+func (session *SmartRoutingSession) contractRoutes(catalog smartrouter.CertifiedRouteCatalog) ([]smartrouter.CertifiedRoute, error) {
+	contract, exists := catalog.Contracts[session.request.ContractID]
+	if !exists {
+		return nil, smartrouter.ErrContractNotFound
+	}
+	poolID := session.policy.PoolPolicy
+	if session.policy.Version == smartrouter.PolicyVersion {
+		if _, automatic := contract.Pools[smartrouter.AutomaticPoolID]; automatic {
+			poolID = smartrouter.AutomaticPoolID
+		}
+	}
+	if session.policy.Version == smartrouter.LegacyPolicyVersion {
+		if override, exists := session.policy.ContractOverrides[session.request.ContractID]; exists && override.PoolPolicy != "" {
+			poolID = override.PoolPolicy
+		}
+	}
+	pool, exists := contract.Pools[poolID]
+	if !exists {
+		return nil, fmt.Errorf("%w: %s", smartrouter.ErrPoolNotFound, poolID)
+	}
+	return pool.Candidates, nil
+}
+
+func (session *SmartRoutingSession) mergedExcludedRoutes(
+	configured []string,
+	quarantined []string,
+	routes []smartrouter.CertifiedRoute,
+	killSwitch string,
+) []string {
+	set := make(map[string]struct{}, len(configured)+len(quarantined)+len(session.blockedRoutes))
+	for _, routeID := range configured {
+		set[routeID] = struct{}{}
+	}
+	for _, routeID := range quarantined {
+		set[routeID] = struct{}{}
+	}
+	for routeID := range session.blockedRoutes {
+		set[routeID] = struct{}{}
+	}
+	if killSwitch == smartroutersetting.KillSwitchFallbackOnly && session.policy.Version == smartrouter.LegacyPolicyVersion {
+		for _, route := range routes {
+			if !route.StableFallback {
+				set[route.RouteID] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(set))
+	for routeID := range set {
+		result = append(result, routeID)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (handle *SmartRouteAttemptHandle) startHeartbeat(ctx context.Context) {
+	go func() {
+		defer close(handle.done)
+		ticker := time.NewTicker(smartRouteLeaseHeartbeatIntervalFor(handle))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-handle.stop:
+				return
+			case <-ticker.C:
+				renewCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if handle.probe != nil {
+					_ = handle.probe.Renew(renewCtx)
+				}
+				if handle.capacity != nil {
+					_ = handle.capacity.Renew(renewCtx)
+				}
+				cancel()
+			}
+		}
+	}()
+}
+
+// smartRouteLeaseHeartbeatIntervalFor keeps every active lease alive without
+// imposing a fixed interval that can exceed a configured probe TTL. A third
+// of the shortest lease TTL leaves room for transient scheduling and network
+// latency while retaining the old 15-second ceiling for long-lived leases.
+func smartRouteLeaseHeartbeatIntervalFor(handle *SmartRouteAttemptHandle) time.Duration {
+	interval := smartRouteLeaseHeartbeatInterval
+	if handle == nil {
+		return interval
+	}
+	for _, lease := range []*SmartRouteLease{handle.probe, handle.capacity} {
+		if lease == nil {
+			continue
+		}
+		lease.mu.Lock()
+		ttl := lease.renewTTL
+		lease.mu.Unlock()
+		if ttl <= 0 {
+			continue
+		}
+		candidate := ttl / 3
+		if candidate < time.Millisecond {
+			candidate = time.Millisecond
+		}
+		if candidate < interval {
+			interval = candidate
+		}
+	}
+	if interval <= 0 {
+		return time.Millisecond
+	}
+	return interval
+}
+
+func (handle *SmartRouteAttemptHandle) stopAndRelease() {
+	if handle == nil {
+		return
+	}
+	handle.stopHeartbeat()
+	handle.releaseLeases()
+}
+
+func (handle *SmartRouteAttemptHandle) stopHeartbeat() {
+	if handle == nil {
+		return
+	}
+	handle.stopOnce.Do(func() { close(handle.stop) })
+	<-handle.done
+}
+
+func (handle *SmartRouteAttemptHandle) releaseLeases() {
+	if handle == nil {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = handle.capacity.Release(releaseCtx)
+	_ = handle.probe.Release(releaseCtx)
+	cancel()
+}
+
+func releaseSmartRouteLease(lease *SmartRouteLease) {
+	if lease == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = lease.Release(ctx)
+	cancel()
+}
+
+func smartRouteLeaseID(lease *SmartRouteLease) string {
+	if lease == nil {
+		return ""
+	}
+	return lease.ID
+}
+
+func isSmartRouteRecoveryAdmission(admission smartrouter.AdmissionKind) bool {
+	return admission == smartrouter.AdmissionProbe || admission == smartrouter.AdmissionWarmSample
+}
+
+func isSmartRouteLeaseAdmission(admission smartrouter.AdmissionKind) bool {
+	return isSmartRouteRecoveryAdmission(admission) || admission == smartrouter.AdmissionVirginBootstrap
+}
+
+func smartRouteRecoveryTimeout(plan smartrouter.PlanResult, request smartrouter.RouteRequest, settings ...smartroutersetting.Setting) time.Duration {
+	// Recovery probes are executed exclusively by SmartRouteProbeWorker. A
+	// foreground user request must never inherit the probe deadline: doing so
+	// turns a warming/open route into a user-visible 504 and makes the caller
+	// wait for an internal health check. The worker passes ProbeTimeoutSeconds
+	// directly to its executor, so retaining this helper as a zero-returning
+	// compatibility shim keeps the attempt context uncapped for every relay
+	// format, including media and long-running responses.
+	_ = plan
+	_ = request
+	_ = settings
+	return 0
+}
+
+func smartRouteStateRoutes(routes []smartrouter.CertifiedRoute) []SmartRouteStateRoute {
+	result := make([]SmartRouteStateRoute, 0, len(routes))
+	for _, route := range routes {
+		result = append(result, SmartRouteStateRoute{
+			RouteID: route.RouteID, CapacityDomain: route.CapacityDomain,
+			CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			StableFallback:   route.StableFallback, MaxInflight: route.MaxInflight,
+		})
+	}
+	return result
+}
+
+func findSmartRoute(routes []smartrouter.CertifiedRoute, routeID string, channelID int) (smartrouter.CertifiedRoute, bool) {
+	for _, route := range routes {
+		if route.RouteID == routeID && route.ChannelID == channelID {
+			return route, true
+		}
+	}
+	return smartrouter.CertifiedRoute{}, false
+}
+
+func strictSmartRouteAttemptLimit(configured, admission int) int {
+	if configured <= 0 {
+		return admission
+	}
+	if admission <= 0 || configured < admission {
+		return configured
+	}
+	return admission
+}
+
+func smartRouteCandidateSetIsSafe(
+	routes []smartrouter.CertifiedRoute,
+	contractID string,
+	policy smartrouter.Policy,
+	prices smartrouter.PriceSnapshot,
+	allowedGroups []string,
+	request *smartrouter.RouteRequest,
+) bool {
+	allowed := make(map[string]struct{}, len(allowedGroups))
+	for _, group := range allowedGroups {
+		allowed[group] = struct{}{}
+	}
+	channels := make(map[int]struct{})
+	for _, route := range routes {
+		if !smartRoutePolicyAllowsCandidate(route, contractID, policy, prices, allowed, request) {
+			continue
+		}
+		channels[route.ChannelID] = struct{}{}
+	}
+	return len(channels) >= 1
+}
+
+func smartRoutePolicyAllowsCandidate(
+	route smartrouter.CertifiedRoute,
+	contractID string,
+	policy smartrouter.Policy,
+	prices smartrouter.PriceSnapshot,
+	allowedGroups map[string]struct{},
+	request *smartrouter.RouteRequest,
+) bool {
+	if _, allowed := allowedGroups[route.Group]; !allowed {
+		return false
+	}
+	if !policy.AllowsGroup(route.Group) {
+		return false
+	}
+	for _, group := range policy.ExcludedGroups {
+		if group == route.Group {
+			return false
+		}
+	}
+	for _, routeID := range policy.ExcludedRoutes {
+		if routeID == route.RouteID {
+			return false
+		}
+	}
+	orderMode := smartrouter.OrderAutoPrice
+	if policy.EffectiveStrategy() == smartrouter.StrategyManual {
+		orderMode = smartrouter.OrderManual
+	}
+	var manualOrder []string
+	if override, exists := policy.ContractOverrides[contractID]; exists {
+		if override.OrderMode != "" {
+			orderMode = override.OrderMode
+		}
+		manualOrder = override.ManualRouteOrder
+	}
+	if orderMode == smartrouter.OrderManual && !policy.AllowFutureCertifiedRoutes {
+		if len(manualOrder) > 0 {
+			listed := false
+			for _, routeID := range manualOrder {
+				if routeID == route.RouteID {
+					listed = true
+					break
+				}
+			}
+			if !listed {
+				return false
+			}
+		} else if len(policy.ManualGroupOrder) > 0 {
+			listed := false
+			for _, group := range policy.ManualGroupOrder {
+				if group == route.Group {
+					listed = true
+					break
+				}
+			}
+			if !listed {
+				return false
+			}
+		}
+	}
+	ratio, priced := prices.RatiosPPM[route.RouteID]
+	if !priced || ratio < 0 || ratio > policy.MaxEffectiveRatioPPM {
+		return false
+	}
+	if request != nil {
+		if route.Capabilities&request.RequiredCapabilities != request.RequiredCapabilities ||
+			request.EstimatedContext < 0 || request.EstimatedContext > route.MaxContext {
+			return false
+		}
+	}
+	return true
+}
+
+func (engine *SmartRouterEngine) EligibleModels(
+	ctx context.Context,
+	userGroup string,
+	policy smartrouter.Policy,
+) ([]string, error) {
+	return engine.EligibleModelsForEndpoints(ctx, userGroup, policy)
+}
+
+// EligibleModelsForEndpoints returns every contract with at least one current,
+// authorized and in-budget route. Multiple routes add failover; a single route
+// remains usable. An empty endpoint list means all phase-one text protocols.
+func (engine *SmartRouterEngine) EligibleModelsForEndpoints(
+	ctx context.Context,
+	userGroup string,
+	policy smartrouter.Policy,
+	endpoints ...string,
+) ([]string, error) {
+	if engine == nil || engine.Settings == nil {
+		return nil, errors.New("smart router engine is unavailable")
+	}
+	policy = smartrouter.NormalizePolicy(policy)
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	policy = resolveSmartRoutePolicyLimits(policy, engine.Settings())
+	catalog, refreshErr := engine.Catalogs.RefreshIfDue(ctx)
+	if catalog == nil {
+		return nil, refreshErr
+	}
+	prices, err := engine.Prices.GetOrRefresh(ctx, userGroup)
+	if err != nil {
+		return nil, err
+	}
+	usable := GetUserUsableGroups(userGroup)
+	allowedGroups := make(map[string]struct{}, len(usable))
+	for group := range usable {
+		allowedGroups[group] = struct{}{}
+	}
+	endpointSet := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint != "" {
+			endpointSet[endpoint] = struct{}{}
+		}
+	}
+	models := make(map[string]struct{})
+	for contractID, contract := range catalog.Contracts {
+		if len(endpointSet) > 0 {
+			if _, accepted := endpointSet[contract.Contract.Endpoint]; !accepted {
+				continue
+			}
+		}
+		poolID := policy.PoolPolicy
+		if policy.Version == smartrouter.PolicyVersion {
+			if _, automatic := contract.Pools[smartrouter.AutomaticPoolID]; automatic {
+				poolID = smartrouter.AutomaticPoolID
+			}
+		} else if override, exists := policy.ContractOverrides[contractID]; exists && override.PoolPolicy != "" {
+			poolID = override.PoolPolicy
+		}
+		pool, exists := contract.Pools[poolID]
+		if !exists {
+			continue
+		}
+		channels := make(map[int]struct{})
+		for _, route := range pool.Candidates {
+			if !smartRoutePolicyAllowsCandidate(route, contractID, policy, *prices, allowedGroups, nil) {
+				continue
+			}
+			channels[route.ChannelID] = struct{}{}
+		}
+		if len(channels) >= 1 {
+			models[contract.Contract.CanonicalModel] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(models))
+	for modelName := range models {
+		result = append(result, modelName)
+	}
+	sort.Strings(result)
+	return result, nil
+}

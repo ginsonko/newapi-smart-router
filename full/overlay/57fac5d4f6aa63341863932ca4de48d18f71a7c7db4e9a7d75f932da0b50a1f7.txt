@@ -1,0 +1,71 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func capabilityFixtureBundle() ModelCapabilityBundle {
+	return ModelCapabilityBundle{Contracts: []ModelCapabilityContract{{
+		ContractID: "video-contract-1",
+		Target:     CapabilityTarget{SiteID: 1, Group: "video", Model: "seedance-2.5-720p"},
+		Provider:   CapabilityProvider{Protocol: "aizzz-video-v1", Create: CapabilityEndpoint{Method: "POST", Path: "/videos"}},
+		Generation: CapabilityGeneration{Duration: CapabilityDuration{Mode: "free", Min: 5, Max: 15, Step: 1}, Resolutions: []string{"720p"}},
+		References: CapabilityReferences{
+			Images: CapabilityReferenceLimit{Roles: []string{"reference"}, Max: 30},
+			Videos: CapabilityReferenceLimit{Roles: []string{"reference"}, Max: 10, MaxTotalDurationSeconds: 29},
+			Audios: CapabilityReferenceLimit{Roles: []string{"reference"}, Max: 10}, MaxTotal: 50,
+		},
+		Routing:    CapabilityRouting{AutomaticEligible: true},
+		Provenance: CapabilityProvenance{SourceKind: "document", ValidationStatus: "validated"},
+	}}}
+}
+
+func TestModelCapabilityBundleRevisionAndNonBlockingMissingContract(t *testing.T) {
+	bundle, err := NormalizeModelCapabilityBundle(capabilityFixtureBundle())
+	require.NoError(t, err)
+	require.NotEmpty(t, bundle.Revision)
+	require.Equal(t, 30, bundle.Contracts[0].References.Images.Max)
+
+	empty, err := NormalizeModelCapabilityBundle(ModelCapabilityBundle{})
+	require.NoError(t, err)
+	require.Empty(t, empty.Contracts)
+	require.NotEmpty(t, empty.Revision)
+}
+
+func TestModelCapabilityStageActivateAndRollback(t *testing.T) {
+	previousDB := DB
+	previousCache := activeCapability.Load()
+	db, err := gorm.Open(sqlite.Open("file:model-capability-contract-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	activeCapability.Store(nil)
+	t.Cleanup(func() {
+		DB = previousDB
+		activeCapability.Store(previousCache)
+	})
+	require.NoError(t, DB.AutoMigrate(&ModelCapabilityBundleRecord{}, &ModelCapabilityCatalogHead{}, &ModelCapabilityChangeSet{}))
+
+	bundle, err := NormalizeModelCapabilityBundle(capabilityFixtureBundle())
+	require.NoError(t, err)
+	record, replayed, err := StageModelCapabilityBundle("capability-op-1", bundle)
+	require.NoError(t, err)
+	require.False(t, replayed)
+	require.NotZero(t, record.ID)
+	_, replayed, err = StageModelCapabilityBundle("capability-op-1", bundle)
+	require.NoError(t, err)
+	require.True(t, replayed)
+
+	result, err := ActivateModelCapabilityBundle("capability-op-1", "", "")
+	require.NoError(t, err)
+	require.Equal(t, bundle.Revision, result.Bundle.Revision)
+	require.Equal(t, "applied", result.ChangeSet.Status)
+
+	rolledBack, err := RollbackModelCapabilityChangeSet(result.ChangeSet.ID, bundle.Revision)
+	require.NoError(t, err)
+	require.Empty(t, rolledBack.Bundle.Contracts)
+	require.Equal(t, ModelCapabilityEmptyRevision(), rolledBack.Bundle.Revision)
+}

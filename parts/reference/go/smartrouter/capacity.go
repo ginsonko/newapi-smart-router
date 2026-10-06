@@ -2,6 +2,8 @@ package smartrouter
 
 import "errors"
 
+var ErrCapacityConstrained = errors.New("smartrouter: all eligible routes are capacity constrained")
+
 type CapacitySnapshot struct {
 	Version string                   `json:"version"`
 	Domains map[string]CapacityState `json:"domains"`
@@ -82,6 +84,11 @@ func chooseCapacity(candidates []Candidate, snapshot CapacitySnapshot, policy Qu
 	var queued *capacityChoice
 	for _, candidate := range candidates {
 		state := snapshot.Domains[candidate.Route.CapacityDomain]
+		if candidate.RecoveryFallback {
+			// A demand fallback may recheck cached upstream backoff, while
+			// actual inflight limits still apply in this plan and lease acquisition.
+			state.BlockedUntilMS = 0
+		}
 		decision := DecideCapacity(state, policy, nowMS, deadlineMS, candidate.Admission)
 		switch decision.Kind {
 		case CapacityTryNow:
@@ -98,7 +105,7 @@ func chooseCapacity(candidates []Candidate, snapshot CapacitySnapshot, policy Qu
 	if queued != nil && !requeued {
 		return *queued, nil
 	}
-	return capacityChoice{}, errors.New("smartrouter: all eligible routes are capacity constrained")
+	return capacityChoice{}, ErrCapacityConstrained
 }
 
 func shouldPreferQueue(queued, immediate Candidate, minSavingPercent int) bool {

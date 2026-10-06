@@ -1,0 +1,100 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMediaGenerationSubmissionScope(t *testing.T) {
+	for _, requestPath := range []string{
+		"/v1/edits", "/v1/images/generations", "/v1/images/edits",
+		"/v1/videos", "/v1/video/generations", "/v1/videos/video_1/remix",
+		"/kling/v1/videos/text2video", "/jimeng/", "/mj/submit/imagine",
+		"/relax/mj/submit/blend", "/api/media/studio/images",
+		"/api/media/studio/image-edits", "/api/media/studio/videos",
+	} {
+		assert.True(t, isMediaGenerationSubmission(http.MethodPost, requestPath), requestPath)
+	}
+	for _, requestPath := range []string{
+		"/v1/responses", "/v1/chat/completions", "/api/status",
+		"/api/smart-router/leaderboard/status", "/api/log/",
+		"/api/media/studio/speech", "/v1/videos/video_1/content",
+	} {
+		assert.False(t, isMediaGenerationSubmission(http.MethodPost, requestPath), requestPath)
+	}
+	assert.False(t, isMediaGenerationSubmission(http.MethodGet, "/v1/images/generations"))
+}
+
+func TestMediaGenerationAdmissionMarksOnlyManagedRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	managed := false
+	engine.POST("/v1/images/generations",
+		func(c *gin.Context) { c.Set("id", 41) },
+		MediaGenerationAdmission(),
+		func(c *gin.Context) {
+			managed = mediaservice.HasGenerationAdmission(c.Request.Context())
+			c.Status(http.StatusNoContent)
+		},
+	)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2"}`))
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusNoContent, response.Code)
+	assert.True(t, managed)
+	assert.Equal(t, "0", response.Header().Get(mediaQueueAheadHeader))
+	assert.NotEmpty(t, response.Header().Get(mediaActiveHeader))
+}
+
+func TestCanceledMediaAdmissionCannotReachDownstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	reached := false
+	engine.POST("/v1/images/generations",
+		func(c *gin.Context) { c.Set("id", 42) },
+		MediaGenerationAdmission(),
+		func(c *gin.Context) { reached = true },
+	)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil).WithContext(canceled)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+
+	assert.False(t, reached)
+	assert.True(t, response.Code == 200 || response.Code == 499,
+		"a disconnected client must not create a downstream side effect")
+}
+
+func TestTextRequestBypassesMediaAdmissionEvenWhenCanceled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	reached := false
+	engine.POST("/v1/responses", MediaGenerationAdmission(), func(c *gin.Context) {
+		reached = true
+		assert.False(t, mediaservice.HasGenerationAdmission(c.Request.Context()))
+		c.Status(http.StatusNoContent)
+	})
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(canceled)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+
+	require.True(t, reached)
+	assert.Equal(t, http.StatusNoContent, response.Code)
+	assert.Empty(t, response.Header().Get(mediaActiveHeader))
+}

@@ -1,0 +1,28 @@
+package controller
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPublicRuntimeCapabilityPreservesControlsWithoutProcurement(t *testing.T) {
+	contract := model.ModelCapabilityContract{
+		RuntimeEnforced: true,
+		Source:          model.CapabilitySource{SupplierID: 99, ChannelIDs: []int{123}, Model: "private-provider-model"},
+		Generation:      model.CapabilityGeneration{RequireResolution: true, ResolutionAliases: map[string]string{"1280x720": "720p"}},
+		References:      model.CapabilityReferences{MaxTotal: 50, PromptReference: &model.CapabilityPromptReference{Required: true}},
+		Commercial:      model.CapabilityCommercial{SourceOffer: model.CapabilityPrice{UnitPrice: "source-private-amount"}, ConsumerOffer: model.CapabilityPrice{UnitPrice: "consumer-price"}},
+	}
+	encoded, err := common.Marshal(sanitizePublicCapabilityContract(contract))
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"runtime_enforced":true`)
+	assert.Contains(t, string(encoded), `"max_total":50`)
+	assert.Contains(t, string(encoded), "consumer-price")
+	assert.NotContains(t, string(encoded), "source-private-amount")
+	assert.NotContains(t, string(encoded), "private-provider-model")
+	assert.NotContains(t, string(encoded), "channel_ids")
+}

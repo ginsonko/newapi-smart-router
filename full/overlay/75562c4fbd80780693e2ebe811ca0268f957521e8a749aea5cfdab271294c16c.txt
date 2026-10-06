@@ -1,0 +1,203 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"gorm.io/gorm"
+)
+
+var imageRouteSpoolCleanup struct {
+	sync.Mutex
+	directory string
+	database  *gorm.DB
+	reader    *os.File
+	lastJobID int64
+}
+
+func cleanupImageRouteSpools(ctx context.Context) {
+	if model.DB == nil || ctx.Err() != nil || !imageRouteSpoolCleanup.TryLock() {
+		return
+	}
+	defer imageRouteSpoolCleanup.Unlock()
+	setting := mediasetting.Get()
+	if setting.CleanupBatchSize <= 0 {
+		return
+	}
+	directory, err := filepath.Abs(filepath.Join(setting.StoragePath, "private-image-routing"))
+	if err != nil {
+		return
+	}
+	if imageRouteSpoolCleanup.directory != directory || imageRouteSpoolCleanup.database != model.DB {
+		if imageRouteSpoolCleanup.reader != nil {
+			_ = imageRouteSpoolCleanup.reader.Close()
+		}
+		imageRouteSpoolCleanup.directory, imageRouteSpoolCleanup.database = directory, model.DB
+		imageRouteSpoolCleanup.reader, imageRouteSpoolCleanup.lastJobID = nil, 0
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil || !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+	for parent := filepath.Dir(directory); ; parent = filepath.Dir(parent) {
+		parentInfo, parentErr := os.Lstat(parent)
+		if parentErr != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		if filepath.Dir(parent) == parent {
+			break
+		}
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(setting.AssetTTLHours) * time.Hour).Unix()
+	var jobs []model.ImageRouteJob
+	if err := model.DB.WithContext(ctx).
+		Where("id > ? AND state IN ? AND updated_at < ? AND (body_path <> ? OR result_path <> ?)",
+			imageRouteSpoolCleanup.lastJobID, []string{model.ImageRouteJobSucceeded, model.ImageRouteJobFailed}, cutoff, "", "").
+		Order("id").Limit(setting.CleanupBatchSize).Find(&jobs).Error; err != nil {
+		return
+	}
+	for _, job := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		imageRouteSpoolCleanup.lastJobID = job.ID
+		for _, spool := range []struct {
+			path        string
+			reservation string
+			pathColumn  string
+			tokenColumn string
+		}{
+			{job.BodyPath, job.BodyReservation, "body_path", "body_reservation"},
+			{job.ResultPath, job.ResultReservation, "result_path", "result_reservation"},
+		} {
+			if spool.path == "" {
+				continue
+			}
+			if spool.pathColumn == "result_path" && strings.HasPrefix(filepath.Base(spool.path), "result-") && strings.HasSuffix(spool.path, ".json") {
+				if err := removeImageRouteSpool(ctx, directory, strings.TrimSuffix(spool.path, ".json"), job.ID); err != nil {
+					continue
+				}
+			}
+			if err := removeImageRouteSpool(ctx, directory, spool.path, job.ID); err != nil {
+				continue
+			}
+			if err := mediaservice.ReleaseImageRouteSpool(spool.reservation); err != nil {
+				continue
+			}
+			if err := model.DB.WithContext(ctx).Model(&model.ImageRouteJob{}).
+				Where("id = ? AND version = ? AND state = ?", job.ID, job.Version, job.State).
+				Where(spool.pathColumn+" = ? AND "+spool.tokenColumn+" = ?", spool.path, spool.reservation).
+				UpdateColumns(map[string]any{spool.pathColumn: "", spool.tokenColumn: ""}).Error; err != nil {
+				return
+			}
+		}
+	}
+	if len(jobs) < setting.CleanupBatchSize {
+		imageRouteSpoolCleanup.lastJobID = 0
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if imageRouteSpoolCleanup.reader != nil {
+		openedInfo, statErr := imageRouteSpoolCleanup.reader.Stat()
+		if statErr != nil || !os.SameFile(openedInfo, directoryInfo) {
+			_ = imageRouteSpoolCleanup.reader.Close()
+			imageRouteSpoolCleanup.reader = nil
+		}
+	}
+	if imageRouteSpoolCleanup.reader == nil {
+		imageRouteSpoolCleanup.reader, err = os.Open(directory)
+		if err != nil {
+			return
+		}
+	}
+	entries, readErr := imageRouteSpoolCleanup.reader.ReadDir(setting.CleanupBatchSize)
+	if readErr != nil {
+		_ = imageRouteSpoolCleanup.reader.Close()
+		imageRouteSpoolCleanup.reader = nil
+		if !errors.Is(readErr, io.EOF) {
+			return
+		}
+	}
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		ttl := setting.InputTTLHours
+		isResult := strings.HasPrefix(entry.Name(), "result-")
+		if isResult {
+			ttl = setting.AssetTTLHours
+		} else if !strings.HasPrefix(entry.Name(), "request-") {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || !info.Mode().IsRegular() || ttl <= 0 || !info.ModTime().Before(now.Add(-time.Duration(ttl)*time.Hour)) {
+			continue
+		}
+		if err := removeImageRouteSpool(ctx, directory, filepath.Join(directory, entry.Name()), 0); err != nil {
+			continue
+		}
+	}
+}
+
+func removeImageRouteSpool(ctx context.Context, directory, path string, jobID int64) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Dir(path) != directory {
+		return errors.New("image route spool is outside its private directory")
+	}
+	var reference model.ImageRouteJob
+	paths := []string{path}
+	if strings.HasPrefix(filepath.Base(path), "result-") {
+		if strings.HasSuffix(path, ".json") {
+			paths = append(paths, strings.TrimSuffix(path, ".json"))
+		} else {
+			paths = append(paths, path+".json")
+		}
+	}
+	query := model.DB.WithContext(ctx).Select("id").Where("id <> ? AND (body_path IN ? OR result_path IN ?)", jobID, paths, paths).Limit(1).Find(&reference)
+	if query.Error != nil {
+		return query.Error
+	}
+	if query.RowsAffected > 0 {
+		return errors.New("image route spool is still referenced")
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("image route spool is not a regular file")
+	}
+	if jobID == 0 {
+		ttl := mediasetting.Get().InputTTLHours
+		if strings.HasPrefix(filepath.Base(path), "result-") {
+			ttl = mediasetting.Get().AssetTTLHours
+		}
+		if ttl <= 0 || !info.ModTime().Before(time.Now().Add(-time.Duration(ttl)*time.Hour)) {
+			return errors.New("image route orphan spool is not expired")
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	err = os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}

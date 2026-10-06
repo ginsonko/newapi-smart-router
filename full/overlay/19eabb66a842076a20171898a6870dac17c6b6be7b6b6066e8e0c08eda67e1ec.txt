@@ -1,0 +1,282 @@
+package media
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+)
+
+const (
+	DefaultHistoryRepairLimit  = 2000
+	HistoryRepairConfirmation  = "REPAIR MEDIA HISTORY"
+	maxHistoryRepairCandidates = 4096
+)
+
+// HistoryRepairItem is a redacted, operator-facing result. It never includes
+// a private source URL, credential, or absolute filesystem path.
+type HistoryRepairItem struct {
+	PublicID       string `json:"public_id"`
+	TaskID         string `json:"task_id,omitempty"`
+	Action         string `json:"action"`
+	Reason         string `json:"reason,omitempty"`
+	SourceFound    bool   `json:"source_found"`
+	ProjectionDone bool   `json:"projection_done"`
+}
+
+type HistoryRepairReport struct {
+	DryRun               bool                `json:"dry_run"`
+	ScannedAssets        int                 `json:"scanned_assets"`
+	QueuedMaterialize    int                 `json:"queued_materialize"`
+	RecoveredLocal       int                 `json:"recovered_local"`
+	MarkedUnavailable    int                 `json:"marked_unavailable"`
+	ProjectionCandidates int                 `json:"projection_candidates"`
+	ProjectionRepaired   int                 `json:"projection_repaired"`
+	Errors               int                 `json:"errors"`
+	StartedAt            int64               `json:"started_at"`
+	FinishedAt           int64               `json:"finished_at"`
+	Items                []HistoryRepairItem `json:"items,omitempty"`
+}
+
+// RunHistoryRepair performs a bounded, idempotent repair pass. Dry-run is the
+// default and only reads metadata/filesystem state. Apply never touches
+// billing, tasks, channels, or provider APIs; it only restores a readable
+// local object reference, requeues a known remote source, or idempotently
+// rebuilds missing task-artifact projections for already successful tasks.
+func RunHistoryRepair(ctx context.Context, dryRun bool, limit int) (HistoryRepairReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 {
+		limit = DefaultHistoryRepairLimit
+	}
+	if limit > DefaultHistoryRepairLimit {
+		limit = DefaultHistoryRepairLimit
+	}
+	report := HistoryRepairReport{DryRun: dryRun, StartedAt: time.Now().Unix()}
+	root, err := storageRoot()
+	if err != nil {
+		return report, err
+	}
+	var blobs []model.MediaBlob
+	query := model.DB.Where("deleted_at = 0").Order("id ASC").Limit(limit)
+	if err := query.Find(&blobs).Error; err != nil {
+		return report, err
+	}
+	report.ScannedAssets = len(blobs)
+	report.Items = make([]HistoryRepairItem, 0)
+	for index := range blobs {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		blob := &blobs[index]
+		item, itemErr := repairHistoryBlob(root, blob, dryRun)
+		if itemErr != nil {
+			report.Errors++
+			if item.Reason == "" {
+				item.Reason = itemErr.Error()
+			}
+			if item.Action != "noop" {
+				report.Items = append(report.Items, item)
+			}
+			continue
+		}
+		if item.Action != "noop" {
+			report.Items = append(report.Items, item)
+		}
+		switch item.Action {
+		case "queue_materialize":
+			report.QueuedMaterialize++
+		case "recover_local":
+			report.RecoveredLocal++
+		case "mark_unavailable":
+			report.MarkedUnavailable++
+		}
+	}
+
+	var tasks []model.Task
+	if err := model.DB.Where("status = ? AND task_id <> ''", model.TaskStatusSuccess).
+		Order("id ASC").Limit(limit).Find(&tasks).Error; err != nil {
+		return report, err
+	}
+	for index := range tasks {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		task := &tasks[index]
+		artifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+		if err != nil {
+			report.Errors++
+			continue
+		}
+		if len(artifacts) > 0 {
+			continue
+		}
+		report.ProjectionCandidates++
+		if dryRun {
+			continue
+		}
+		if _, err := EnsureTaskArtifacts(task); err != nil {
+			report.Errors++
+			continue
+		}
+		report.ProjectionRepaired++
+	}
+	report.FinishedAt = time.Now().Unix()
+	sortHistoryRepairItems(report.Items)
+	return report, nil
+}
+
+func repairHistoryBlob(root string, blob *model.MediaBlob, dryRun bool) (HistoryRepairItem, error) {
+	item := HistoryRepairItem{PublicID: blob.PublicID, TaskID: blob.TaskPublicID, Action: "noop"}
+	if blob.Status != model.MediaBlobStatusReady || blob.DeletedAt != 0 {
+		return item, nil
+	}
+	if blob.StorageBackend == model.MediaStorageBackendRemote &&
+		isRecoverableRemoteSource(blob.PrivateSource) && blob.MaterializeStatus != model.MediaMaterializeComplete {
+		item.Action, item.SourceFound = "queue_materialize", true
+		if dryRun {
+			return item, nil
+		}
+		return item, model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blob.ID).
+			Updates(map[string]any{"materialize_status": model.MediaMaterializePending,
+				"materialize_last_error": "", "materialize_next_retry_at": time.Now().Unix(),
+				"materialize_lease_owner": "", "materialize_lease_until": 0}).Error
+	}
+	availability := InspectMediaAvailability(blob)
+	if availability.Status == MediaAvailabilityAvailable {
+		return item, nil
+	}
+	switch blob.StorageBackend {
+	case model.MediaStorageBackendLocal:
+		candidate, ok := findHistoryLocalCandidate(root, blob)
+		if ok {
+			item.Action, item.SourceFound = "recover_local", true
+			if dryRun {
+				return item, nil
+			}
+			relative, err := filepath.Rel(root, candidate)
+			if err != nil || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || relative == ".." {
+				return item, fmt.Errorf("recovery candidate is outside media root")
+			}
+			info, err := os.Stat(candidate)
+			if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
+				return item, errors.New("recovery candidate is not a readable regular file")
+			}
+			updates := map[string]any{
+				"object_key": filepath.ToSlash(relative), "storage_backend": model.MediaStorageBackendLocal,
+				"size_bytes": info.Size(), "status": model.MediaBlobStatusReady,
+				"materialize_status": model.MediaMaterializeComplete, "materialize_last_error": "",
+				"materialize_next_retry_at": 0, "materialize_attempts": 0,
+			}
+			if err := model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blob.ID).Updates(updates).Error; err != nil {
+				return item, err
+			}
+			return item, nil
+		}
+		item.Action, item.Reason = "mark_unavailable", availability.Reason
+		if dryRun {
+			return item, nil
+		}
+		return item, model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blob.ID).
+			Updates(map[string]any{"materialize_status": model.MediaMaterializePermanentlyUnavailable,
+				"materialize_last_error": availability.Reason, "materialize_next_retry_at": 0}).Error
+	case model.MediaStorageBackendRemote:
+		if isRecoverableRemoteSource(blob.PrivateSource) {
+			item.Action, item.SourceFound = "queue_materialize", true
+			if dryRun {
+				return item, nil
+			}
+			return item, model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blob.ID).
+				Updates(map[string]any{"materialize_status": model.MediaMaterializePending,
+					"materialize_last_error": "", "materialize_next_retry_at": time.Now().Unix(),
+					"materialize_lease_owner": "", "materialize_lease_until": 0}).Error
+		}
+		item.Action, item.Reason = "mark_unavailable", "remote_source_missing"
+		if dryRun {
+			return item, nil
+		}
+		return item, model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blob.ID).
+			Updates(map[string]any{"materialize_status": model.MediaMaterializePermanentlyUnavailable,
+				"materialize_last_error": item.Reason, "materialize_next_retry_at": 0}).Error
+	default:
+		item.Action, item.Reason = "mark_unavailable", "unsupported_storage_backend"
+		if dryRun {
+			return item, nil
+		}
+		return item, model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blob.ID).
+			Updates(map[string]any{"materialize_status": model.MediaMaterializePermanentlyUnavailable,
+				"materialize_last_error": item.Reason, "materialize_next_retry_at": 0}).Error
+	}
+}
+
+func isRecoverableRemoteSource(source string) bool {
+	source = strings.ToLower(strings.TrimSpace(source))
+	return strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://")
+}
+
+func findHistoryLocalCandidate(root string, blob *model.MediaBlob) (string, bool) {
+	if blob == nil {
+		return "", false
+	}
+	paths := make([]string, 0, 8)
+	if blob.ObjectKey != "" {
+		if path, err := ResolveObjectPath(blob.ObjectKey); err == nil {
+			paths = append(paths, path)
+		}
+	}
+	for _, dir := range []string{"objects", "objects-legacy", "legacy-objects", "old-objects", "candidate", "candidate-objects"} {
+		paths = append(paths, filepath.Join(root, dir, blob.PublicID))
+		paths = append(paths, filepath.Join(root, dir, blob.PublicID+filepath.Ext(blob.Filename)))
+	}
+	for _, path := range paths {
+		if isMatchingMediaFile(path, blob.SizeBytes) {
+			return path, true
+		}
+	}
+	// A bounded walk catches old deployments that nested objects by a different
+	// prefix. It never scans outside the configured persistent media root.
+	found := ""
+	count := 0
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if count >= maxHistoryRepairCandidates {
+			return fs.SkipDir
+		}
+		if entry.IsDir() {
+			if path != root && filepath.Base(path) == "tmp" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		count++
+		if filepath.Base(path) == blob.PublicID || strings.Contains(filepath.Base(path), blob.PublicID) {
+			if isMatchingMediaFile(path, blob.SizeBytes) {
+				found = path
+			}
+		}
+		return nil
+	})
+	return found, found != ""
+}
+
+func isMatchingMediaFile(path string, expectedSize int64) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
+		return false
+	}
+	return expectedSize <= 0 || info.Size() == expectedSize
+}
+
+func sortHistoryRepairItems(items []HistoryRepairItem) {
+	sort.Slice(items, func(i, j int) bool { return items[i].PublicID < items[j].PublicID })
+}

@@ -1,0 +1,51 @@
+package advancedcustom
+
+import (
+	"encoding/json"
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNativeMessagesContractKeepsToolBlocksAndHeaders(t *testing.T) {
+	config := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{
+		{IncomingPath: "/v1/messages", UpstreamPath: "/v1/messages", Converter: dto.AdvancedCustomConverterNone,
+			Auth: &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeHeader, Name: "x-api-key", Value: "{api_key}"}},
+		{IncomingPath: "/v1/chat/completions", UpstreamPath: "/v1/chat/completions", Converter: dto.AdvancedCustomConverterNone},
+		{IncomingPath: "/v1/responses", UpstreamPath: "/v1/responses", Converter: dto.AdvancedCustomConverterNone},
+	}}
+	info := advancedCustomRelayInfo(config)
+	info.RelayFormat = types.RelayFormatClaude
+	info.RequestURLPath = "/v1/messages?beta=true"
+	info.IsClaudeBetaQuery = true
+	c := advancedCustomGinContext(info.RequestURLPath)
+	c.Request.Header.Set("anthropic-version", "2023-06-01")
+	c.Request.Header.Set("anthropic-beta", "context-1m-2025-08-07")
+	var request dto.ClaudeRequest
+	input := `{"model":"claude-test","max_tokens":64,"tools":[{"name":"read","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"tool_choice":{"type":"auto","disable_parallel_tool_use":true},"context_management":{"edits":[]},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"inspect","signature":"sig_test"},{"type":"tool_use","id":"a","name":"read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","is_error":true,"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}},{"type":"text","text":"result","cache_control":{"type":"ephemeral"}}]}]}]}`
+	require.NoError(t, json.Unmarshal([]byte(input), &request))
+	a := &Adaptor{}
+	converted, err := a.ConvertClaudeRequest(c, info, &request)
+	require.NoError(t, err)
+	require.Same(t, &request, converted)
+	raw, err := json.Marshal(converted)
+	require.NoError(t, err)
+	require.JSONEq(t, input, string(raw))
+	url, err := a.GetRequestURL(info)
+	require.NoError(t, err)
+	require.Equal(t, "https://fallback.example/v1/messages?beta=true", url)
+	header := http.Header{}
+	require.NoError(t, a.SetupRequestHeader(c, &header, info))
+	require.Equal(t, "sk-test", header.Get("x-api-key"))
+	require.Equal(t, "context-1m-2025-08-07", header.Get("anthropic-beta"))
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		other := advancedCustomRelayInfo(config)
+		other.RequestURLPath = path
+		url, err := (&Adaptor{}).GetRequestURL(other)
+		require.NoError(t, err)
+		require.Equal(t, "https://fallback.example"+path, url)
+	}
+}

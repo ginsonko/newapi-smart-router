@@ -1,0 +1,44 @@
+package controller
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestPaymentReturnKeepsTrustedBrowserOrigin(t *testing.T) {
+	previousAddress, previousTrusted, previousTheme := system_setting.ServerAddress, common.SessionCookieTrustedURLs, common.GetTheme()
+	t.Cleanup(func() {
+		system_setting.ServerAddress = previousAddress
+		common.SessionCookieTrustedURLs = previousTrusted
+		common.SetTheme(previousTheme)
+	})
+	system_setting.ServerAddress = "https://api.example.test"
+	common.SessionCookieTrustedURLs = []string{"https://example.test", "https://www.example.test"}
+	common.SetTheme("default")
+	for _, tc := range []struct{ name, host, origin, referer, want string }{
+		{"wallet origin", "example.test", "https://example.test", "", "https://example.test/wallet?show_history=true"},
+		{"referrer", "api.example.test", "", "https://www.example.test/wallet", "https://www.example.test/wallet?show_history=true"},
+		{"private referrer", "example.test", "", "", "https://example.test/wallet?show_history=true"},
+		{"untrusted origin and host", "evil.test", "https://evil.test", "", "https://api.example.test/wallet?show_history=true"},
+		{"suffix attack", "example.test.evil.test", "https://example.test.evil.test", "", "https://api.example.test/wallet?show_history=true"},
+		{"userinfo attack", "evil.test", "https://example.test@evil.test", "", "https://api.example.test/wallet?show_history=true"},
+		{"scheme downgrade", "evil.test", "http://example.test", "", "https://api.example.test/wallet?show_history=true"},
+		{"untrusted port", "evil.test", "https://example.test:8443", "", "https://api.example.test/wallet?show_history=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "https://"+tc.host+"/api/user/pay", nil)
+			c.Request.Header.Set("Origin", tc.origin)
+			c.Request.Header.Set("Referer", tc.referer)
+			assert.Equal(t, tc.want, paymentReturnPath("/console/topup?show_history=true", c))
+		})
+	}
+	assert.Equal(t, "https://api.example.test/wallet", paymentReturnPath("/console/topup"))
+	common.SetTheme("classic")
+	assert.Equal(t, "https://api.example.test/console/topup", paymentReturnPath("/console/topup"))
+}

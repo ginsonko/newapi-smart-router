@@ -1,0 +1,40 @@
+package model
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestParameterPublicSchedulesKeepScopeAndHideProcurement(t *testing.T) {
+	old := billing_setting.GetParameterPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateParameterPricingFromJSONString(old)
+		require.NoError(t, err)
+	})
+	_, _, err := billing_setting.UpdateParameterPricingFromJSONString(`{"schema_version":1,"rules":[
+ {"id":"global","group":"*","model":"m","channel_id":0,"conditions":{"resolution":"720p","quality":"hd"},"unit":"per_second","unit_price":".1","currency":"USD"},
+ {"id":"specific","group":"g","model":"m","channel_id":1,"conditions":{},"unit":"per_second","unit_price":".6","currency":"USD","source_unit_price":".2","source_currency":"USD","source":"private-source"},
+ {"id":"second","group":"g","model":"m","channel_id":2,"conditions":{"resolution":"720p"},"unit":"per_second","unit_price":".9","currency":"USD"}
+ ]}`)
+	require.NoError(t, err)
+	rows := PublicParameterPrices("m", "g", []int{1, 2, 1})
+	require.Len(t, rows, 2)
+	plans := map[string]int{}
+	for _, row := range rows {
+		plans[row.ScheduleID]++
+		if row.UnitPrice == "0.6" {
+			assert.Equal(t, 9, row.Priority)
+			assert.Empty(t, row.Conditions)
+		}
+	}
+	assert.Len(t, plans, 2)
+	raw, err := common.Marshal(rows)
+	require.NoError(t, err)
+	for _, secret := range []string{"channel_id", "source_unit_price", "private-source", "procurement"} {
+		assert.NotContains(t, string(raw), secret)
+	}
+	assert.Empty(t, PublicParameterPrices("m", "g", nil), "unbound global rows cannot create public model access")
+}

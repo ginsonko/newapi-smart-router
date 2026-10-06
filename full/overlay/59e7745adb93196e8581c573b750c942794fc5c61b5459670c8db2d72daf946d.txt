@@ -1,0 +1,73 @@
+package ratio_setting
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestGroupRatioRevisionChangesOnlyAfterValidUpdate(t *testing.T) {
+	originalGroups := GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, UpdateGroupRatioByJSONString(originalGroups))
+	})
+
+	beforeJSON := GroupRatio2JSONString()
+	before := GetGroupRatioRevision()
+	beforeContent := GetGroupRatioContentRevision()
+	require.Error(t, UpdateGroupRatioByJSONString(`{"broken":`))
+	require.Equal(t, before, GetGroupRatioRevision())
+	require.JSONEq(t, beforeJSON, GroupRatio2JSONString(), "invalid JSON must not clear the last valid map")
+	require.Equal(t, beforeContent, GetGroupRatioContentRevision())
+	require.Error(t, UpdateGroupRatioByJSONString(`{"default":-1}`))
+	require.JSONEq(t, beforeJSON, GroupRatio2JSONString(), "invalid negative ratios must not replace the live map")
+
+	require.NoError(t, UpdateGroupRatioByJSONString(`{"default":1,"discount":0.02}`))
+	changed := GetGroupRatioRevision()
+	require.Greater(t, changed, before)
+	changedContent := GetGroupRatioContentRevision()
+	require.NotEqual(t, beforeContent, changedContent)
+
+	require.NoError(t, UpdateGroupRatioByJSONString(`{"discount":0.0200,"default":1.0}`))
+	require.Equal(t, changed, GetGroupRatioRevision(), "semantic replay must not churn runtime snapshots")
+	require.Equal(t, changedContent, GetGroupRatioContentRevision(), "key order and numeric formatting must not change revision")
+}
+
+func TestGroupOverrideChangesStableContentRevisionAndEffectiveResolution(t *testing.T) {
+	originalGroups := GroupRatio2JSONString()
+	originalOverrides := GroupGroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, UpdateGroupRatioByJSONString(originalGroups))
+		require.NoError(t, UpdateGroupGroupRatioByJSONString(originalOverrides))
+	})
+
+	require.NoError(t, UpdateGroupRatioByJSONString(`{"route":0.2}`))
+	require.NoError(t, UpdateGroupGroupRatioByJSONString(`{}`))
+	base, special, hasSpecial, revisionA := ResolveEffectiveGroupRatio("vip", "route")
+	require.Equal(t, 0.2, base)
+	require.Equal(t, -1.0, special)
+	require.False(t, hasSpecial)
+
+	require.NoError(t, UpdateGroupGroupRatioByJSONString(`{"vip":{"route":0.15}}`))
+	effective, override, hasSpecial, revisionB := ResolveEffectiveGroupRatio("vip", "route")
+	require.Equal(t, 0.15, effective)
+	require.Equal(t, 0.15, override)
+	require.True(t, hasSpecial)
+	require.NotEqual(t, revisionA, revisionB)
+}
+
+func TestUnknownNewGroupNeedsNoCodeRegistration(t *testing.T) {
+	originalGroups := GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, UpdateGroupRatioByJSONString(originalGroups))
+	})
+
+	_, _, _, configured, revisionA := ResolveConfiguredGroupRatio("future-user", "future-relayops-group")
+	require.False(t, configured)
+
+	require.NoError(t, UpdateGroupRatioByJSONString(`{"future-relayops-group":0.137}`))
+	ratio, _, _, configured, revisionB := ResolveConfiguredGroupRatio("future-user", "future-relayops-group")
+	require.True(t, configured)
+	require.Equal(t, 0.137, ratio)
+	require.NotEqual(t, revisionA, revisionB)
+}

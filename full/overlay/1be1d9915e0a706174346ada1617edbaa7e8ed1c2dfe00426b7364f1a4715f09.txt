@@ -1,0 +1,170 @@
+package model
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTenantCostDownstreamRegistryScopesFutureTenants(t *testing.T) {
+	setupTenantCostTestDB(t)
+	second := &TenantCostDownstream{TenantID: "media-partner", DisplayName: "Media Partner", ConfigKey: "media_partner", Status: TenantCostDownstreamActive}
+	require.NoError(t, UpsertTenantCostDownstream(second))
+
+	// A second tenant registers an otherwise unseen slot without changing the
+	// default tenant's catalog or requiring a code-level product list.
+	_, err := ProvisionTenantCostSlot(TenantCostSlotProvisionSpec{
+		TenantID: second.TenantID, ProductPoolID: "media_ultra", ProductFamily: "media",
+		ServiceTier: "burst", PublicLabel: "高并发", ProfileID: "media-burst",
+		ProfileRevision: "rev-1", ProviderClass: "anonymous", ProfileStatus: TenantBindingPending,
+	}, 7)
+	require.NoError(t, err)
+	secondCatalog, err := BuildTenantCostCatalogForTenant(second.TenantID)
+	require.NoError(t, err)
+	require.Len(t, secondCatalog, 1)
+	assert.Equal(t, "media_ultra", secondCatalog[0].ProductPoolID)
+	defaultCatalog, err := BuildTenantCostCatalogForTenant(DefaultTenantCostTenantID)
+	require.NoError(t, err)
+	assert.Empty(t, defaultCatalog)
+
+	spec := tenantCostTestSpec("media-event-1")
+	spec.TenantID = second.TenantID
+	spec.DownstreamRequestId = "media-request-1"
+	spec.GatewayRequestId = "media-gateway-1"
+	result, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	assert.Equal(t, second.TenantID, result.Event.TenantID)
+	defaultEvents, err := ListTenantCostEvents(DefaultTenantCostTenantID, 0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, defaultEvents)
+	mediaEvents, err := ListTenantCostEvents(second.TenantID, 0, 10)
+	require.NoError(t, err)
+	assert.Len(t, mediaEvents, 1)
+
+	row, secret, err := CreateTenantReportingTokenWithAudit(second.TenantID, TenantCostReportingPermission, 0, 7)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.NotEmpty(t, secret)
+	assert.Equal(t, second.TenantID, row.TenantID)
+
+	require.NoError(t, SetTenantCostDownstreamStatus(second.TenantID, TenantCostDownstreamDisabled, 7))
+	_, err = LookupTenantReportingToken(secret)
+	assert.ErrorIs(t, err, ErrTenantCostReportingToken)
+	_, _, err = CreateTenantReportingTokenWithAudit(second.TenantID, TenantCostReportingPermission, time.Now().Add(time.Hour).Unix(), 7)
+	assert.ErrorIs(t, err, ErrTenantCostScope)
+}
+
+func TestTenantCostDownstreamRegistryRejectsUnknownAndConfigCollision(t *testing.T) {
+	setupTenantCostTestDB(t)
+	_, err := RequireRegisteredTenantCostDownstream("not-registered")
+	assert.ErrorIs(t, err, ErrTenantCostScope)
+	assert.ErrorIs(t, UpsertTenantCostDownstream(&TenantCostDownstream{
+		TenantID: "another", DisplayName: "Another", ConfigKey: "downstream", Status: TenantCostDownstreamActive,
+	}), ErrTenantCostConflict)
+
+	profile := &TenantRouteProfile{TenantID: "not-registered", ProfileID: "p", Revision: "r", ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous"}
+	assert.ErrorIs(t, UpsertTenantRouteProfile(profile), ErrTenantCostScope)
+}
+
+func TestTenantCostDownstreamConfigKeyCannotAliasAnotherEnvironmentSuffix(t *testing.T) {
+	setupTenantCostTestDB(t)
+
+	assert.Equal(t, "media_partner", DefaultTenantCostConfigKey("media-partner"))
+	for _, configKey := range []string{"media-partner", "media.partner", "media:partner", "_media_partner", "media_partner_"} {
+		err := UpsertTenantCostDownstream(&TenantCostDownstream{
+			TenantID: "tenant-" + DefaultTenantCostConfigKey(configKey), DisplayName: "Media Partner",
+			ConfigKey: configKey, Status: TenantCostDownstreamActive,
+		})
+		assert.ErrorIs(t, err, ErrTenantCostInvalidInput, configKey)
+	}
+
+	row := &TenantCostDownstream{TenantID: "media-partner", DisplayName: "Media Partner", ConfigKey: "MEDIA_PARTNER", Status: TenantCostDownstreamActive}
+	assert.ErrorIs(t, UpsertTenantCostDownstream(row), ErrTenantCostInvalidInput)
+	// The caller must make the normalized key explicit; the persistence layer
+	// does not silently rewrite a key that could be shared with another
+	// deployment's environment suffix.
+	row.ConfigKey = "media_partner"
+	require.NoError(t, UpsertTenantCostDownstream(row))
+	assert.Equal(t, "media_partner", row.ConfigKey)
+}
+
+func TestTenantCostDownstreamMetadataUpsertPreservesDisabledStatus(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	row := &TenantCostDownstream{
+		TenantID: "metadata-tenant", DisplayName: "Metadata Tenant", ConfigKey: "metadata_tenant",
+		Status: TenantCostDownstreamActive,
+	}
+	require.NoError(t, UpsertTenantCostDownstream(row))
+	require.NoError(t, SetTenantCostDownstreamStatus(row.TenantID, TenantCostDownstreamDisabled, 7))
+
+	// The metadata endpoint currently supplies active when status is omitted,
+	// and older callers may send status=active explicitly. Neither form may
+	// re-enable a downstream that an operator disabled.
+	updated := &TenantCostDownstream{
+		TenantID: row.TenantID, DisplayName: "Metadata Tenant Updated", ConfigKey: "metadata_tenant_v2",
+		Status: TenantCostDownstreamActive,
+	}
+	require.NoError(t, UpsertTenantCostDownstreamWithAudit(updated, 7))
+	got, err := GetTenantCostDownstream(row.TenantID)
+	require.NoError(t, err)
+	assert.Equal(t, TenantCostDownstreamDisabled, got.Status)
+	assert.Equal(t, "Metadata Tenant Updated", got.DisplayName)
+	assert.Equal(t, "metadata_tenant_v2", got.ConfigKey)
+
+	var statusAudits []TenantCostAuditEvent
+	require.NoError(t, db.Where("tenant_id = ? AND action = ?", row.TenantID, "downstream_status_changed").Find(&statusAudits).Error)
+	assert.Len(t, statusAudits, 1, "metadata upsert must not masquerade as a status change")
+
+	// The dedicated state endpoint remains the only path that changes status.
+	require.NoError(t, SetTenantCostDownstreamStatus(row.TenantID, TenantCostDownstreamActive, 7))
+	got, err = GetTenantCostDownstream(row.TenantID)
+	require.NoError(t, err)
+	assert.Equal(t, TenantCostDownstreamActive, got.Status)
+	require.NoError(t, db.Where("tenant_id = ? AND action = ?", row.TenantID, "downstream_status_changed").Find(&statusAudits).Error)
+	assert.Len(t, statusAudits, 2)
+}
+
+func TestTenantCostPersistenceIdentitiesAreTenantScoped(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	second := &TenantCostDownstream{TenantID: "second-tenant", DisplayName: "Second Tenant", ConfigKey: "second_tenant", Status: TenantCostDownstreamActive}
+	require.NoError(t, UpsertTenantCostDownstream(second))
+
+	// Profile IDs and event IDs are logical names supplied by an integration.
+	// The same name in two downstreams must not become a cross-tenant database
+	// conflict or cause one tenant's row to replace the other.
+	for _, tenantID := range []string{DefaultTenantCostTenantID, second.TenantID} {
+		require.NoError(t, UpsertTenantRouteProfile(&TenantRouteProfile{
+			TenantID: tenantID, ProfileID: "shared-profile", Revision: "rev-" + tenantID,
+			ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业",
+			ProviderClass: "anonymous", Status: TenantBindingEnabled,
+		}))
+	}
+
+	firstSpec := tenantCostTestSpec("shared-event")
+	secondSpec := firstSpec
+	secondSpec.TenantID = second.TenantID
+	secondSpec.DownstreamRequestId = "second-request"
+	secondSpec.GatewayRequestId = "second-gateway-request"
+	first, err := AppendTenantCostEvent(firstSpec)
+	require.NoError(t, err)
+	secondEvent, err := AppendTenantCostEvent(secondSpec)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultTenantCostTenantID, first.Event.TenantID)
+	assert.Equal(t, second.TenantID, secondEvent.Event.TenantID)
+
+	firstRetry := firstSpec
+	firstRetry.EventID = "shared-retry"
+	secondRetry := secondSpec
+	secondRetry.EventID = "shared-retry"
+	require.NoError(t, EnqueueTenantCostProjection(firstRetry, nil))
+	require.NoError(t, EnqueueTenantCostProjection(secondRetry, nil))
+	var retryCount int64
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Where("event_id = ?", "shared-retry").Count(&retryCount).Error)
+	assert.EqualValues(t, 2, retryCount)
+
+	var outboxCount int64
+	require.NoError(t, db.Model(&TenantCostOutbox{}).Where("event_id = ?", "shared-event").Count(&outboxCount).Error)
+	assert.EqualValues(t, 2, outboxCount)
+}

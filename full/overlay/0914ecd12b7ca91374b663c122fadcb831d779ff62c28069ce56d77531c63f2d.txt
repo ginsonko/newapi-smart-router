@@ -1,0 +1,227 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+// ----------------------------------------------------------------------------
+// Pricing Types
+// ----------------------------------------------------------------------------
+
+export type PricingVendor = {
+  id: number
+  name: string
+  icon?: string
+  description?: string
+}
+
+export type PricingModel = {
+  id: number
+  model_name: string
+  description?: string
+  icon?: string
+  vendor_id?: number
+  vendor_name?: string
+  vendor_icon?: string
+  vendor_description?: string
+  quota_type: number
+  model_ratio: number
+  completion_ratio: number
+  model_price?: number
+  cache_ratio?: number | null
+  create_cache_ratio?: number | null
+  image_ratio?: number | null
+  audio_ratio?: number | null
+  audio_completion_ratio?: number | null
+  enable_groups: string[]
+  tags?: string
+  supported_endpoint_types?: string[]
+  key?: string
+  group_ratio?: Record<string, number>
+  /** Billing mode (e.g. "tiered_expr") used to flag dynamic pricing */
+  billing_mode?: string
+  /** Raw expression describing dynamic / tiered billing */
+  billing_expr?: string
+  /** Pricing version returned by backend, useful for cache busting */
+  pricing_version?: string
+  /** Complete, coherent price contracts keyed by the actual NewAPI group. */
+  group_pricing?: Record<string, GroupPricing>
+  media_capability_contracts?: PublicMediaCapabilityContract[]
+  /**
+   * Optional model metadata fields reserved for backend-provided catalog data.
+   * Keep them data-driven; do not synthesize display values on the client.
+   */
+  context_length?: number
+  max_output_tokens?: number
+  knowledge_cutoff?: string
+  release_date?: string
+  parameter_count?: string
+  input_modalities?: Modality[]
+  output_modalities?: Modality[]
+  capabilities?: ModelCapability[]
+}
+
+export type GroupPricing = {
+  parameter_prices?: ParameterPrice[]
+  group: string
+  scope: 'global' | 'group_model' | string
+  contract_revision?: string
+  billing_mode: 'ratio' | 'fixed_price' | 'tiered_expr' | string
+  billing_unit:
+    | 'per_million_tokens'
+    | 'per_request'
+    | 'per_second'
+    | 'fixed_duration'
+    | string
+  quota_type: number
+  model_price?: number | null
+  model_ratio?: number | null
+  completion_ratio?: number | null
+  cache_ratio?: number | null
+  cache_creation_ratio?: number | null
+  cache_creation_5m_ratio?: number | null
+  cache_creation_1h_ratio?: number | null
+  image_ratio?: number | null
+  audio_ratio?: number | null
+  audio_completion_ratio?: number | null
+  billing_expr?: string
+  fixed_duration_seconds?: number
+  base_group_ratio: number
+  effective_group_ratio: number
+  has_user_group_ratio?: boolean
+  effective_model_price?: number | null
+  effective_model_ratio?: number | null
+  base_input_usd?: number | null
+  base_output_usd?: number | null
+  effective_input_usd?: number | null
+  effective_output_usd?: number | null
+  actual_input_cost_basis?: string
+  actual_input_cost_endpoint?: string
+  recent_cache_rate_ppm?: number | null
+  estimated_input_usd_per_million?: number | null
+  actual_input_cost_samples?: number
+  sampled_route_count?: number
+  actual_input_cost_last_observed_at_ms?: number
+}
+
+export type ParameterPrice = {
+  revision: string
+  schedule_id?: string
+  priority?: number
+  model: string
+  group: string
+  unit: 'per_request' | 'per_image' | 'per_second' | 'fixed_duration'
+  currency: string
+  unit_price: string
+  conditions: { resolution?: string; quality?: string }
+  fixed_duration_seconds?: number
+}
+
+export type PublicMediaCapabilityDuration = {
+  mode: string
+  min?: number
+  max?: number
+  step?: number
+  default?: number
+  fixed?: number
+  values?: number[]
+}
+
+export type PublicMediaCapabilityReferenceLimit = {
+  enabled?: boolean
+  max?: number
+  max_bytes?: number
+  max_remote_bytes?: number
+  max_total_bytes?: number
+  mime_types?: string[]
+}
+
+/** The public capability catalog deliberately omits supplier identities and cost. */
+export type PublicMediaCapabilityContract = {
+  contract_id: string
+  revision: string
+  runtime_enforced?: boolean
+  target: { model: string; group: string }
+  generation: {
+    resolutions?: string[]
+    aspect_ratios?: string[]
+    allowed_modes?: string[]
+    forbidden_modes?: string[]
+    duration?: PublicMediaCapabilityDuration
+  }
+  references?: {
+    images?: PublicMediaCapabilityReferenceLimit
+    videos?: PublicMediaCapabilityReferenceLimit
+    audios?: PublicMediaCapabilityReferenceLimit
+    max_total?: number
+    mixed?: boolean
+    native_human_images?: boolean
+    forbidden_roles?: string[]
+    prompt_reference?: { required: boolean }
+  }
+  provider?: {
+    reference_encoding?: Record<string, string>
+    generation_fields?: Record<string, string>
+  }
+  commercial?: {
+    consumer_offer?: {
+      billing_unit?: string
+      unit_price?: string
+      currency?: string
+    }
+  }
+}
+
+/** Input/output modalities supported by a model. */
+export type Modality = 'text' | 'image' | 'audio' | 'video' | 'file'
+
+/** Functional capabilities a model exposes. */
+export type ModelCapability =
+  | 'function_calling'
+  | 'streaming'
+  | 'vision'
+  | 'json_mode'
+  | 'structured_output'
+  | 'reasoning'
+  | 'tools'
+  | 'system_prompt'
+  | 'web_search'
+  | 'code_interpreter'
+  | 'caching'
+  | 'embeddings'
+
+export type PricingData = {
+  success: boolean
+  message?: string
+  data: PricingModel[]
+  vendors: PricingVendor[]
+  group_ratio: Record<string, number>
+  usable_group: Record<string, { desc: string; ratio: number }>
+  supported_endpoint: Record<string, string>
+  auto_groups: string[]
+  group_model_pricing_revision?: string
+  capability_contracts?: PublicMediaCapabilityContract[]
+}
+
+export type TokenUnit = 'M' | 'K'
+export type PriceType =
+  | 'input'
+  | 'output'
+  | 'cache'
+  | 'create_cache'
+  | 'image'
+  | 'audio_input'
+  | 'audio_output'
+export type QuotaType = 0 | 1 // 0: token-based, 1: per-request

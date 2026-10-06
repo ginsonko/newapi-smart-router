@@ -1,0 +1,46 @@
+package controller
+
+import (
+	"net/url"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
+)
+
+func paymentReturnPath(suffix string, contexts ...*gin.Context) string {
+	base := strings.TrimRight(system_setting.ServerAddress, "/")
+	// Payments must return to the browser origin that owns the login session.
+	// The public API address may be a different host. Reuse the administrator's
+	// exact trusted origins; never turn an arbitrary Origin or Host into a redirect.
+	if len(contexts) > 0 && contexts[0] != nil && contexts[0].Request != nil {
+		request := contexts[0].Request
+		trusted := append([]string{base}, common.SessionCookieTrustedURLs...)
+		for _, source := range []string{request.Header.Get("Origin"), request.Referer()} {
+			origin, err := url.Parse(source)
+			if err != nil || origin.User != nil || origin.Host == "" ||
+				(origin.Scheme != "https" && origin.Scheme != "http") {
+				continue
+			}
+			for _, configured := range trusted {
+				allowed, err := url.Parse(configured)
+				if err == nil && allowed.User == nil && origin.Scheme == allowed.Scheme &&
+					strings.EqualFold(origin.Host, allowed.Host) {
+					return origin.Scheme + "://" + origin.Host + common.ThemeAwarePath(suffix)
+				}
+			}
+		}
+		// Referrer policies can suppress both headers. The request host is useful
+		// only when it exactly matches a configured trusted origin (including port).
+		for _, configured := range trusted {
+			allowed, err := url.Parse(configured)
+			if err == nil && allowed.User == nil && allowed.Host != "" &&
+				(allowed.Scheme == "https" || allowed.Scheme == "http") &&
+				strings.EqualFold(request.Host, allowed.Host) {
+				return allowed.Scheme + "://" + allowed.Host + common.ThemeAwarePath(suffix)
+			}
+		}
+	}
+	return base + common.ThemeAwarePath(suffix)
+}

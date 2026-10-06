@@ -1,0 +1,98 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  emptyGroupModelPricingFormValue,
+  groupModelPricingEntryToForm,
+  groupModelPricingFormToEntry,
+} from './group-model-pricing-form'
+
+describe('group model pricing form conversion', () => {
+  test('fixed duration stays one fixed charge rather than a per-second price', () => {
+    const form = emptyGroupModelPricingFormValue('video', 'jimeng')
+    form.billingMode = 'fixed_price'
+    form.modelPrice = '7.6'
+    form.taskUnit = 'fixed_duration'
+    form.fixedDurationSeconds = '15'
+
+    const entry = groupModelPricingFormToEntry(form)
+    assert.equal(entry.setting.model_price, 7.6)
+    assert.deepEqual(entry.setting.task_profile, {
+      unit: 'fixed_duration',
+      fixed_duration_seconds: 15,
+    })
+    assert.equal(entry.setting.model_ratio, undefined)
+  })
+
+  test('ratio mode preserves a complete independent price vector', () => {
+    const form = emptyGroupModelPricingFormValue('gpt', 'gpt-5')
+    form.billingMode = 'ratio'
+    form.modelRatio = '2'
+    form.completionRatio = '8'
+    form.cacheRatio = '0.25'
+    form.audioRatio = '4'
+
+    const entry = groupModelPricingFormToEntry(form)
+    assert.equal(entry.setting.model_ratio, 2)
+    assert.equal(entry.setting.completion_ratio, 8)
+    assert.equal(entry.setting.cache_ratio, 0.25)
+    assert.equal(entry.setting.audio_ratio, 4)
+    assert.equal(entry.setting.model_price, undefined)
+  })
+
+  test('form roundtrip preserves provenance and per-second unit', () => {
+    const form = groupModelPricingEntryToForm({
+      group: 'video',
+      model: 'jimeng',
+      setting: {
+        billing_mode: 'fixed_price',
+        model_price: 0.1664,
+        task_profile: { unit: 'per_second' },
+        source: 'AIZZZ / jimeng',
+        source_revision: 'hash-1',
+        source_observed_at_unix_ms: 1_750_000_000_000,
+      },
+    })
+
+    assert.equal(form.taskUnit, 'per_second')
+    assert.equal(form.source, 'AIZZZ / jimeng')
+    assert.deepEqual(groupModelPricingFormToEntry(form).setting, {
+      billing_mode: 'fixed_price',
+      model_price: 0.1664,
+      task_profile: { unit: 'per_second' },
+      source: 'AIZZZ / jimeng',
+      source_revision: 'hash-1',
+      source_observed_at_unix_ms: 1_750_000_000_000,
+    })
+  })
+
+  test('invalid negative price and fixed duration are rejected locally', () => {
+    const negative = emptyGroupModelPricingFormValue('video', 'jimeng')
+    negative.modelPrice = '-1'
+    assert.throws(() => groupModelPricingFormToEntry(negative), /non-negative/)
+
+    const duration = emptyGroupModelPricingFormValue('video', 'jimeng')
+    duration.modelPrice = '1'
+    duration.taskUnit = 'fixed_duration'
+    duration.fixedDurationSeconds = '3601'
+    assert.throws(() => groupModelPricingFormToEntry(duration), /1 to 3600/)
+  })
+})

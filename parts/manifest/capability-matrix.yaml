@@ -1,5 +1,5 @@
-matrix_version: "3.0.0-alpha.1"
-status: "public_alpha_v0_3_candidate_not_release_evidence"
+matrix_version: "4.0.0-alpha.1"
+status: "public_alpha_v0_4_candidate_not_release_evidence"
 forms:
   full:
     name: "Full compatibility distribution"

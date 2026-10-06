@@ -1,0 +1,62 @@
+package common
+
+import (
+	"bytes"
+	"mime/multipart"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCleanupMultipartFormsRemovesEveryReusableTemporaryFile(t *testing.T) {
+	previousLimit := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 1
+	t.Cleanup(func() { constant.MaxFileDownloadMB = previousLimit })
+
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	part, err := writer.CreateFormFile("image", "large.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte(strings.Repeat("x", 2*1024*1024)))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest("POST", "/v1/images/edits", bytes.NewReader(payload.Bytes()))
+	context.Request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	first, err := ParseMultipartFormReusable(context)
+	require.NoError(t, err)
+	second, err := ParseMultipartFormReusable(context)
+	require.NoError(t, err)
+	context.Request.MultipartForm = first
+
+	temporaryPaths := make([]string, 0, 2)
+	for _, form := range []*multipart.Form{first, second} {
+		file, openErr := form.File["image"][0].Open()
+		require.NoError(t, openErr)
+		onDisk, ok := file.(*os.File)
+		require.True(t, ok, "test payload must cross the multipart memory threshold")
+		temporaryPaths = append(temporaryPaths, onDisk.Name())
+		require.NoError(t, file.Close())
+		_, statErr := os.Stat(onDisk.Name())
+		require.NoError(t, statErr)
+	}
+
+	CleanupMultipartForms(context)
+	CleanupMultipartForms(context)
+	for _, temporaryPath := range temporaryPaths {
+		_, statErr := os.Stat(temporaryPath)
+		assert.ErrorIs(t, statErr, os.ErrNotExist)
+	}
+	assert.Nil(t, context.Request.MultipartForm)
+	CleanupBodyStorage(context)
+}

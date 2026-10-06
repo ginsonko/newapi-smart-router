@@ -1,0 +1,972 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/service"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+const (
+	smartRouterConfigOptionKey        = smartroutersetting.ConfigName + ".config"
+	smartRouterLeaderboardMaxPageSize = 1000
+)
+
+var smartRouterConfigUpdateMu sync.Mutex
+
+func GetSmartRouterOptions(c *gin.Context) {
+	setting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	userPolicy := setting.DefaultPolicy
+	// The site template is only a safe starting point for newly created keys.
+	// Old v3 publishing-scope fields must never silently become a v4 default
+	// whitelist; per-key exclusions are preserved when an existing key is edited.
+	if userPolicy.Version == smartrouter.PolicyVersion {
+		userPolicy.PoolPolicy = ""
+		userPolicy.ExcludedGroups = nil
+		userPolicy.ExcludedRoutes = nil
+		userPolicy.ManualGroupOrder = nil
+		userPolicy.AllowFutureGroups = true
+		userPolicy.AllowFutureCertifiedRoutes = true
+		if userPolicy.MaxEffectiveRatioPPM == 0 {
+			userPolicy.MaxEffectiveRatioPPM = setting.DefaultMaxEffectiveRatioPPM
+		}
+	}
+	data := gin.H{
+		"enabled":                          setting.Enabled,
+		"default_for_new_keys":             setting.DefaultForNewKeys,
+		"default_policy":                   userPolicy,
+		"catalog_ready":                    false,
+		"catalog_version":                  "",
+		"model_count":                      0,
+		"route_count":                      0,
+		"catalog_updated_at":               int64(0),
+		"attempt_limit_enabled":            setting.AttemptLimitEnabled,
+		"max_attempts":                     setting.MaxAttempts,
+		"max_failure_threshold":            setting.MaxFailureThreshold,
+		"default_max_effective_ratio_ppm":  setting.DefaultMaxEffectiveRatioPPM,
+		"absolute_max_effective_ratio_ppm": setting.AbsoluteMaxEffectiveRatioPPM,
+		"max_queue_wait_ms":                setting.MaxQueueWaitMS,
+		"groups":                           []service.SmartRouteGroupOption{},
+	}
+	if !setting.Enabled {
+		c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err == nil {
+		catalog, refreshErr := engine.Catalogs.RefreshIfDue(c.Request.Context())
+		if refreshErr == nil && catalog != nil {
+			userGroup := c.GetString("user_group")
+			visibilityPolicy := service.SmartRouterCatalogVisibilityPolicy(userPolicy, setting)
+			models, modelErr := engine.EligibleModels(c.Request.Context(), userGroup, visibilityPolicy)
+			groups, groupErr := engine.EligibleGroupOptions(c.Request.Context(), userGroup, userPolicy)
+			if modelErr == nil && groupErr == nil && len(models) > 0 && len(groups) > 0 {
+				if len(userPolicy.ManualGroupOrder) == 0 {
+					for _, group := range groups {
+						userPolicy.ManualGroupOrder = append(userPolicy.ManualGroupOrder, group.Group)
+					}
+					data["default_policy"] = userPolicy
+				}
+				data["catalog_ready"] = true
+				data["catalog_version"] = catalog.Version
+				data["model_count"] = len(models)
+				data["groups"] = groups
+				if report, ok := engine.Catalogs.LastReport(); ok {
+					data["route_count"] = report.DiscoveredRoutes
+					data["catalog_updated_at"] = report.UpdatedAt
+				}
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func GetSmartRouterConfig(c *gin.Context) {
+	setting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    smartRouterConfigResponse(c, setting, false),
+	})
+}
+
+func UpdateSmartRouterConfig(c *gin.Context) {
+	var requested smartroutersetting.Setting
+	if err := common.DecodeJson(c.Request.Body, &requested); err != nil {
+		common.ApiErrorMsg(c, "智能路由配置不是有效的 JSON")
+		return
+	}
+	if err := requested.Validate(); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	requested = smartroutersetting.Normalize(requested)
+
+	smartRouterConfigUpdateMu.Lock()
+	defer smartRouterConfigUpdateMu.Unlock()
+
+	if requested.Enabled {
+		if _, _, err := service.BuildCertifiedRouteCatalog(c.Request.Context(), requested, service.MainDatabaseCatalogSource{}); err != nil {
+			common.ApiErrorMsg(c, "自动发现目录预检失败，配置未保存: "+err.Error())
+			return
+		}
+	}
+	encoded, err := common.Marshal(requested)
+	if err != nil {
+		common.ApiErrorMsg(c, "智能路由配置序列化失败: "+err.Error())
+		return
+	}
+	if err := model.UpdateOptionsBulk(map[string]string{smartRouterConfigOptionKey: string(encoded)}); err != nil {
+		common.ApiErrorMsg(c, "智能路由配置保存失败: "+err.Error())
+		return
+	}
+
+	data := smartRouterConfigResponse(c, requested, true)
+	ready, _ := data["catalog_ready"].(bool)
+	if requested.Enabled && !ready {
+		common.ApiErrorMsg(c, "配置已保存，但本实例尚未生成可用路线目录；智能 Key 保持关闭")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func RefreshSmartRouterCatalog(c *gin.Context) {
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	engine.Catalogs.Invalidate()
+	engine.Prices.InvalidateAll()
+	catalog, err := engine.Catalogs.Refresh(c.Request.Context())
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"catalog_ready":   catalog != nil,
+			"catalog_version": catalog.Version,
+		},
+	})
+}
+
+func GetSmartRouterCatalogReport(c *gin.Context) {
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	_, refreshErr := engine.Catalogs.RefreshIfDue(c.Request.Context())
+	report, ok := engine.Catalogs.LastReport()
+	if !ok {
+		if refreshErr != nil {
+			common.ApiErrorMsg(c, refreshErr.Error())
+			return
+		}
+		common.ApiErrorMsg(c, "smart router discovery report is not available")
+		return
+	}
+	data := gin.H{"report": report}
+	if refreshErr != nil {
+		data["refresh_error"] = refreshErr.Error()
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func GetSmartRouterHealth(c *gin.Context) {
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	query, err := smartRouterHealthQuery(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	report, err := engine.HealthReportPage(ctx, query)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+func GetSmartRouterCacheEconomyStatus(c *gin.Context) {
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	if engine.CacheEconomy == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"data":    service.SmartRouteCacheEconomyStatus{},
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    engine.CacheEconomy.Status(),
+	})
+}
+
+func smartRouterHealthQuery(c *gin.Context) (service.SmartRouteHealthQuery, error) {
+	query := service.SmartRouteHealthQuery{
+		Page: 1, PageSize: 100,
+		Search: c.Query("q"), Model: c.Query("model"), Endpoint: c.Query("endpoint"),
+		Group: c.Query("group"), Sort: c.Query("sort"), Order: c.Query("order"),
+		PrimaryStates: splitSmartRouterQueryValues(c.QueryArray("primary_state"), c.Query("status")),
+		ProbeStates:   splitSmartRouterQueryValues(c.QueryArray("probe_state"), ""),
+	}
+	if len([]rune(query.Search)) > 128 {
+		return query, errors.New("q must not exceed 128 characters")
+	}
+	pageValue := strings.TrimSpace(c.Query("page"))
+	if pageValue == "" {
+		pageValue = strings.TrimSpace(c.Query("p"))
+	}
+	if pageValue != "" {
+		page, err := strconv.Atoi(pageValue)
+		if err != nil || page < 1 {
+			return query, errors.New("page must be a positive integer")
+		}
+		query.Page = page
+	}
+	if value := strings.TrimSpace(c.Query("page_size")); value != "" {
+		pageSize, err := strconv.Atoi(value)
+		if err != nil || pageSize < 1 || pageSize > 100 {
+			return query, errors.New("page_size must be between 1 and 100")
+		}
+		query.PageSize = pageSize
+	}
+	channelValue := strings.TrimSpace(c.Query("channel"))
+	if channelValue == "" {
+		channelValue = strings.TrimSpace(c.Query("channel_id"))
+	}
+	if channelValue != "" {
+		channelID, err := strconv.Atoi(channelValue)
+		if err != nil || channelID <= 0 {
+			return query, errors.New("channel must be a positive integer")
+		}
+		query.ChannelID = channelID
+	}
+	if value, exists := c.GetQuery("requires_admin_review"); exists {
+		requiresReview, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return query, errors.New("requires_admin_review must be true or false")
+		}
+		query.RequiresAdminReview = &requiresReview
+	}
+	return query, nil
+}
+
+func splitSmartRouterQueryValues(repeated []string, commaSeparated string) []string {
+	values := make([]string, 0, len(repeated)+1)
+	for _, raw := range append(repeated, commaSeparated) {
+		for _, value := range strings.Split(raw, ",") {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				values = append(values, value)
+			}
+		}
+	}
+	return values
+}
+
+// GetSmartRouterUserStatus exposes only the route summary belonging to the
+// caller's own smart key. Operational identifiers and provider errors remain
+// restricted to the root health endpoint.
+func GetSmartRouterUserStatus(c *gin.Context) {
+	tokenID, err := strconv.Atoi(strings.TrimSpace(c.Query("token_id")))
+	if err != nil || tokenID <= 0 {
+		tokenID = c.GetInt("token_id")
+	}
+	if tokenID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "token_id is required"})
+		return
+	}
+	modelName := strings.TrimSpace(c.Query("model"))
+	if modelName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "model is required for a preference snapshot"})
+		return
+	}
+	token, err := model.GetTokenByIds(tokenID, c.GetInt("id"))
+	if err != nil || token == nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "smart key was not found"})
+		return
+	}
+	policy, err := token.GetSmartRoutingPolicy()
+	if err != nil || policy == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "this key is not configured for smart routing"})
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	page := common.GetPageQuery(c)
+	requiredCapabilities, parseErr := strconv.ParseUint(strings.TrimSpace(c.DefaultQuery("required_capabilities", "0")), 10, 64)
+	if parseErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "required_capabilities must be a non-negative integer"})
+		return
+	}
+	estimatedContext, parseErr := strconv.Atoi(strings.TrimSpace(c.DefaultQuery("estimated_context", "0")))
+	if parseErr != nil || estimatedContext < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "estimated_context must be a non-negative integer"})
+		return
+	}
+	deadlineBudgetMS, parseErr := strconv.ParseInt(strings.TrimSpace(c.DefaultQuery("deadline_budget_ms", "0")), 10, 64)
+	if parseErr != nil || deadlineBudgetMS < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "deadline_budget_ms must be a non-negative integer"})
+		return
+	}
+	report, err := engine.UserDecisionStatusReport(c.Request.Context(), service.SmartRouteUserStatusRequest{
+		TokenID: tokenID, UserGroup: c.GetString("user_group"), Policy: *policy,
+		Model: modelName, Endpoint: c.Query("endpoint"), Group: c.Query("group"), Status: c.Query("status"),
+		RequiredCapabilities: requiredCapabilities, EstimatedContext: estimatedContext,
+		DeadlineBudgetMS: deadlineBudgetMS, IncludeExcluded: c.Query("include_excluded") != "false",
+		Page: page.GetPage(), PageSize: page.GetPageSize(),
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrSmartRouteStatusModelRequired) || errors.Is(err, service.ErrSmartRouteStatusEndpointRequired) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+// GetSmartRouterUserStatusModels lists privacy-safe model + endpoint summaries
+// for one smart-routing key. It deliberately omits physical route and upstream
+// identifiers; users can open /status for the exact decision explanation.
+func GetSmartRouterUserStatusModels(c *gin.Context) {
+	tokenID, err := strconv.Atoi(strings.TrimSpace(c.Query("token_id")))
+	if err != nil || tokenID <= 0 {
+		tokenID = c.GetInt("token_id")
+	}
+	if tokenID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "token_id is required"})
+		return
+	}
+	token, err := model.GetTokenByIds(tokenID, c.GetInt("id"))
+	if err != nil || token == nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "smart key was not found"})
+		return
+	}
+	policy, err := token.GetSmartRoutingPolicy()
+	if err != nil || policy == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "this key is not configured for smart routing"})
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	page := common.GetPageQuery(c)
+	report, err := engine.UserStatusModelIndex(c.Request.Context(), service.SmartRouteUserModelIndexRequest{
+		TokenID: tokenID, UserGroup: c.GetString("user_group"), Policy: *policy,
+		Query: c.Query("q"), Page: page.GetPage(), PageSize: page.GetPageSize(),
+	})
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+// GetSmartRouterGlobalLeaderboardStatus exposes the same privacy-safe route
+// evidence as the key status page, but from one site-wide public-group
+// snapshot. A selected smart key is intentionally not accepted as input.
+func smartRouterLeaderboardUserGroup(c *gin.Context) (string, error) {
+	// Match relay's current account identity rather than a stale session group
+	// or a client-supplied route/query parameter.
+	user, err := model.GetUserCache(c.GetInt("id"))
+	if err != nil {
+		return "", err
+	}
+	return user.Group, nil
+}
+
+func GetSmartRouterGlobalLeaderboardStatus(c *gin.Context) {
+	userGroup, err := smartRouterLeaderboardUserGroup(c)
+	if err != nil {
+		common.ApiErrorMsg(c, "暂时无法读取账户分组，请稍后重试")
+		return
+	}
+	modelName := strings.TrimSpace(c.Query("model"))
+	if modelName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "model is required for a leaderboard snapshot"})
+		return
+	}
+	requiredCapabilities, parseErr := strconv.ParseUint(strings.TrimSpace(c.DefaultQuery("required_capabilities", "0")), 10, 64)
+	if parseErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "required_capabilities must be a non-negative integer"})
+		return
+	}
+	estimatedContext, parseErr := strconv.Atoi(strings.TrimSpace(c.DefaultQuery("estimated_context", "0")))
+	if parseErr != nil || estimatedContext < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "estimated_context must be a non-negative integer"})
+		return
+	}
+	deadlineBudgetMS, parseErr := strconv.ParseInt(strings.TrimSpace(c.DefaultQuery("deadline_budget_ms", "0")), 10, 64)
+	if parseErr != nil || deadlineBudgetMS < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "deadline_budget_ms must be a non-negative integer"})
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	page := smartRouterLeaderboardPage(c)
+	report, err := engine.GlobalLeaderboardStatusReport(c.Request.Context(), service.SmartRouteGlobalLeaderboardStatusRequest{
+		UserGroup: userGroup,
+		Model:     modelName, Endpoint: c.Query("endpoint"), Group: c.Query("group"), Status: c.Query("status"),
+		RequiredCapabilities: requiredCapabilities, EstimatedContext: estimatedContext,
+		DeadlineBudgetMS: deadlineBudgetMS, IncludeExcluded: true,
+		Page: page.GetPage(), PageSize: page.GetPageSize(),
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrSmartRouteStatusModelRequired) || errors.Is(err, service.ErrSmartRouteStatusEndpointRequired) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+func GetSmartRouterGlobalLeaderboardModels(c *gin.Context) {
+	userGroup, err := smartRouterLeaderboardUserGroup(c)
+	if err != nil {
+		common.ApiErrorMsg(c, "暂时无法读取账户分组，请稍后重试")
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	page := smartRouterLeaderboardPage(c)
+	report, err := engine.GlobalLeaderboardModelIndex(c.Request.Context(), service.SmartRouteGlobalLeaderboardModelIndexRequest{
+		UserGroup: userGroup,
+		Query:     c.Query("q"), Page: page.GetPage(), PageSize: page.GetPageSize(),
+	})
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+// GetSmartRouterRouteAnalytics exposes only the opaque, public route view.
+// Invalid and unknown ids share one response so callers cannot enumerate
+// physical channel topology through error differences.
+func GetSmartRouterRouteAnalytics(c *gin.Context) {
+	report, err := service.GetRouteAnalyticsDetailReportV1(
+		c.Request.Context(), strings.TrimSpace(c.Param("detail_id")), c.Query("range"), time.Now(),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrRouteAnalyticsRangeV1):
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "range must be one of 1h, 24h, or 3d"})
+		case errors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(err.Error(), "detail id"):
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "route analytics view was not found"})
+		default:
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "route analytics are temporarily unavailable"})
+		}
+		return
+	}
+	userGroup, err := smartRouterLeaderboardUserGroup(c)
+	if err != nil {
+		common.ApiErrorMsg(c, "暂时无法读取账户分组，请稍后重试")
+		return
+	}
+	if !service.GroupInUserUsableGroups(userGroup, report.GroupName) {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "未找到可查看的线路详情"})
+		return
+	}
+	if engine, engineErr := service.GetDefaultSmartRouterEngine(); engineErr == nil {
+		engine.EnrichRouteAnalyticsDetailReportV1(c.Request.Context(), userGroup, &report)
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+// GetSmartRouterKeyUsageAnalytics enforces ownership before reading any
+// aggregate. Root/admin sessions intentionally receive no bypass here.
+func GetSmartRouterKeyUsageAnalytics(c *gin.Context) {
+	tokenID, err := strconv.Atoi(strings.TrimSpace(c.Query("token_id")))
+	if err != nil || tokenID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "token_id is required"})
+		return
+	}
+	if _, err := model.GetTokenByIds(tokenID, c.GetInt("id")); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "key usage analytics were not found"})
+		return
+	}
+	report, err := service.GetKeyUsageAnalyticsReportV1(
+		c.Request.Context(), c.GetInt("id"), tokenID, c.Query("range"), c.Query("model"), time.Now(),
+	)
+	if err != nil {
+		if errors.Is(err, service.ErrRouteAnalyticsRangeV1) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "range must be one of 1h, 1d, or 7d"})
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "key usage analytics are temporarily unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": report})
+}
+
+// smartRouterLeaderboardPage keeps the all-site leaderboard bounded while
+// allowing its single-page UI to receive the complete model and route index.
+// The ordinary API pagination ceiling remains unchanged.
+func smartRouterLeaderboardPage(c *gin.Context) *common.PageInfo {
+	page := common.GetPageQuery(c)
+	requested, err := strconv.Atoi(strings.TrimSpace(c.Query("page_size")))
+	if err != nil || requested <= page.PageSize {
+		return page
+	}
+	if requested > smartRouterLeaderboardMaxPageSize {
+		requested = smartRouterLeaderboardMaxPageSize
+	}
+	page.PageSize = requested
+	return page
+}
+
+func ScheduleSmartRouterProbe(c *gin.Context) {
+	routeID := strings.TrimSpace(c.Param("route_id"))
+	if routeID == "" {
+		common.ApiErrorMsg(c, "smart route id is required")
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	result, err := engine.ScheduleRouteProbeDetailed(c.Request.Context(), routeID)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	recordManageAudit(c, "smart_router.health_probe_schedule", map[string]interface{}{
+		"route_id": routeID, "route_epoch": result.State.Epoch, "phase": result.State.Phase,
+		"mode": result.Mode, "disposition": result.Disposition,
+	})
+	statusCode := http.StatusOK
+	success := true
+	switch result.Disposition {
+	case "queued", "natural_traffic_only":
+		statusCode = http.StatusAccepted
+	case "cooldown", "waiting_for_budget":
+		// These are idempotent control-plane states, not failed probes. A prior
+		// request or the durable worker already owns the operation.
+		statusCode = http.StatusOK
+	case "queue_full":
+		statusCode = http.StatusTooManyRequests
+		success = false
+	case "worker_unavailable":
+		statusCode = http.StatusServiceUnavailable
+		success = false
+	case "requires_reset":
+		statusCode = http.StatusConflict
+		success = false
+	case "not_found":
+		statusCode = http.StatusNotFound
+		success = false
+	case "unsupported":
+		statusCode = http.StatusUnprocessableEntity
+		success = false
+	}
+	if result.RetryAfterMS > 0 {
+		retryAfterSeconds := (result.RetryAfterMS + 999) / 1000
+		c.Header("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
+	}
+	response := gin.H{"success": success, "data": gin.H{
+		"status": result.Disposition, "disposition": result.Disposition,
+		"mode":     result.Mode,
+		"route_id": routeID, "epoch": result.State.Epoch,
+		"phase": result.State.Phase, "next_probe_at_ms": result.State.NextProbeAtMS,
+		"sample_due_at_ms": result.State.SampleDueAtMS,
+		"probe_capability": result.ProbeCapability,
+		"worker_available": result.WorkerAvailable,
+		"retry_after_ms":   result.RetryAfterMS,
+	}}
+	if !success {
+		response["message"] = result.Disposition
+	}
+	c.JSON(statusCode, response)
+}
+
+type smartRouterBulkRecoveryScheduleFunc func(context.Context) (service.SmartRouteBulkRecoveryResult, error)
+
+type smartRouterManageAuditFunc func(*gin.Context, string, map[string]interface{})
+
+// ScheduleAllSmartRouterRecoveries makes every existing automatic recovery item
+// immediately eligible for the durable probe queue. Manual blacklists remain
+// authoritative; the service deliberately does not turn this action into a
+// synchronous upstream probe storm.
+func ScheduleAllSmartRouterRecoveries(c *gin.Context) {
+	handleSmartRouterBulkRecovery(c, func(ctx context.Context) (service.SmartRouteBulkRecoveryResult, error) {
+		engine, err := service.GetDefaultSmartRouterEngine()
+		if err != nil {
+			return service.SmartRouteBulkRecoveryResult{}, err
+		}
+		return engine.ScheduleAllAutomaticRecoveries(ctx)
+	}, recordManageAudit)
+}
+
+func handleSmartRouterBulkRecovery(
+	c *gin.Context,
+	schedule smartRouterBulkRecoveryScheduleFunc,
+	audit smartRouterManageAuditFunc,
+) {
+	result, err := schedule(c.Request.Context())
+	statusCode, status, success, message := classifySmartRouterBulkRecovery(result, err)
+	auditFields := map[string]interface{}{
+		"status": status, "success": success,
+		"contracts": result.Contracts, "physical_routes": result.PhysicalRoutes,
+		"queued": result.Queued, "already_queued": result.AlreadyQueued,
+		"queue_full": result.QueueFull, "manual_blacklists_preserved": true,
+	}
+	if err != nil {
+		auditFields["error"] = err.Error()
+	}
+	if audit != nil {
+		audit(c, "smart_router.health_recovery_schedule_all", auditFields)
+	}
+
+	data := gin.H{
+		"status": status, "complete": err == nil && result.QueueFull == 0,
+		"contracts": result.Contracts, "physical_routes": result.PhysicalRoutes,
+		"queued": result.Queued, "already_queued": result.AlreadyQueued,
+		"queue_full": result.QueueFull, "accepted": result.Queued + result.AlreadyQueued,
+		"manual_blacklists_preserved": true,
+	}
+	response := gin.H{"success": success, "data": data}
+	if message != "" {
+		response["message"] = message
+	}
+	c.JSON(statusCode, response)
+}
+
+func classifySmartRouterBulkRecovery(
+	result service.SmartRouteBulkRecoveryResult,
+	err error,
+) (statusCode int, status string, success bool, message string) {
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSmartRouterDisabled):
+			return http.StatusConflict, "recovery_disabled", false, err.Error()
+		case errors.Is(err, service.ErrNoCurrentSmartCatalog):
+			return http.StatusConflict, "catalog_unavailable", false, err.Error()
+		case errors.Is(err, service.ErrSmartRouteProbeExecutorUnavailable):
+			return http.StatusServiceUnavailable, "worker_unavailable", false, err.Error()
+		case errors.Is(err, context.DeadlineExceeded):
+			return http.StatusGatewayTimeout, "timeout", false, err.Error()
+		case errors.Is(err, context.Canceled):
+			return http.StatusRequestTimeout, "canceled", false, err.Error()
+		default:
+			return http.StatusInternalServerError, "failed", false, err.Error()
+		}
+	}
+	accepted := result.Queued + result.AlreadyQueued
+	if result.QueueFull > 0 {
+		if accepted == 0 {
+			return http.StatusTooManyRequests, "queue_full", false,
+				"automatic recovery queue is full; no recovery item was accepted"
+		}
+		return http.StatusAccepted, "partially_queued", true,
+			"some automatic recovery items could not be queued because the queue is full"
+	}
+	if result.Queued > 0 {
+		return http.StatusAccepted, "queued", true, ""
+	}
+	if result.AlreadyQueued > 0 {
+		return http.StatusOK, "already_queued", true, ""
+	}
+	return http.StatusOK, "nothing_to_requeue", true, ""
+}
+
+func ResetSmartRouterHealth(c *gin.Context) {
+	routeID := strings.TrimSpace(c.Param("route_id"))
+	if routeID == "" {
+		common.ApiErrorMsg(c, "smart route id is required")
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	state, err := engine.ResetRouteHealth(c.Request.Context(), routeID)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	recordManageAudit(c, "smart_router.health_reset", map[string]interface{}{
+		"route_id": routeID, "route_epoch": state.Epoch, "phase": state.Phase,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"status": "reset", "route_id": routeID, "state": state,
+	}})
+}
+
+func ResetAllSmartRouterHealth(c *gin.Context) {
+	var request struct {
+		Confirmation string `json:"confirmation"`
+	}
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil || strings.TrimSpace(request.Confirmation) != "RESET AUTOMATIC HEALTH" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请提交确认词 RESET AUTOMATIC HEALTH"})
+		return
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	reset, failed, err := engine.ResetAllAutomaticHealth(c.Request.Context())
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	recordManageAudit(c, "smart_router.health_reset_all", map[string]interface{}{
+		"reset": reset, "failed": failed, "manual_health_preserved": true,
+		"automatic_only": true,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"reset": reset, "failed": failed, "automatic_only": true,
+		"manual_health_preserved": true,
+	}})
+}
+
+func ListSmartRouterBlocks(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	blocks, total, err := service.ListSmartRouteBlocks(c.Request.Context(), service.SmartRouteBlockListFilter{
+		Source: c.Query("source"), Scope: c.Query("scope"),
+		IncludeExpired: c.Query("include_expired") == "true",
+		Offset:         page.GetStartIdx(), Limit: page.GetPageSize(),
+	})
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"items": blocks, "total": total, "revision": service.GetSmartRouteBlockRevision(),
+	}})
+}
+
+func CreateSmartRouterBlock(c *gin.Context) {
+	var request model.SmartRouteBlock
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		common.ApiErrorMsg(c, "smart route block is not valid JSON")
+		return
+	}
+	request.Id = 0
+	request.Source = service.SmartRouteBlockSourceManual
+	request.CreatedBy = c.GetInt("id")
+	request.Epoch = 0
+	created, err := service.CreateSmartRouteBlock(c.Request.Context(), request)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	recordManageAudit(c, "smart_router.block_create", map[string]interface{}{
+		"id": created.Id, "scope": created.Scope, "source": created.Source,
+		"group": created.Group, "model_pattern": created.ModelPattern,
+		"channel_id": created.ChannelId, "route_id": created.RouteId,
+		"reason": created.Reason, "expires_at": created.ExpiresAt,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": created})
+}
+
+func DeleteSmartRouterBlock(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		common.ApiErrorMsg(c, "smart route block id must be positive")
+		return
+	}
+	deleted, err := service.DeleteSmartRouteBlock(c.Request.Context(), id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	recordManageAudit(c, "smart_router.block_delete", map[string]interface{}{
+		"id": deleted.Id, "scope": deleted.Scope, "source": deleted.Source,
+		"group": deleted.Group, "model_pattern": deleted.ModelPattern,
+		"channel_id": deleted.ChannelId, "route_id": deleted.RouteId,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": deleted})
+}
+
+func ListSmartRouterReconciliations(c *gin.Context) {
+	pageInfo := common.GetPageQuery(c)
+	var quotaKnown *bool
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("usage", "unknown"))) {
+	case "all":
+	case "known":
+		value := true
+		quotaKnown = &value
+	case "unknown":
+		value := false
+		quotaKnown = &value
+	default:
+		common.ApiErrorMsg(c, "usage 必须是 unknown、known 或 all")
+		return
+	}
+	reservations, total, err := model.ListPendingQuotaReservations(
+		c.Request.Context(),
+		quotaKnown,
+		pageInfo.GetStartIdx(),
+		pageInfo.GetPageSize(),
+	)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	pageInfo.SetTotal(int(total))
+	pageInfo.SetItems(reservations)
+	common.ApiSuccess(c, pageInfo)
+}
+
+type settleSmartRouterReconciliationRequest struct {
+	ActualQuota *int `json:"actual_quota"`
+	Confirm     bool `json:"confirm"`
+}
+
+func SettleSmartRouterReconciliation(c *gin.Context) {
+	reservationID := strings.TrimSpace(c.Param("reservation_id"))
+	if reservationID == "" {
+		common.ApiErrorMsg(c, "缺少 reservation_id")
+		return
+	}
+	var request settleSmartRouterReconciliationRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil || request.ActualQuota == nil {
+		common.ApiErrorMsg(c, "必须填写实际额度 actual_quota")
+		return
+	}
+	if !request.Confirm {
+		common.ApiErrorMsg(c, "请核对上游用量后将 confirm 设为 true")
+		return
+	}
+
+	reservation, err := model.GetQuotaReservation(c.Request.Context(), reservationID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if reservation.Status != model.QuotaReservationStatusActive || !reservation.SettlementPending {
+		common.ApiErrorMsg(c, "该预留记录不处于待对账状态")
+		return
+	}
+	settled, err := service.NewQuotaReservationService().Settle(
+		c.Request.Context(),
+		reservationID,
+		*request.ActualQuota,
+	)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAudit(c, "smart_router.reconciliation_settle", map[string]interface{}{
+		"reservation_id":         reservationID,
+		"target_user_id":         reservation.UserId,
+		"actual_quota":           *request.ActualQuota,
+		"reserved_quota":         reservation.ReservedQuota,
+		"previous_quota_known":   reservation.SettlementQuotaKnown,
+		"previous_attempt_count": reservation.SettlementAttempts,
+	})
+	common.ApiSuccess(c, settled)
+}
+
+func RetryKnownSmartRouterReconciliations(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
+	defer cancel()
+	result, err := service.ReconcileKnownSmartRouteReservations(ctx, time.Now(), 100, true)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAudit(c, "smart_router.reconciliation_retry", map[string]interface{}{
+		"scanned":  result.Scanned,
+		"due":      result.Due,
+		"settled":  result.Settled,
+		"deferred": result.Deferred,
+		"failed":   result.Failed,
+	})
+	common.ApiSuccess(c, result)
+}
+
+func smartRouterConfigResponse(c *gin.Context, setting smartroutersetting.Setting, forceRefresh bool) gin.H {
+	publicSetting := smartroutersetting.Clone(setting)
+	// v3 publishing lists remain decode-only compatibility state. Returning
+	// them would make a v4 client preserve obsolete administrator workload.
+	publicSetting.CertifiedGroups = nil
+	publicSetting.TextContracts = nil
+	data := gin.H{
+		"setting":         publicSetting,
+		"catalog_ready":   false,
+		"catalog_version": "",
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		return data
+	}
+	var catalogReady bool
+	var catalogVersion string
+	var refreshErr error
+	if setting.Enabled {
+		published, err := engine.Catalogs.RefreshIfDue(c.Request.Context())
+		if forceRefresh {
+			engine.Catalogs.Invalidate()
+			published, err = engine.Catalogs.Refresh(c.Request.Context())
+		}
+		refreshErr = err
+		if published != nil && err == nil {
+			catalogReady = true
+			catalogVersion = published.Version
+		}
+	}
+	data["catalog_ready"] = catalogReady
+	data["catalog_version"] = catalogVersion
+	if report, ok := engine.Catalogs.LastReport(); ok {
+		sort.Slice(report.Rejections, func(i, j int) bool {
+			left, right := report.Rejections[i], report.Rejections[j]
+			if left.Group != right.Group {
+				return left.Group < right.Group
+			}
+			if left.Model != right.Model {
+				return left.Model < right.Model
+			}
+			return left.ChannelID < right.ChannelID
+		})
+		data["catalog_report"] = report
+	}
+	if refreshErr != nil && !errors.Is(refreshErr, service.ErrSmartRouterDisabled) {
+		data["catalog_error"] = refreshErr.Error()
+	}
+	return data
+}

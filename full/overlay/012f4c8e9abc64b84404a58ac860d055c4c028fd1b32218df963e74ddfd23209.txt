@@ -1,0 +1,27 @@
+package service
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/require"
+)
+
+func TestResponsesWebSearchUsesConfiguredTypePriceAndGroup(t *testing.T) {
+	for _, toolType := range []string{"web_search", dto.BuildInToolWebSearchPreview} {
+		context, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{toolType: {ToolName: toolType, CallCount: 9}}}}
+		summary := textQuotaSummary{ModelName: "gpt-4o", GroupRatio: 0.22}
+		price := operation_setting.GetToolPriceForModel(toolType, summary.ModelName)
+		expected := decimal.NewFromFloat(price).Mul(decimal.NewFromInt(9)).Div(decimal.NewFromInt(1000)).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+		require.True(t, expected.Equal(calculateTextToolCallSurcharge(context, info, &summary)))
+		require.Equal(t, 9, summary.WebSearchCallCount)
+		require.Equal(t, price, summary.WebSearchPrice)
+	}
+}

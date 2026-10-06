@@ -1,0 +1,245 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func configureDeliveryFixture(t *testing.T) {
+	t.Helper()
+	configureTaskFinalizationMedia(t)
+	setting := mediasetting.Get()
+	setting.RemoteMaterializeEnabled = true
+	setting.Enabled = true
+	require.NoError(t, mediasetting.Replace(setting))
+	fetch := system_setting.GetFetchSetting()
+	old := *fetch
+	fetch.AllowPrivateIp = true
+	fetch.AllowedPorts = []string{"1-65535"}
+	t.Cleanup(func() { *fetch = old })
+	InitHttpClient()
+}
+
+func TestVideoDeliveryRecoversRelativeEndpointsAndOriginalAsset(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, suffix string
+		legacy, absolute    bool
+	}{
+		{"content", "content_url", "content", false, false},
+		{"download", "download_url", "download", false, false},
+		{"both prefer original", "both", "download", false, false},
+		{"absolute", "video_url", "content", false, true},
+		{"adaptor only", "nonstandard", "download", false, false},
+		{"legacy disabled", "both", "download", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			configureDeliveryFixture(t)
+			payload := []byte("\x00\x00\x00\x14ftypisom\x00\x00\x00\x00isom")
+			if file := os.Getenv("GENERIC_DELIVERY_TEST_MEDIA"); file != "" {
+				var err error
+				payload, err = os.ReadFile(file)
+				require.NoError(t, err)
+			}
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "/v1/videos/provider-video/"+tc.suffix, r.URL.Path)
+				assert.Equal(t, "Bearer frozen-fixture-key", r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "video/mp4")
+				w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+				_, _ = w.Write(payload)
+			}))
+			defer server.Close()
+			task := seedFinalizationTask(t, "public-video", model.TaskStatusInProgress)
+			task.PrivateData = model.TaskPrivateData{Key: "frozen-fixture-key", UpstreamTaskID: "provider-video"}
+			require.NoError(t, model.DB.Save(task).Error)
+			// Exercise a snapshot created before the upstream assigned its id.
+			require.NoError(t, model.DB.Create(&model.TaskDeliverySnapshot{TaskRowID: task.ID, UpstreamBaseURL: server.URL + "/v1", UpstreamTaskID: task.TaskID, CredentialRef: "task.private_data.key"}).Error)
+			var oldBlobID int64
+			var oldAsset string
+			if tc.legacy {
+				// The old order is already charged. Exercise its durable receipt,
+				// not just the legacy completion callback counter.
+				task.Quota = 100
+				seedSubscription(t, 1, task.UserId, 1000, 100)
+				task.PrivateData.BillingSource = model.QuotaReservationFundingSubscription
+				require.NoError(t, model.DB.Save(task).Error)
+				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", task.UserId).Updates(map[string]any{"used_quota": 100, "request_count": 1}).Error)
+				require.NoError(t, model.DB.Create(&model.TaskBillingReceipt{TaskRowID: task.ID, UserID: task.UserId, SubscriptionID: 1, FundingSource: model.QuotaReservationFundingSubscription, SubmissionQuota: 100, PreConsumedQuota: 100, AppliedQuota: 100, UsageAppliedQuota: 100, RequestCountApplied: true, State: model.TaskBillingReceiptTracking, Version: 1}).Error)
+				blob, artifact, err := media.SaveRemoteArtifact(media.RemoteArtifactInput{UserID: task.UserId, TaskRowID: task.ID, TaskPublicID: task.TaskID, SourceURL: "task://" + task.TaskID, Type: "video", Role: "primary", ProviderOutputIdentity: "task.result_url", MimeType: "video/mp4"})
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(blob).Updates(map[string]any{"materialize_status": model.MediaMaterializeDisabled, "materialize_last_error": "source is delivered by an authenticated task proxy"}).Error)
+				oldBlobID, oldAsset = blob.ID, artifact.PublicAssetID
+			}
+			endpoint := "/v1/videos/provider-video/" + tc.suffix
+			if tc.absolute {
+				endpoint = server.URL + endpoint
+			}
+			response := map[string]any{"status": "completed", "progress": 100, tc.field: endpoint}
+			if tc.field == "both" {
+				delete(response, "both")
+				response["content_url"] = "/v1/videos/provider-video/content"
+				response["download_url"] = "/v1/videos/provider-video/download"
+			}
+			raw, err := common.Marshal(response)
+			require.NoError(t, err)
+			adaptor := &taskPollingFetchAdaptor{}
+			result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
+			if tc.field == "nonstandard" {
+				result.Url = endpoint
+			}
+			require.ErrorIs(t, ApplyVideoTaskResult(context.Background(), adaptor, task, result, raw), ErrTaskArtifactsNotReady)
+			require.Equal(t, string(model.TaskStatusFinalizing), string(task.Status))
+			decorated, err := media.DecorateOpenAIVideoResponse(raw, task)
+			require.NoError(t, err)
+			var public map[string]any
+			require.NoError(t, common.Unmarshal(decorated, &public))
+			assert.Equal(t, "in_progress", public["status"])
+			assert.EqualValues(t, 99, public["progress"])
+			assert.Empty(t, public["artifacts"])
+			assert.NotContains(t, public, "content_url")
+			assert.Zero(t, adaptor.adjustmentCount())
+			// Reload before retry to model a process restart.
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			require.ErrorIs(t, ApplyVideoTaskResult(context.Background(), adaptor, task, result, raw), ErrTaskArtifactsNotReady)
+			artifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+			require.NoError(t, err)
+			require.Len(t, artifacts, 1)
+			if tc.legacy {
+				assert.Equal(t, oldBlobID, artifacts[0].MediaBlobID)
+				assert.Equal(t, oldAsset, artifacts[0].PublicAssetID)
+			}
+			blob, err := model.ClaimNextMediaMaterialization("worker-one", time.Minute)
+			require.NoError(t, err)
+			_, secondClaim := model.ClaimNextMediaMaterialization("worker-two", time.Minute)
+			require.Error(t, secondClaim)
+			materializeRemoteMediaBlob(context.Background(), blob, "worker-one")
+			require.NoError(t, model.DB.First(blob, blob.ID).Error)
+			require.Equal(t, model.MediaMaterializeComplete, blob.MaterializeStatus, blob.MaterializeLastError)
+			stored, err := os.ReadFile(filepath.Join(mediasetting.Get().StoragePath, blob.ObjectKey))
+			require.NoError(t, err)
+			assert.Equal(t, payload, stored)
+			sum := sha256.Sum256(stored)
+			assert.Equal(t, hex.EncodeToString(sum[:]), blob.ContentHash)
+			require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task, result, raw))
+			require.NoError(t, ApplyVideoTaskResult(context.Background(), adaptor, task, result, raw))
+			assert.Equal(t, string(model.TaskStatusSuccess), string(task.Status))
+			assert.Equal(t, 1, adaptor.adjustmentCount())
+			assert.EqualValues(t, 1, requests.Load())
+			artifacts, err = model.ListTaskArtifacts(task.UserId, task.TaskID)
+			require.NoError(t, err)
+			require.Len(t, artifacts, 1)
+			if tc.legacy {
+				assert.Equal(t, oldAsset, artifacts[0].PublicAssetID)
+				receipt, err := model.GetTaskBillingReceipt(task.ID)
+				require.NoError(t, err)
+				assert.Equal(t, model.TaskBillingReceiptApplied, receipt.State)
+				assert.Equal(t, 100, receipt.AppliedQuota)
+				assert.EqualValues(t, 100, getSubscriptionUsed(t, 1))
+				var user model.User
+				require.NoError(t, model.DB.First(&user, task.UserId).Error)
+				assert.Equal(t, 100, user.UsedQuota)
+				assert.Equal(t, 1, user.RequestCount)
+			}
+			t.Logf("archived %d bytes sha256=%s; one GET, one settlement, preserved task and asset", len(stored), blob.ContentHash)
+		})
+	}
+}
+
+func TestVideoDeliveryRedirectAndCredentialBoundaries(t *testing.T) {
+	for _, mode := range []string{"same_task", "public_cdn", "other_task", "missing_credential", "truncated", "upstream_503"} {
+		t.Run(mode, func(t *testing.T) {
+			truncate(t)
+			configureDeliveryFixture(t)
+			var firstHits, destinationHits atomic.Int32
+			payload := []byte("\x00\x00\x00\x14ftypisom\x00\x00\x00\x00isom")
+			cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				destinationHits.Add(1)
+				assert.Empty(t, r.Header.Get("Authorization"), "provider key must not reach another origin")
+				assert.Empty(t, r.Header.Get("Referer"), "signed source URL must not leak through redirect headers")
+				w.Header().Set("Content-Type", "video/mp4")
+				_, _ = w.Write(payload)
+			}))
+			defer cdn.Close()
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/videos/provider-video/content" {
+					firstHits.Add(1)
+					assert.Equal(t, "Bearer frozen-fixture-key", r.Header.Get("Authorization"))
+					switch mode {
+					case "public_cdn":
+						http.Redirect(w, r, cdn.URL+"/signed.mp4", http.StatusFound)
+					case "other_task":
+						http.Redirect(w, r, "/v1/videos/foreign-video/download", http.StatusFound)
+					case "truncated":
+						w.Header().Set("Content-Type", "video/mp4")
+						w.Header().Set("Content-Length", "999")
+						_, _ = w.Write(payload)
+					case "upstream_503":
+						w.WriteHeader(http.StatusServiceUnavailable)
+					default:
+						http.Redirect(w, r, "/v1/videos/provider-video/download", http.StatusFound)
+					}
+					return
+				}
+				destinationHits.Add(1)
+				assert.Equal(t, "/v1/videos/provider-video/download", r.URL.Path)
+				assert.Equal(t, "Bearer frozen-fixture-key", r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "video/mp4")
+				_, _ = w.Write(payload)
+			}))
+			defer provider.Close()
+			task := seedFinalizationTask(t, "public-video", model.TaskStatusFinalizing)
+			task.PrivateData = model.TaskPrivateData{UpstreamTaskID: "provider-video", Key: "frozen-fixture-key"}
+			if mode == "missing_credential" {
+				task.PrivateData.Key = ""
+			}
+			require.NoError(t, model.DB.Save(task).Error)
+			require.NoError(t, model.DB.Create(&model.TaskDeliverySnapshot{TaskRowID: task.ID, UpstreamBaseURL: provider.URL, UpstreamTaskID: "provider-video", CredentialRef: "task.private_data.key"}).Error)
+			_, _, err := media.SaveRemoteArtifact(media.RemoteArtifactInput{UserID: task.UserId, TaskRowID: task.ID, TaskPublicID: task.TaskID, SourceURL: provider.URL + "/v1/videos/provider-video/content", Type: "video", Role: "primary", ProviderOutputIdentity: "task.completed_url", MimeType: "video/mp4"})
+			require.NoError(t, err)
+			blob, err := model.ClaimNextMediaMaterialization("worker", time.Minute)
+			require.NoError(t, err)
+			materializeRemoteMediaBlob(context.Background(), blob, "worker")
+			require.NoError(t, model.DB.First(blob, blob.ID).Error)
+			if mode == "same_task" || mode == "public_cdn" {
+				require.Equal(t, model.MediaMaterializeComplete, blob.MaterializeStatus, blob.MaterializeLastError)
+				assert.EqualValues(t, 1, destinationHits.Load())
+			} else {
+				require.Equal(t, model.MediaMaterializeRetry, blob.MaterializeStatus)
+				assert.Equal(t, 1, blob.MaterializeAttempts)
+				assert.Empty(t, blob.ObjectKey)
+				assert.Zero(t, blob.SizeBytes)
+				assert.Zero(t, destinationHits.Load())
+				assert.NotContains(t, blob.MaterializeLastError, "frozen-fixture-key")
+			}
+			if mode == "missing_credential" {
+				assert.Zero(t, firstHits.Load())
+			} else {
+				assert.EqualValues(t, 1, firstHits.Load())
+			}
+			var count int64
+			require.NoError(t, model.DB.Model(&model.Task{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count, "download failure must not create another generation")
+		})
+	}
+}

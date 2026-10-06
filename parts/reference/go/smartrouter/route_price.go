@@ -38,6 +38,12 @@ type RoutePrice struct {
 	Scope                   string `json:"scope,omitempty"`
 	Revision                string `json:"revision,omitempty"`
 	IncomparableReason      string `json:"incomparable_reason,omitempty"`
+	// TieredExpression is an internal, versioned pricing adapter used only to
+	// predict normalized input cost from observed token mix. Billing continues
+	// to use its own frozen BillingSnapshot and never reads this field.
+	TieredExpression       string `json:"-"`
+	TieredExpressionHash   string `json:"tiered_expression_hash,omitempty"`
+	TieredInputPredictable bool   `json:"tiered_input_predictable,omitempty"`
 }
 
 func LegacyRoutePrice(ratioPPM int64) RoutePrice {

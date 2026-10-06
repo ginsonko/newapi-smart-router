@@ -1,0 +1,575 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+var imageRouteDispatches = struct {
+	sync.Mutex
+	active map[int64]struct{}
+}{active: make(map[int64]struct{})}
+
+func scheduleImageRouteJob(job *model.ImageRouteJob) {
+	imageRouteDispatches.Lock()
+	_, running := imageRouteDispatches.active[job.ID]
+	limit := mediasetting.Get().GenerationActiveGlobal + mediasetting.Get().GenerationQueueGlobalMax
+	if running || len(imageRouteDispatches.active) >= limit {
+		imageRouteDispatches.Unlock()
+		return
+	}
+	imageRouteDispatches.active[job.ID] = struct{}{}
+	imageRouteDispatches.Unlock()
+	go func() {
+		defer func() {
+			imageRouteDispatches.Lock()
+			delete(imageRouteDispatches.active, job.ID)
+			imageRouteDispatches.Unlock()
+			if recovered := recover(); recovered != nil {
+				common.SysError("image route dispatch interrupted; intent retained")
+			}
+		}()
+		executeImageRouteJob(context.Background(), job)
+	}()
+}
+
+func startSmartImageJob(c *gin.Context, info *relaycommon.RelayInfo, policy smartrouter.Policy, request smartrouter.RouteRequest) *types.NewAPIError {
+	if c.GetHeader(types.ParameterQuoteHeader) != "" {
+		if _, verified := c.Get(types.ParameterQuoteContextKey); !verified {
+			return types.NewErrorWithStatusCode(errors.New("请先获取并验证有效的绘图报价"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+	}
+	quoteSnapshot, err := imageRouteCommitmentSnapshot(c, types.ParameterQuoteContextKey)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	commitmentSnapshot, err := imageRouteCommitmentSnapshot(c, types.ParameterCommitmentContextKey)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	session, err := engine.NewSession(c.Request.Context(), info.TokenId, info.UserGroup, request, policy)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	policy = session.ResolvedPolicy()
+	groups := []string{}
+	for group := range service.GetUserUsableGroups(info.UserGroup) {
+		if policy.AllowsGroup(group) {
+			groups = append(groups, group)
+		}
+	}
+	policyRaw, err := common.Marshal(policy)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	groupRaw, err := common.Marshal(groups)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	reservation, err := mediaservice.ReserveImageRouteSpool(storage.Size(), time.Now().Add(time.Duration(mediasetting.Get().InputTTLHours)*time.Hour).Unix())
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	keepReservation := false
+	defer func() {
+		if !keepReservation {
+			mediaservice.ReleaseImageRouteSpool(reservation)
+		}
+	}()
+	directory, err := filepath.Abs(filepath.Join(mediasetting.Get().StoragePath, "private-image-routing"))
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	if err = os.MkdirAll(directory, 0700); err != nil {
+		return smartRouteControllerError(err)
+	}
+	spool, err := os.CreateTemp(directory, "request-*")
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	defer spool.Close()
+	contentType := c.GetHeader("Content-Type")
+	if _, err = storage.Seek(0, io.SeekStart); err == nil {
+		contentType, err = normalizeImageRouteBody(storage, spool, contentType)
+	}
+	if err == nil {
+		err = spool.Sync()
+	}
+	if err == nil {
+		var stat os.FileInfo
+		stat, err = spool.Stat()
+		if err == nil {
+			err = mediaservice.GrowImageRouteSpool(reservation, stat.Size())
+		}
+	}
+	if err != nil {
+		_ = os.Remove(spool.Name())
+		return smartRouteControllerError(err)
+	}
+	publicID := c.GetString(mediaStudioOperationContextKey)
+	if publicID == "" {
+		publicID = model.GenerateTaskID()
+	}
+	imageRequest, ok := info.Request.(*dto.ImageRequest)
+	if !ok {
+		_ = os.Remove(spool.Name())
+		return smartRouteControllerError(errors.New("绘图请求格式无效"))
+	}
+	job := &model.ImageRouteJob{
+		PublicTaskID: publicID, UserID: info.UserId, TokenID: info.TokenId,
+		RequestPath: c.Request.URL.Path, ContentType: contentType, BodyPath: spool.Name(), BodyReservation: reservation,
+		PolicyJSON: string(policyRaw), FrozenGroupsJSON: string(groupRaw), AttemptedChannelsJSON: "[]",
+		ClientIP: c.ClientIP(), ResponseFormat: imageRequest.ResponseFormat, NoRetention: c.GetBool("image_task_no_retention"),
+		TenantRequestID: common.GetContextKeyString(c, constant.ContextKeyTenantCostRequestID), QuoteToken: c.GetHeader(types.ParameterQuoteHeader),
+		QuoteSnapshotJSON: quoteSnapshot, CommitmentJSON: commitmentSnapshot,
+		State: "ready", Version: 1,
+	}
+	root := model.InitTask(constant.TaskPlatform("smart_image"), model.TaskInitParams{UserID: info.UserId, OriginModelName: info.OriginModelName, PublicTaskID: publicID, Group: info.UserGroup})
+	root.Status, root.Progress, root.ReconcileSince, root.NextPollAt = model.TaskStatusSubmitted, "5%", time.Now().Unix(), 253402300799
+	root.Properties.MediaMode, root.Properties.MediaSize = "images", imageRequest.Size
+	if strings.HasSuffix(job.RequestPath, "/edits") {
+		root.Properties.MediaMode = "image-edits"
+	}
+	root.PrivateData.ImageTask = &model.ImageTaskContext{ResponseFormat: imageRequest.ResponseFormat, Count: 1, NoRetention: job.NoRetention}
+	root.Data = []byte(`{}`)
+	if err := model.CreateImageRouteJob(job, root); err != nil {
+		_ = os.Remove(spool.Name())
+		return smartRouteControllerError(err)
+	}
+	keepReservation = true
+	_ = spool.Close()
+	if release, found := c.Get("media_generation_release"); found {
+		if release, ok := release.(func()); ok {
+			release()
+		}
+	}
+	c.Set(service.ImageTaskOwnedContextKey, true)
+	c.Header("X-New-Api-Task-ID", publicID)
+	c.Header("Location", "/v1/images/generations/"+publicID)
+	scheduleImageRouteJob(job)
+	if c.GetBool("is_playground") || strings.Contains(strings.ToLower(c.GetHeader("Prefer")), "respond-async") || c.Query("async") == "1" {
+		c.JSON(http.StatusAccepted, gin.H{"id": publicID, "task_id": publicID, "object": "image", "status": "queued", "data": []any{}, "status_url": "/v1/images/generations/" + publicID})
+		return nil
+	}
+	return waitSmartImageJob(c, info, publicID)
+}
+
+func waitSmartImageJob(c *gin.Context, info *relaycommon.RelayInfo, publicID string) *types.NewAPIError {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		job, found, err := model.GetImageRouteJob(publicID, info.UserId)
+		if err != nil {
+			return smartRouteControllerError(err)
+		}
+		if !found {
+			return smartRouteControllerError(errors.New("绘图路由任务不存在"))
+		}
+		if message := imageRouteUncertainty(job); message != "" {
+			return types.NewErrorWithStatusCode(fmt.Errorf("%s（任务编号：%s）", message, publicID), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
+		switch job.State {
+		case "succeeded":
+			raw, err := imageRouteJobResponse(job)
+			if err != nil {
+				return smartRouteControllerError(err)
+			}
+			if info.IsStream {
+				response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewReader(raw))}
+				_, apiErr := openaichannel.OpenaiImageJSONAsStreamHandler(c, info, response)
+				return apiErr
+			}
+			c.Data(http.StatusOK, "application/json", raw)
+			return nil
+		case "failed", "unknown":
+			return types.NewErrorWithStatusCode(fmt.Errorf("%s（任务编号：%s）", job.LastError, publicID), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
+		select {
+		case <-c.Request.Context().Done():
+			return nil
+		case <-ticker.C:
+			if info.IsStream {
+				helper.SetEventStreamHeaders(c)
+				_, _ = c.Writer.WriteString(": 图片路由处理中\n\n")
+				c.Writer.Flush()
+			}
+		}
+	}
+}
+
+func imageRouteJobResponse(job *model.ImageRouteJob) ([]byte, error) {
+	if job.State != "succeeded" {
+		return nil, errors.New("绘图尚未完成")
+	}
+	if job.CurrentTaskID != "" {
+		task, found, err := model.GetByTaskId(job.UserID, job.CurrentTaskID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, errors.New("图片交付任务缺失")
+		}
+		return service.ImageTaskResponse(task)
+	}
+	if job.ResultPath == "" {
+		return nil, errors.New("图片交付文件缺失")
+	}
+	raw, err := os.ReadFile(job.ResultPath)
+	if err != nil || job.NoRetention {
+		return raw, err
+	}
+	archived, err := model.ListTaskArtifacts(job.UserID, job.PublicTaskID)
+	if err != nil {
+		return nil, err
+	}
+	if len(archived) == 0 {
+		return raw, nil
+	}
+	artifacts, err := mediaservice.ListDeliverableTaskArtifacts(job.UserID, job.PublicTaskID)
+	if err != nil {
+		return nil, err
+	}
+	var response dto.ImageResponse
+	if err := common.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	if len(artifacts) != len(response.Data) {
+		return nil, errors.New("图片归档已删除或暂不可交付")
+	}
+	if job.ResponseFormat != "b64_json" {
+		public := mediaservice.PublicArtifacts(artifacts, false)
+		for index := range response.Data {
+			response.Data[index].Url = public[index].DownloadURL
+		}
+		return common.Marshal(response)
+	}
+	return raw, nil
+}
+
+func executeImageRouteJob(parent context.Context, job *model.ImageRouteJob) {
+	ctx, cancel := context.WithTimeout(parent, imageRouteDispatchTimeout())
+	defer cancel()
+	release, _, err := mediaservice.AcquireGeneration(ctx, job.UserID)
+	if err != nil {
+		return
+	}
+	defer release()
+	ctx = mediaservice.WithGenerationAdmission(ctx)
+	claimed, won, err := model.ClaimImageRouteJob(job.ID, job.Version)
+	if err != nil || !won {
+		return
+	}
+	job = claimed
+	output, err := os.CreateTemp(filepath.Dir(job.BodyPath), "result-*")
+	if err != nil {
+		finishImageRouteJob(job, "failed", nil, "图片交付存储暂不可用，未发送上游", "")
+		return
+	}
+	defer output.Close()
+	resultReservation, err := mediaservice.ReserveImageRouteSpool(1, time.Now().Add(time.Duration(mediasetting.Get().AssetTTLHours)*time.Hour).Unix())
+	if err != nil {
+		_ = os.Remove(output.Name())
+		finishImageRouteJob(job, "failed", nil, "图片交付容量不足，未发送上游", "")
+		return
+	}
+	keepOutput := false
+	resultPath := output.Name() + ".json"
+	defer func() {
+		if !keepOutput {
+			_ = output.Close()
+			removed := true
+			for _, path := range []string{output.Name(), resultPath} {
+				if path == "" {
+					continue
+				}
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					removed = false
+				}
+			}
+			if removed {
+				mediaservice.ReleaseImageRouteSpool(resultReservation)
+			}
+		}
+	}()
+	persistedOutput := model.DB.Transaction(func(tx *gorm.DB) error {
+		persisted := tx.Model(&model.ImageRouteJob{}).Where("id = ? AND version = ? AND state = ?", job.ID, job.Version, "dispatching").Updates(map[string]any{"result_reservation": resultReservation, "result_path": resultPath})
+		if persisted.Error != nil {
+			return persisted.Error
+		}
+		if persisted.RowsAffected != 1 {
+			return model.ErrImageRouteJobConflict
+		}
+		return model.HoldImageRouteSpoolTx(tx, resultReservation)
+	})
+	if persistedOutput != nil {
+		return
+	}
+	result := &imageRouteResponseWriter{header: make(http.Header), file: output, reservation: resultReservation}
+	requestBody, err := os.Open(job.BodyPath)
+	if err != nil {
+		finishImageRouteJob(job, "failed", nil, "绘图请求快照不可读取", "")
+		return
+	}
+	defer requestBody.Close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, job.RequestPath, requestBody)
+	if err != nil {
+		finishImageRouteJob(job, "failed", nil, "绘图请求快照无效", "")
+		return
+	}
+	request.RemoteAddr = net.JoinHostPort(job.ClientIP, "0")
+	request.Header.Set("Content-Type", job.ContentType)
+	request.Header.Set("Prefer", "respond-async")
+	request.Header.Set(types.ParameterQuoteHeader, job.QuoteToken)
+	if job.TenantRequestID != "" {
+		request.Header.Set("X-Gateway-Request-Id", fmt.Sprintf("%s-r%d", job.TenantRequestID, job.Version))
+	}
+	var frozenPolicy smartrouter.Policy
+	if err := common.UnmarshalJsonStr(job.PolicyJSON, &frozenPolicy); err != nil {
+		finishImageRouteJob(job, "failed", nil, "绘图路由策略快照无效", "")
+		return
+	}
+	user, err := model.GetUserById(job.UserID, true)
+	if err != nil || user.Status != common.UserStatusEnabled {
+		finishImageRouteJob(job, "failed", nil, "账户已不可用，未继续生成", "")
+		return
+	}
+	token := &model.Token{UserId: job.UserID, Name: "media-studio", Group: "auto", RoutingPolicy: job.PolicyJSON, UnlimitedQuota: true}
+	var currentImagePolicy *smartrouter.Policy
+	if job.TokenID > 0 {
+		token, err = model.GetTokenByIds(job.TokenID, job.UserID)
+		if err != nil || token.Status != common.TokenStatusEnabled || (token.ExpiredTime != -1 && token.ExpiredTime < time.Now().Unix()) {
+			finishImageRouteJob(job, "failed", nil, "原令牌已不可用，未继续生成", "")
+			return
+		}
+		currentPolicy, err := token.GetSmartRoutingPolicy()
+		if allowed := token.GetIpLimits(); len(allowed) > 0 && !common.IsIpInCIDRList(net.ParseIP(job.ClientIP), allowed) {
+			finishImageRouteJob(job, "failed", nil, "原请求 IP 已不在令牌允许范围，未继续生成", "")
+			return
+		}
+		if err != nil || currentPolicy == nil || !currentPolicy.Enabled {
+			finishImageRouteJob(job, "failed", nil, "原令牌不再启用智能路由", "")
+			return
+		}
+		currentImagePolicy = currentPolicy
+		frozenPolicy.ExcludedGroups = append(frozenPolicy.ExcludedGroups, currentPolicy.ExcludedGroups...)
+		frozenPolicy.ExcludedRoutes = append(frozenPolicy.ExcludedRoutes, currentPolicy.ExcludedRoutes...)
+		var originalGroups []string
+		if common.UnmarshalJsonStr(job.FrozenGroupsJSON, &originalGroups) != nil {
+			finishImageRouteJob(job, "failed", nil, "分组快照无效", "")
+			return
+		}
+		for _, group := range originalGroups {
+			if !currentPolicy.AllowsGroup(group) {
+				frozenPolicy.ExcludedGroups = append(frozenPolicy.ExcludedGroups, group)
+			}
+		}
+		if currentPolicy.MaxEffectiveRatioPPM > 0 && currentPolicy.MaxEffectiveRatioPPM < frozenPolicy.MaxEffectiveRatioPPM {
+			frozenPolicy.MaxEffectiveRatioPPM = currentPolicy.MaxEffectiveRatioPPM
+		}
+	}
+	router := gin.New()
+	router.Use(middleware.BodyStorageCleanup())
+	router.Use(func(c *gin.Context) {
+		user.ToBaseUser().WriteContext(c)
+		if err := middleware.SetupContextForToken(c, token); err != nil {
+			return
+		}
+		common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, frozenPolicy)
+		if currentImagePolicy != nil {
+			c.Set("image_route_current_policy", *currentImagePolicy)
+		}
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, "auto")
+		c.Set(common.RequestIdKey, fmt.Sprintf("%s-r%d", job.PublicTaskID, job.Version))
+		c.Set(service.ImageRouteJobContextKey, job.ID)
+		c.Set("image_route_public_id", job.PublicTaskID)
+		c.Set("image_task_no_retention", job.NoRetention)
+		if err := restoreImageRouteCommitments(c, job); err != nil {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": gin.H{"message": "绘图价格承诺无法恢复，未发送上游"}})
+			return
+		}
+		if job.TokenID == 0 {
+			c.Set("is_playground", true)
+		}
+		c.Next()
+		if c.GetBool("image_attempt_uncertain") {
+			c.Header("X-New-Api-Image-Uncertain", "true")
+		}
+	})
+	router.POST(job.RequestPath, middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAIImage) })
+	keepOutput = true
+	router.ServeHTTP(result, request)
+	var deliveredImage dto.ImageResponse
+	deliveryComplete := false
+	if result.err == nil && result.code >= 200 && result.code < 300 && output.Sync() == nil {
+		_, _ = output.Seek(0, io.SeekStart)
+		if common.DecodeJson(output, &deliveredImage) == nil && len(deliveredImage.Data) > 0 {
+			if output.Close() == nil && os.Rename(output.Name(), resultPath) == nil {
+				deliveryComplete = true
+			}
+		}
+	}
+	latest, found, err := model.GetImageRouteJob(job.PublicTaskID, job.UserID)
+	if err != nil || !found {
+		return
+	}
+	if latest.State == "waiting" {
+		keepOutput = false
+		reconcileImageRouteJob(ctx, latest)
+		return
+	}
+	if latest.State != "dispatching" {
+		return
+	}
+	if deliveryComplete {
+		for index := range deliveredImage.Data {
+			deliveredImage.Data[index].B64Json = ""
+		}
+		data, err := common.Marshal(deliveredImage)
+		if err == nil {
+			finishImageRouteJob(latest, "succeeded", data, "", resultPath)
+		}
+		return
+	}
+	if result.err != nil || output.Sync() != nil {
+		finishImageRouteJob(latest, "unknown", nil, "图片交付写入未确认，请勿重复生成", resultPath)
+		return
+	}
+	_, _ = output.Seek(0, io.SeekStart)
+	if result.code >= 200 && result.code < 300 {
+		finishImageRouteJob(latest, "unknown", nil, "上游返回结果未能确认，请勿重复生成", resultPath)
+		return
+	}
+	message := "绘图候选均未成功，已停止本次请求"
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_, _ = output.Seek(0, io.SeekStart)
+	if common.DecodeJson(io.LimitReader(output, 1<<20), &payload) == nil && payload.Error.Message != "" {
+		message = payload.Error.Message
+	}
+	state := "failed"
+	if result.Header().Get("X-New-Api-Image-Uncertain") == "true" {
+		state = "unknown"
+	}
+	if state == "failed" {
+		keepOutput = false
+		resultPath = ""
+	}
+	finishImageRouteJob(latest, state, nil, message, resultPath)
+}
+
+func finishImageRouteJob(job *model.ImageRouteJob, state string, data []byte, reason, resultPath string) {
+	won, err := model.CompleteImageRouteJob(job.ID, job.Version, state, data, reason, resultPath)
+	if err != nil {
+		common.SysError("image route completion pending: " + err.Error())
+		return
+	}
+	if won && (state == "succeeded" || state == "failed") {
+		if err := os.Remove(job.BodyPath); err == nil || os.IsNotExist(err) {
+			mediaservice.ReleaseImageRouteSpool(job.BodyReservation)
+		}
+	}
+}
+
+func reconcileImageRouteJob(ctx context.Context, job *model.ImageRouteJob) {
+	if job.State != "waiting" || job.CurrentTaskID == "" {
+		return
+	}
+	child, found, err := model.GetByTaskId(job.UserID, job.CurrentTaskID)
+	if err != nil || !found {
+		return
+	}
+	switch child.Status {
+	case model.TaskStatusSuccess:
+		service.ObserveImageTaskTerminal(child, true)
+		finishImageRouteJob(job, "succeeded", child.Data, "", "")
+	case model.TaskStatusFailure:
+		service.ObserveImageTaskTerminal(child, false)
+		if child.PrivateData.ImageTask == nil || !child.PrivateData.ImageTask.RetryableFailure {
+			finishImageRouteJob(job, "failed", nil, child.FailReason, "")
+			return
+		}
+		won, err := model.ResumeImageRouteJob(job.ID, job.Version)
+		if err != nil || !won {
+			return
+		}
+		resumed, found, err := model.GetImageRouteJob(job.PublicTaskID, job.UserID)
+		if err == nil && found {
+			scheduleImageRouteJob(resumed)
+		}
+	case model.TaskStatusUnknown:
+		return
+	}
+}
+
+type imageRouteJobHandler struct{}
+
+func (imageRouteJobHandler) Type() string            { return "image_route_continue" }
+func (imageRouteJobHandler) Interval() time.Duration { return 5 * time.Second }
+func (imageRouteJobHandler) NewPayload() any         { return nil }
+func (imageRouteJobHandler) Enabled() bool {
+	return constant.UpdateTask
+}
+func (imageRouteJobHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	var cursor int64
+	scanned := 0
+	var scanErr error
+	for ctx.Err() == nil {
+		jobs, err := model.UpdateImageRouteJobActiveTasks(cursor)
+		if err != nil {
+			scanErr = err
+			break
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		for _, job := range jobs {
+			cursor = job.ID
+			scanned++
+			if job.State == "ready" {
+				scheduleImageRouteJob(job)
+			} else {
+				reconcileImageRouteJob(ctx, job)
+			}
+		}
+	}
+	reconcileImageRouteDeliveries(ctx)
+	cleanupImageRouteSpools(ctx)
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, map[string]any{"scanned": scanned}, scanErr)
+}

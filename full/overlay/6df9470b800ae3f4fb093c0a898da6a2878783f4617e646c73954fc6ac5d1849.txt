@@ -1,0 +1,34 @@
+package service
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
+
+const smartRouteObservationIdentityVersion = "smart-route-observation-v2"
+
+// smartRouteCanonicalObservationID returns a bounded, irreversible identity
+// shared by the live projector and log replay. The caller supplies only the
+// minimum stable fields needed by one metric domain; raw request IDs are never
+// persisted in route state or analytics profiles.
+func smartRouteCanonicalObservationID(kind string, parts ...string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		return ""
+	}
+	payload := smartRouteObservationIdentityVersion + "\x00" + kind
+	hasIdentity := false
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		payload += "\x00" + part
+		if part != "" {
+			hasIdentity = true
+		}
+	}
+	if !hasIdentity {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(payload))
+	return smartRouteObservationIdentityVersion + ":" + hex.EncodeToString(digest[:16])
+}

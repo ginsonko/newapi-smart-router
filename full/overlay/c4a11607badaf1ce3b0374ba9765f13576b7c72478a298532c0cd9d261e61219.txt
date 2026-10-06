@@ -1,0 +1,413 @@
+package openai
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/relayconvert"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+
+	defer service.CloseResponseBodyGracefully(resp)
+
+	var responsesResp dto.OpenAIResponsesResponse
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+	}
+
+	if err := common.Unmarshal(body, &responsesResp); err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+	}
+	if isSmartResponsesRequest(c) {
+		if semanticErr := smartResponsesResponseSemanticError(&responsesResp); semanticErr != nil {
+			return nil, semanticErr
+		}
+	}
+
+	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		return nil, MarkSmartResponsesUpstreamError(c, types.WithOpenAIError(*oaiError, resp.StatusCode, types.ErrOptionWithUpstreamResponseReceived()))
+	}
+
+	chatId := helper.GetResponseID(c)
+	chatResp, usage, err := service.ResponsesResponseToChatCompletionsResponse(&responsesResp, chatId)
+	if err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+	}
+
+	if usage == nil || usage.TotalTokens == 0 {
+		text := service.ExtractOutputTextFromResponses(&responsesResp)
+		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
+		chatResp.Usage = *usage
+	}
+	if usage != nil && usage.InputTokens > 0 {
+		usage.UsageSource = "openai-responses"
+	}
+
+	var responseBody []byte
+	switch info.RelayFormat {
+	case types.RelayFormatClaude:
+		claudeResp := service.ResponseOpenAI2Claude(chatResp, info)
+		responseBody, err = common.Marshal(claudeResp)
+	case types.RelayFormatGemini:
+		geminiResp := service.ResponseOpenAI2Gemini(chatResp, info)
+		responseBody, err = common.Marshal(geminiResp)
+	default:
+		responseBody, err = common.Marshal(chatResp)
+	}
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
+	}
+
+	service.IOCopyBytesGracefully(c, resp, responseBody)
+	return usage, nil
+}
+
+func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+	if semanticErr := guardSmartResponsesStream(c, info, resp); semanticErr != nil {
+		return nil, semanticErr
+	}
+
+	accumulator := relayconvert.NewResponsesBufferedAccumulator()
+	var finalResponse *dto.OpenAIResponsesResponse
+	var streamErr *types.NewAPIError
+	terminalSeen := false
+
+	scanner := helper.NewStreamScanner(resp.Body)
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) < 6 || line[:5] != "data:" {
+			continue
+		}
+		data := line[5:]
+		data = strings.TrimSpace(data)
+		if data == "" || data == "[DONE]" {
+			if data == "[DONE]" {
+				break
+			}
+			continue
+		}
+
+		var streamResp dto.ResponsesStreamResponse
+		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
+			logger.LogError(c, "failed to unmarshal buffered responses stream event: "+err.Error())
+			streamErr = MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+			break
+		}
+		if isSmartResponsesRequest(c) {
+			if semanticErr := smartResponsesStreamSemanticError(&streamResp); semanticErr != nil {
+				streamErr = semanticErr
+				break
+			}
+			terminalSeen, _ = observeSmartResponsesStreamEvent(c, info, &streamResp)
+		}
+		accumulator.ProcessEvent(&streamResp)
+		switch streamResp.Type {
+		case "response.completed", "response.done", "response.incomplete":
+			finalResponse = streamResp.Response
+			if finalResponse == nil {
+				finalResponse = &dto.OpenAIResponsesResponse{}
+			}
+			if streamResp.Type == "response.completed" || streamResp.Type == "response.done" {
+				if len(finalResponse.Status) == 0 {
+					finalResponse.Status = []byte(`"completed"`)
+				}
+			}
+			if streamResp.Type == "response.incomplete" {
+				if len(finalResponse.Status) == 0 {
+					finalResponse.Status = []byte(`"incomplete"`)
+				}
+			}
+		case "response.failed", "response.error":
+			if streamResp.Response != nil {
+				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
+					streamErr = MarkSmartResponsesUpstreamError(c, types.WithOpenAIError(*oaiErr, http.StatusBadGateway, types.ErrOptionWithUpstreamResponseReceived()))
+					break
+				}
+			}
+			streamErr = MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusBadGateway))
+		}
+		if streamErr != nil || terminalSeen || finalResponse != nil {
+			break
+		}
+	}
+	if streamErr != nil {
+		return nil, PreserveSmartResponsesSingleRouteError(c, streamErr)
+	}
+	if err := scanner.Err(); err != nil {
+		if isSmartResponsesRequest(c) && c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+		}
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway))
+	}
+	if isSmartResponsesRequest(c) && !terminalSeen && !SmartResponsesTerminalSeen(c) {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+		}
+		incompleteErr := MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+			fmt.Errorf("Responses stream ended before a terminal event"),
+			types.ErrorCodeReadResponseBodyFailed,
+			http.StatusBadGateway,
+		))
+		return nil, PreserveSmartResponsesSingleRouteError(c, incompleteErr)
+	}
+	if finalResponse == nil {
+		// Fixed-key compatibility retains the historical synthetic completion.
+		// Smart Responses requests have already returned above when no explicit
+		// terminal event was observed.
+		finalResponse = &dto.OpenAIResponsesResponse{
+			ID:        helper.GetResponseID(c),
+			CreatedAt: int(time.Now().Unix()),
+			Model:     info.UpstreamModelName,
+			Status:    []byte(`"completed"`),
+		}
+	}
+	if isSmartResponsesRequest(c) {
+		if semanticErr := smartResponsesResponseSemanticError(finalResponse); semanticErr != nil {
+			return nil, semanticErr
+		}
+	}
+	accumulator.SupplementResponseOutput(finalResponse)
+
+	chatId := helper.GetResponseID(c)
+	chatResp, usage, err := service.ResponsesResponseToChatCompletionsResponse(finalResponse, chatId)
+	if err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+	}
+	if usage == nil || usage.TotalTokens == 0 {
+		text := service.ExtractOutputTextFromResponses(finalResponse)
+		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
+		chatResp.Usage = *usage
+	}
+	if usage != nil && usage.InputTokens > 0 {
+		usage.UsageSource = "openai-responses"
+	}
+
+	var responseBody []byte
+	switch info.RelayFormat {
+	case types.RelayFormatClaude:
+		claudeResp := service.ResponseOpenAI2Claude(chatResp, info)
+		responseBody, err = common.Marshal(claudeResp)
+	case types.RelayFormatGemini:
+		geminiResp := service.ResponseOpenAI2Gemini(chatResp, info)
+		responseBody, err = common.Marshal(geminiResp)
+	default:
+		responseBody, err = common.Marshal(chatResp)
+	}
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
+	}
+
+	service.IOCopyBytesGracefully(c, resp, responseBody)
+	return usage, nil
+}
+
+func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+
+	defer service.CloseResponseBodyGracefully(resp)
+	if semanticErr := guardSmartResponsesStream(c, info, resp); semanticErr != nil {
+		return nil, semanticErr
+	}
+
+	responseId := helper.GetResponseID(c)
+	createAt := time.Now().Unix()
+	state := relayconvert.NewResponsesToChatStreamState(info.UpstreamModelName, false)
+	state.ID = responseId
+	state.Created = createAt
+	streamErr := (*types.NewAPIError)(nil)
+	newStreamError := func(err error, code types.ErrorCode, status int) *types.NewAPIError {
+		if info.RelayFormat == types.RelayFormatClaude {
+			return types.NewOpenAIError(err, code, status, types.ErrOptionWithSkipRetry())
+		}
+		return types.NewOpenAIError(err, code, status)
+	}
+
+	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo == nil {
+		info.ClaudeConvertInfo = relaycommon.NewClaudeConvertInfo()
+	}
+
+	sendChatChunk := func(chunk dto.ChatCompletionsStreamResponse) bool {
+		if len(chunk.Choices) == 0 && chunk.Usage == nil {
+			return true
+		}
+		if responsesClientDisconnected(c, info, nil) {
+			return true
+		}
+		if info.RelayFormat == types.RelayFormatOpenAI {
+			if err := helper.ObjectData(c, &chunk); err != nil {
+				if responsesClientDisconnected(c, info, nil) {
+					return true
+				}
+				streamErr = newStreamError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				return false
+			}
+			if isSmartResponsesRequest(c) {
+				markSmartResponsesSemanticCommitted(c)
+			}
+			return true
+		}
+
+		chunkData, err := common.Marshal(&chunk)
+		if err != nil {
+			streamErr = newStreamError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
+			return false
+		}
+		if err := HandleStreamFormat(c, info, string(chunkData), false, false); err != nil {
+			if responsesClientDisconnected(c, info, nil) {
+				return true
+			}
+			streamErr = newStreamError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			return false
+		}
+		if isSmartResponsesRequest(c) {
+			markSmartResponsesSemanticCommitted(c)
+		}
+		return true
+	}
+
+	helper.StreamScannerHandlerWithOptions(c, resp, info, responsesStreamScannerOptions(), func(data string, sr *helper.StreamResult) {
+		if streamErr != nil {
+			sr.Stop(streamErr)
+			return
+		}
+
+		var streamResp dto.ResponsesStreamResponse
+		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
+			logger.LogError(c, "failed to unmarshal responses stream event: "+err.Error())
+			if info.RelayFormat == types.RelayFormatClaude {
+				streamErr = newStreamError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
+				if isSmartResponsesRequest(c) {
+					streamErr.MarkUpstreamResponseReceived()
+				}
+				sr.Stop(streamErr)
+			} else {
+				if isSmartResponsesRequest(c) {
+					streamErr = MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+					sr.Stop(streamErr)
+				} else {
+					sr.Error(err)
+				}
+			}
+			return
+		}
+
+		if isSmartResponsesRequest(c) {
+			if semanticErr := smartResponsesStreamSemanticError(&streamResp); semanticErr != nil {
+				streamErr = semanticErr
+				sr.Stop(streamErr)
+				return
+			}
+		} else if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
+			if streamResp.Response != nil {
+				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
+					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
+					if info.RelayFormat == types.RelayFormatClaude {
+						streamErr = types.NewOpenAIError(streamErr, types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+					}
+					sr.Stop(streamErr)
+					return
+				}
+			}
+			streamErr = newStreamError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
+			return
+		}
+		observeSmartResponsesStreamEvent(c, info, &streamResp)
+
+		chunks, err := relayconvert.ResponsesStreamEventToChatChunks(&streamResp, state)
+		if err != nil {
+			streamErr = newStreamError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			if isSmartResponsesRequest(c) {
+				streamErr.MarkUpstreamResponseReceived()
+			}
+			sr.Stop(streamErr)
+			return
+		}
+		for _, chunk := range chunks {
+			if !sendChatChunk(chunk) {
+				sr.Stop(streamErr)
+				return
+			}
+		}
+	})
+
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	if isSmartResponsesRequest(c) && !SmartResponsesTerminalSeen(c) {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+		}
+		incompleteErr := MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+			fmt.Errorf("Responses stream ended before a terminal event"),
+			types.ErrorCodeReadResponseBodyFailed,
+			http.StatusBadGateway,
+		))
+		return nil, PreserveSmartResponsesSingleRouteError(c, incompleteErr)
+	}
+
+	usage := state.Usage
+	if usage.TotalTokens == 0 {
+		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+		state.Usage = usage
+	}
+	if usage != nil && usage.InputTokens > 0 {
+		usage.UsageSource = "openai-responses"
+	}
+
+	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo != nil {
+		info.ClaudeConvertInfo.Usage = usage
+	}
+	for _, chunk := range relayconvert.FinalizeResponsesToChatStream(state) {
+		if !sendChatChunk(chunk) {
+			return nil, streamErr
+		}
+	}
+	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo != nil && !info.ClaudeConvertInfo.Done {
+		// A Responses terminal event can emit the Chat finish chunk while usage is
+		// still only stored in state. Feed the now-known usage through the same
+		// converter so every started Claude block receives its stop/message_stop.
+		finalUsage := helper.GenerateFinalUsageResponse(responseId, state.Created, state.Model, *usage)
+		if !sendChatChunk(*finalUsage) {
+			return nil, streamErr
+		}
+	}
+	if info.RelayFormat == types.RelayFormatOpenAI && info.ShouldIncludeUsage && usage != nil &&
+		!responsesClientDisconnected(c, info, nil) {
+		if err := helper.ObjectData(c, helper.GenerateFinalUsageResponse(responseId, state.Created, state.Model, *usage)); err != nil {
+			if !responsesClientDisconnected(c, info, nil) {
+				return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			}
+		}
+	}
+
+	if info.RelayFormat == types.RelayFormatOpenAI && !responsesClientDisconnected(c, info, nil) {
+		helper.Done(c)
+	}
+	return usage, nil
+}

@@ -1,0 +1,222 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+// SmartRouteExternalSuccess is a proven successful request that did not enter
+// through an automatic Smart Routing session (for example a fixed group Key,
+// an ordinary Key, or the administrator's real channel test). It contains only
+// exact route identity; no credential or upstream URL is persisted.
+type SmartRouteExternalSuccess struct {
+	ChannelID         int
+	ChannelGeneration string
+	CanonicalModel    string
+	UpstreamModel     string
+	RequestPath       string
+	ObservationID     string
+	StartedAtMS       int64
+	AtMS              int64
+	TTFT              time.Duration
+	TTFTObserved      bool
+}
+
+// SmartRouteExternalFailure is one provider-attributable failure observed by
+// fixed-group or ordinary-key traffic. User validation, content rejection and
+// client cancellation never reach this projection.
+type SmartRouteExternalFailure struct {
+	SmartRouteExternalSuccess
+	Outcome      smartrouter.QualityOutcome
+	RetryAfter   time.Duration
+	HTTPStatus   int
+	ErrorSummary string
+}
+
+// ObserveSmartRouteExternalSuccess publishes a successful fixed/direct request
+// to the current Smart Router state. A missing/disabled catalog is a no-op so a
+// normal API response never depends on Smart Router administration being on.
+func ObserveSmartRouteExternalSuccess(
+	ctx context.Context,
+	observation SmartRouteExternalSuccess,
+) (int, error) {
+	engine, err := GetDefaultSmartRouterEngine()
+	if err != nil {
+		if errors.Is(err, ErrSmartRouterDisabled) || errors.Is(err, ErrNoCertifiedSmartRoutes) ||
+			errors.Is(err, ErrNoDiscoveredSmartRoutes) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return engine.ObserveExternalSuccess(ctx, observation)
+}
+
+func ObserveSmartRouteExternalFailure(
+	ctx context.Context,
+	observation SmartRouteExternalFailure,
+) (int, error) {
+	engine, err := GetDefaultSmartRouterEngine()
+	if err != nil {
+		if errors.Is(err, ErrSmartRouterDisabled) || errors.Is(err, ErrNoCertifiedSmartRoutes) ||
+			errors.Is(err, ErrNoDiscoveredSmartRoutes) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if engine == nil || engine.Catalogs == nil || engine.State == nil {
+		return 0, errors.New("smart router external failure dependencies are incomplete")
+	}
+	catalog, ok := engine.Catalogs.Current()
+	if !ok || catalog == nil {
+		return 0, nil
+	}
+	return recordSmartRouteExternalObservation(ctx, engine, *catalog, observation.SmartRouteExternalSuccess,
+		observation.Outcome, observation.RetryAfter, observation.HTTPStatus, observation.ErrorSummary)
+}
+
+// ObserveExternalSuccess restores every route-ID alias of one exact physical
+// route. Group is deliberately not part of the match: the same channel,
+// configuration generation, upstream model and protocol contract may be
+// published into several groups, but it represents one proven upstream path.
+func (engine *SmartRouterEngine) ObserveExternalSuccess(
+	ctx context.Context,
+	observation SmartRouteExternalSuccess,
+) (int, error) {
+	if engine == nil || engine.Catalogs == nil || engine.State == nil {
+		return 0, errors.New("smart router external success dependencies are incomplete")
+	}
+	catalog, ok := engine.Catalogs.Current()
+	if !ok || catalog == nil {
+		return 0, nil
+	}
+	return recordSmartRouteExternalSuccess(ctx, engine, *catalog, observation)
+}
+
+func recordSmartRouteExternalSuccess(
+	ctx context.Context,
+	engine *SmartRouterEngine,
+	catalog smartrouter.CertifiedRouteCatalog,
+	observation SmartRouteExternalSuccess,
+) (int, error) {
+	return recordSmartRouteExternalObservation(ctx, engine, catalog, observation,
+		smartrouter.OutcomeSuccess, 0, 0, "")
+}
+
+func recordSmartRouteExternalObservation(
+	ctx context.Context,
+	engine *SmartRouterEngine,
+	catalog smartrouter.CertifiedRouteCatalog,
+	observation SmartRouteExternalSuccess,
+	outcome smartrouter.QualityOutcome,
+	retryAfter time.Duration,
+	httpStatus int,
+	errorSummary string,
+) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	observation.ChannelGeneration = strings.TrimSpace(observation.ChannelGeneration)
+	observation.CanonicalModel = strings.TrimSpace(observation.CanonicalModel)
+	observation.UpstreamModel = strings.TrimSpace(observation.UpstreamModel)
+	observation.RequestPath = strings.TrimSpace(observation.RequestPath)
+	observation.ObservationID = smartRouteCanonicalObservationID("request", observation.ObservationID)
+	if observation.ChannelID <= 0 || observation.ChannelGeneration == "" ||
+		observation.CanonicalModel == "" || observation.UpstreamModel == "" || observation.RequestPath == "" {
+		return 0, nil
+	}
+	contractID, endpoint, _, err := SmartContractIdentity(observation.CanonicalModel, observation.RequestPath)
+	if err != nil {
+		if errors.Is(err, ErrUnsupportedSmartRouteEndpoint) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	contract, exists := catalog.Contracts[contractID]
+	if !exists || contract.Contract.Endpoint != endpoint ||
+		contract.Contract.CanonicalModel != observation.CanonicalModel {
+		return 0, nil
+	}
+
+	routesByID := make(map[string]smartrouter.CertifiedRoute)
+	for _, pool := range contract.Pools {
+		for _, route := range pool.Candidates {
+			if route.ChannelID != observation.ChannelID ||
+				route.ChannelGeneration != observation.ChannelGeneration ||
+				route.UpstreamModel != observation.UpstreamModel {
+				continue
+			}
+			routesByID[route.RouteID] = route
+		}
+	}
+	if len(routesByID) == 0 {
+		return 0, nil
+	}
+	routes := make([]smartrouter.CertifiedRoute, 0, len(routesByID))
+	for _, route := range routesByID {
+		routes = append(routes, route)
+	}
+	sort.Slice(routes, func(left, right int) bool { return routes[left].RouteID < routes[right].RouteID })
+
+	setting := smartroutersetting.Normalize(smartroutersetting.Setting{})
+	if engine.Settings != nil {
+		setting = smartroutersetting.Normalize(engine.Settings())
+	}
+	for index, route := range routes {
+		record := SmartRouteAttemptRecord{
+			CatalogVersion:   catalog.Version,
+			RouteID:          route.RouteID,
+			Group:            route.Group,
+			Model:            observation.CanonicalModel,
+			ChannelID:        route.ChannelID,
+			ContractID:       contractID,
+			Endpoint:         endpoint,
+			CapacityDomain:   route.CapacityDomain,
+			CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			StableFallback:   route.StableFallback,
+			DemandRecovery:   setting.TextProbeDelayMS() > 0,
+			PassiveRecovery:  SmartRouteRequiresPassiveRecovery(observation.CanonicalModel, route),
+			Outcome:          outcome,
+			SkipDomainUpdate: index > 0,
+			ObservationID:    observation.ObservationID,
+			StartedAtMS:      observation.StartedAtMS,
+			AtMS:             observation.AtMS,
+			TTFT:             observation.TTFT,
+			TTFTObserved:     observation.TTFTObserved,
+			Admission:        smartrouter.AdmissionNormal,
+			RetryAfter:       retryAfter,
+			HTTPStatus:       httpStatus,
+			ErrorSummary:     errorSummary,
+		}
+		if err := engine.State.RecordAttempt(ctx, record); err != nil {
+			return index, err
+		}
+	}
+	if outcome != smartrouter.OutcomeSuccess && outcome != smartrouter.OutcomeImagePending && engine.Settings != nil && endpoint != SmartEndpointImages && endpoint != SmartEndpointImageEdits {
+		setting := smartroutersetting.Normalize(engine.Settings())
+		replayClass, _ := smartRouteStatusRequestProfile(endpoint)
+		allowedGroups := make([]string, 0, len(routes))
+		for _, route := range routes {
+			allowedGroups = append(allowedGroups, route.Group)
+		}
+		engine.hintAutomaticRecovery(ctx, catalog.Version, "external", smartrouter.RouteRequest{
+			CanonicalModel: observation.CanonicalModel,
+			ContractID:     contractID,
+			Endpoint:       endpoint,
+			ReplayClass:    replayClass,
+		}, smartRouteGlobalLeaderboardPolicy(setting), "", allowedGroups, routes)
+	}
+	if outcome == smartrouter.OutcomeSuccess {
+		notifySmartRouteDiscovery(smartrouter.RouteRequest{
+			CanonicalModel: observation.CanonicalModel,
+			ContractID:     contractID,
+			Endpoint:       endpoint,
+		})
+	}
+	return len(routes), nil
+}

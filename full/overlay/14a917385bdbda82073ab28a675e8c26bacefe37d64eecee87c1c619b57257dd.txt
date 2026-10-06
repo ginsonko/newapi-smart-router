@@ -1,0 +1,359 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import { ArrowLeftIcon, RefreshCwIcon } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { useAuthStore } from '@/stores/auth-store'
+
+import { AnalyticsTrendChart } from './analytics-trend-chart'
+import { getSmartRouterRouteAnalytics } from './api'
+import {
+  formatSmartRouterInputCostPPM,
+  formatSmartRouterRoutePrice,
+  ratioText,
+} from './health-view-model'
+import {
+  readLeaderboardPreferencesV3,
+  writeLeaderboardPreferencesV3,
+} from './leaderboard-preferences'
+
+type RouteAnalyticsRange = '1h' | '24h' | '3d'
+
+function percentFromPPM(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value / 10_000
+    : null
+}
+
+function formatPercent(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${value.toFixed(1)}%`
+    : '—'
+}
+
+function formatLatency(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  if (value >= 1_000) return `${(value / 1_000).toFixed(2)} s`
+  return `${Math.round(value)} ms`
+}
+
+function MetricCard(props: { label: string; value: string; detail?: string }) {
+  return (
+    <div className='min-w-0 rounded-xl border p-3'>
+      <div className='text-muted-foreground text-xs'>{props.label}</div>
+      <div className='mt-1 truncate text-lg font-semibold tabular-nums'>
+        {props.value}
+      </div>
+      {props.detail && (
+        <div className='text-muted-foreground mt-1 text-xs'>{props.detail}</div>
+      )}
+    </div>
+  )
+}
+
+export function RouteAnalyticsPage(props: { detailId: string }) {
+  const { t } = useTranslation()
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const userGroup = useAuthStore((state) => state.auth.user?.group ?? '')
+  const [range, setRange] = useState<RouteAnalyticsRange>(
+    () => readLeaderboardPreferencesV3(userId).routeRange
+  )
+  useEffect(() => {
+    const preferences = readLeaderboardPreferencesV3(userId)
+    writeLeaderboardPreferencesV3(userId, { ...preferences, routeRange: range })
+  }, [range, userId])
+  const query = useQuery({
+    queryKey: ['smart-router-route-analytics', userId, userGroup, props.detailId, range],
+    queryFn: () =>
+      getSmartRouterRouteAnalytics({ detailId: props.detailId, range }),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
+  const report = query.data?.data
+  const points = report?.points ?? []
+  const summary = report?.summary
+
+  return (
+    <main className='space-y-4' data-route-analytics-page='true'>
+      <div className='flex flex-wrap items-center justify-between gap-3'>
+        <div className='min-w-0'>
+          <Button
+            render={<Link to='/smart-routing/leaderboard' />}
+            variant='ghost'
+            size='sm'
+            className='mb-1 -ml-2'
+          >
+            <ArrowLeftIcon aria-hidden='true' />
+            {t('Back to channel leaderboard')}
+          </Button>
+          <div className='text-muted-foreground text-xs font-medium tracking-wide'>
+            {t('Channel trend details')}
+          </div>
+          <h1 className='mt-1 truncate text-xl font-semibold'>
+            {report?.group_name ?? t('Channel trend details')}
+          </h1>
+          <p className='text-muted-foreground mt-1 text-sm'>
+            {report
+              ? `${report.model} · ${report.endpoint}`
+              : t('Loading route identity...')}
+          </p>
+        </div>
+        <div className='flex items-center gap-2'>
+          <NativeSelect
+            aria-label={t('Time range')}
+            value={range}
+            onChange={(event) =>
+              setRange(event.target.value as RouteAnalyticsRange)
+            }
+          >
+            <NativeSelectOption value='1h'>
+              {t('Last 1 hour')}
+            </NativeSelectOption>
+            <NativeSelectOption value='24h'>
+              {t('Last 24 hours')}
+            </NativeSelectOption>
+            <NativeSelectOption value='3d'>
+              {t('Last 3 days')}
+            </NativeSelectOption>
+          </NativeSelect>
+          <Button
+            type='button'
+            variant='outline'
+            size='icon'
+            aria-label={t('Refresh')}
+            disabled={query.isFetching}
+            onClick={() => void query.refetch()}
+          >
+            <RefreshCwIcon
+              className={query.isFetching ? 'animate-spin' : undefined}
+            />
+          </Button>
+        </div>
+      </div>
+
+      {query.isError && (
+        <Alert variant='destructive'>
+          <AlertDescription>
+            {t('Unable to load route analytics.')}
+          </AlertDescription>
+        </Alert>
+      )}
+      {report?.coverage.partial && (
+        <Alert>
+          <AlertDescription>
+            {t('Analytics coverage is partial: {{reason}}', {
+              reason: t(
+                report.coverage.missing_reason ?? 'Backfill in progress'
+              ),
+            })}
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {report && (
+        <>
+          <div className='flex flex-wrap items-center gap-2 rounded-xl border p-3'>
+            <Badge variant='outline'>
+              {t(report.current_state || 'Current status unknown')}
+            </Badge>
+            <span className='text-sm font-medium'>{report.group_name}</span>
+            <span className='text-muted-foreground text-xs tabular-nums'>
+              {t('Group ratio')}:{' '}
+              {ratioText(report.group_ratio_ppm) ?? t('Unknown')}
+            </span>
+            <span className='text-muted-foreground text-xs'>
+              {report.current_price
+                ? formatSmartRouterRoutePrice(report.current_price, t)
+                : t('Current price is being synchronized')}
+            </span>
+            <span className='text-muted-foreground ml-auto text-xs'>
+              {report.coverage.freshness_at_ms
+                ? t('Updated {{time}}', {
+                    time: new Date(
+                      report.coverage.freshness_at_ms
+                    ).toLocaleString(),
+                  })
+                : t('Freshness unknown')}
+            </span>
+          </div>
+
+          <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-5'>
+            <MetricCard
+              label={t('Logical requests')}
+              value={`${summary?.logical_requests ?? 0}`}
+              detail={t('{{count}} points with samples', {
+                count: summary?.coverage_points ?? 0,
+              })}
+            />
+            <MetricCard
+              label={t('Final availability')}
+              value={formatPercent(
+                percentFromPPM(summary?.final_availability_rate_ppm)
+              )}
+              detail={t('{{count}} recovered after retry', {
+                count: summary?.retry_recoveries ?? 0,
+              })}
+            />
+            <MetricCard
+              label={t('Real cache rate')}
+              value={formatPercent(percentFromPPM(summary?.cache_rate_ppm))}
+              detail={t('{{count}} input tokens', {
+                count: summary?.total_input_tokens ?? 0,
+              })}
+            />
+            <MetricCard
+              label={t('Average first-token latency')}
+              value={formatLatency(summary?.ttft_average_ms)}
+              detail={t('{{count}} TTFT samples', {
+                count: summary?.ttft_samples ?? 0,
+              })}
+            />
+            <MetricCard
+              label={t('Request-time predicted input cost')}
+              value={formatSmartRouterInputCostPPM(
+                summary?.predicted_input_cost_ppm,
+                ' / 1M tokens'
+              )}
+              detail={t('{{count}} priced input tokens', {
+                count: summary?.predicted_input_tokens ?? 0,
+              })}
+            />
+          </div>
+
+          <div className='grid min-w-0 gap-4 xl:grid-cols-2'>
+            <AnalyticsTrendChart
+              title={t('Real cache rate trend')}
+              subtitle={t(
+                'Real cache-read input tokens divided by total input tokens; gaps mean unknown.'
+              )}
+              series={[
+                {
+                  key: 'cache',
+                  label: t('Real cache rate'),
+                  color: '#2563eb',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: percentFromPPM(point.cache_rate_ppm),
+                    requests: point.logical_requests,
+                    samples: point.total_input_tokens,
+                  })),
+                },
+              ]}
+              formatValue={(value) => `${value.toFixed(2)}%`}
+              formatAxis={(value) => `${Math.round(value)}%`}
+              zeroBased
+            />
+            <AnalyticsTrendChart
+              title={t('Actual first-token latency trend')}
+              subtitle={t(
+                'Only successful requests with a real semantic first token are included.'
+              )}
+              series={[
+                {
+                  key: 'ttft',
+                  label: t('Average TTFT'),
+                  color: '#d97706',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: point.ttft_average_ms,
+                    requests: point.logical_requests,
+                    samples: point.ttft_samples,
+                  })),
+                },
+              ]}
+              formatValue={formatLatency}
+              formatAxis={formatLatency}
+              zeroBased
+            />
+            <AnalyticsTrendChart
+              title={t('Final availability trend')}
+              subtitle={t(
+                'Solid: final success after bounded retry. Dashed: first-attempt success. Probes are excluded.'
+              )}
+              series={[
+                {
+                  key: 'final',
+                  label: t('Final availability'),
+                  color: '#2563eb',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: percentFromPPM(point.final_availability_rate_ppm),
+                    requests: point.logical_requests,
+                    samples: point.logical_requests,
+                  })),
+                },
+                {
+                  key: 'first',
+                  label: t('First-attempt success'),
+                  color: '#d97706',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: percentFromPPM(point.first_hit_success_rate_ppm),
+                    requests: point.logical_requests,
+                    samples: point.logical_requests,
+                  })),
+                },
+              ]}
+              formatValue={(value) => `${value.toFixed(2)}%`}
+              formatAxis={(value) => `${Math.round(value)}%`}
+              zeroBased
+            />
+            <AnalyticsTrendChart
+              title={t('Request-time predicted input cost trend')}
+              subtitle={t(
+                'Frozen request-time price evidence and the real input token mix; not a provider invoice.'
+              )}
+              series={[
+                {
+                  key: 'cost',
+                  label: t('Predicted input cost'),
+                  color: '#7c3aed',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: point.predicted_input_cost_ppm,
+                    requests: point.logical_requests,
+                    samples: point.predicted_input_tokens,
+                  })),
+                },
+              ]}
+              formatValue={(value) =>
+                formatSmartRouterInputCostPPM(value, ' / 1M tokens')
+              }
+              formatAxis={(value) => formatSmartRouterInputCostPPM(value, '')}
+              zeroBased
+            />
+          </div>
+        </>
+      )}
+
+      {query.isPending && (
+        <div className='text-muted-foreground rounded-xl border border-dashed p-10 text-center text-sm'>
+          {t('Loading real route time buckets...')}
+        </div>
+      )}
+    </main>
+  )
+}

@@ -1,0 +1,59 @@
+package ratio_setting
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+var missingGroupRatios = struct {
+	sync.Mutex
+	until    time.Time
+	counts   map[string]uint64
+	overflow uint64
+}{counts: make(map[string]uint64)}
+
+// Bound both repeated log I/O and memory when arbitrary missing names appear.
+// On the next lookup after the window, retain a count of every suppressed hit.
+func logMissingGroupRatio(name string) {
+	if len(name) > 128 {
+		name = name[:128] + "…"
+	}
+	now := time.Now()
+	messages := make([]string, 0, 2)
+	missingGroupRatios.Lock()
+	if !now.Before(missingGroupRatios.until) {
+		if len(missingGroupRatios.counts) > 0 {
+			counts := make([]string, 0, len(missingGroupRatios.counts))
+			for group, count := range missingGroupRatios.counts {
+				if count > 1 {
+					counts = append(counts, fmt.Sprintf("%q:%d", group, count-1))
+				}
+			}
+			if len(counts) > 0 || missingGroupRatios.overflow > 0 {
+				messages = append(messages, fmt.Sprintf("group ratio missing lookups suppressed: [%s], additional_names_hits=%d", strings.Join(counts, ","), missingGroupRatios.overflow))
+			}
+		}
+		clear(missingGroupRatios.counts)
+		missingGroupRatios.overflow = 0
+		missingGroupRatios.until = now.Add(time.Minute)
+	}
+	count, exists := missingGroupRatios.counts[name]
+	if exists {
+		if count < ^uint64(0) {
+			missingGroupRatios.counts[name] = count + 1
+		}
+	} else if len(missingGroupRatios.counts) < 128 {
+		missingGroupRatios.counts[name] = 1
+		messages = append(messages, fmt.Sprintf("group ratio not found: %q (fallback=1; repeats summarized each minute)", name))
+	} else if missingGroupRatios.overflow < ^uint64(0) {
+		missingGroupRatios.overflow++
+	}
+	missingGroupRatios.Unlock()
+	for _, message := range messages {
+		common.SysLog(message)
+	}
+}

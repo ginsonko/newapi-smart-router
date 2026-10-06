@@ -1,0 +1,540 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type visibilitySnapshotStore struct {
+	snapshot smartrouter.ActualInputCostSnapshot
+}
+
+func (store visibilitySnapshotStore) Snapshot() smartrouter.ActualInputCostSnapshot {
+	return store.snapshot
+}
+
+func (visibilitySnapshotStore) Observe(SmartRouteActualInputCostObservation) bool { return false }
+
+func (visibilitySnapshotStore) Status() SmartRouteActualInputCostStatus {
+	return SmartRouteActualInputCostStatus{}
+}
+
+func (visibilitySnapshotStore) Close() {}
+
+func actualInputCostVisibilityPrice(scorePPM int64) smartrouter.RoutePrice {
+	return smartrouter.RoutePrice{
+		BillingMode: "ratio", BillingUnit: "per_token",
+		ComparisonClass: "token-full", ActualInputComparisonClass: "token-input",
+		ScorePPM: scorePPM, StaticComparable: true, CachePricingKnown: true,
+		CacheReadRatioPPM:       100_000,
+		CacheCreation5mRatioPPM: 1_250_000,
+		CacheCreation1hRatioPPM: 2_000_000,
+	}
+}
+
+func TestActualInputCostVisibilityAggregatesExactProfilesOnceAndKeepsZeroRate(t *testing.T) {
+	routeA := smartrouter.CertifiedRoute{
+		RouteID: "route-a", Group: "economy", UpstreamModel: "upstream-model",
+		CacheDomain: "cache-a", CacheNamespaceRevision: "r1",
+	}
+	routeB := smartrouter.CertifiedRoute{
+		RouteID: "route-b", Group: "economy", UpstreamModel: "upstream-model",
+		CacheDomain: "cache-b", CacheNamespaceRevision: "r1",
+	}
+	contract := smartrouter.RouteContract{
+		ContractID: "contract", CanonicalModel: "gpt-test", Endpoint: SmartEndpointChat,
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			"contract": {
+				Contract: contract,
+				Pools: map[string]smartrouter.CertifiedPool{
+					smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{routeA, routeB}},
+					"duplicate-pool":            {Candidates: []smartrouter.CertifiedRoute{routeA}},
+				},
+			},
+		},
+	}
+	price := actualInputCostVisibilityPrice(150_000)
+	prices := smartrouter.PriceSnapshot{
+		Version: "price",
+		RoutePrices: map[string]smartrouter.RoutePrice{
+			routeA.RouteID: price,
+			routeB.RouteID: price,
+		},
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointChat}).UsageSemantic()
+	keyA := smartrouter.ActualInputCostKey(
+		routeA.CacheNamespaceIdentity(), routeA.UpstreamModel,
+		contract.CanonicalModel, contract.Endpoint, usageSemantic,
+	)
+	keyB := smartrouter.ActualInputCostKey(
+		routeB.CacheNamespaceIdentity(), routeB.UpstreamModel,
+		contract.CanonicalModel, contract.Endpoint, usageSemantic,
+	)
+	profileA := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			Key: keyA, TotalInputTokens: 100, RegularInputTokens: 100, Reliable: true,
+		},
+		1_000,
+	)
+	invalidProfile := smartrouter.ActualInputCostProfile{
+		Version: "future-version", WeightedRegularTokens: 100,
+		WeightedTotalInputTokens: 100, WeightedSamples: 1, TotalSamples: 1, LastEventMS: 2_000,
+	}
+
+	visibility := buildSmartRouteActualInputCostVisibilityAt(
+		catalog,
+		prices,
+		smartrouter.ActualInputCostSnapshot{keyA: profileA, keyB: invalidProfile},
+		1_000,
+	)
+
+	summary, exists := visibility.ModelGroups["gpt-test"]["economy"]
+	require.True(t, exists)
+	assert.Equal(t, int64(450_000), summary.CacheReadRatePPM,
+		"the valid route's recent mix and the sibling route's cold-start prior are both represented")
+	assert.Equal(t, SmartEndpointChat, summary.Endpoint)
+	require.NotNil(t, summary.EstimatedUSDPerM)
+	assert.InDelta(t, 0.1785, *summary.EstimatedUSDPerM, 1e-12)
+	assert.Equal(t, int64(1), summary.Samples)
+	assert.Equal(t, 1, summary.SampledRoutes, "invalid profiles must not count as sampled routes")
+	assert.Equal(t, 2, summary.RouteCount, "a route repeated in another pool must count once")
+	assert.Equal(t, int64(1_000), summary.LastObservedAtMS)
+
+	groupSummary, exists := visibility.Groups["economy"]
+	require.True(t, exists)
+	assert.Equal(t, int64(450_000), groupSummary.CacheReadRatePPM,
+		"group summaries must retain the same cold-start prior projection as model summaries")
+	assert.Equal(t, 1, groupSummary.ModelCount)
+	assert.Equal(t, int64(1), groupSummary.Samples)
+
+	aged := buildSmartRouteActualInputCostVisibilityAt(
+		catalog, prices, smartrouter.ActualInputCostSnapshot{keyA: profileA, keyB: invalidProfile},
+		1_000+int64(72*time.Hour/time.Millisecond),
+	)
+	agedSummary, agedExists := aged.ModelGroups["gpt-test"]["economy"]
+	require.True(t, agedExists, "expired evidence falls back to the configured cache prior")
+	assert.Equal(t, int64(900_000), agedSummary.CacheReadRatePPM)
+	assert.Contains(t, aged.Groups, "economy")
+}
+
+func TestActualInputCostVisibilityKeepsProtocolsIsolatedAndPrefersResponses(t *testing.T) {
+	responsesRoute := smartrouter.CertifiedRoute{
+		RouteID: "responses", Group: "economy", UpstreamModel: "provider-model",
+		CacheDomain: "responses-cache", CacheNamespaceRevision: "r1",
+	}
+	messagesRoute := smartrouter.CertifiedRoute{
+		RouteID: "messages", Group: "economy", UpstreamModel: "provider-model",
+		CacheDomain: "messages-cache", CacheNamespaceRevision: "r1",
+	}
+	responsesContract := smartrouter.RouteContract{
+		ContractID: "responses-contract", CanonicalModel: "gpt-5.6-sol", Endpoint: SmartEndpointResponses,
+	}
+	messagesContract := smartrouter.RouteContract{
+		ContractID: "messages-contract", CanonicalModel: "gpt-5.6-sol", Endpoint: SmartEndpointMessages,
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			responsesContract.ContractID: {
+				Contract: responsesContract,
+				Pools: map[string]smartrouter.CertifiedPool{
+					smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{responsesRoute}},
+				},
+			},
+			messagesContract.ContractID: {
+				Contract: messagesContract,
+				Pools: map[string]smartrouter.CertifiedPool{
+					smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{messagesRoute}},
+				},
+			},
+		},
+	}
+	price := actualInputCostVisibilityPrice(100_000)
+	prices := smartrouter.PriceSnapshot{Version: "price", RoutePrices: map[string]smartrouter.RoutePrice{
+		responsesRoute.RouteID: price,
+		messagesRoute.RouteID:  price,
+	}}
+	responsesKey := smartrouter.ActualInputCostKey(
+		responsesRoute.CacheNamespaceIdentity(), responsesRoute.UpstreamModel,
+		responsesContract.CanonicalModel, responsesContract.Endpoint,
+		(smartrouter.RouteRequest{Endpoint: responsesContract.Endpoint}).UsageSemantic(),
+	)
+	messagesKey := smartrouter.ActualInputCostKey(
+		messagesRoute.CacheNamespaceIdentity(), messagesRoute.UpstreamModel,
+		messagesContract.CanonicalModel, messagesContract.Endpoint,
+		(smartrouter.RouteRequest{Endpoint: messagesContract.Endpoint}).UsageSemantic(),
+	)
+	responsesProfile := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			Key: responsesKey, TotalInputTokens: 100, CacheReadTokens: 100, Reliable: true,
+		},
+		1_000,
+	)
+	messagesProfile := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			Key: messagesKey, TotalInputTokens: 100, RegularInputTokens: 100, Reliable: true,
+		},
+		1_000,
+	)
+
+	visibility := buildSmartRouteActualInputCostVisibilityAt(
+		catalog,
+		prices,
+		smartrouter.ActualInputCostSnapshot{
+			responsesKey: responsesProfile,
+			messagesKey:  messagesProfile,
+		},
+		1_000,
+	)
+
+	summary := visibility.ModelGroups["gpt-5.6-sol"]["economy"]
+	assert.Equal(t, SmartEndpointResponses, summary.Endpoint)
+	assert.Equal(t, int64(1_000_000), summary.CacheReadRatePPM,
+		"the marketplace projection must not average Anthropic evidence into Responses")
+}
+
+func TestActualInputCostVisibilityWeightsPhysicalRoutesByReliableSampleCount(t *testing.T) {
+	const nowMS = int64(10_000)
+	routeHigh := smartrouter.CertifiedRoute{
+		RouteID: "high", Group: "economy", UpstreamModel: "upstream-model",
+		CacheDomain: "cache-high", CacheNamespaceRevision: "r1",
+	}
+	routeLow := smartrouter.CertifiedRoute{
+		RouteID: "low", Group: "economy", UpstreamModel: "upstream-model",
+		CacheDomain: "cache-low", CacheNamespaceRevision: "r1",
+	}
+	contract := smartrouter.RouteContract{
+		ContractID: "contract", CanonicalModel: "gpt-5.6-sol", Endpoint: SmartEndpointChat,
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			"contract": {
+				Contract: contract,
+				Pools: map[string]smartrouter.CertifiedPool{
+					smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{routeHigh, routeLow}},
+				},
+			},
+		},
+	}
+	price := actualInputCostVisibilityPrice(150_000)
+	prices := smartrouter.PriceSnapshot{
+		Version: "price",
+		RoutePrices: map[string]smartrouter.RoutePrice{
+			routeHigh.RouteID: price,
+			routeLow.RouteID:  price,
+		},
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointChat}).UsageSemantic()
+	highKey := smartrouter.ActualInputCostKey(
+		routeHigh.CacheNamespaceIdentity(), routeHigh.UpstreamModel,
+		contract.CanonicalModel, contract.Endpoint, usageSemantic,
+	)
+	lowKey := smartrouter.ActualInputCostKey(
+		routeLow.CacheNamespaceIdentity(), routeLow.UpstreamModel,
+		contract.CanonicalModel, contract.Endpoint, usageSemantic,
+	)
+	const (
+		highSamples = int64(100)
+		lowSamples  = int64(100)
+		highRate    = 0.9
+		lowRate     = 0.1
+		highTokens  = 100_000.0
+		lowTokens   = 100_000.0
+	)
+	profile := func(key string, samples int64, tokens, cacheRate, weightedSamples float64) smartrouter.ActualInputCostProfile {
+		p := smartrouter.ActualInputCostProfile{Version: smartrouter.ActualInputCostFeatureVersion}
+		for i := int64(0); i < samples && i < 100; i++ {
+			read := int64(tokens * cacheRate / float64(samples))
+			regular := int64(tokens/float64(samples)) - read
+			if regular < 0 {
+				regular = 0
+			}
+			total := regular + read
+			p = smartrouter.ApplyActualInputCostWindowObservation(p, smartrouter.ActualInputCostObservation{
+				ObservationID: fmt.Sprintf("%s-%d", key, i), Key: key, EventMS: nowMS - i,
+				RegularInputTokens: regular, CacheReadTokens: read, TotalInputTokens: total, Reliable: true,
+			}, nowMS)
+		}
+		return p
+	}
+
+	visibility := buildSmartRouteActualInputCostVisibilityAt(
+		catalog,
+		prices,
+		smartrouter.ActualInputCostSnapshot{
+			highKey: profile(highKey, highSamples, highTokens, highRate, 50.4437),
+			lowKey:  profile(lowKey, lowSamples, lowTokens, lowRate, 48.0973),
+		},
+		nowMS,
+	)
+
+	summary, exists := visibility.ModelGroups[contract.CanonicalModel]["economy"]
+	require.True(t, exists)
+	expectedRate := math.Round(
+		(highRate*float64(highSamples) + lowRate*float64(lowSamples)) /
+			float64(highSamples+lowSamples) * 1_000_000,
+	)
+	assert.Equal(t, int64(500_000), summary.CacheReadRatePPM)
+	assert.InDelta(t, 500_000, summary.CacheReadRatePPM, 1,
+		"the unified estimator must aggregate the raw one-hour token mix")
+	expectedCostPPM := math.Round(150_000 * (1 - 0.9*expectedRate/1_000_000))
+	require.NotNil(t, summary.EstimatedUSDPerM)
+	assert.InDelta(t, expectedCostPPM*2/1_000_000, *summary.EstimatedUSDPerM, 1e-12)
+	assert.Equal(t, highSamples+lowSamples, summary.Samples)
+	assert.Equal(t, 2, summary.SampledRoutes)
+	assert.Equal(t, SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes, summary.Basis)
+	assert.Equal(t, int64(500_000), visibility.Groups["economy"].CacheReadRatePPM,
+		"the group projection must use the same rounded aggregate cache rate")
+	assert.Equal(t, SmartRouteActualInputCostBasisSampleWeightedPhysicalRoutes, visibility.Groups["economy"].Basis)
+}
+
+func TestActualInputCostVisibilityHidesInconsistentModelGroupPrices(t *testing.T) {
+	routeA := smartrouter.CertifiedRoute{RouteID: "a", Group: "economy", UpstreamModel: "up", CacheDomain: "a"}
+	routeB := smartrouter.CertifiedRoute{RouteID: "b", Group: "economy", UpstreamModel: "up", CacheDomain: "b"}
+	contract := smartrouter.RouteContract{ContractID: "contract", CanonicalModel: "model", Endpoint: SmartEndpointChat}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog", Contracts: map[string]smartrouter.ContractCatalog{
+		"contract": {Contract: contract, Pools: map[string]smartrouter.CertifiedPool{
+			smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{routeA, routeB}},
+		}},
+	}}
+	prices := smartrouter.PriceSnapshot{Version: "price", RoutePrices: map[string]smartrouter.RoutePrice{
+		"a": actualInputCostVisibilityPrice(100_000),
+		"b": actualInputCostVisibilityPrice(200_000),
+	}}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointChat}).UsageSemantic()
+	snapshot := make(smartrouter.ActualInputCostSnapshot)
+	for _, route := range []smartrouter.CertifiedRoute{routeA, routeB} {
+		key := smartrouter.ActualInputCostKey(route.CacheNamespaceIdentity(), route.UpstreamModel, "model", SmartEndpointChat, usageSemantic)
+		snapshot[key] = smartrouter.ApplyActualInputCostObservation(
+			smartrouter.ActualInputCostProfile{},
+			smartrouter.ActualInputCostObservation{Key: key, TotalInputTokens: 10, RegularInputTokens: 10, Reliable: true},
+			1_000,
+		)
+	}
+
+	visibility := buildSmartRouteActualInputCostVisibilityAt(catalog, prices, snapshot, 1_000)
+	summary, exists := visibility.ModelGroups["model"]["economy"]
+	require.True(t, exists, "price inconsistency must not hide real cache facts")
+	assert.Zero(t, summary.CacheReadRatePPM)
+	require.NotNil(t, summary.EstimatedUSDPerM)
+	assert.InDelta(t, 0.3, *summary.EstimatedUSDPerM, 1e-12)
+	require.Contains(t, visibility.Groups, "economy")
+}
+
+func TestActualInputCostVisibilityExcludesExpiredPhysicalRouteBeforeAggregation(t *testing.T) {
+	routeOld := smartrouter.CertifiedRoute{RouteID: "old", Group: "economy", UpstreamModel: "up", CacheDomain: "old"}
+	routeFresh := smartrouter.CertifiedRoute{RouteID: "fresh", Group: "economy", UpstreamModel: "up", CacheDomain: "fresh"}
+	contract := smartrouter.RouteContract{ContractID: "contract", CanonicalModel: "model", Endpoint: SmartEndpointChat}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog", Contracts: map[string]smartrouter.ContractCatalog{
+		"contract": {Contract: contract, Pools: map[string]smartrouter.CertifiedPool{
+			smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{routeOld, routeFresh}},
+		}},
+	}}
+	price := actualInputCostVisibilityPrice(100_000)
+	prices := smartrouter.PriceSnapshot{Version: "price", RoutePrices: map[string]smartrouter.RoutePrice{
+		routeOld.RouteID: price, routeFresh.RouteID: price,
+	}}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointChat}).UsageSemantic()
+	nowMS := int64(1_000) + int64(72*time.Hour/time.Millisecond)
+	oldKey := smartrouter.ActualInputCostKey(routeOld.CacheNamespaceIdentity(), routeOld.UpstreamModel, "model", SmartEndpointChat, usageSemantic)
+	freshKey := smartrouter.ActualInputCostKey(routeFresh.CacheNamespaceIdentity(), routeFresh.UpstreamModel, "model", SmartEndpointChat, usageSemantic)
+	oldProfile := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{Key: oldKey, TotalInputTokens: 100, RegularInputTokens: 100, Reliable: true},
+		1_000,
+	)
+	freshProfile := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{Key: freshKey, TotalInputTokens: 100, CacheReadTokens: 100, Reliable: true},
+		nowMS,
+	)
+
+	visibility := buildSmartRouteActualInputCostVisibilityAt(
+		catalog, prices, smartrouter.ActualInputCostSnapshot{oldKey: oldProfile, freshKey: freshProfile}, nowMS,
+	)
+	summary := visibility.ModelGroups["model"]["economy"]
+	assert.Equal(t, int64(950_000), summary.CacheReadRatePPM,
+		"expired route evidence decays to the configured prior instead of making the group disappear")
+	require.NotNil(t, summary.EstimatedUSDPerM)
+	assert.InDelta(t, 0.029, *summary.EstimatedUSDPerM, 1e-8)
+	assert.Equal(t, nowMS, summary.LastObservedAtMS)
+	assert.Equal(t, int64(950_000), visibility.Groups["economy"].CacheReadRatePPM,
+		"an expired physical route contributes the configured prior while the fresh route remains fully cached")
+}
+
+func TestActualInputCostVisibilityPredictsTieredExpressionWithUnifiedFormula(t *testing.T) {
+	route := smartrouter.CertifiedRoute{
+		RouteID: "tiered", Group: "Example Discount gpt", UpstreamModel: "provider-sol",
+		CacheDomain: "channel:46", CacheNamespaceRevision: "generation-7",
+	}
+	contract := smartrouter.RouteContract{
+		ContractID: "responses", CanonicalModel: "gpt-5.6-sol", Endpoint: SmartEndpointResponses,
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog", Contracts: map[string]smartrouter.ContractCatalog{
+		contract.ContractID: {Contract: contract, Pools: map[string]smartrouter.CertifiedPool{
+			smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{route}},
+		}},
+	}}
+	price := smartrouter.RoutePrice{
+		BillingMode: "tiered_expr", BillingUnit: "per_token", StaticComparable: true,
+		ComparisonClass: "tiered", ActualInputComparisonClass: "normalized-input-v2", ScorePPM: 50_000,
+		TieredExpression: "tier(\"input\", p * 2 + cr * 0.2)", TieredInputPredictable: true,
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: contract.Endpoint}).UsageSemantic()
+	key := smartrouter.ActualInputCostKey(
+		route.CacheNamespaceIdentity(), route.UpstreamModel, contract.CanonicalModel, contract.Endpoint, usageSemantic,
+	)
+	profile := smartrouter.ApplyActualInputCostWindowObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			Key: key, TotalInputTokens: 100, RegularInputTokens: 10, CacheReadTokens: 90,
+			Reliable: true, EventMS: 1_000,
+		}, 1_000,
+	)
+	visibility := buildSmartRouteActualInputCostVisibilityAt(
+		catalog,
+		smartrouter.PriceSnapshot{Version: "price", RoutePrices: map[string]smartrouter.RoutePrice{route.RouteID: price}},
+		smartrouter.ActualInputCostSnapshot{key: profile}, 1_000,
+	)
+	summary, exists := visibility.ModelGroups[contract.CanonicalModel][route.Group]
+	require.True(t, exists)
+	assert.Equal(t, int64(900_000), summary.CacheReadRatePPM)
+	assert.Equal(t, int64(1), summary.Samples)
+	require.NotNil(t, summary.EstimatedUSDPerM)
+	assert.Equal(t, smartrouter.ActualInputCostCostSourceRatio, summary.CostSource)
+}
+
+func TestActualInputCostVisibilityKeepsCacheFactsAcrossDynamicPriceRevision(t *testing.T) {
+	route := smartrouter.CertifiedRoute{
+		RouteID: "tiered-dynamic", Group: "Example Discount gpt", UpstreamModel: "provider-sol",
+		CacheDomain: "channel:46", CacheNamespaceRevision: "generation-7",
+	}
+	contract := smartrouter.RouteContract{
+		ContractID: "responses", CanonicalModel: "gpt-5.6-sol", Endpoint: SmartEndpointResponses,
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog", Contracts: map[string]smartrouter.ContractCatalog{
+		contract.ContractID: {Contract: contract, Pools: map[string]smartrouter.CertifiedPool{
+			smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{route}},
+		}},
+	}}
+	price := smartrouter.RoutePrice{
+		BillingMode: "tiered_expr", BillingUnit: "per_token", StaticComparable: true,
+		ComparisonClass: "tiered", ActualInputComparisonClass: "normalized-input-v2", ScorePPM: 55_000,
+		TieredExpression:     `tier("base", p * 2 + cr * 0.2)`,
+		TieredExpressionHash: billingexpr.ExprHashString(`tier("base", p * 2 + cr * 0.2)`), TieredInputPredictable: true,
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: contract.Endpoint}).UsageSemantic()
+	key := smartrouter.ActualInputCostKey(
+		route.CacheNamespaceIdentity(), route.UpstreamModel, contract.CanonicalModel, contract.Endpoint, usageSemantic,
+	)
+	profile := smartrouter.ApplyActualInputCostWindowObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{
+			ObservationID: "request-a", Key: key, TotalInputTokens: 100, RegularInputTokens: 10, CacheReadTokens: 90,
+			Reliable: true, EventMS: 1_000, TieredExpressionHash: "revision-a", TieredInputPriceMicros: 380_000,
+		}, 1_000,
+	)
+	build := func(routePrice smartrouter.RoutePrice) SmartRouteActualInputCostModelGroupSummary {
+		visibility := buildSmartRouteActualInputCostVisibilityAt(
+			catalog,
+			smartrouter.PriceSnapshot{Version: "price", RoutePrices: map[string]smartrouter.RoutePrice{route.RouteID: routePrice}},
+			smartrouter.ActualInputCostSnapshot{key: profile}, 1_000,
+		)
+		summary, exists := visibility.ModelGroups[contract.CanonicalModel][route.Group]
+		require.True(t, exists)
+		return summary
+	}
+
+	matched := build(price)
+	assert.Equal(t, int64(900_000), matched.CacheReadRatePPM)
+	assert.Equal(t, int64(1), matched.Samples)
+	assert.Equal(t, int64(1), matched.CostSamples)
+	assert.Equal(t, smartrouter.ActualInputCostCostSourceRatio, matched.CostSource)
+
+	price.TieredExpressionHash = "revision-b"
+	price.TieredExpression = `tier("base", p * 3 + cr * 0.2)`
+	revised := build(price)
+	assert.Equal(t, int64(900_000), revised.CacheReadRatePPM)
+	assert.Equal(t, int64(1), revised.Samples)
+	assert.Equal(t, int64(1), revised.CostSamples)
+	require.NotNil(t, revised.EstimatedUSDPerM)
+}
+
+func TestActualInputCostVisibilityNeverDisplaysHiddenPriorAsMeasuredData(t *testing.T) {
+	route := smartrouter.CertifiedRoute{
+		RouteID: "route", Group: "economy", UpstreamModel: "upstream", CacheDomain: "cache",
+	}
+	price := actualInputCostVisibilityPrice(100_000)
+
+	estimate, _, available := smartRouteActualInputCostEstimateAt(
+		route, "model", SmartEndpointChat, price, smartrouter.ActualInputCostSnapshot{}, 1_000,
+	)
+	assert.True(t, available)
+	assert.Equal(t, smartrouter.ActualInputCostOptimistic, estimate.Source)
+	assert.False(t, estimate.HasRealEvidence)
+	assert.Nil(t, estimate.ObservedCacheReadRatePPM)
+
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: SmartEndpointChat}).UsageSemantic()
+	key := smartrouter.ActualInputCostKey(
+		route.CacheNamespaceIdentity(), route.UpstreamModel, "model", SmartEndpointChat, usageSemantic,
+	)
+	profile := smartrouter.ApplyActualInputCostObservation(
+		smartrouter.ActualInputCostProfile{},
+		smartrouter.ActualInputCostObservation{Key: key, TotalInputTokens: 10, RegularInputTokens: 10, Reliable: true},
+		1_000,
+	)
+	estimate, _, available = smartRouteActualInputCostEstimateAt(
+		route, "model", SmartEndpointChat, price, smartrouter.ActualInputCostSnapshot{key: profile}, 1_000,
+	)
+	assert.True(t, available)
+	assert.Equal(t, smartrouter.ActualInputCostObserved, estimate.Source)
+	assert.Zero(t, estimate.CacheReadRatePPM)
+
+	profile = smartrouter.ApplyActualInputCostObservation(
+		profile, smartrouter.ActualInputCostObservation{Key: key, MissingEvidence: true}, 2_000,
+	)
+	estimate, _, available = smartRouteActualInputCostEstimateAt(
+		route, "model", SmartEndpointChat, price, smartrouter.ActualInputCostSnapshot{key: profile}, 2_000,
+	)
+	assert.True(t, available, "a reliable current Window remains valid after a missing-evidence diagnostic")
+	assert.Equal(t, smartrouter.ActualInputCostOptimistic, estimate.Source)
+}
+
+func TestActualInputCostVisibilityBuildsMissingInMemoryPriceSnapshot(t *testing.T) {
+	catalogs := publishedCatalogManager(t)
+	ratios := &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000, "fallback": 50_000},
+		},
+	}
+	prices := NewPriceSnapshotManager(catalogs, ratios)
+	engine := &SmartRouterEngine{
+		Catalogs:         catalogs,
+		Prices:           prices,
+		ActualInputCosts: visibilitySnapshotStore{snapshot: smartrouter.ActualInputCostSnapshot{}},
+	}
+
+	assert.False(t, func() bool { _, ok := prices.Current("standard"); return ok }())
+	visibility := engine.ActualInputCostVisibility(context.Background(), "standard")
+
+	assert.Empty(t, visibility.ModelGroups)
+	assert.Empty(t, visibility.Groups)
+	assert.True(t, func() bool { _, ok := prices.Current("standard"); return ok }(),
+		"the pricing page must populate the bounded in-memory price projection")
+}

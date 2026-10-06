@@ -1,0 +1,1296 @@
+package media
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"mime"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/shirou/gopsutil/disk"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var (
+	ErrMediaDisabled       = errors.New("media storage is disabled")
+	ErrMediaCapacity       = errors.New("media storage capacity exceeded")
+	ErrUserMediaCapacity   = errors.New("user media storage capacity exceeded")
+	ErrMediaFileTooLarge   = errors.New("media file exceeds the configured size limit")
+	ErrUnsupportedMedia    = errors.New("unsupported media type")
+	ErrUnsafeStorageObject = errors.New("unsafe media storage object path")
+	materializeGate        adaptiveGate
+	storageReconcileMu     sync.Mutex
+)
+
+type uploadPermitContextKey struct{}
+
+type uploadPermit struct {
+	active atomic.Bool
+}
+
+type adaptiveGate struct {
+	mu     sync.Mutex
+	active int
+	wake   chan struct{}
+}
+
+func (gate *adaptiveGate) acquire(ctx context.Context, limit int) error {
+	if limit < 1 {
+		limit = 1
+	}
+	for {
+		gate.mu.Lock()
+		if gate.wake == nil {
+			gate.wake = make(chan struct{})
+		}
+		if gate.active < limit {
+			gate.active++
+			gate.mu.Unlock()
+			return nil
+		}
+		wake := gate.wake
+		gate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wake:
+		}
+	}
+}
+
+func (gate *adaptiveGate) release() {
+	gate.mu.Lock()
+	if gate.active > 0 {
+		gate.active--
+	}
+	if gate.wake == nil {
+		gate.wake = make(chan struct{})
+	}
+	close(gate.wake)
+	gate.wake = make(chan struct{})
+	gate.mu.Unlock()
+}
+
+func AcquireDownload(ctx context.Context, userID int) (func(), AdmissionSnapshot, error) {
+	setting := mediasetting.Get()
+	limit := setting.DownloadConnectionHardGlobal
+	snapshot, err := downloadConnectionGate.acquire(
+		ctx, userID, limit, setting.DownloadConnectionHardPerUser,
+		limit*4, setting.DownloadConnectionHardPerUser*4,
+	)
+	if err != nil {
+		return nil, snapshot, err
+	}
+	snapshot.ActiveCapacity = limit
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			current := mediasetting.Get()
+			downloadConnectionGate.release(
+				userID,
+				current.DownloadConnectionHardGlobal,
+				current.DownloadConnectionHardPerUser,
+			)
+		})
+	}, snapshot, nil
+}
+
+// AcquireUpload reserves one upload slot before multipart parsing begins. The
+// returned context lets SaveUpload reuse that same slot, so a request never
+// deadlocks by acquiring the upload gate twice when the configured limit is 1.
+func AcquireUpload(ctx context.Context, userID int) (context.Context, func(), AdmissionSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if permit, ok := ctx.Value(uploadPermitContextKey{}).(*uploadPermit); ok && permit != nil && permit.active.Load() {
+		return ctx, func() {}, AdmissionSnapshot{}, nil
+	}
+	setting := mediasetting.Get()
+	if !setting.Enabled {
+		return ctx, nil, AdmissionSnapshot{}, ErrMediaDisabled
+	}
+	limit := setting.UploadConnectionHardGlobal
+	snapshot, err := uploadConnectionGate.acquire(
+		ctx, userID, limit, setting.UploadConnectionHardPerUser,
+		limit*4, setting.UploadConnectionHardPerUser*4,
+	)
+	if err != nil {
+		return ctx, nil, snapshot, err
+	}
+	snapshot.ActiveCapacity = limit
+	permit := &uploadPermit{}
+	permit.active.Store(true)
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			permit.active.Store(false)
+			current := mediasetting.Get()
+			uploadConnectionGate.release(
+				userID,
+				current.UploadConnectionHardGlobal,
+				current.UploadConnectionHardPerUser,
+			)
+		})
+	}
+	return context.WithValue(ctx, uploadPermitContextKey{}, permit), release, snapshot, nil
+}
+
+func acquireUploadForSave(ctx context.Context, userID int) (func(), error) {
+	if ctx != nil {
+		if permit, ok := ctx.Value(uploadPermitContextKey{}).(*uploadPermit); ok && permit != nil && permit.active.Load() {
+			return func() {}, nil
+		}
+	}
+	setting := mediasetting.Get()
+	limit := setting.UploadConnectionHardGlobal
+	_, err := uploadConnectionGate.acquire(
+		ctx, userID, limit, setting.UploadConnectionHardPerUser,
+		limit*4, setting.UploadConnectionHardPerUser*4,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		current := mediasetting.Get()
+		uploadConnectionGate.release(
+			userID,
+			current.UploadConnectionHardGlobal,
+			current.UploadConnectionHardPerUser,
+		)
+	}, nil
+}
+
+type UploadInput struct {
+	UserID           int
+	Username         string
+	Filename         string
+	Purpose          string
+	Role             string
+	SizeHint         int64
+	Reader           io.Reader
+	TTLHours         int
+	SourceKind       string
+	TaskPublicID     string
+	ChannelID        int
+	Model            string
+	Group            string
+	Metadata         []byte
+	DeclaredMimeType string
+}
+
+type RemoteArtifactInput struct {
+	UserID                 int
+	Username               string
+	TaskRowID              int64
+	TaskPublicID           string
+	ChannelID              int
+	Model                  string
+	Group                  string
+	SourceURL              string
+	ProviderOutputIdentity string
+	Type                   string
+	Role                   string
+	Position               int
+	MimeType               string
+	Filename               string
+	SizeBytes              int64
+	DurationSeconds        float64
+	Width                  int
+	Height                 int
+	HasAudio               bool
+	Metadata               []byte
+}
+
+type RemoteBlobInput struct {
+	UserID          int
+	Username        string
+	TaskPublicID    string
+	ChannelID       int
+	Model           string
+	Group           string
+	SourceURL       string
+	Type            string
+	Role            string
+	MimeType        string
+	Filename        string
+	SizeBytes       int64
+	DurationSeconds float64
+	Width           int
+	Height          int
+	HasAudio        bool
+	Metadata        []byte
+}
+
+func NewPublicID(prefix string) (string, error) {
+	key, err := common.GenerateRandomCharsKey(32)
+	if err != nil {
+		return "", err
+	}
+	return prefix + key, nil
+}
+
+func storageRoot() (string, error) {
+	setting := mediasetting.Get()
+	root, err := filepath.Abs(setting.StoragePath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(root), nil
+}
+
+func EnsureStorage() error {
+	if !mediasetting.Get().Enabled {
+		return ErrMediaDisabled
+	}
+	root, err := storageRoot()
+	if err != nil {
+		return err
+	}
+	for _, directory := range []string{root, filepath.Join(root, "objects"), filepath.Join(root, "tmp")} {
+		if err := os.MkdirAll(directory, 0o750); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// InitializeStorage performs the full database-to-storage reconciliation once
+// at process startup. Request-time uploads call EnsureStorage only, avoiding a
+// full-library aggregate scan for every file.
+func InitializeStorage() error {
+	if err := EnsureStorage(); err != nil {
+		return err
+	}
+	if err := CleanupTemporaryFiles(time.Duration(mediasetting.Get().TemporaryFileTTLHours) * time.Hour); err != nil {
+		// A single crash leftover with unusual permissions must not disable the
+		// entire media subsystem. Capacity reservations still protect new writes,
+		// and the next scheduled cleanup will retry the stale file.
+		common.SysLog("media temporary cleanup partially failed during initialization: " + err.Error())
+	}
+	if err := model.ReconcileTaskMediaInputLeases(); err != nil {
+		return fmt.Errorf("reconcile media task leases: %w", err)
+	}
+	return ReconcileStorageState()
+}
+
+func RequestSpoolDirectory() (string, error) {
+	if err := EnsureStorage(); err != nil {
+		return "", err
+	}
+	root, err := storageRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "tmp"), nil
+}
+
+// CleanupTemporaryFiles removes only stale regular files from the media spool.
+// A configurable multi-hour TTL keeps active files safe during blue-green
+// overlap while reclaiming crash leftovers without administrator work.
+func CleanupTemporaryFiles(maxAge time.Duration) error {
+	if maxAge <= 0 {
+		return fmt.Errorf("temporary media lifetime must be positive")
+	}
+	directory, err := RequestSpoolDirectory()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	var cleanupErr error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect temporary media file %q: %w", entry.Name(), infoErr))
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove temporary media file %q: %w", entry.Name(), removeErr))
+		}
+	}
+	return cleanupErr
+}
+
+func normalizeUploadSize(sizeHint int64, setting mediasetting.Setting) (int64, error) {
+	if sizeHint < 0 || sizeHint > setting.MaxFileBytes {
+		return 0, ErrMediaFileTooLarge
+	}
+	if sizeHint == 0 {
+		return setting.MaxFileBytes, nil
+	}
+	return sizeHint, nil
+}
+
+func reserveStorage(userID int, bytes int64) (string, error) {
+	return reserveStorageWithScope(userID, bytes, true)
+}
+
+// ReserveRequestSpool accounts for temporary request-body disk usage across
+// all web instances. It deliberately does not consume the user's durable asset
+// allowance, but it does share the global capacity and reserved-space guard.
+func ReserveRequestSpool(bytes int64) (func(), error) {
+	reservation, err := BeginRequestSpoolReservation(bytes, bytes)
+	if err != nil {
+		return nil, err
+	}
+	return reservation.Release, nil
+}
+
+const requestSpoolReservationStep int64 = 8 * 1024 * 1024
+
+// RequestSpoolReservation tracks temporary request or response bytes without
+// pessimistically reserving the full request limit for every small image. It
+// grows before the next bytes are handed to a disk writer, while retaining the
+// same global capacity and free-disk checks as durable media reservations.
+type RequestSpoolReservation struct {
+	mu            sync.Mutex
+	token         string
+	maxBytes      int64
+	reservedBytes int64
+	released      bool
+}
+
+func requestSpoolReservationTarget(bytes, maxBytes int64) (int64, error) {
+	if bytes < 0 || maxBytes <= 0 || bytes > maxBytes {
+		return 0, ErrMediaFileTooLarge
+	}
+	if bytes == 0 {
+		return 0, nil
+	}
+	target := ((bytes + requestSpoolReservationStep - 1) / requestSpoolReservationStep) * requestSpoolReservationStep
+	if target > maxBytes {
+		target = maxBytes
+	}
+	return target, nil
+}
+
+func BeginRequestSpoolReservation(maxBytes, initialBytes int64) (*RequestSpoolReservation, error) {
+	setting := mediasetting.Get()
+	if maxBytes <= 0 || maxBytes > setting.MaxRequestBytes || initialBytes < 0 || initialBytes > maxBytes {
+		return nil, ErrMediaFileTooLarge
+	}
+	if err := EnsureStorage(); err != nil {
+		return nil, err
+	}
+	if initialBytes == 0 {
+		initialBytes = min(requestSpoolReservationStep, maxBytes)
+	}
+	target, err := requestSpoolReservationTarget(initialBytes, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	token, err := reserveStorageWithScope(0, target, false)
+	if err != nil {
+		return nil, err
+	}
+	return &RequestSpoolReservation{
+		token: token, maxBytes: maxBytes, reservedBytes: target,
+	}, nil
+}
+
+func (reservation *RequestSpoolReservation) GrowTo(bytes int64) error {
+	if reservation == nil {
+		return fmt.Errorf("media request spool reservation is unavailable")
+	}
+	reservation.mu.Lock()
+	defer reservation.mu.Unlock()
+	if reservation.released {
+		return fmt.Errorf("media request spool reservation is already released")
+	}
+	target, err := requestSpoolReservationTarget(bytes, reservation.maxBytes)
+	if err != nil {
+		return err
+	}
+	if target <= reservation.reservedBytes {
+		return nil
+	}
+	if err := growReservation(reservation.token, 0, target-reservation.reservedBytes); err != nil {
+		return err
+	}
+	reservation.reservedBytes = target
+	return nil
+}
+
+func (reservation *RequestSpoolReservation) Release() {
+	if reservation == nil {
+		return
+	}
+	reservation.mu.Lock()
+	if reservation.released {
+		reservation.mu.Unlock()
+		return
+	}
+	reservation.released = true
+	token := reservation.token
+	reservation.mu.Unlock()
+	releaseReservation(token)
+}
+
+func reserveStorageWithScope(userID int, bytes int64, enforceUserLimit bool) (string, error) {
+	setting := mediasetting.Get()
+	root, err := storageRoot()
+	if err != nil {
+		return "", err
+	}
+	if bytes <= 0 || (enforceUserLimit && userID <= 0) {
+		return "", fmt.Errorf("invalid media storage reservation")
+	}
+	if err := ReconcileStorageStateIfStale(time.Minute); err != nil {
+		return "", err
+	}
+	reservationToken, err := NewPublicID("resv_")
+	if err != nil {
+		return "", err
+	}
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		if enforceUserLimit {
+			var userUsed int64
+			if err := tx.Model(&model.MediaBlob{}).
+				Where("user_id = ? AND deleted_at = 0 AND storage_backend = ? AND status IN ?", userID, model.MediaStorageBackendLocal, []string{model.MediaBlobStatusUploading, model.MediaBlobStatusReady}).
+				Select("COALESCE(SUM(size_bytes), 0)").Scan(&userUsed).Error; err != nil {
+				return err
+			}
+			var userReserved int64
+			if err := tx.Model(&model.MediaStorageReservation{}).
+				Where("user_id = ? AND state = ? AND expires_at > ?", userID, "reserved", time.Now().Unix()).
+				Select("COALESCE(SUM(bytes), 0)").Scan(&userReserved).Error; err != nil {
+				return err
+			}
+			if userUsed > setting.PerUserMaxBytes-userReserved || bytes > setting.PerUserMaxBytes-userUsed-userReserved {
+				return ErrUserMediaCapacity
+			}
+		}
+		effectiveUsed := effectiveMediaUsedBytes(*state)
+		if effectiveUsed > setting.GlobalMaxBytes-state.ReservedBytes || bytes > setting.GlobalMaxBytes-effectiveUsed-state.ReservedBytes {
+			return ErrMediaCapacity
+		}
+		usage, usageErr := disk.Usage(root)
+		if usageErr != nil {
+			return fmt.Errorf("media disk capacity check failed: %w", usageErr)
+		}
+		reservedNeed := state.ReservedBytes + bytes
+		if setting.ReservedFreeBytes > 0 {
+			if reservedNeed > int64(^uint64(0)>>1)-setting.ReservedFreeBytes {
+				return ErrMediaCapacity
+			}
+			reservedNeed += setting.ReservedFreeBytes
+		}
+		if usage.Free < uint64(reservedNeed) {
+			return ErrMediaCapacity
+		}
+		reservation := model.MediaStorageReservation{
+			Token: reservationToken, UserID: userID, Bytes: bytes, State: "reserved",
+			ExpiresAt: time.Now().Add(time.Duration(setting.UploadReservationMinutes) * time.Minute).Unix(),
+		}
+		if err := tx.Create(&reservation).Error; err != nil {
+			return err
+		}
+		return tx.Model(state).Updates(map[string]any{
+			"reserved_bytes": gorm.Expr("reserved_bytes + ?", bytes),
+		}).Error
+	})
+	return reservationToken, err
+}
+
+func growReservation(token string, userID int, delta int64) error {
+	if token == "" || delta <= 0 {
+		return nil
+	}
+	if err := ReconcileStorageStateIfStale(time.Minute); err != nil {
+		return err
+	}
+	setting := mediasetting.Get()
+	root, err := storageRoot()
+	if err != nil {
+		return err
+	}
+	return model.DB.Transaction(func(tx *gorm.DB) error {
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		var reservation model.MediaStorageReservation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("token = ? AND state = ?", token, "reserved").First(&reservation).Error; err != nil {
+			return err
+		}
+		effectiveUsed := effectiveMediaUsedBytes(*state)
+		if effectiveUsed > setting.GlobalMaxBytes-state.ReservedBytes || delta > setting.GlobalMaxBytes-effectiveUsed-state.ReservedBytes {
+			return ErrMediaCapacity
+		}
+		usage, usageErr := disk.Usage(root)
+		if usageErr != nil {
+			return fmt.Errorf("media disk capacity check failed: %w", usageErr)
+		}
+		reservedNeed := state.ReservedBytes + delta
+		if setting.ReservedFreeBytes > 0 {
+			if reservedNeed > int64(^uint64(0)>>1)-setting.ReservedFreeBytes {
+				return ErrMediaCapacity
+			}
+			reservedNeed += setting.ReservedFreeBytes
+		}
+		if usage.Free < uint64(reservedNeed) {
+			return ErrMediaCapacity
+		}
+		if err := tx.Model(&reservation).Updates(map[string]any{"bytes": gorm.Expr("bytes + ?", delta)}).Error; err != nil {
+			return err
+		}
+		return tx.Model(state).Update("reserved_bytes", gorm.Expr("reserved_bytes + ?", delta)).Error
+	})
+}
+
+func releaseReservation(token string) {
+	if token == "" {
+		return
+	}
+	_ = model.DB.Transaction(func(tx *gorm.DB) error {
+		var reservation model.MediaStorageReservation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("token = ? AND state = ?", token, "reserved").First(&reservation).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(state).Update("reserved_bytes", gorm.Expr("CASE WHEN reserved_bytes >= ? THEN reserved_bytes - ? ELSE 0 END", reservation.Bytes, reservation.Bytes)).Error; err != nil {
+			return err
+		}
+		return tx.Model(&reservation).Update("state", "released").Error
+	})
+}
+
+func finalizeReservation(token string, blob *model.MediaBlob) error {
+	return model.DB.Transaction(func(tx *gorm.DB) error {
+		var reservation model.MediaStorageReservation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("token = ? AND state = ?", token, "reserved").First(&reservation).Error; err != nil {
+			return err
+		}
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(blob).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(state).Updates(map[string]any{
+			"reserved_bytes": gorm.Expr("CASE WHEN reserved_bytes >= ? THEN reserved_bytes - ? ELSE 0 END", reservation.Bytes, reservation.Bytes),
+			"used_bytes":     gorm.Expr("used_bytes + ?", blob.SizeBytes),
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&reservation).Update("state", "committed").Error
+	})
+}
+
+func SaveUpload(ctx context.Context, input UploadInput) (*model.MediaBlob, error) {
+	setting := mediasetting.Get()
+	if !setting.Enabled {
+		return nil, ErrMediaDisabled
+	}
+	if input.UserID <= 0 || input.Reader == nil {
+		return nil, fmt.Errorf("invalid media upload")
+	}
+	releaseUpload, err := acquireUploadForSave(ctx, input.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseUpload()
+	if err := EnsureStorage(); err != nil {
+		return nil, err
+	}
+	reservedBytes, err := normalizeUploadSize(input.SizeHint, setting)
+	if err != nil {
+		return nil, err
+	}
+	reservation, err := reserveStorage(input.UserID, reservedBytes)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			releaseReservation(reservation)
+		}
+	}()
+
+	root, err := storageRoot()
+	if err != nil {
+		return nil, err
+	}
+	publicID, err := NewPublicID("file_")
+	if err != nil {
+		return nil, err
+	}
+	temporary, err := os.CreateTemp(filepath.Join(root, "tmp"), publicID+"-*")
+	if err != nil {
+		return nil, err
+	}
+	temporaryName := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryName)
+	}()
+
+	hasher := sha256.New()
+	reader := bufio.NewReader(input.Reader)
+	peek, peekErr := reader.Peek(512)
+	if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, bufio.ErrBufferFull) {
+		return nil, peekErr
+	}
+	detectedMIME := http.DetectContentType(peek)
+	if detectedMIME == "application/octet-stream" && strings.Contains(input.DeclaredMimeType, "/") {
+		detectedMIME = strings.TrimSpace(strings.SplitN(input.DeclaredMimeType, ";", 2)[0])
+	}
+	mediaType := mediaTypeForMIME(detectedMIME)
+	if mediaType == "other" && input.Purpose != "assistants" && input.Purpose != "user_data" {
+		return nil, ErrUnsupportedMedia
+	}
+
+	limited := io.LimitReader(reader, setting.MaxFileBytes+1)
+	written, copyErr := io.Copy(io.MultiWriter(temporary, hasher), limited)
+	if copyErr != nil {
+		return nil, copyErr
+	}
+	if written > setting.MaxFileBytes || (input.SizeHint > 0 && written > reservedBytes) {
+		return nil, ErrMediaFileTooLarge
+	}
+	if written == 0 {
+		return nil, fmt.Errorf("media file is empty")
+	}
+	if err := temporary.Sync(); err != nil {
+		return nil, err
+	}
+	if err := temporary.Close(); err != nil {
+		return nil, err
+	}
+
+	extension := safeExtension(input.Filename, detectedMIME)
+	objectKey := filepath.Join("objects", publicID[:minInt(len(publicID), 10)], publicID+extension)
+	finalPath, err := ResolveObjectPath(objectKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o750); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(temporaryName, finalPath); err != nil {
+		return nil, err
+	}
+	durationSeconds := probeUploadedMediaDuration(ctx, finalPath, extension, mediaType)
+
+	ttlHours := input.TTLHours
+	if ttlHours <= 0 {
+		ttlHours = setting.InputTTLHours
+	}
+	now := time.Now().Unix()
+	sourceKind := strings.TrimSpace(input.SourceKind)
+	if sourceKind == "" {
+		sourceKind = "upload"
+	}
+	blob := &model.MediaBlob{
+		PublicID: publicID, UserID: input.UserID, UsernameSnapshot: input.Username,
+		Filename: normalizeMediaFilename(input.Filename, detectedMIME, mediaType), Purpose: input.Purpose,
+		MediaType: mediaType, Role: input.Role, SourceKind: sourceKind,
+		StorageBackend: model.MediaStorageBackendLocal, ObjectKey: objectKey,
+		ContentHash: hex.EncodeToString(hasher.Sum(nil)), MimeType: detectedMIME,
+		SizeBytes: written, DurationSeconds: durationSeconds, Status: model.MediaBlobStatusReady,
+		TaskPublicID: input.TaskPublicID, ChannelID: input.ChannelID, Model: input.Model,
+		Group: input.Group, Metadata: input.Metadata,
+		ModerationStatus: model.MediaModerationUnreviewed, LastAccessedAt: now,
+		ExpiresAt: time.Now().Add(time.Duration(ttlHours) * time.Hour).Unix(),
+	}
+	if err := finalizeReservation(reservation, blob); err != nil {
+		_ = os.Remove(finalPath)
+		return nil, err
+	}
+	committed = true
+	return blob, nil
+}
+
+func probeUploadedMediaDuration(ctx context.Context, filename, extension, mediaType string) float64 {
+	if mediaType != "video" && mediaType != "audio" {
+		return 0
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	duration, err := common.GetAudioDuration(ctx, file, strings.ToLower(extension))
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
+}
+
+func SaveRemoteArtifact(input RemoteArtifactInput) (*model.MediaBlob, *model.TaskArtifact, error) {
+	setting := mediasetting.Get()
+	if !setting.Enabled {
+		return nil, nil, ErrMediaDisabled
+	}
+	assetID, err := NewPublicID("asset_")
+	if err != nil {
+		return nil, nil, err
+	}
+	expiresAt := time.Now().Add(time.Duration(setting.AssetTTLHours) * time.Hour).Unix()
+	blob, err := newRemoteBlob(RemoteBlobInput{
+		UserID: input.UserID, Username: input.Username, TaskPublicID: input.TaskPublicID,
+		ChannelID: input.ChannelID, Model: input.Model, Group: input.Group,
+		SourceURL: input.SourceURL, Type: input.Type, Role: input.Role,
+		MimeType: input.MimeType, Filename: input.Filename, SizeBytes: input.SizeBytes,
+		DurationSeconds: input.DurationSeconds, Width: input.Width, Height: input.Height,
+		HasAudio: input.HasAudio, Metadata: input.Metadata,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	artifact := &model.TaskArtifact{
+		PublicAssetID: assetID, TaskRowID: input.TaskRowID, TaskPublicID: input.TaskPublicID,
+		UserID: input.UserID, ChannelID: input.ChannelID,
+		ProviderOutputIdentity: input.ProviderOutputIdentity, Type: input.Type, Role: input.Role,
+		Position: input.Position, Status: "ready", MimeType: input.MimeType, Filename: input.Filename,
+		SizeBytes: input.SizeBytes, DurationSeconds: input.DurationSeconds, Width: input.Width,
+		Height: input.Height, HasAudio: input.HasAudio, Metadata: input.Metadata, ExpiresAt: expiresAt,
+	}
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
+		var existing model.TaskArtifact
+		lookup := tx.Where("task_row_id = ? AND provider_output_identity = ?", input.TaskRowID, input.ProviderOutputIdentity).First(&existing)
+		if lookup.Error == nil {
+			artifact = &existing
+			return tx.Where("id = ?", existing.MediaBlobID).First(blob).Error
+		}
+		if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+			return lookup.Error
+		}
+		if err := tx.Create(blob).Error; err != nil {
+			return err
+		}
+		artifact.MediaBlobID = blob.ID
+		return tx.Create(artifact).Error
+	})
+	return blob, artifact, err
+}
+
+func SaveRemoteBlob(input RemoteBlobInput) (*model.MediaBlob, error) {
+	if !mediasetting.Get().Enabled {
+		return nil, ErrMediaDisabled
+	}
+	blob, err := newRemoteBlob(input)
+	if err != nil {
+		return nil, err
+	}
+	if err := model.DB.Create(blob).Error; err != nil {
+		return nil, err
+	}
+	return blob, nil
+}
+
+// MaterializeRemoteBlob atomically replaces a provider URL with a locally
+// managed object while preserving the public blob and asset IDs. A failed
+// transfer leaves the remote asset readable through the existing proxy path.
+func MaterializeRemoteBlob(
+	ctx context.Context,
+	blob *model.MediaBlob,
+	leaseOwner string,
+	reader io.Reader,
+	sizeHint int64,
+	declaredMimeType string,
+) error {
+	setting := mediasetting.Get()
+	if !setting.Enabled || !setting.RemoteMaterializeEnabled {
+		return ErrMediaDisabled
+	}
+	if blob == nil || blob.ID <= 0 || blob.UserID <= 0 || reader == nil || leaseOwner == "" {
+		return fmt.Errorf("invalid remote media materialization")
+	}
+	reader = WrapUpstreamArchiveReader(ctx, reader)
+	if err := materializeGate.acquire(ctx, setting.RemoteMaterializeWorkers); err != nil {
+		return err
+	}
+	defer materializeGate.release()
+	if err := EnsureStorage(); err != nil {
+		return err
+	}
+	maxBytes := setting.RemoteMaterializeMaxBytes
+	if maxBytes <= 0 || maxBytes > setting.MaxFileBytes {
+		maxBytes = setting.MaxFileBytes
+	}
+	if sizeHint < -1 || sizeHint > maxBytes {
+		return ErrMediaFileTooLarge
+	}
+	reservedBytes := sizeHint
+	if reservedBytes <= 0 {
+		reservedBytes = maxBytes
+		if reservedBytes > 8*1024*1024 {
+			reservedBytes = 8 * 1024 * 1024
+		}
+	}
+	reservation, err := reserveStorage(blob.UserID, reservedBytes)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			releaseReservation(reservation)
+		}
+	}()
+
+	root, err := storageRoot()
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Join(root, "tmp"), blob.PublicID+"-materialize-*")
+	if err != nil {
+		return err
+	}
+	temporaryName := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryName)
+	}()
+
+	hasher := sha256.New()
+	buffered := bufio.NewReader(reader)
+	peek, peekErr := buffered.Peek(512)
+	if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, bufio.ErrBufferFull) {
+		return peekErr
+	}
+	detectedMIME := http.DetectContentType(peek)
+	if detectedMIME == "application/octet-stream" && strings.Contains(declaredMimeType, "/") {
+		detectedMIME = strings.TrimSpace(strings.SplitN(declaredMimeType, ";", 2)[0])
+	}
+	if mediaTypeForMIME(detectedMIME) == "other" {
+		return ErrUnsupportedMedia
+	}
+	var written int64
+	buffer := make([]byte, 256*1024)
+	for {
+		read, readErr := buffered.Read(buffer)
+		if read > 0 {
+			if written+int64(read) > maxBytes {
+				return ErrMediaFileTooLarge
+			}
+			if written+int64(read) > reservedBytes {
+				growBy := reservedBytes
+				if growBy < int64(read) {
+					growBy = int64(read)
+				}
+				if err := growReservation(reservation, blob.UserID, growBy); err != nil {
+					return err
+				}
+				reservedBytes += growBy
+			}
+			if _, err := temporary.Write(buffer[:read]); err != nil {
+				return err
+			}
+			if _, err := hasher.Write(buffer[:read]); err != nil {
+				return err
+			}
+			written += int64(read)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return readErr
+		}
+	}
+	if written == 0 {
+		return fmt.Errorf("remote media asset is empty")
+	}
+	if written > maxBytes || written > reservedBytes {
+		return ErrMediaFileTooLarge
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+
+	extension := safeExtension(blob.Filename, detectedMIME)
+	objectKey := filepath.Join("objects", blob.PublicID[:minInt(len(blob.PublicID), 10)], blob.PublicID+extension)
+	finalPath, err := ResolveObjectPath(objectKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o750); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryName, finalPath); err != nil {
+		return err
+	}
+
+	now := time.Now().Unix()
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
+		var reservationRow model.MediaStorageReservation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("token = ? AND state = ?", reservation, "reserved").First(&reservationRow).Error; err != nil {
+			return err
+		}
+		var current model.MediaBlob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND storage_backend = ? AND materialize_lease_owner = ? AND deleted_at = 0",
+				blob.ID, model.MediaStorageBackendRemote, leaseOwner).First(&current).Error; err != nil {
+			return err
+		}
+		normalizedFilename := normalizeMediaFilename(current.Filename, detectedMIME, current.MediaType)
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		updates := map[string]any{
+			"storage_backend":           model.MediaStorageBackendLocal,
+			"object_key":                objectKey,
+			"private_source":            "",
+			"content_hash":              hex.EncodeToString(hasher.Sum(nil)),
+			"mime_type":                 detectedMIME,
+			"filename":                  normalizedFilename,
+			"size_bytes":                written,
+			"materialize_status":        model.MediaMaterializeComplete,
+			"materialize_next_retry_at": 0,
+			"materialize_last_error":    "",
+			"materialize_lease_owner":   "",
+			"materialize_lease_until":   0,
+			"materialized_at":           now,
+		}
+		if err := tx.Model(&model.MediaBlob{}).Where("id = ?", blob.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.TaskArtifact{}).Where("media_blob_id = ?", blob.ID).
+			Updates(map[string]any{"mime_type": detectedMIME, "filename": normalizedFilename, "size_bytes": written}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(state).Updates(map[string]any{
+			"reserved_bytes": gorm.Expr("CASE WHEN reserved_bytes >= ? THEN reserved_bytes - ? ELSE 0 END", reservationRow.Bytes, reservationRow.Bytes),
+			"used_bytes":     gorm.Expr("used_bytes + ?", written),
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&reservationRow).Update("state", "committed").Error
+	})
+	if err != nil {
+		_ = os.Remove(finalPath)
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func newRemoteBlob(input RemoteBlobInput) (*model.MediaBlob, error) {
+	if input.UserID <= 0 || strings.TrimSpace(input.SourceURL) == "" {
+		return nil, fmt.Errorf("invalid remote media asset")
+	}
+	publicID, err := NewPublicID("blob_")
+	if err != nil {
+		return nil, err
+	}
+	setting := mediasetting.Get()
+	now := time.Now().Unix()
+	filename := normalizeMediaFilename(input.Filename, input.MimeType, input.Type)
+	materializeStatus := model.MediaMaterializeDisabled
+	materializeNextRetryAt := int64(0)
+	if setting.RemoteMaterializeEnabled {
+		materializeStatus = model.MediaMaterializePending
+		materializeNextRetryAt = now
+	}
+	return &model.MediaBlob{
+		PublicID: publicID, UserID: input.UserID, UsernameSnapshot: input.Username,
+		Filename: filename, Purpose: "generated", MediaType: input.Type, Role: input.Role,
+		SourceKind: "provider", StorageBackend: model.MediaStorageBackendRemote,
+		PrivateSource: input.SourceURL, MimeType: input.MimeType, SizeBytes: input.SizeBytes,
+		DurationSeconds: input.DurationSeconds, Width: input.Width, Height: input.Height,
+		HasAudio: input.HasAudio, Status: model.MediaBlobStatusReady,
+		MaterializeStatus: materializeStatus, MaterializeNextRetryAt: materializeNextRetryAt,
+		TaskPublicID: input.TaskPublicID, ChannelID: input.ChannelID, Model: input.Model,
+		Group: input.Group, Metadata: input.Metadata,
+		ModerationStatus: model.MediaModerationUnreviewed, LastAccessedAt: now,
+		ExpiresAt: time.Now().Add(time.Duration(setting.AssetTTLHours) * time.Hour).Unix(),
+	}, nil
+}
+
+func ResolveObjectPath(objectKey string) (string, error) {
+	root, err := storageRoot()
+	if err != nil {
+		return "", err
+	}
+	cleanKey := filepath.Clean(objectKey)
+	if filepath.IsAbs(cleanKey) || cleanKey == "." || strings.HasPrefix(cleanKey, ".."+string(filepath.Separator)) || cleanKey == ".." {
+		return "", ErrUnsafeStorageObject
+	}
+	path := filepath.Join(root, cleanKey)
+	relative, err := filepath.Rel(root, path)
+	if err != nil || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || relative == ".." {
+		return "", ErrUnsafeStorageObject
+	}
+	return path, nil
+}
+
+type physicalStorageSnapshot struct {
+	usedBytes          int64
+	untrackedBytes     int64
+	temporaryBytes     int64
+	fileCount          int64
+	untrackedFileCount int64
+	temporaryFileCount int64
+}
+
+func effectiveMediaUsedBytes(state model.MediaStorageState) int64 {
+	physicalWithLedgerDelta := state.PhysicalUsedBytes
+	if state.UsedBytes > state.LedgerBytesAtScan {
+		physicalWithLedgerDelta += state.UsedBytes - state.LedgerBytesAtScan
+	}
+	if physicalWithLedgerDelta > state.UsedBytes {
+		return physicalWithLedgerDelta
+	}
+	return state.UsedBytes
+}
+
+func ReconcileStorageStateIfStale(maxAge time.Duration) error {
+	if maxAge > 0 {
+		state := model.MediaStorageState{ID: 1}
+		if err := model.DB.FirstOrCreate(&state, model.MediaStorageState{ID: 1}).Error; err != nil {
+			return err
+		}
+		if state.LastScannedAt > 0 && state.LastScanError == "" &&
+			time.Since(time.Unix(state.LastScannedAt, 0)) < maxAge {
+			return nil
+		}
+	}
+	storageReconcileMu.Lock()
+	defer storageReconcileMu.Unlock()
+	if maxAge > 0 {
+		state := model.MediaStorageState{ID: 1}
+		if err := model.DB.First(&state, 1).Error; err == nil && state.LastScannedAt > 0 &&
+			state.LastScanError == "" && time.Since(time.Unix(state.LastScannedAt, 0)) < maxAge {
+			return nil
+		}
+	}
+	return reconcileStorageState()
+}
+
+func ReconcileStorageState() error {
+	storageReconcileMu.Lock()
+	defer storageReconcileMu.Unlock()
+	return reconcileStorageState()
+}
+
+func reconcileStorageState() error {
+	if err := EnsureStorage(); err != nil {
+		return err
+	}
+	root, err := storageRoot()
+	if err != nil {
+		return err
+	}
+	var objectKeys []string
+	if err := model.DB.Model(&model.MediaBlob{}).
+		Where("storage_backend = ? AND deleted_at = 0 AND status IN ? AND object_key <> ''",
+			model.MediaStorageBackendLocal, []string{model.MediaBlobStatusUploading, model.MediaBlobStatusReady}).
+		Pluck("object_key", &objectKeys).Error; err != nil {
+		return err
+	}
+	trackedPaths := make(map[string]struct{}, len(objectKeys))
+	for _, objectKey := range objectKeys {
+		objectPath, resolveErr := ResolveObjectPath(objectKey)
+		if resolveErr == nil {
+			trackedPaths[filepath.Clean(objectPath)] = struct{}{}
+		}
+	}
+	snapshot, scanErr := scanPhysicalStorage(root, trackedPaths)
+	if scanErr != nil {
+		common.SysLog("media physical storage scan failed: " + scanErr.Error())
+	}
+	databaseErr := model.DB.Transaction(func(tx *gorm.DB) error {
+		now := time.Now().Unix()
+		var expired []model.MediaStorageReservation
+		if err := tx.Where("state = ? AND expires_at <= ?", "reserved", now).Find(&expired).Error; err != nil {
+			return err
+		}
+		if len(expired) > 0 {
+			if err := tx.Model(&model.MediaStorageReservation{}).
+				Where("state = ? AND expires_at <= ?", "reserved", now).Update("state", "expired").Error; err != nil {
+				return err
+			}
+		}
+		var used int64
+		if err := tx.Model(&model.MediaBlob{}).
+			Where("storage_backend = ? AND deleted_at = 0 AND status = ?", model.MediaStorageBackendLocal, model.MediaBlobStatusReady).
+			Select("COALESCE(SUM(size_bytes), 0)").Scan(&used).Error; err != nil {
+			return err
+		}
+		var reserved int64
+		if err := tx.Model(&model.MediaStorageReservation{}).
+			Where("state = ? AND expires_at > ?", "reserved", now).
+			Select("COALESCE(SUM(bytes), 0)").Scan(&reserved).Error; err != nil {
+			return err
+		}
+		state, err := model.EnsureMediaStorageState(tx)
+		if err != nil {
+			return err
+		}
+		updates := map[string]any{
+			"used_bytes": used, "reserved_bytes": reserved,
+		}
+		if scanErr == nil {
+			updates["physical_used_bytes"] = snapshot.usedBytes
+			updates["ledger_bytes_at_scan"] = used
+			updates["untracked_bytes"] = snapshot.untrackedBytes
+			updates["temporary_bytes"] = snapshot.temporaryBytes
+			updates["physical_file_count"] = snapshot.fileCount
+			updates["untracked_file_count"] = snapshot.untrackedFileCount
+			updates["temporary_file_count"] = snapshot.temporaryFileCount
+			updates["last_scanned_at"] = now
+			updates["last_scan_error"] = ""
+		} else {
+			updates["last_scan_error"] = scanErr.Error()
+		}
+		return tx.Model(state).Updates(updates).Error
+	})
+	return databaseErr
+}
+
+func scanPhysicalStorage(root string, trackedPaths map[string]struct{}) (physicalStorageSnapshot, error) {
+	snapshot := physicalStorageSnapshot{}
+	var scanErr error
+	err := filepath.WalkDir(root, func(currentPath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			scanErr = errors.Join(scanErr, fmt.Errorf("inspect %q: %w", currentPath, walkErr))
+			if entry != nil && entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			scanErr = errors.Join(scanErr, fmt.Errorf("inspect %q: %w", currentPath, infoErr))
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		snapshot.usedBytes += info.Size()
+		snapshot.fileCount++
+		relative, relativeErr := filepath.Rel(root, currentPath)
+		if relativeErr != nil {
+			scanErr = errors.Join(scanErr, fmt.Errorf("resolve %q: %w", currentPath, relativeErr))
+			return nil
+		}
+		if relative == "tmp" || strings.HasPrefix(relative, "tmp"+string(filepath.Separator)) {
+			snapshot.temporaryBytes += info.Size()
+			snapshot.temporaryFileCount++
+			return nil
+		}
+		if _, tracked := trackedPaths[filepath.Clean(currentPath)]; !tracked {
+			snapshot.untrackedBytes += info.Size()
+			snapshot.untrackedFileCount++
+		}
+		return nil
+	})
+	if err != nil {
+		scanErr = errors.Join(scanErr, err)
+	}
+	return snapshot, scanErr
+}
+
+func mediaTypeForMIME(mimeType string) string {
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return "image"
+	case strings.HasPrefix(mimeType, "video/"):
+		return "video"
+	case strings.HasPrefix(mimeType, "audio/"):
+		return "audio"
+	case strings.HasPrefix(mimeType, "text/") || mimeType == "application/pdf" || mimeType == "application/json":
+		return "file"
+	default:
+		return "other"
+	}
+}
+
+func safeExtension(filename, mimeType string) string {
+	extension := strings.ToLower(filepath.Ext(filename))
+	if len(extension) > 12 || strings.ContainsAny(extension, `/\\`) {
+		extension = ""
+	}
+	if extension != "" {
+		return extension
+	}
+	extensions, _ := mime.ExtensionsByType(mimeType)
+	if len(extensions) > 0 && len(extensions[0]) <= 12 {
+		return extensions[0]
+	}
+	return ""
+}
+
+func normalizeMediaFilename(filename, mimeType, mediaType string) string {
+	fallback := "result" + extensionForMediaType(mediaType)
+	normalized := sanitizeFilename(filename, fallback)
+	if safeExtension(normalized, "") != "" {
+		return normalized
+	}
+	extension := safeExtension("", mimeType)
+	if extension == "" {
+		extension = extensionForMediaType(mediaType)
+	}
+	return normalized + extension
+}
+
+func sanitizeFilename(filename, fallback string) string {
+	filename = filepath.Base(strings.TrimSpace(filename))
+	if filename == "." || filename == "" {
+		return fallback
+	}
+	filename = strings.Map(func(r rune) rune {
+		if r < 32 || r == '/' || r == '\\' {
+			return '_'
+		}
+		return r
+	}, filename)
+	if len(filename) > 240 {
+		filename = filename[:240]
+	}
+	return filename
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

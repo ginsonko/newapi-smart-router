@@ -1,0 +1,88 @@
+package middleware
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupTenantCostTokenAuthDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previous := model.DB
+	previousMain := common.MainDatabaseType()
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:tenant-token-auth-%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previous
+		common.SetMainDatabaseType(previousMain)
+	})
+	require.NoError(t, db.AutoMigrate(&model.TenantCostDownstream{}, &model.TenantCredentialBinding{}))
+	require.NoError(t, model.EnsureDefaultTenantCostDownstream())
+	return db
+}
+
+func TestSetupContextForTokenKeepsUnboundLegacyKeyIndependentFromTenantTables(t *testing.T) {
+	previous := model.DB
+	model.DB = nil
+	t.Cleanup(func() { model.DB = previous })
+	ctx, recorder := newTokenAuthTestContext()
+	token := &model.Token{Id: 401, UserId: 40, Group: "default", TenantCostBindingID: 0}
+	require.NoError(t, SetupContextForToken(ctx, token))
+	assert.False(t, ctx.IsAborted())
+	assert.Equal(t, http.StatusOK, recorder.Code)
+}
+
+func TestSetupContextForTokenFailsClosedWhenBoundMarkerCannotResolve(t *testing.T) {
+	setupTenantCostTokenAuthDB(t)
+	ctx, recorder := newTokenAuthTestContext()
+	token := &model.Token{Id: 402, UserId: 40, Group: "default", TenantCostBindingID: 999}
+	err := SetupContextForToken(ctx, token)
+	require.Error(t, err)
+	assert.True(t, ctx.IsAborted())
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+}
+
+func TestSetupContextForTokenUsesExactEnabledBindingMarker(t *testing.T) {
+	db := setupTenantCostTokenAuthDB(t)
+	binding := model.TenantCredentialBinding{
+		TokenID: 403, TenantID: model.DefaultTenantCostTenantID,
+		CredentialPurpose: model.TenantCredentialPurposeDataPlane,
+		KeyID:             "key-403", KeySuffix: "x403", ProductPoolID: "openai_gpt", ServiceTier: "pro",
+		RouteProfileID: "profile-403", ProfileRevision: "rev-1", ModelCatalogRevision: "catalog-1",
+		BindingStatus: model.TenantBindingEnabled,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+	ctx, recorder := newTokenAuthTestContext()
+	token := &model.Token{Id: 403, UserId: 40, Group: "default", TenantCostBindingID: binding.ID}
+	require.NoError(t, SetupContextForToken(ctx, token))
+	assert.False(t, ctx.IsAborted())
+	assert.Equal(t, http.StatusOK, recorder.Code)
+}
+
+func TestSetupContextForTokenRejectsDisabledBinding(t *testing.T) {
+	db := setupTenantCostTokenAuthDB(t)
+	binding := model.TenantCredentialBinding{
+		TokenID: 404, TenantID: model.DefaultTenantCostTenantID,
+		CredentialPurpose: model.TenantCredentialPurposeDataPlane,
+		KeyID:             "key-404", KeySuffix: "x404", ProductPoolID: "openai_gpt", ServiceTier: "pro",
+		RouteProfileID: "profile-404", ProfileRevision: "rev-1", ModelCatalogRevision: "catalog-1",
+		BindingStatus: model.TenantBindingDisabled,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+	ctx, recorder := newTokenAuthTestContext()
+	token := &model.Token{Id: 404, UserId: 40, Group: "default", TenantCostBindingID: binding.ID}
+	err := SetupContextForToken(ctx, token)
+	require.Error(t, err)
+	assert.True(t, ctx.IsAborted())
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
+}

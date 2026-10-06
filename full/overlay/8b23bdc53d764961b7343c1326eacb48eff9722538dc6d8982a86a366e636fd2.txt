@@ -1,0 +1,278 @@
+import type {
+  SmartRouterStatusItem,
+  SmartRouterStatusModelIndexItem,
+} from './types'
+
+export type LeaderboardMetric =
+  | 'usage'
+  | 'cache'
+  | 'cost'
+  | 'ttft'
+  | 'stability'
+  | 'weighted'
+
+export type LeaderboardWeightKey = 'cache' | 'cost' | 'ttft' | 'stability'
+export type LeaderboardWeights = Record<LeaderboardWeightKey, number>
+
+export type LeaderboardMetricDatum = {
+  value?: number
+  source: string
+  observed: boolean
+  sampleCount?: number
+  confidencePPM?: number
+  rankable: boolean
+}
+
+export type LeaderboardEvidence = {
+  cache: LeaderboardMetricDatum
+  cost: LeaderboardMetricDatum
+  ttft: LeaderboardMetricDatum
+  stability: LeaderboardMetricDatum
+}
+
+
+function finite(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function sampleCount(item: SmartRouterStatusItem) {
+  const metricSamples = [
+    finite(item.actual_input_cost_samples),
+    finite(item.recent_ttft_samples),
+    finite(item.recent_stability_samples),
+  ].filter((value): value is number => value !== undefined && value > 0)
+  return metricSamples.length > 0 ? Math.max(...metricSamples) : undefined
+}
+
+function metricSampleCount(
+  item: SmartRouterStatusItem,
+  metric: Exclude<LeaderboardMetric, 'usage' | 'weighted'>
+) {
+  switch (metric) {
+    case 'cache':
+    case 'cost':
+      return finite(item.actual_input_cost_samples)
+    case 'ttft':
+      return finite(item.recent_ttft_samples)
+    case 'stability':
+      return finite(item.recent_stability_samples)
+  }
+}
+
+function recentUsageCount(item: SmartRouterStatusItem) {
+  return finite(item.recent_usage_count) ?? 0
+}
+
+function recentStabilityValue(item: SmartRouterStatusItem) {
+  const samples = finite(item.recent_stability_samples)
+  if (samples === undefined || samples <= 0) return undefined
+  return finite(item.recent_stability_rate)
+}
+
+export function leaderboardConfidence(item: SmartRouterStatusItem) {
+  const count = sampleCount(item)
+  if (count === undefined) return 'reference'
+  if (count >= 20) return 'high'
+  if (count >= 5) return 'medium'
+  return 'low'
+}
+
+export function leaderboardConfidencePercent(item: SmartRouterStatusItem) {
+  const count = sampleCount(item)
+  return count === undefined ? undefined : Math.min(100, Math.max(0, count))
+}
+
+export function buildLeaderboardEvidence(items: SmartRouterStatusItem[]) {
+  return new Map(
+    items.map((item) => {
+      const routeCache = finite(item.routing_cache_weight_ppm)
+      const realCache = finite(item.recent_cache_rate_ppm)
+      const cost = finite(item.predicted_input_cost_ppm)
+      const ttft = finite(item.recent_ttft_average_ms)
+      const recentStability = recentStabilityValue(item)
+      const hasSamples = sampleCount(item) !== undefined
+      let cacheSource = 'No observed data'
+      if (routeCache !== undefined) {
+        cacheSource = 'Recent observed routing data'
+      } else if (realCache !== undefined) {
+        cacheSource = 'Route observed'
+      }
+      let ttftSource = 'No observed data'
+      if (ttft !== undefined) {
+        ttftSource = 'Route observed'
+      }
+      let stabilitySource = 'No observed data'
+      if (recentStability !== undefined) {
+        stabilitySource = 'Recent weighted route evidence'
+      }
+      const evidence: LeaderboardEvidence = {
+        cache: {
+          value: routeCache ?? realCache,
+          source: cacheSource,
+          observed: realCache !== undefined && hasSamples,
+          sampleCount: metricSampleCount(item, 'cache'),
+          confidencePPM: finite(item.actual_input_cost_confidence_ppm),
+          rankable:
+            (routeCache !== undefined || realCache !== undefined) &&
+            Boolean(item.ranking_cost_source) &&
+            item.ranking_cost_source === 'observed',
+        },
+        cost: {
+          value: cost,
+          source: cost === undefined ? 'No observed data' : 'Predicted cost',
+          observed: item.ranking_cost_source === 'observed',
+          sampleCount: metricSampleCount(item, 'cost'),
+          confidencePPM: finite(item.actual_input_cost_confidence_ppm),
+          rankable:
+            cost !== undefined &&
+            item.ranking_cost_source === 'observed',
+        },
+        ttft: {
+          value: ttft,
+          source: ttftSource,
+          observed: ttft !== undefined,
+          sampleCount: metricSampleCount(item, 'ttft'),
+          confidencePPM: finite(item.recent_ttft_confidence_ppm),
+          rankable:
+            ttft !== undefined &&
+            item.recent_ttft_source !== 'system_reference' &&
+            item.recent_ttft_source !== 'recent_system_reference',
+        },
+        stability: {
+          value: recentStability,
+          source: stabilitySource,
+          observed: recentStability !== undefined,
+          sampleCount: metricSampleCount(item, 'stability'),
+          confidencePPM: finite(item.stability_confidence_ppm),
+          rankable:
+            recentStability !== undefined &&
+            item.recent_stability_source !== 'system_reference' &&
+            item.recent_stability_source !== 'recent_system_reference',
+        },
+      }
+      return [item, evidence] as const
+    })
+  )
+}
+
+export function defaultLeaderboardSelection() {
+  return {
+    model: 'gpt-5.6-sol',
+    endpoint: 'openai-responses-v1',
+    metric: 'cost' as const,
+  }
+}
+
+export function sortLeaderboardModels<
+  T extends SmartRouterStatusModelIndexItem,
+>(models: T[]): T[] {
+  return [...models].sort((left, right) => {
+    const leftModel = left.model?.toLowerCase() ?? ''
+    const rightModel = right.model?.toLowerCase() ?? ''
+    const leftSol = leftModel === 'gpt-5.6-sol'
+    const rightSol = rightModel === 'gpt-5.6-sol'
+    if (leftSol !== rightSol) return leftSol ? -1 : 1
+    const leftResponses = left.endpoint === 'openai-responses-v1'
+    const rightResponses = right.endpoint === 'openai-responses-v1'
+    if (leftModel === rightModel && leftResponses !== rightResponses) {
+      return leftResponses ? -1 : 1
+    }
+    return (
+      (left.model ?? '').localeCompare(right.model ?? '') ||
+      (left.endpoint ?? '').localeCompare(right.endpoint ?? '')
+    )
+  })
+}
+
+export function leaderboardMetricValue(
+  item: SmartRouterStatusItem,
+  metric: Exclude<LeaderboardMetric, 'weighted'>,
+  evidence: Map<SmartRouterStatusItem, LeaderboardEvidence>
+) {
+  const row = evidence.get(item)
+  switch (metric) {
+    case 'usage':
+      return recentUsageCount(item)
+    case 'cache':
+      return row?.cache.value
+    case 'cost':
+      return row?.cost.value
+    case 'ttft':
+      return row?.ttft.value
+    case 'stability':
+      return row?.stability.value
+  }
+}
+
+export function leaderboardSampleCount(item: SmartRouterStatusItem) {
+  return sampleCount(item)
+}
+
+export type LeaderboardRankBadge = {
+  metric: Exclude<LeaderboardMetric, 'usage' | 'weighted'>
+  rank: 1 | 2 | 3
+}
+
+function displayedMetricValue(
+  metric: LeaderboardRankBadge['metric'],
+  value: number
+) {
+  switch (metric) {
+    case 'cache':
+      return Math.round(value / 1_000) * 1_000
+    case 'cost':
+      return Math.round(value)
+    case 'ttft':
+      return Math.round(value)
+    case 'stability':
+      return Math.round(value * 1_000) / 1_000
+  }
+}
+
+export function buildLeaderboardDenseRanks(
+  items: SmartRouterStatusItem[],
+  evidence: Map<SmartRouterStatusItem, LeaderboardEvidence>
+) {
+  const result = new Map<SmartRouterStatusItem, LeaderboardRankBadge[]>()
+  const metrics: Array<{
+    metric: LeaderboardRankBadge['metric']
+    higherIsBetter: boolean
+  }> = [
+    { metric: 'cache', higherIsBetter: true },
+    { metric: 'cost', higherIsBetter: false },
+    { metric: 'ttft', higherIsBetter: false },
+    { metric: 'stability', higherIsBetter: true },
+  ]
+  for (const definition of metrics) {
+    const values = items
+      .flatMap((item) => {
+        const datum = evidence.get(item)?.[definition.metric]
+        if (!datum?.rankable || datum.value === undefined) return []
+        return [
+          {
+            item,
+            value: displayedMetricValue(definition.metric, datum.value),
+          },
+        ]
+      })
+      .sort((left, right) =>
+        definition.higherIsBetter
+          ? right.value - left.value
+          : left.value - right.value
+      )
+    let rank = 0
+    let previous: number | undefined
+    for (const current of values) {
+      if (previous === undefined || current.value !== previous) rank += 1
+      previous = current.value
+      if (rank > 3) break
+      const badges = result.get(current.item) ?? []
+      badges.push({
+        metric: definition.metric,
+        rank: rank as 1 | 2 | 3,
+      })
+      result.set(current.item, badges)
+    }
+  }
+  return result
+}

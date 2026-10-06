@@ -1,0 +1,382 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+func setupImageRouteCleanupTest(t *testing.T, batch int) (*gorm.DB, string) {
+	t.Helper()
+	database, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "cleanup.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	connection, err := database.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	require.NoError(t, database.AutoMigrate(&model.ImageRouteJob{}, &model.MediaBlob{}, &model.MediaStorageReservation{}, &model.MediaStorageState{}))
+	previousDB, previousSetting := model.DB, mediasetting.Get()
+	model.DB = database
+	setting := previousSetting
+	setting.StoragePath = t.TempDir()
+	setting.InputTTLHours, setting.AssetTTLHours, setting.CleanupBatchSize = 1, 2, batch
+	setting.ReservedFreeBytes = 1
+	require.NoError(t, mediasetting.Replace(setting))
+	directory := filepath.Join(setting.StoragePath, "private-image-routing")
+	require.NoError(t, os.MkdirAll(directory, 0700))
+	t.Cleanup(func() {
+		imageRouteSpoolCleanup.Lock()
+		if imageRouteSpoolCleanup.reader != nil {
+			require.NoError(t, imageRouteSpoolCleanup.reader.Close())
+		}
+		imageRouteSpoolCleanup.reader, imageRouteSpoolCleanup.database = nil, nil
+		imageRouteSpoolCleanup.directory, imageRouteSpoolCleanup.lastJobID = "", 0
+		imageRouteSpoolCleanup.Unlock()
+		model.DB = previousDB
+		require.NoError(t, mediasetting.Replace(previousSetting))
+		require.NoError(t, connection.Close())
+	})
+	return database, directory
+}
+
+func writeImageRouteCleanupFile(t *testing.T, path string, age time.Duration) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(path, []byte("spool"), 0600))
+	created := time.Now().Add(-age)
+	require.NoError(t, os.Chtimes(path, created, created))
+}
+
+func createImageRouteCleanupJob(t *testing.T, database *gorm.DB, directory, state string) *model.ImageRouteJob {
+	t.Helper()
+	job := &model.ImageRouteJob{
+		PublicTaskID: "cleanup-" + state, UserID: 71, State: state, Version: 3,
+		BodyPath: filepath.Join(directory, "request-"+state), ResultPath: filepath.Join(directory, "result-"+state),
+		UpdatedAt: time.Now().Add(-24 * time.Hour).Unix(),
+	}
+	var err error
+	job.BodyReservation, err = mediaservice.ReserveImageRouteSpool(5, time.Now().Add(time.Minute).Unix())
+	require.NoError(t, err)
+	job.ResultReservation, err = mediaservice.ReserveImageRouteSpool(5, time.Now().Add(time.Minute).Unix())
+	require.NoError(t, err)
+	writeImageRouteCleanupFile(t, job.BodyPath, 24*time.Hour)
+	writeImageRouteCleanupFile(t, job.ResultPath, 24*time.Hour)
+	require.NoError(t, database.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(job).Error; err != nil {
+			return err
+		}
+		if err := model.HoldImageRouteSpoolTx(tx, job.BodyReservation); err != nil {
+			return err
+		}
+		return model.HoldImageRouteSpoolTx(tx, job.ResultReservation)
+	}))
+	return job
+}
+
+func requireImageRouteCleanupReservation(t *testing.T, database *gorm.DB, token, state string) {
+	t.Helper()
+	var reservation model.MediaStorageReservation
+	require.NoError(t, database.Where("token = ?", token).First(&reservation).Error)
+	require.Equal(t, state, reservation.State)
+	if state == "reserved" {
+		require.Equal(t, mediaservice.ImageRouteSpoolReservationExpiresAt, reservation.ExpiresAt)
+	}
+}
+
+func TestImageRouteCleanupKeepsActiveUnknownAndStrandedEvidence(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 3)
+	jobs := []*model.ImageRouteJob{}
+	for _, state := range []string{"ready", "waiting", "dispatching", "unknown", "stranded"} {
+		jobs = append(jobs, createImageRouteCleanupJob(t, database, directory, state))
+	}
+	for pass := 0; pass < 8; pass++ {
+		cleanupImageRouteSpools(context.Background())
+	}
+	require.NoError(t, mediaservice.ReconcileStorageState())
+	for _, job := range jobs {
+		require.FileExists(t, job.BodyPath)
+		require.FileExists(t, job.ResultPath)
+		requireImageRouteCleanupReservation(t, database, job.BodyReservation, "reserved")
+		requireImageRouteCleanupReservation(t, database, job.ResultReservation, "reserved")
+		var saved model.ImageRouteJob
+		require.NoError(t, database.First(&saved, job.ID).Error)
+		require.Equal(t, job.State, saved.State)
+		require.Equal(t, job.Version, saved.Version)
+	}
+	var capacity model.MediaStorageState
+	require.NoError(t, database.First(&capacity, 1).Error)
+	require.EqualValues(t, 50, capacity.ReservedBytes)
+}
+
+func TestImageRouteCleanupOnlyExpiredConfirmedTerminalsAndReplay(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 2)
+	succeeded := createImageRouteCleanupJob(t, database, directory, "succeeded")
+	failed := createImageRouteCleanupJob(t, database, directory, "failed")
+	recent := createImageRouteCleanupJob(t, database, directory, "recent")
+	require.NoError(t, database.Model(recent).UpdateColumns(map[string]any{"state": "succeeded", "updated_at": time.Now().Unix()}).Error)
+	for pass := 0; pass < 5; pass++ {
+		cleanupImageRouteSpools(context.Background())
+	}
+	for _, job := range []*model.ImageRouteJob{succeeded, failed} {
+		require.NoFileExists(t, job.BodyPath)
+		require.NoFileExists(t, job.ResultPath)
+		requireImageRouteCleanupReservation(t, database, job.BodyReservation, "released")
+		requireImageRouteCleanupReservation(t, database, job.ResultReservation, "released")
+		var saved model.ImageRouteJob
+		require.NoError(t, database.First(&saved, job.ID).Error)
+		require.Empty(t, saved.BodyPath)
+		require.Empty(t, saved.ResultPath)
+		require.Empty(t, saved.BodyReservation)
+		require.Empty(t, saved.ResultReservation)
+		require.Equal(t, job.UpdatedAt, saved.UpdatedAt)
+	}
+	require.FileExists(t, recent.BodyPath)
+	require.FileExists(t, recent.ResultPath)
+	requireImageRouteCleanupReservation(t, database, recent.BodyReservation, "reserved")
+}
+
+func TestImageRouteCleanupFailedRemovalPreservesCapacityAndDoesNotStarve(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 1)
+	blocked := createImageRouteCleanupJob(t, database, directory, "failed")
+	require.NoError(t, os.Remove(blocked.BodyPath))
+	require.NoError(t, os.Mkdir(blocked.BodyPath, 0700))
+	writeImageRouteCleanupFile(t, filepath.Join(blocked.BodyPath, "keep"), 24*time.Hour)
+	other := createImageRouteCleanupJob(t, database, directory, "succeeded")
+	cleanupImageRouteSpools(context.Background())
+	require.DirExists(t, blocked.BodyPath)
+	requireImageRouteCleanupReservation(t, database, blocked.BodyReservation, "reserved")
+	requireImageRouteCleanupReservation(t, database, blocked.ResultReservation, "released")
+	require.FileExists(t, other.BodyPath)
+	cleanupImageRouteSpools(context.Background())
+	require.NoFileExists(t, other.BodyPath)
+	requireImageRouteCleanupReservation(t, database, other.BodyReservation, "released")
+	var capacity model.MediaStorageState
+	require.NoError(t, database.First(&capacity, 1).Error)
+	require.EqualValues(t, 5, capacity.ReservedBytes)
+	require.NoError(t, os.Remove(filepath.Join(blocked.BodyPath, "keep")))
+	require.NoError(t, os.Remove(blocked.BodyPath))
+	for pass := 0; pass < 3; pass++ {
+		cleanupImageRouteSpools(context.Background())
+	}
+	requireImageRouteCleanupReservation(t, database, blocked.BodyReservation, "released")
+}
+
+func TestImageRouteCleanupOrphansAreTTLBoundedAndEventuallyVisited(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 2)
+	active := createImageRouteCleanupJob(t, database, directory, "unknown")
+	old := []string{}
+	for index := 0; index < 7; index++ {
+		name := fmt.Sprintf("request-orphan-%d", index)
+		if index%2 == 1 {
+			name = fmt.Sprintf("result-orphan-%d", index)
+		}
+		path := filepath.Join(directory, name)
+		writeImageRouteCleanupFile(t, path, 24*time.Hour)
+		old = append(old, path)
+	}
+	recent := filepath.Join(directory, "request-recent")
+	resultWithinTTL := filepath.Join(directory, "result-within-ttl")
+	unrelated := filepath.Join(directory, "other-private-file")
+	writeImageRouteCleanupFile(t, recent, 30*time.Minute)
+	writeImageRouteCleanupFile(t, resultWithinTTL, 90*time.Minute)
+	writeImageRouteCleanupFile(t, unrelated, 24*time.Hour)
+	for pass := 0; pass < 15; pass++ {
+		before := 0
+		for _, path := range old {
+			if _, err := os.Stat(path); err == nil {
+				before++
+			}
+		}
+		cleanupImageRouteSpools(context.Background())
+		after := 0
+		for _, path := range old {
+			if _, err := os.Stat(path); err == nil {
+				after++
+			}
+		}
+		require.LessOrEqual(t, before-after, 2)
+	}
+	for _, path := range old {
+		require.NoFileExists(t, path)
+	}
+	for _, path := range []string{recent, resultWithinTTL, unrelated, active.BodyPath, active.ResultPath} {
+		require.FileExists(t, path)
+	}
+}
+
+func TestImageRouteCleanupDatabaseFailurePreservesOrphans(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "dispatching")
+	unboundPath := job.ResultPath
+	require.NoError(t, database.Model(job).UpdateColumn("result_path", "").Error)
+	sentinel := errors.New("DB unavailable while checking orphan references")
+	require.NoError(t, database.Callback().Query().Before("gorm:query").Register("image_cleanup_db_failure", func(transaction *gorm.DB) {
+		if strings.Contains(transaction.Statement.SQL.String(), "id <>") || len(transaction.Statement.Selects) > 0 {
+			transaction.AddError(sentinel)
+		}
+	}))
+	for pass := 0; pass < 3; pass++ {
+		cleanupImageRouteSpools(context.Background())
+	}
+	require.FileExists(t, unboundPath)
+	require.NoError(t, database.Callback().Query().Remove("image_cleanup_db_failure"))
+	for pass := 0; pass < 3; pass++ {
+		cleanupImageRouteSpools(context.Background())
+	}
+	require.NoFileExists(t, unboundPath)
+}
+
+func TestImageRouteCleanupRejectsOutsideNestedAndReferencedPaths(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "succeeded")
+	active := createImageRouteCleanupJob(t, database, directory, "stranded")
+	require.NoError(t, database.Model(active).UpdateColumn("body_path", job.BodyPath).Error)
+	outside := filepath.Join(t.TempDir(), "result-outside")
+	writeImageRouteCleanupFile(t, outside, 24*time.Hour)
+	require.NoError(t, database.Model(job).UpdateColumn("result_path", outside).Error)
+	cleanupImageRouteSpools(context.Background())
+	require.FileExists(t, job.BodyPath)
+	require.FileExists(t, outside)
+	requireImageRouteCleanupReservation(t, database, job.BodyReservation, "reserved")
+	requireImageRouteCleanupReservation(t, database, job.ResultReservation, "reserved")
+	nested := filepath.Join(directory, "subdir")
+	require.NoError(t, os.Mkdir(nested, 0700))
+	nestedPath := filepath.Join(nested, "request-nested")
+	writeImageRouteCleanupFile(t, nestedPath, 24*time.Hour)
+	require.Error(t, removeImageRouteSpool(context.Background(), directory, nestedPath, 0))
+	require.FileExists(t, nestedPath)
+}
+
+func TestImageRouteCleanupLedgerFailureRetriesOnlyAfterFileIsGone(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "succeeded")
+	require.NoError(t, database.Callback().Update().Before("gorm:update").Register("image_cleanup_ledger_failure", func(transaction *gorm.DB) {
+		if transaction.Statement.Schema != nil && transaction.Statement.Schema.Table == "media_storage_states" {
+			transaction.AddError(errors.New("ledger unavailable"))
+		}
+	}))
+	cleanupImageRouteSpools(context.Background())
+	require.NoFileExists(t, job.BodyPath)
+	requireImageRouteCleanupReservation(t, database, job.BodyReservation, "reserved")
+	var saved model.ImageRouteJob
+	require.NoError(t, database.First(&saved, job.ID).Error)
+	require.Equal(t, job.BodyPath, saved.BodyPath)
+	require.NoError(t, database.Callback().Update().Remove("image_cleanup_ledger_failure"))
+	cleanupImageRouteSpools(context.Background())
+	requireImageRouteCleanupReservation(t, database, job.BodyReservation, "released")
+	require.NoError(t, database.First(&saved, job.ID).Error)
+	require.Empty(t, saved.BodyPath)
+}
+
+func TestImageRouteCleanupCancellationAndConcurrentCalls(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "succeeded")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cleanupImageRouteSpools(ctx)
+	require.FileExists(t, job.BodyPath)
+	var workers sync.WaitGroup
+	for index := 0; index < 5; index++ {
+		workers.Add(1)
+		go func() { defer workers.Done(); cleanupImageRouteSpools(context.Background()) }()
+	}
+	workers.Wait()
+	require.NoFileExists(t, job.BodyPath)
+	requireImageRouteCleanupReservation(t, database, job.BodyReservation, "released")
+}
+
+func TestImageRouteCleanupProtectsInflightResultCompletionAlias(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "dispatching")
+	inflightPath := job.ResultPath
+	require.NoError(t, database.Model(job).UpdateColumn("result_path", inflightPath+".json").Error)
+	for pass := 0; pass < 3; pass++ {
+		cleanupImageRouteSpools(context.Background())
+	}
+	require.FileExists(t, inflightPath)
+	requireImageRouteCleanupReservation(t, database, job.ResultReservation, "reserved")
+	require.NoError(t, database.Model(job).UpdateColumns(map[string]any{"state": "succeeded", "updated_at": time.Now().Add(-24 * time.Hour).Unix()}).Error)
+	cleanupImageRouteSpools(context.Background())
+	require.NoFileExists(t, inflightPath)
+	requireImageRouteCleanupReservation(t, database, job.ResultReservation, "released")
+}
+
+func TestImageRouteCleanupBlockedInflightAliasKeepsResultReservation(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "failed")
+	inflightPath := job.ResultPath
+	require.NoError(t, os.Remove(inflightPath))
+	require.NoError(t, os.Mkdir(inflightPath, 0700))
+	writeImageRouteCleanupFile(t, filepath.Join(inflightPath, "keep"), 24*time.Hour)
+	require.NoError(t, database.Model(job).UpdateColumn("result_path", inflightPath+".json").Error)
+	cleanupImageRouteSpools(context.Background())
+	require.DirExists(t, inflightPath)
+	requireImageRouteCleanupReservation(t, database, job.ResultReservation, "reserved")
+	var saved model.ImageRouteJob
+	require.NoError(t, database.First(&saved, job.ID).Error)
+	require.Equal(t, inflightPath+".json", saved.ResultPath)
+}
+
+func TestImageRouteCleanupSymlinkDoesNotDeleteTarget(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	job := createImageRouteCleanupJob(t, database, directory, "succeeded")
+	outside := filepath.Join(t.TempDir(), "keep")
+	writeImageRouteCleanupFile(t, outside, 24*time.Hour)
+	require.NoError(t, os.Remove(job.BodyPath))
+	if err := os.Symlink(outside, job.BodyPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	cleanupImageRouteSpools(context.Background())
+	require.FileExists(t, outside)
+	info, err := os.Lstat(job.BodyPath)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink)
+	requireImageRouteCleanupReservation(t, database, job.BodyReservation, "reserved")
+}
+
+func TestImageRouteCleanupUnknownFinalAndTemporaryEvidenceRemainTogether(t *testing.T) {
+	for _, state := range []string{"unknown", "stranded"} {
+		t.Run(state, func(t *testing.T) {
+			database, directory := setupImageRouteCleanupTest(t, 10)
+			job := createImageRouteCleanupJob(t, database, directory, state)
+			inflightPath := job.ResultPath
+			finalPath := inflightPath + ".json"
+			writeImageRouteCleanupFile(t, finalPath, 24*time.Hour)
+			require.NoError(t, database.Model(job).UpdateColumn("result_path", finalPath).Error)
+			for pass := 0; pass < 3; pass++ {
+				cleanupImageRouteSpools(context.Background())
+			}
+			require.FileExists(t, inflightPath)
+			require.FileExists(t, finalPath)
+			requireImageRouteCleanupReservation(t, database, job.ResultReservation, "reserved")
+		})
+	}
+}
+
+func TestImageRouteCleanupRejectsSymlinkPrivateDirectory(t *testing.T) {
+	database, directory := setupImageRouteCleanupTest(t, 10)
+	outside := t.TempDir()
+	path := filepath.Join(outside, "request-keep")
+	writeImageRouteCleanupFile(t, path, 24*time.Hour)
+	require.NoError(t, os.Remove(directory))
+	if err := os.Symlink(outside, directory); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	cleanupImageRouteSpools(context.Background())
+	require.FileExists(t, path)
+	var jobs int64
+	require.NoError(t, database.Model(&model.ImageRouteJob{}).Count(&jobs).Error)
+	require.Zero(t, jobs)
+}

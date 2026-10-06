@@ -1,0 +1,103 @@
+package service
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/require"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestMediaProbeEntryAndStaleQueueNeverExecute(t *testing.T) {
+	var calls atomic.Int64
+	worker, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(context.Context, SmartRouteProbeExecutionRequest) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{}
+	}))
+	for _, name := range []string{"gpt-image-2", "gpt-image-2-chain", "sora-2", "veo-3", "seedance-2.0"} {
+		hint := durableRecoveryTestHint(session)
+		hint.Request.CanonicalModel = name
+		hint.Request.Endpoint = SmartEndpointResponses
+		require.Equal(t, SmartRouteProbeUnsupported, worker.hint(hint, false))
+		hint.Request.CanonicalModel = "opaque-alias"
+		hint.Routes[0].UpstreamModel = name
+		require.Equal(t, SmartRouteProbeUnsupported, worker.hint(hint, false))
+		hint.ForceProbe = false
+		_, handled := worker.handleColdStartHint(hint, *setting)
+		require.False(t, handled)
+		job := &smartRouteProbeJob{key: "stale", canonicalModel: "opaque-alias", endpoint: SmartEndpointChat, route: hint.Routes[0]}
+		worker.execute(job, *setting)
+	}
+	require.Zero(t, calls.Load())
+	require.Zero(t, worker.Stats().Queued)
+	require.True(t, SmartRouteSyntheticProbeAllowed(SmartEndpointResponses, "gpt-text", smartrouter.CertifiedRoute{UpstreamModel: "gpt-text"}))
+}
+
+func TestMediaProbeLegacyDurableHintIsAcknowledgedWithoutGeneration(t *testing.T) {
+	client := smartRouteRedisIntegrationClient(t)
+	ctx := context.Background()
+	var calls atomic.Int64
+	worker, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(context.Context, SmartRouteProbeExecutionRequest) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := durableRecoveryTestHint(session)
+	hint.Request.CanonicalModel = "gpt-image-2"
+	hint.Request.Endpoint = SmartEndpointResponses
+	disposition, err := persistSmartRouteRecoveryHint(ctx, hint, setting.ProbeQueueCapacity)
+	require.NoError(t, err)
+	require.Equal(t, SmartRouteProbeUnsupported, disposition)
+	key := smartRouteDurableHintKey(smartRouteRecoveryHintStorageIdentity(hint))
+	payload, err := common.Marshal(hint)
+	require.NoError(t, err)
+	require.NoError(t, client.Set(ctx, key, payload, 0).Err())
+	require.NoError(t, client.ZAdd(ctx, smartRouteRecoveryHintRedisKey(), &redis.Z{Score: float64(time.Now().Add(-time.Minute).UnixMilli()), Member: key}).Err())
+	worker.restoreDurableHints()
+	require.False(t, worker.RunOne())
+	require.Zero(t, calls.Load())
+	require.Zero(t, client.ZCard(ctx, smartRouteRecoveryHintRedisKey()).Val())
+	require.Equal(t, int64(0), client.Exists(ctx, key).Val())
+}
+
+func TestMediaRecoveryRedisLeaseAndCooldown(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	defer client.Close()
+	cfg := DefaultSmartRouteStateConfig()
+	now := time.Now()
+	server.SetTime(now)
+	cfg.Clock = func() time.Time { return now }
+	store, err := NewRedisSmartRouteStateStore(client, cfg)
+	require.NoError(t, err)
+	ctx := context.Background()
+	route := SmartRouteStateRoute{RouteID: "media-real", CapacityDomain: "media-capacity"}
+	require.NoError(t, store.RecordAttempt(ctx, SmartRouteAttemptRecord{RouteID: route.RouteID, Outcome: smartrouter.OutcomeInfrastructure, PassiveRecovery: true, ObservationID: "real-1", StartedAtMS: now.UnixMilli() - 1}))
+	snapshot, err := store.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	q := snapshot.Quality.Routes[route.RouteID]
+	require.Equal(t, int64(60_000), q.NextProbeAtMS-now.UnixMilli())
+	request := SmartRouteProbeRequest{RouteID: route.RouteID, LeaseKey: "physical-media", ExpectedEpoch: q.Epoch}
+	_, granted, err := store.TryAcquireProbe(ctx, request)
+	require.NoError(t, err)
+	require.False(t, granted)
+	now = now.Add(time.Minute)
+	server.SetTime(now)
+	lease, granted, err := store.TryAcquireProbe(ctx, request)
+	require.NoError(t, err)
+	require.True(t, granted)
+	_, granted, err = store.TryAcquireProbe(ctx, request)
+	require.NoError(t, err)
+	require.False(t, granted)
+	require.NoError(t, store.RecordAttempt(ctx, SmartRouteAttemptRecord{RouteID: route.RouteID, Outcome: smartrouter.OutcomeSuccess, PassiveRecovery: true, Admission: smartrouter.AdmissionProbe, ProbeLeaseID: lease.ID, RouteEpoch: q.Epoch, ObservationID: "real-2", StartedAtMS: now.UnixMilli() - 1}))
+	require.NoError(t, lease.Release(ctx))
+	snapshot, err = store.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	q = snapshot.Quality.Routes[route.RouteID]
+	require.Equal(t, smartrouter.QualityHealthy, q.Phase)
+	require.Equal(t, uint64(1), q.RealSuccesses)
+	require.Zero(t, q.ProbeSuccesses)
+}

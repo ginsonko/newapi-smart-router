@@ -1,0 +1,697 @@
+package service
+
+// This file is the narrow adapter between the existing billing authorities
+// and Downstream's append-only upstream-cost.v2 export.  It never changes a
+// balance, reservation, task receipt or user-visible response.  A projection
+// failure is logged and left for the bounded reconciler; it is intentionally
+// not returned to the API request after the authoritative billing operation.
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+)
+
+// All cost projection events for the current process pass through one short
+// critical section. The authoritative billing transaction is still the money
+// fence; this mutex only prevents a settlement goroutine and a refund/zero
+// goroutine from observing each other's not-yet-committed export row. The
+// immutable event conflict check below remains the cross-process safeguard.
+var tenantCostProjectionMu sync.Mutex
+
+// snapshotTenantCostRelayInfo copies only the request-local, non-sensitive
+// fields consumed by the cost projection. RelayInfo owns a mutex (and may
+// point at live websocket/request state), so copying the whole struct into an
+// async closure would copy a lock and could race with the active relay. Keep
+// this snapshot deliberately narrow: the authoritative billing path has
+// already completed before the async projector reads it.
+func snapshotTenantCostRelayInfo(info *relaycommon.RelayInfo) *relaycommon.RelayInfo {
+	if info == nil {
+		return &relaycommon.RelayInfo{}
+	}
+	snapshot := relaycommon.RelayInfo{
+		StartTime:           info.StartTime,
+		OriginModelName:     info.OriginModelName,
+		UsingGroup:          info.UsingGroup,
+		RequestId:           info.RequestId,
+		Billing:             info.Billing,
+		PriceData:           info.PriceData,
+		TenantCostRequestID: info.TenantCostRequestID,
+	}
+	if info.TenantCostBinding != nil {
+		binding := *info.TenantCostBinding
+		snapshot.TenantCostBinding = &binding
+	}
+	if info.TenantCostUsage != nil {
+		usage := *info.TenantCostUsage
+		snapshot.TenantCostUsage = &usage
+	}
+	if info.ChannelMeta != nil {
+		channel := &relaycommon.ChannelMeta{
+			ChannelId:         info.ChannelMeta.ChannelId,
+			UpstreamModelName: info.ChannelMeta.UpstreamModelName,
+		}
+		snapshot.ChannelMeta = channel
+	}
+	if info.TaskRelayInfo != nil {
+		task := *info.TaskRelayInfo
+		task.LockedChannel = nil
+		snapshot.TaskRelayInfo = &task
+	}
+	return &snapshot
+}
+
+// CaptureTenantCostUsage copies only numeric usage evidence into RelayInfo.
+// Callers invoke it immediately before the normal billing settle path.  The
+// snapshot is optional, so providers without usage continue through the
+// existing fallback/unknown semantics.
+func CaptureTenantCostUsage(info *relaycommon.RelayInfo, usage *dto.Usage) {
+	if info == nil || usage == nil {
+		return
+	}
+	input := int64(usage.PromptTokens)
+	if input == 0 {
+		input = int64(usage.InputTokens)
+	}
+	output := int64(usage.CompletionTokens)
+	if output == 0 {
+		output = int64(usage.OutputTokens)
+	}
+	snapshot := &common.TenantCostUsageSnapshot{
+		InputTokens:        input,
+		OutputTokens:       output,
+		CacheReadTokens:    int64(usage.PromptTokensDetails.CachedTokens),
+		CacheWrite5mTokens: int64(usage.ClaudeCacheCreation5mTokens),
+		CacheWrite1hTokens: int64(usage.ClaudeCacheCreation1hTokens),
+		AudioInputTokens:   int64(usage.PromptTokensDetails.AudioTokens),
+		AudioOutputTokens:  int64(usage.CompletionTokenDetails.AudioTokens),
+		RequestCount:       1,
+	}
+	if usage.TotalTokens <= 0 {
+		snapshot.InputTokens = input
+		snapshot.OutputTokens = output
+	}
+	info.TenantCostUsage = snapshot
+}
+
+const (
+	tenantCostDefaultBillingMode = "token"
+	tenantCostDefaultBillingUnit = "token"
+)
+
+func tenantCostEnabled(info *relaycommon.RelayInfo) bool {
+	return info != nil && info.TenantCostBinding != nil &&
+		model.IsValidTenantCostTenantID(info.TenantCostBinding.TenantID) &&
+		info.TenantCostBinding.CredentialPurpose == model.TenantCredentialPurposeDataPlane
+}
+
+func tenantCostAmount(quota int64) string {
+	if common.QuotaPerUnit <= 0 {
+		return "0"
+	}
+	return decimal.NewFromInt(quota).
+		Div(decimal.NewFromFloat(common.QuotaPerUnit)).StringFixed(8)
+}
+
+func tenantCostEventID(kind, stable string) string {
+	value := strings.TrimSpace(kind) + ":" + strings.TrimSpace(stable)
+	sum := sha256.Sum256([]byte(value))
+	return "uce_" + hex.EncodeToString(sum[:])
+}
+
+func tenantCostBindingNamespace(bindingID int64, keyID string) string {
+	if bindingID > 0 {
+		return "binding:" + strconv.FormatInt(bindingID, 10)
+	}
+	// Older snapshots may not contain BindingID. A validated public key ID is
+	// still a safer namespace than a raw client request ID in that case.
+	return "key:" + strings.TrimSpace(keyID)
+}
+
+func tenantCostProviderReference(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	// The HMAC is server-local and cannot be reversed by the reporting tenant.
+	return "sha256:" + common.HmacSha256(value, common.SessionSecret)
+}
+
+func tenantCostSnapshot(info *relaycommon.RelayInfo) (common.TenantCostBindingContext, bool) {
+	if !tenantCostEnabled(info) {
+		return common.TenantCostBindingContext{}, false
+	}
+	return *info.TenantCostBinding, true
+}
+
+func buildTenantCostSpec(info *relaycommon.RelayInfo, eventType string, parentID *string, quota int64, status string, evidence string, unknownReason string) (model.TenantCostEventSpec, error) {
+	binding, ok := tenantCostSnapshot(info)
+	if !ok {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost binding is not present")
+	}
+	if info.PriceData.ParameterPricing != nil && status == model.TenantCostStatusFinal {
+		if parentID != nil || (eventType != model.TenantCostEventSettlement && eventType != model.TenantCostEventObservedZero) {
+			return model.TenantCostEventSpec{}, errors.New("parameter adjustments require a durable refund or correction operation")
+		}
+		// Parameter terminal facts are transactionally frozen, including their
+		// operation ID. Rebuilding from the mutable request could double publish.
+		return model.ReadParameterReservationTerminal(context.Background(), binding.TenantID, smartReservationID(info))
+	}
+	requestID := strings.TrimSpace(info.TenantCostRequestID)
+	if requestID == "" {
+		requestID = strings.TrimSpace(info.RequestId)
+	}
+	if requestID == "" {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost request id is empty")
+	}
+	requestedModel := strings.TrimSpace(info.OriginModelName)
+	if requestedModel == "" {
+		requestedModel = "unknown"
+	}
+	canonicalModel := requestedModel
+	upstreamModel := ""
+	if info.ChannelMeta != nil {
+		upstreamModel = strings.TrimSpace(info.ChannelMeta.UpstreamModelName)
+	}
+	if upstreamModel == "" {
+		upstreamModel = canonicalModel
+	}
+	billingMode := strings.TrimSpace(info.PriceData.BillingMode)
+	if billingMode == "" {
+		billingMode = tenantCostDefaultBillingMode
+	}
+	billingUnit := tenantCostBillingUnit(info)
+	if status == "" {
+		status = model.TenantCostStatusFinal
+	}
+	if evidence == "" {
+		evidence = model.TenantCostEvidenceFallback
+	}
+	amount := tenantCostAmount(quota)
+	var procurement *string
+	if evidence != model.TenantCostEvidenceUnknown {
+		// Without a separately verified provider receipt the safe, conservative
+		// fallback is the exact Gateway charge. This is explicitly labelled and is
+		// never presented as an upstream exact amount.
+		procurement = &amount
+	}
+	providerRef := ""
+	if info.ChannelMeta != nil {
+		providerRef = tenantCostProviderReference(info.ChannelMeta.UpstreamModelName + ":" + info.RequestId)
+	}
+	sourcePrice, providerCost := model.TenantParameterCostBasis(info.PriceData.ParameterPricing)
+	operationID := ""
+	if info.PriceData.ParameterPricing != nil {
+		operationID = eventType + ":" + info.RequestId
+		upstreamModel = ""
+	}
+	return model.TenantCostEventSpec{
+		SourcePrice: sourcePrice, ProviderCost: providerCost, OperationID: operationID,
+		TenantID: binding.TenantID,
+		EventID:  tenantCostEventID(eventType, tenantCostBindingNamespace(binding.BindingID, binding.KeyID)+":"+requestID), EventType: eventType,
+		ParentEventID: parentID, OccurredAt: info.StartTime, FinalizedAt: time.Now().UTC(),
+		DownstreamRequestId: bindingRequestID(info), GatewayRequestId: info.RequestId,
+		ReservationID: smartReservationID(info), RouteReceiptID: routeReceiptID(info),
+		ProviderReferenceHash: providerRef, ProductPoolID: binding.ProductPoolID, ServiceTier: binding.ServiceTier,
+		RouteProfileID: binding.RouteProfileID, ProfileRevision: binding.ProfileRevision, KeyID: binding.KeyID,
+		RequestedModel: requestedModel, CanonicalModel: canonicalModel, UpstreamModel: upstreamModel,
+		MappingRevision: binding.ModelCatalogRevision, BillingMode: billingMode, BillingUnit: billingUnit,
+		Usage:            tenantCostUsage(info),
+		GatewayChargeQuota: quota, GatewayChargeAmount: amount, Currency: "USD", ProcurementAmount: procurement,
+		ProcurementCurrency: "USD", Evidence: evidence, BasisKind: "gateway_charge_fallback",
+		BasisRevision: info.PriceData.PricingRevision, Formula: "procurement=gateway_charge (fallback)",
+		UnknownReason: unknownReason, Status: status, SitePriceRevision: info.PriceData.PricingRevision,
+		Rounding: "half_up:8",
+	}, nil
+}
+
+// tenantCostBillingUnit preserves the real unit contract instead of falling
+// back to the internal "quota" representation for ordinary token requests.
+// Media task profiles already carry an explicit unit; text/audio requests use
+// token-family units so a consumer never mistakes a quota ledger integer for
+// provider usage.
+func tenantCostBillingUnit(info *relaycommon.RelayInfo) string {
+	if info == nil {
+		return tenantCostDefaultBillingMode
+	}
+	if unit := strings.TrimSpace(info.PriceData.TaskBillingUnit); unit != "" {
+		return unit
+	}
+	if info.TenantCostUsage != nil &&
+		(info.TenantCostUsage.AudioInputTokens > 0 || info.TenantCostUsage.AudioOutputTokens > 0) {
+		return "audio_token"
+	}
+	switch strings.TrimSpace(info.PriceData.BillingMode) {
+	case "fixed_price":
+		return "per_request"
+	case "ratio", "tiered_expr", "token", "":
+		return "token"
+	default:
+		return "token"
+	}
+}
+
+func tenantCostUsage(info *relaycommon.RelayInfo) model.TenantCostBillingUsage {
+	if info == nil || info.TenantCostUsage == nil {
+		return model.TenantCostBillingUsage{}
+	}
+	u := info.TenantCostUsage
+	return model.TenantCostBillingUsage{
+		InputTokens:       positiveCountString(u.InputTokens),
+		OutputTokens:      positiveCountString(u.OutputTokens),
+		CacheReadTokens:   positiveCountString(u.CacheReadTokens),
+		CacheWrite5m:      positiveCountString(u.CacheWrite5mTokens),
+		CacheWrite1h:      positiveCountString(u.CacheWrite1hTokens),
+		AudioInputTokens:  positiveCountString(u.AudioInputTokens),
+		AudioOutputTokens: positiveCountString(u.AudioOutputTokens),
+		Seconds:           positiveCountString(u.Seconds),
+		RequestCount:      positiveCountString(u.RequestCount),
+	}
+}
+
+func positiveCountString(value int64) string {
+	if value <= 0 {
+		return ""
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func bindingRequestID(info *relaycommon.RelayInfo) string {
+	if info == nil {
+		return ""
+	}
+	return strings.TrimSpace(info.TenantCostRequestID)
+}
+
+func smartReservationID(info *relaycommon.RelayInfo) string {
+	if info == nil || info.Billing == nil {
+		return ""
+	}
+	if provider, ok := info.Billing.(interface{ ReservationID() string }); ok {
+		return strings.TrimSpace(provider.ReservationID())
+	}
+	return ""
+}
+
+func routeReceiptID(info *relaycommon.RelayInfo) string {
+	if info == nil || info.ChannelMeta == nil {
+		return ""
+	}
+	// Keep the receipt useful for internal reconciliation without exposing a
+	// physical channel ID or group name to the reporting consumer.
+	return "route:" + strings.TrimPrefix(tenantCostProviderReference(
+		fmt.Sprintf("%d:%s", info.ChannelMeta.ChannelId, info.UsingGroup)), "sha256:")
+}
+
+func appendTenantCostSpec(spec model.TenantCostEventSpec) error {
+	_, err := model.AppendTenantCostEvent(spec)
+	if err == nil {
+		return nil
+	}
+	// Conflicts and invalid snapshots are deterministic review items, not
+	// transient work.  Other database/serialization failures are retained in
+	// a bounded durable queue so a process restart cannot lose the fact.
+	if errors.Is(err, model.ErrTenantCostConflict) || errors.Is(err, model.ErrTenantCostInvalidInput) ||
+		errors.Is(err, model.ErrTenantCostScope) {
+		return err
+	}
+	if queueErr := model.EnqueueTenantCostProjection(spec, err); queueErr != nil {
+		return fmt.Errorf("%w (durable retry enqueue failed: %v)", err, queueErr)
+	}
+	return err
+}
+
+// ProjectTenantCostSettlementAsync is called only after the existing billing
+// authority has succeeded. It is intentionally asynchronous and bounded by
+// the normal goroutine pool so a cost DB hiccup cannot alter /v1 semantics.
+func ProjectTenantCostSettlementAsync(c *gin.Context, info *relaycommon.RelayInfo, quota int64) {
+	if !tenantCostEnabled(info) {
+		return
+	}
+	if info.PriceData.ParameterPricing != nil {
+		return
+	} // durable reservation/task queue owns this fact
+	snapshot := snapshotTenantCostRelayInfo(info)
+	gopool.Go(func() {
+		tenantCostProjectionMu.Lock()
+		defer tenantCostProjectionMu.Unlock()
+		eventType := model.TenantCostEventSettlement
+		evidence := model.TenantCostEvidenceFallback
+		if quota == 0 {
+			eventType = model.TenantCostEventObservedZero
+			evidence = model.TenantCostEvidenceExact
+		}
+		spec, err := buildTenantCostSpec(snapshot, eventType, nil, quota, model.TenantCostStatusFinal, evidence, "")
+		if err == nil {
+			err = appendTenantCostSpec(spec)
+		}
+		if err != nil {
+			logTenantCostProjection(nil, "settlement", err)
+		}
+	})
+}
+
+// ProjectTenantCostZeroAsync records a known no-charge terminal request. It
+// is used for failed/fully refunded attempts and never charges the customer.
+func ProjectTenantCostZeroAsync(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	ProjectTenantCostRefundOrZeroAsync(c, info, reason)
+}
+
+// ProjectTenantCostRefundOrZeroAsync preserves the append-only event contract:
+// if a positive settlement fact already exists, append a negative refund that
+// points to it; an explicitly persisted zero parent remains observed_zero. If
+// the parent is not yet visible, append a distinct pending/unknown diagnostic
+// rather than claiming a final zero. A short, bounded lookup retry handles the
+// normal race without blocking /v1.
+func ProjectTenantCostRefundOrZeroAsync(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	if !tenantCostEnabled(info) {
+		return
+	}
+	if info.PriceData.ParameterPricing != nil {
+		return
+	} // only an authoritative refund operation may emit a negative fact
+	snapshot := snapshotTenantCostRelayInfo(info)
+	gopool.Go(func() {
+		tenantCostProjectionMu.Lock()
+		defer tenantCostProjectionMu.Unlock()
+		var parent *model.TenantCostEvent
+		var lookupErr error
+		taskPublicID := ""
+		if snapshot.TaskRelayInfo != nil {
+			taskPublicID = strings.TrimSpace(snapshot.TaskRelayInfo.PublicTaskID)
+		}
+		for attempt := 0; attempt < 3; attempt++ {
+			parent, lookupErr = model.FindTenantCostChargeEvent(
+				snapshot.TenantCostBinding.TenantID,
+				snapshot.TenantCostRequestID,
+				snapshot.RequestId,
+				smartReservationID(snapshot),
+				taskPublicID,
+			)
+			if lookupErr != nil || parent != nil {
+				break
+			}
+			if attempt < 2 {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+		var spec model.TenantCostEventSpec
+		err := lookupErr
+		if err == nil && parent != nil && parent.GatewayChargeQuota > 0 {
+			parentID := parent.EventID
+			spec, err = buildTenantCostSpec(snapshot, model.TenantCostEventRefund, &parentID,
+				-parent.GatewayChargeQuota, model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, strings.TrimSpace(reason))
+		} else if err == nil && parent != nil {
+			// A persisted zero-charge parent is an explicit no-charge fact. Keep
+			// it terminal, but do not manufacture a second positive/negative
+			// event for the same request.
+			spec, err = buildTenantCostSpec(snapshot, model.TenantCostEventObservedZero, nil, 0,
+				model.TenantCostStatusFinal, model.TenantCostEvidenceExact, strings.TrimSpace(reason))
+		} else {
+			// The authoritative billing path may have completed while its
+			// asynchronous cost projection is still in flight.  A missing parent
+			// is therefore not evidence of zero cost.  Persist a distinct pending
+			// unknown fact so a later reconciliation/terminal projection can add
+			// the real settlement or refund without colliding with this diagnostic.
+			unknownReason := "parent_charge_not_projected"
+			if lookupErr != nil {
+				unknownReason = "parent_charge_lookup_error"
+			}
+			spec, err = buildTenantCostPendingUnknownSpec(snapshot, unknownReason+":"+strings.TrimSpace(reason))
+		}
+		if err == nil {
+			err = appendTenantCostSpec(spec)
+		}
+		if err != nil {
+			logTenantCostProjection(nil, "refund_or_zero", err)
+		}
+	})
+}
+
+// buildTenantCostPendingUnknownSpec records that a terminal request could not
+// yet be correlated with its positive settlement.  It deliberately uses a
+// stable event ID in a different namespace from the terminal settlement ID:
+// repeated retries replay one diagnostic, while a later real settlement can
+// still be appended and audited independently.
+func buildTenantCostPendingUnknownSpec(info *relaycommon.RelayInfo, reason string) (model.TenantCostEventSpec, error) {
+	spec, err := buildTenantCostSpec(info, model.TenantCostEventSettlement, nil, 0,
+		model.TenantCostStatusPending, model.TenantCostEvidenceUnknown, strings.TrimSpace(reason))
+	if err != nil {
+		return spec, err
+	}
+	binding, ok := tenantCostSnapshot(info)
+	if !ok {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost binding is not present")
+	}
+	requestID := strings.TrimSpace(info.TenantCostRequestID)
+	if requestID == "" {
+		requestID = strings.TrimSpace(info.RequestId)
+	}
+	if requestID == "" {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost request id is empty")
+	}
+	spec.EventID = tenantCostEventID("pending", tenantCostBindingNamespace(binding.BindingID, binding.KeyID)+":"+requestID)
+	spec.BasisKind = "parent_settlement_pending"
+	spec.Formula = ""
+	return spec, nil
+}
+
+func logTenantCostProjection(c *gin.Context, kind string, err error) {
+	message := "tenant cost " + kind + " projection failed: " + err.Error()
+	if c != nil {
+		// Keep this diagnostic out of the user response; the request has already
+		// completed its authoritative billing path.
+		common.SysLog(message)
+		return
+	}
+	common.SysLog(message)
+}
+
+// ProjectTenantCostSettlementSync is used by the bounded reconciler and tests.
+// It has the same semantics as the async helper but returns the projection
+// error to the caller for retry accounting.
+func ProjectTenantCostSettlementSync(ctx context.Context, info *relaycommon.RelayInfo, quota int64) error {
+	if !tenantCostEnabled(info) {
+		return nil
+	}
+	eventType := model.TenantCostEventSettlement
+	evidence := model.TenantCostEvidenceFallback
+	if quota == 0 {
+		eventType = model.TenantCostEventObservedZero
+		evidence = model.TenantCostEvidenceExact
+	}
+	spec, err := buildTenantCostSpec(info, eventType, nil, quota, model.TenantCostStatusFinal, evidence, "")
+	if err != nil {
+		return err
+	}
+	_, err = model.AppendTenantCostEvent(spec)
+	return err
+}
+
+// tenantCostTaskTime returns a stable task-origin timestamp. Task timestamps
+// are Unix seconds while event envelopes use RFC3339Nano.
+func tenantCostTaskTime(task *model.Task) time.Time {
+	if task == nil {
+		return time.Now().UTC()
+	}
+	if task.StartTime > 0 {
+		return time.Unix(task.StartTime, 0).UTC()
+	}
+	if task.CreatedAt > 0 {
+		return time.Unix(task.CreatedAt, 0).UTC()
+	}
+	return time.Now().UTC()
+}
+
+func tenantCostTaskSpec(task *model.Task, receipt *model.TaskBillingReceipt, eventType, status, evidence, unknownReason string) (model.TenantCostEventSpec, error) {
+	if task != nil && receipt != nil && status == model.TenantCostStatusFinal && task.PrivateData.BillingContext != nil && task.PrivateData.BillingContext.ParameterPricing != nil {
+		return model.BuildParameterTaskCostSpec(task, receipt)
+	}
+	if task == nil || task.PrivateData.BillingContext == nil || task.PrivateData.BillingContext.TenantCost == nil {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost task binding is not present")
+	}
+	contextSnapshot := task.PrivateData.BillingContext
+	binding := contextSnapshot.TenantCost
+	if !model.IsValidTenantCostTenantID(binding.TenantID) || strings.TrimSpace(binding.KeyID) == "" {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost task binding is invalid")
+	}
+	requestID := strings.TrimSpace(binding.DownstreamRequestId)
+	if requestID == "" {
+		requestID = strings.TrimSpace(task.PrivateData.BillingRequestID)
+	}
+	if requestID == "" {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost task request id is empty")
+	}
+	quota := int64(task.Quota)
+	if receipt != nil {
+		quota = int64(receipt.AppliedQuota)
+	}
+	if quota < 0 {
+		return model.TenantCostEventSpec{}, errors.New("tenant cost task quota is negative")
+	}
+	requestedModel := strings.TrimSpace(contextSnapshot.OriginModelName)
+	if requestedModel == "" {
+		requestedModel = strings.TrimSpace(task.Properties.OriginModelName)
+	}
+	if requestedModel == "" {
+		requestedModel = "unknown"
+	}
+	upstreamModel := strings.TrimSpace(task.Properties.UpstreamModelName)
+	if upstreamModel == "" {
+		upstreamModel = requestedModel
+	}
+	billingMode := strings.TrimSpace(contextSnapshot.BillingMode)
+	if billingMode == "" {
+		billingMode = tenantCostDefaultBillingMode
+	}
+	billingUnit := strings.TrimSpace(contextSnapshot.TaskBillingUnit)
+	if billingUnit == "" {
+		switch strings.TrimSpace(contextSnapshot.BillingMode) {
+		case "task", "fixed_price":
+			billingUnit = "per_request"
+		default:
+			billingUnit = tenantCostDefaultBillingUnit
+		}
+	}
+	amount := tenantCostAmount(quota)
+	var procurement *string
+	if evidence != model.TenantCostEvidenceUnknown {
+		procurement = &amount
+	}
+	reservationID := strings.TrimSpace(task.BillingReservationID)
+	if receipt != nil && receipt.ReservationID != nil {
+		reservationID = strings.TrimSpace(*receipt.ReservationID)
+	}
+	stableTaskID := strings.TrimSpace(task.TaskID)
+	if stableTaskID == "" {
+		stableTaskID = strconv.FormatInt(task.ID, 10)
+	}
+	routeReceipt := ""
+	if task.ChannelId != 0 || strings.TrimSpace(task.Group) != "" {
+		// The task row still carries the physical route for internal delivery,
+		// but the partner fact must expose only a stable one-way reference.
+		routeReceipt = "route:" + strings.TrimPrefix(tenantCostProviderReference(
+			fmt.Sprintf("%d:%s", task.ChannelId, task.Group)), "sha256:")
+	}
+	eventNamespace := tenantCostBindingNamespace(binding.BindingID, binding.KeyID) + ":task:" + stableTaskID
+	providerRef := tenantCostProviderReference(task.GetUpstreamTaskID())
+	usage := model.TenantCostBillingUsage{}
+	switch billingUnit {
+	case "per_second":
+		if task.Properties.MediaDuration > 0 {
+			usage.Seconds = strconv.Itoa(task.Properties.MediaDuration)
+		}
+	case "per_request", "fixed_duration":
+		usage.RequestCount = "1"
+	}
+	sourcePrice, providerCost := model.TenantParameterCostBasis(contextSnapshot.ParameterPricing)
+	operationID := ""
+	if contextSnapshot.ParameterPricing != nil {
+		operationID = eventType + ":" + stableTaskID
+		upstreamModel = ""
+	}
+	return model.TenantCostEventSpec{
+		SourcePrice: sourcePrice, ProviderCost: providerCost, OperationID: operationID,
+		TenantID: binding.TenantID, EventID: tenantCostEventID(eventType, eventNamespace), EventType: eventType,
+		OccurredAt: tenantCostTaskTime(task), FinalizedAt: time.Now().UTC(),
+		DownstreamRequestId: requestID, GatewayRequestId: task.PrivateData.BillingRequestID,
+		ReservationID: reservationID, RouteReceiptID: routeReceipt, ProviderReferenceHash: providerRef,
+		TaskPublicID: stableTaskID, ProductPoolID: binding.ProductPoolID, ServiceTier: binding.ServiceTier,
+		RouteProfileID: binding.RouteProfileID, ProfileRevision: binding.ProfileRevision, KeyID: binding.KeyID,
+		RequestedModel: requestedModel, CanonicalModel: requestedModel, UpstreamModel: upstreamModel,
+		MappingRevision: binding.ModelCatalogRevision, BillingMode: billingMode, BillingUnit: billingUnit,
+		Usage: usage, GatewayChargeQuota: quota, GatewayChargeAmount: amount, Currency: "USD",
+		ProcurementAmount: procurement, ProcurementCurrency: "USD", Evidence: evidence,
+		BasisKind: "gateway_charge_fallback", BasisRevision: contextSnapshot.PricingRevision,
+		Formula: "procurement=gateway_charge (fallback)", UnknownReason: unknownReason, Status: status,
+		SitePriceRevision: contextSnapshot.PricingRevision, Rounding: "half_up:8",
+	}, nil
+}
+
+// ProjectTenantCostTaskTerminalAsync is invoked after TaskBillingReceipt has
+// atomically applied the terminal state. It is intentionally keyed by the
+// durable task ID, so a poll replay cannot create a second partner event.
+func ProjectTenantCostTaskTerminalAsync(task *model.Task, receipt *model.TaskBillingReceipt) {
+	if task == nil || task.PrivateData.BillingContext == nil || task.PrivateData.BillingContext.TenantCost == nil {
+		return
+	}
+	snapshot := *task
+	if task.PrivateData.BillingContext != nil {
+		contextSnapshot := *task.PrivateData.BillingContext
+		if task.PrivateData.BillingContext.TenantCost != nil {
+			bindingSnapshot := *task.PrivateData.BillingContext.TenantCost
+			contextSnapshot.TenantCost = &bindingSnapshot
+		}
+		snapshot.PrivateData.BillingContext = &contextSnapshot
+	}
+	var receiptSnapshot *model.TaskBillingReceipt
+	if receipt != nil {
+		copyReceipt := *receipt
+		receiptSnapshot = &copyReceipt
+	}
+	gopool.Go(func() {
+		tenantCostProjectionMu.Lock()
+		defer tenantCostProjectionMu.Unlock()
+		eventType := model.TenantCostEventObservedZero
+		evidence := model.TenantCostEvidenceExact
+		chargeQuota := int64(snapshot.Quota)
+		if receiptSnapshot != nil {
+			chargeQuota = int64(receiptSnapshot.AppliedQuota)
+		}
+		if snapshot.Status == model.TaskStatusSuccess && chargeQuota > 0 {
+			eventType = model.TenantCostEventSettlement
+			evidence = model.TenantCostEvidenceFallback
+		}
+		spec, err := tenantCostTaskSpec(&snapshot, receiptSnapshot, eventType, model.TenantCostStatusFinal, evidence, "")
+		if err == nil {
+			_, err = model.AppendTenantCostEvent(spec)
+		}
+		if err != nil {
+			logTenantCostProjection(nil, "task_terminal", err)
+		}
+	})
+}
+
+// ProjectTenantCostTaskPendingAsync records a bounded diagnostic for a task
+// that has not reached a durable terminal receipt yet. It never charges and
+// uses a distinct event ID so a later terminal event can supersede it without
+// mutating history.
+func ProjectTenantCostTaskPendingAsync(task *model.Task, reason string) {
+	if task == nil || task.PrivateData.BillingContext == nil || task.PrivateData.BillingContext.TenantCost == nil {
+		return
+	}
+	snapshot := *task
+	gopool.Go(func() {
+		tenantCostProjectionMu.Lock()
+		defer tenantCostProjectionMu.Unlock()
+		spec, err := tenantCostTaskSpec(&snapshot, nil, model.TenantCostEventSettlement, model.TenantCostStatusPending,
+			model.TenantCostEvidenceUnknown, strings.TrimSpace(reason))
+		if err == nil {
+			// Use a pending-specific ID rather than the terminal settlement ID.
+			stableTaskID := strings.TrimSpace(snapshot.TaskID)
+			if stableTaskID == "" {
+				stableTaskID = strconv.FormatInt(snapshot.ID, 10)
+			}
+			binding := snapshot.PrivateData.BillingContext.TenantCost
+			spec.EventID = tenantCostEventID("pending", tenantCostBindingNamespace(binding.BindingID, binding.KeyID)+":task:"+stableTaskID)
+			_, err = model.AppendTenantCostEvent(spec)
+		}
+		if err != nil {
+			logTenantCostProjection(nil, "task_pending", err)
+		}
+	})
+}

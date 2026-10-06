@@ -1,0 +1,35 @@
+package model
+
+import (
+	"github.com/stretchr/testify/require"
+	"strings"
+	"testing"
+)
+
+func TestCapabilityReferenceURLFieldContract(t *testing.T) {
+	for _, field := range []string{"", "url", "source", "download_href"} {
+		t.Run("valid_"+field, func(t *testing.T) {
+			bundle := capabilityFixtureBundle()
+			bundle.Contracts[0].Provider.ReferenceURLField = field
+			normalized, err := NormalizeModelCapabilityBundle(bundle)
+			require.NoError(t, err)
+			require.Equal(t, field, normalized.Contracts[0].Provider.ReferenceURLField)
+		})
+	}
+	for _, field := range []string{"type", "role", "source.url", "a b", "references[0]", strings.Repeat("x", 65)} {
+		t.Run("invalid_"+field, func(t *testing.T) {
+			bundle := capabilityFixtureBundle()
+			bundle.Contracts[0].Provider.ReferenceURLField = field
+			_, err := NormalizeModelCapabilityBundle(bundle)
+			require.ErrorContains(t, err, "reference_url_field")
+		})
+	}
+	a := capabilityFixtureBundle()
+	b := capabilityFixtureBundle()
+	b.Contracts[0].Provider.ReferenceURLField = "source"
+	na, err := NormalizeModelCapabilityBundle(a)
+	require.NoError(t, err)
+	nb, err := NormalizeModelCapabilityBundle(b)
+	require.NoError(t, err)
+	require.NotEqual(t, na.Revision, nb.Revision, "wire changes must invalidate the bound capability revision")
+}

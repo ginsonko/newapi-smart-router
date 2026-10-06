@@ -20,10 +20,10 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 
-RELEASE_VERSION = "v0.3.0-alpha.1"
+RELEASE_VERSION = "v0.4.0-alpha.1"
 RELEASE_NAME = f"newapi-smart-router-{RELEASE_VERSION}"
 MARKER_NAME = ".smart-router-release-root"
-FIXED_ZIP_TIME = (2026, 8, 19, 0, 0, 0)
+FIXED_ZIP_TIME = (2026, 10, 6, 0, 0, 0)
 DENIED_COMPONENTS = {
     ".git", ".tmp", ".cache", "node_modules", "coverage",
     "backup", "backups", "vendor",
@@ -499,12 +499,12 @@ def copy_tree(source: Path, target: Path, ignore_names: set[str] | None = None) 
 def update_parts_manifest(path: Path, source_snapshot_id: str) -> None:
     text = path.read_text(encoding="utf-8")
     manifest = yaml.safe_load(text)
-    if manifest.get("manifest_version") != "3.0.0-alpha.1":
+    if manifest.get("manifest_version") != "4.0.0-alpha.1":
         raise RuntimeError("unexpected Agent Parts manifest version")
     reference = manifest.get("reference")
     if not isinstance(reference, dict):
         raise RuntimeError("Agent Parts reference contract is missing")
-    placeholder = "bound_by_v0_3_release_source_receipt"
+    placeholder = "bound_by_v0_4_release_source_receipt"
     if reference.get("baseline") != placeholder:
         raise RuntimeError("Agent Parts source baseline placeholder is missing or already bound")
     needle = f'  baseline: "{placeholder}"'
@@ -559,7 +559,7 @@ def attach_full_release_docs(target: Path, source_receipt: dict, repository: Pat
         "NOTICE", "COMMERCIAL-LICENSE.md",
     ):
         shutil.copy2(repository / relative, release_docs / relative)
-    for directory in ("parts", "bridge", "integration"):
+    for directory in ("parts", "bridge", "integration", "core", "docs", "compatibility"):
         copy_tree(repository / directory, release_docs / directory, {"__pycache__", ".pytest_cache"})
     (target / "SMART-ROUTER-RELEASE.md").write_text(
         "# NewAPI Smart Router Full Alpha\n\n"
@@ -573,7 +573,7 @@ def attach_full_release_docs(target: Path, source_receipt: dict, repository: Pat
 def frontend_source_digest(full_source: Path, relative: Path) -> str:
     digest = hashlib.sha256()
     root = full_source / relative
-    for source in sorted(path for path in root.rglob("*") if path.is_file() and "dist" not in path.parts):
+    for source in sorted(path for path in root.rglob("*") if path.is_file() and not any(part in {"dist", "node_modules", ".tanstack"} for part in path.relative_to(root).parts) and not path.name.endswith(".tsbuildinfo")):
         path = source.relative_to(full_source).as_posix()
         digest.update(path.encode("utf-8"))
         digest.update(b"\0")
@@ -756,7 +756,7 @@ def archive_inventory(path: Path) -> dict:
     return {"archive": path.name, "entries": entries}
 
 
-def main() -> int:
+def legacy_main() -> int:
     script_root = Path(__file__).resolve().parent.parent
     default_work = script_root.parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -999,6 +999,11 @@ def main() -> int:
     except Exception:
         print(f"staging retained for diagnosis: {staging}", file=sys.stderr)
         raise
+
+
+def main() -> int:
+    from build_v04 import main as current_main
+    return current_main()
 
 
 if __name__ == "__main__":

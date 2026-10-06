@@ -1,0 +1,125 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+)
+
+// MediaHistoryRepairOptions bounds one operator-triggered repair pass. The
+// default is dry-run; Apply only changes media projection/materializer state
+// after the source has been positively classified.
+type MediaHistoryRepairOptions struct {
+	Limit int
+	Apply bool
+}
+
+type MediaHistoryRepairItem struct {
+	BlobID       int64  `json:"blob_id"`
+	PublicID     string `json:"public_id"`
+	TaskPublicID string `json:"task_public_id,omitempty"`
+	Action       string `json:"action"`
+	Reason       string `json:"reason,omitempty"`
+	SizeBytes    int64  `json:"size_bytes,omitempty"`
+}
+
+type MediaHistoryRepairReport struct {
+	DryRun          bool                     `json:"dry_run"`
+	Scanned         int                      `json:"scanned"`
+	LocalRestored   int                      `json:"local_restored"`
+	RemoteRequeued  int                      `json:"remote_requeued"`
+	MarkedPermanent int                      `json:"marked_permanently_unavailable"`
+	Skipped         int                      `json:"skipped"`
+	Items           []MediaHistoryRepairItem `json:"items"`
+}
+
+// RepairMediaHistory reconciles database rows with local objects and remote
+// materialization sources. It never submits a provider task and never touches
+// quota, task billing, or settlement rows. Remote sources are only requeued;
+// their bytes are fetched later by the existing bounded materializer.
+func RepairMediaHistory(ctx context.Context, options MediaHistoryRepairOptions) (MediaHistoryRepairReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	limit := options.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	blobs, err := model.ListMediaHistoryRepairBlobs(limit)
+	if err != nil {
+		return MediaHistoryRepairReport{}, err
+	}
+	report := MediaHistoryRepairReport{DryRun: !options.Apply, Items: make([]MediaHistoryRepairItem, 0, len(blobs))}
+	for index := range blobs {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		blob := &blobs[index]
+		report.Scanned++
+		item := MediaHistoryRepairItem{BlobID: blob.ID, PublicID: blob.PublicID, TaskPublicID: blob.TaskPublicID}
+		if blob.StorageBackend == model.MediaStorageBackendLocal && strings.TrimSpace(blob.ObjectKey) != "" {
+			objectPath, pathErr := mediaservice.ResolveObjectPath(blob.ObjectKey)
+			if pathErr == nil {
+				if info, statErr := os.Stat(objectPath); statErr == nil && info.Mode().IsRegular() && info.Size() > 0 {
+					item.Action, item.SizeBytes = "restore_local", info.Size()
+					if options.Apply {
+						if updateErr := model.RestoreMediaBlobFromLocalObject(blob.ID, info.Size()); updateErr != nil {
+							return report, fmt.Errorf("restore media blob %d: %w", blob.ID, updateErr)
+						}
+					}
+					report.LocalRestored++
+					report.Items = append(report.Items, item)
+					continue
+				}
+			}
+			item.Action = "mark_permanently_unavailable"
+			item.Reason = "local media object is missing or unreadable"
+			if options.Apply {
+				if updateErr := model.MarkMediaPermanentlyUnavailable(blob.ID, item.Reason); updateErr != nil {
+					return report, fmt.Errorf("mark media blob %d unavailable: %w", blob.ID, updateErr)
+				}
+			}
+			report.MarkedPermanent++
+			report.Items = append(report.Items, item)
+			continue
+		}
+		source := strings.TrimSpace(blob.PrivateSource)
+		parsed, parseErr := url.Parse(source)
+		if parseErr == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+			item.Action = "requeue_remote_materialization"
+			item.Reason = "remote source is still recorded; materializer will re-read it"
+			if options.Apply {
+				if updateErr := model.RequeueMediaMaterialization(blob.ID); updateErr != nil {
+					return report, fmt.Errorf("requeue media blob %d: %w", blob.ID, updateErr)
+				}
+			}
+			report.RemoteRequeued++
+			report.Items = append(report.Items, item)
+			continue
+		}
+		item.Action = "mark_permanently_unavailable"
+		item.Reason = "no readable local object or replayable remote source"
+		if options.Apply {
+			if updateErr := model.MarkMediaPermanentlyUnavailable(blob.ID, item.Reason); updateErr != nil {
+				return report, fmt.Errorf("mark media blob %d unavailable: %w", blob.ID, updateErr)
+			}
+		}
+		report.MarkedPermanent++
+		report.Items = append(report.Items, item)
+	}
+	if len(report.Items) == 0 && report.Scanned == 0 {
+		return report, nil
+	}
+	return report, nil
+}
+
+var ErrMediaHistoryRepairApplyConfirmation = errors.New("media history repair apply requires explicit confirmation")

@@ -1,0 +1,169 @@
+package service
+
+import (
+	"context"
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPerCallImageCatalogAndLegacyQuote(t *testing.T) {
+	original := billing_setting.GetGroupModelPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(original)
+		require.NoError(t, err)
+	})
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{"schema_version":1,"groups":{"economy":{"gpt-image-1":{"billing_mode":"fixed_price","model_price":0.4}},"fallback":{"gpt-image-1":{"billing_mode":"fixed_price","model_price":0.1}}}}`)
+	require.NoError(t, err)
+	setting := smartCatalogTestSetting(constant.EndpointTypeImageGeneration)
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, smartCatalogFixture("gpt-image-1", constant.ChannelTypeOpenAI))
+	require.NoError(t, err)
+	entry := contractByEndpoint(t, catalog, SmartEndpointImages)
+	requestContext := newSmartRequestContext(t, http.MethodPost, "/v1/images/generations", `{"model":"gpt-image-1","prompt":"test","n":2}`)
+	request, err := BuildSmartRouteRequest(requestContext, "gpt-image-1", 0)
+	require.NoError(t, err)
+	prices := smartrouter.PriceSnapshot{Version: "legacy-percall", RatiosPPM: map[string]int64{}, RoutePrices: map[string]smartrouter.RoutePrice{}}
+	quality := smartrouter.QualitySnapshot{Version: "healthy", Routes: map[string]smartrouter.QualityState{}}
+	for _, route := range entry.Pools[smartrouter.AutomaticPoolID].Candidates {
+		price, priceErr := (NewAPIRouteRatioSource{}).RoutePriceDescriptor("gpt-image-1", route.Group, 50_000)
+		require.NoError(t, priceErr)
+		assert.Equal(t, "fixed_price", price.BillingMode)
+		assert.Equal(t, "per_request", price.BillingUnit)
+		prices.RatiosPPM[route.RouteID] = 50_000
+		prices.RoutePrices[route.RouteID] = price
+		quality.Routes[route.RouteID] = smartrouter.QualityState{Phase: smartrouter.QualityHealthy, StableSinceMS: 1}
+	}
+	require.Len(t, prices.RoutePrices, 2)
+	input := smartrouter.PlanInput{NowMS: 100_000, Request: request, Policy: setting.DefaultPolicy, Catalog: catalog, Prices: prices, Quality: quality, AllowedGroups: []string{"economy", "fallback"}, Attempt: smartrouter.AttemptState{MaxAttempts: 2}}
+	plan, err := smartrouter.Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "fallback", plan.Group)
+	assert.Equal(t, int64(10_000), plan.Price.ScorePPM)
+	input.AllowedGroups = []string{"economy"}
+	plan, err = smartrouter.Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "economy", plan.Group)
+	assert.Equal(t, int64(40_000), plan.Price.ScorePPM)
+	input.Policy.MaxEffectiveRatioPPM = 49_999
+	_, err = smartrouter.Plan(input)
+	assert.ErrorIs(t, err, smartrouter.ErrNoCandidate)
+}
+
+func TestPerCallParameterQuoteMatchesBilling(t *testing.T) {
+	original := billing_setting.GetParameterPricingJSONString()
+	originalCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalCache
+		_, _, err := billing_setting.UpdateParameterPricingFromJSONString(original)
+		require.NoError(t, err)
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.ModelCapabilityCatalogHead{}, &model.ModelCapabilityBundleRecord{}))
+	adapter := &dto.ImageAdapterConfig{Models: map[string]dto.ImageAdapterModel{
+		"gpt-test": {DefaultQuality: "high", QualityOrder: []string{"high"}, QualityAliases: map[string]string{"hd": "high"}, TierSizes: map[string]map[string]string{"high": {"1:1": "1024x1024", "16:9": "1536x864"}}},
+	}}
+	testCases := []struct {
+		name      string
+		rule      string
+		body      string
+		adapter   *dto.ImageAdapterConfig
+		wantScore int64
+	}{
+		{name: "per request is charged once for three images", rule: `{"id":"request","group":"*","model":"gpt-test","conditions":{},"unit":"per_request","unit_price":"0.48","currency":"USD"}`, body: `{"model":"gpt-test","prompt":"test","n":3}`, wantScore: 480_000},
+		{name: "per image is multiplied exactly once", rule: `{"id":"image","group":"*","model":"gpt-test","conditions":{},"unit":"per_image","unit_price":"0.48","currency":"USD"}`, body: `{"model":"gpt-test","prompt":"test","n":3}`, wantScore: 1_440_000},
+		{name: "adapter defaults supply the billing dimensions", rule: `{"id":"default","group":"*","model":"gpt-test","conditions":{"resolution":"1024x1024","quality":"high"},"unit":"per_request","unit_price":"0.48","currency":"USD"}`, body: `{"model":"gpt-test","prompt":"test","n":1}`, adapter: adapter, wantScore: 480_000},
+		{name: "adapter alias uses the same quality as billing", rule: `{"id":"alias","group":"*","model":"gpt-test","conditions":{"resolution":"1024x1024","quality":"high"},"unit":"per_request","unit_price":"0.48","currency":"USD"}`, body: `{"model":"gpt-test","prompt":"test","n":1,"quality":"hd"}`, adapter: adapter, wantScore: 480_000},
+		{name: "adapter aspect selects the same size as billing", rule: `{"id":"wide","group":"*","model":"gpt-test","conditions":{"resolution":"1536x864","quality":"high"},"unit":"per_request","unit_price":"0.72","currency":"USD"}`, body: `{"model":"gpt-test","prompt":"test","n":1,"aspect_ratio":"16:9"}`, adapter: adapter, wantScore: 720_000},
+		{name: "adapter resolution tier uses configured default aspect", rule: `{"id":"tier","group":"*","model":"gpt-test","conditions":{"resolution":"1024x1024","quality":"high"},"unit":"per_request","unit_price":"0.48","currency":"USD"}`, body: `{"model":"gpt-test","prompt":"test","n":1,"resolution":"hd"}`, adapter: adapter, wantScore: 480_000},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, _, err := billing_setting.UpdateParameterPricingFromJSONString(`{"schema_version":1,"rules":[` + testCase.rule + `]}`)
+			require.NoError(t, err)
+			channel := model.Channel{Id: 98641, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
+			channel.SetOtherSettings(dto.ChannelOtherSettings{ImageAdapter: testCase.adapter})
+			require.NoError(t, model.DB.Create(&channel).Error)
+			t.Cleanup(func() { require.NoError(t, model.DB.Delete(&model.Channel{}, channel.Id).Error) })
+			requestContext := newSmartRequestContext(t, http.MethodPost, "/v1/images/generations", testCase.body)
+			request, err := BuildSmartRouteRequest(requestContext, "gpt-test", 0)
+			require.NoError(t, err)
+			originalShape := *request.Media
+			var imageRequest dto.ImageRequest
+			require.NoError(t, common.Unmarshal([]byte(testCase.body), &imageRequest))
+			relayInfo := &relaycommon.RelayInfo{OriginModelName: "gpt-test", UsingGroup: "economy", Request: &imageRequest, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id, ChannelType: channel.Type, UpstreamModelName: "gpt-test", ChannelOtherSettings: channel.GetOtherSettings()}}
+			billed, err := helper.ResolveRequestParameterPrice(requestContext, relayInfo)
+			require.NoError(t, err)
+			require.NotNil(t, billed)
+			route := smartrouter.CertifiedRoute{RouteID: "percall", Group: "economy", ChannelID: channel.Id, UpstreamModel: "gpt-test", Capabilities: SmartCapabilityImageGeneration, MaxContext: 128_000}
+			routeQuote, _, err := resolveParameterMediaRoute(request, route)
+			require.NoError(t, err)
+			require.NotNil(t, routeQuote)
+			assert.Equal(t, originalShape, *request.Media)
+			assert.Equal(t, billed.Amount, routeQuote.Amount)
+			assert.Equal(t, billed.Quota, routeQuote.Quota)
+			catalog := &smartrouter.CertifiedRouteCatalog{Version: "parameter-test", Contracts: map[string]smartrouter.ContractCatalog{request.ContractID: {Contract: smartrouter.RouteContract{ContractID: request.ContractID, CanonicalModel: request.CanonicalModel, Endpoint: request.Endpoint, CapabilityFingerprint: request.CapabilityFingerprint}, Pools: map[string]smartrouter.CertifiedPool{smartrouter.AutomaticPoolID: {Candidates: []smartrouter.CertifiedRoute{route}}}}}}
+			prices := &smartrouter.PriceSnapshot{Version: "base", RatiosPPM: map[string]int64{route.RouteID: 50_000}, RoutePrices: map[string]smartrouter.RoutePrice{}}
+			nextCatalog, quoted, err := parameterMediaRoutingSnapshot(request, catalog, prices)
+			require.NoError(t, err)
+			assert.Contains(t, quoted.RatiosPPM, route.RouteID)
+			price, rejection := quoted.RoutePrices[route.RouteID].QuoteMedia(request.Media)
+			assert.Empty(t, rejection)
+			assert.Equal(t, testCase.wantScore, price.ScorePPM)
+			assert.Equal(t, "media_request_cost_v1", price.ComparisonClass)
+			assert.Empty(t, prices.RoutePrices)
+			assert.Equal(t, "base", prices.Version)
+			assert.Nil(t, catalog.Contracts[request.ContractID].Pools[smartrouter.AutomaticPoolID].Candidates[0].Media)
+			input := smartrouter.PlanInput{NowMS: 100_000, Request: request, Policy: smartCatalogTestSetting(constant.EndpointTypeImageGeneration).DefaultPolicy, Catalog: *nextCatalog, Prices: *quoted, Quality: smartrouter.QualitySnapshot{Version: "healthy", Routes: map[string]smartrouter.QualityState{route.RouteID: {Phase: smartrouter.QualityHealthy, StableSinceMS: 1}}}, AllowedGroups: []string{"economy"}, Attempt: smartrouter.AttemptState{MaxAttempts: 2}}
+			plan, err := smartrouter.Plan(input)
+			require.NoError(t, err)
+			assert.Equal(t, route.RouteID, plan.RouteID)
+			assert.Equal(t, testCase.wantScore, plan.Price.ScorePPM)
+			input.AllowedGroups = []string{"fallback"}
+			_, err = smartrouter.Plan(input)
+			assert.ErrorIs(t, err, smartrouter.ErrNoCandidate)
+		})
+	}
+}
+
+func TestPerCallParameterQuoteRetainsAdapterRejection(t *testing.T) {
+	original := billing_setting.GetParameterPricingJSONString()
+	originalCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalCache
+		_, _, err := billing_setting.UpdateParameterPricingFromJSONString(original)
+		require.NoError(t, err)
+	})
+	_, _, err := billing_setting.UpdateParameterPricingFromJSONString(`{"schema_version":1,"rules":[{"id":"bounded","group":"*","model":"gpt-test","conditions":{},"unit":"per_request","unit_price":"0.48","currency":"USD"}]}`)
+	require.NoError(t, err)
+	channel := model.Channel{Id: 98642, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{ImageAdapter: &dto.ImageAdapterConfig{MaxOutputs: 1}})
+	require.NoError(t, model.DB.Create(&channel).Error)
+	t.Cleanup(func() { require.NoError(t, model.DB.Delete(&model.Channel{}, channel.Id).Error) })
+	requestContext := newSmartRequestContext(t, http.MethodPost, "/v1/images/generations", `{"model":"gpt-test","prompt":"test","n":2}`)
+	request, err := BuildSmartRouteRequest(requestContext, "gpt-test", 0)
+	require.NoError(t, err)
+	route := smartrouter.CertifiedRoute{RouteID: "bounded", Group: "economy", ChannelID: channel.Id, UpstreamModel: "gpt-test"}
+	quote, _, err := resolveParameterMediaRoute(request, route)
+	require.Error(t, err)
+	assert.Nil(t, quote)
+	assert.Contains(t, err.Error(), "最多生成1张")
+}
+
+func TestPerCallMultipartImagePreservesPricingAspect(t *testing.T) {
+	requestContext, _ := newSmartMultipartRequestContext(t, "/v1/images/edits", map[string]string{"model": "gpt-test", "prompt": "test", "aspect_ratio": "16:9"}, map[string]string{"image": "fixture"})
+	request, err := BuildSmartRouteRequest(requestContext, "gpt-test", 0)
+	require.NoError(t, err)
+	require.NotNil(t, request.Media)
+	assert.Equal(t, "16:9", request.Media.AspectRatio)
+}
