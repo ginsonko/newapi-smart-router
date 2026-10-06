@@ -1,0 +1,145 @@
+name: Build and upload existing draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Existing draft release numeric ID
+        required: true
+        type: string
+      release_tag:
+        description: Existing draft tag matching the builder release version
+        required: true
+        type: string
+      expected_metadata:
+        description: JSON mapping existing manifest/checksum names to expected old SHA-256; empty object forbids replacement
+        required: true
+        default: '{}'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-release-${{ github.repository }}-${{ inputs.release_id }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GOTOOLCHAIN: local
+  GOCACHE: ${{ runner.temp }}/go-cache
+  GOTMPDIR: ${{ runner.temp }}/go-tmp
+  BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-cache
+
+jobs:
+  build-draft:
+    if: github.repository == 'ginsonko/newapi-smart-router'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.21'
+      - name: Verify source and install validation dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -p "$GOCACHE" "$GOTMPDIR" "$RUNNER_TEMP/build-evidence"
+          python -m pip install --disable-pip-version-check PyYAML==6.0.2 jsonschema==4.24.0
+          python -m unittest discover -s scripts -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/build-evidence/tooling.log"
+          python scripts/validate_repository.py --root . | tee "$RUNNER_TEMP/build-evidence/repository-validation.log"
+      - name: Download pinned public Full base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' > "$RUNNER_TEMP/base-input.txt"
+          import json
+          import re
+          from pathlib import Path
+          base = json.loads(Path('full/reference-v0.4.json').read_text())['base']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?', base['release']):
+              raise RuntimeError('Invalid pinned base release')
+          expected_root = 'newapi-smart-router-' + base['release'] + '-full-source'
+          if base['asset'] != expected_root + '.zip' or base['archive_root'] != expected_root or not re.fullmatch(r'[0-9a-f]{64}', base['sha256']):
+              raise RuntimeError('Pinned base asset/root/digest mismatch')
+          print('https://github.com/ginsonko/newapi-smart-router/releases/download/' + base['release'] + '/' + base['asset'])
+          print(base['sha256'])
+          PY
+          mapfile -t base < "$RUNNER_TEMP/base-input.txt"
+          curl --fail --location --proto '=https' --proto-redir '=https' --output "$RUNNER_TEMP/base-full-source.zip" "${base[0]}"
+          printf '%s  %s\n' "${base[1]}" "$RUNNER_TEMP/base-full-source.zip" | sha256sum --check
+      - name: Build all forms with existing full checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build_v04.py \
+            --base-full-archive "$RUNNER_TEMP/base-full-source.zip" \
+            --output "$RUNNER_TEMP/smart-router-release" \
+            --go "$(command -v go)" --bun "$(command -v bun)" \
+            2>&1 | tee "$RUNNER_TEMP/build-evidence/build.log"
+      - name: Bind actual workflow commit and revalidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'smart-router-release'
+          validation = json.loads((root / 'receipts/validation-report.json').read_text())
+          build = json.loads((root / 'receipts/build-and-test.json').read_text())
+          if validation.get('status') != 'LOCAL_RC_READY' or validation.get('checks_passed', 0) < 77 or validation.get('checks_failed') != 0 or not build.get('commands') or any(command['exit_code'] != 0 for command in build['commands']):
+              raise RuntimeError('Hosted build and full validation have not passed')
+          path = root / 'artifacts/RELEASE-MANIFEST.json'
+          manifest = json.loads(path.read_text())
+          gate = 'github_hosted_build_and_tests'
+          if gate not in manifest['completed_gates']:
+              manifest['completed_gates'].append(gate)
+          manifest['build_run_url'] = 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID']
+          path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+          PY
+          python scripts/finalize_public_release.py --release-root "$RUNNER_TEMP/smart-router-release" --repository-commit "$GITHUB_SHA"
+          python scripts/validate_release.py --release-root "$RUNNER_TEMP/smart-router-release" | tee "$RUNNER_TEMP/build-evidence/final-validation.log"
+          (cd "$RUNNER_TEMP/smart-router-release/artifacts" && sha256sum --check SHA256SUMS)
+      - name: Upload only to matching existing draft
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_METADATA_JSON: ${{ inputs.expected_metadata }}
+        run: |
+          set -euo pipefail
+          python scripts/upload_draft_release.py \
+            --release-root "$RUNNER_TEMP/smart-router-release" \
+            --release-id "$RELEASE_ID" --tag "$RELEASE_TAG" --sha "$GITHUB_SHA" \
+            --report "$RUNNER_TEMP/build-evidence/draft-upload.json"
+      - name: Preserve build artifacts and evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/build-evidence
+            ${{ runner.temp }}/smart-router-release/receipts
+            ${{ runner.temp }}/smart-router-release/artifacts
+          if-no-files-found: warn
+          retention-days: 14
