@@ -27,9 +27,6 @@ concurrency:
 env:
   PYTHONDONTWRITEBYTECODE: '1'
   GOTOOLCHAIN: local
-  GOCACHE: ${{ runner.temp }}/go-cache
-  GOTMPDIR: ${{ runner.temp }}/go-tmp
-  BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-cache
 
 jobs:
   build-draft:
@@ -62,6 +59,10 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
+          export GOCACHE="$RUNNER_TEMP/go-cache"
+          export GOTMPDIR="$RUNNER_TEMP/go-tmp"
+          export BUN_INSTALL_CACHE_DIR="$RUNNER_TEMP/bun-cache"
+          printf '%s\n' "GOCACHE=$GOCACHE" "GOTMPDIR=$GOTMPDIR" "BUN_INSTALL_CACHE_DIR=$BUN_INSTALL_CACHE_DIR" >> "$GITHUB_ENV"
           mkdir -p "$GOCACHE" "$GOTMPDIR" "$RUNNER_TEMP/build-evidence"
           python -m pip install --disable-pip-version-check PyYAML==6.0.2 jsonschema==4.24.0
           python -m unittest discover -s scripts -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/build-evidence/tooling.log"
