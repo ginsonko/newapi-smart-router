@@ -1,0 +1,109 @@
+package relay
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/QuantumNous/new-api/common"
+	appconstant "github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+// StandaloneSearchHelper is deliberately a thin Codex-only transport. The
+// experimental request and response stay opaque; only the model mapping and
+// required response.output type are interpreted locally.
+func StandaloneSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info == nil || (info.ApiType != appconstant.APITypeOpenAI && info.ApiType != appconstant.APITypeCodex) {
+		return types.NewErrorWithStatusCode(errors.New("standalone web search requires an OpenAI-compatible or Codex channel"), types.ErrorCodeInvalidApiType, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	request, ok := info.Request.(*dto.StandaloneSearchRequest)
+	if !ok {
+		return types.NewErrorWithStatusCode(fmt.Errorf("invalid standalone search request type %T", info.Request), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	info.InitChannelMeta(c)
+	if err := mapStandaloneSearchModel(c, info, request); err != nil {
+		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
+	}
+	if len(info.ParamOverride) > 0 {
+		return types.NewError(errors.New("standalone search does not support channel parameter overrides"), types.ErrorCodeChannelParamOverrideInvalid, types.ErrOptionWithSkipRetry())
+	}
+	body, err := common.Marshal(request)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	reader, size, closer, err := relaycommon.NewOutboundJSONBody(body)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	defer closer.Close()
+	info.UpstreamRequestBodySize = size
+
+	adaptor := GetAdaptor(info.ApiType)
+	if adaptor == nil {
+		return types.NewErrorWithStatusCode(fmt.Errorf("invalid standalone search api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	adaptor.Init(info)
+	rawResp, err := adaptor.DoRequest(c, info, reader)
+	if err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	resp, ok := rawResp.(*http.Response)
+	if !ok || resp == nil {
+		return types.NewError(errors.New("codex search: empty upstream response"), types.ErrorCodeEmptyResponse, types.ErrOptionWithSkipRetry())
+	}
+	defer resp.Body.Close()
+	if isExplicitStandaloneSearchRejection(resp.StatusCode) {
+		service.ReleaseStandaloneSearchAfterExplicitRejection(c)
+		return service.RelayErrorHandler(c.Request.Context(), resp, false)
+	}
+	result, apiErr := codex.ParseStandaloneSearchResponse(c, resp)
+	if apiErr != nil {
+		return apiErr
+	}
+	responseBody, ok := result.([]byte)
+	if !ok {
+		return types.NewError(errors.New("codex search: invalid decoded response"), types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	if err := service.PostStandaloneSearchConsume(c, info); err != nil {
+		// The upstream search has succeeded. Keep its replay fence and surface an
+		// explicit accounting-pending failure; the request must never be repeated.
+		return types.NewError(fmt.Errorf("standalone search succeeded but billing settlement is pending; do not replay this search id: %w", err), types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
+	if err := service.CommitStandaloneSearchResult(c, responseBody); err != nil {
+		// Keep the pending marker when the success result cannot be cached. A
+		// later duplicate must fail as uncertain instead of issuing and charging
+		// another upstream search.
+		common.SysLog("standalone search result cache write failed; replay remains fenced: " + err.Error())
+		return types.NewError(errors.New("standalone search succeeded but its retry-safe result could not be persisted; use a new search id"), types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", responseBody)
+	return nil
+}
+
+func isExplicitStandaloneSearchRejection(statusCode int) bool {
+	return statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices
+}
+
+func mapStandaloneSearchModel(c *gin.Context, info *relaycommon.RelayInfo, request *dto.StandaloneSearchRequest) error {
+	mapping := common.GetContextKeyString(c, appconstant.ContextKeyChannelModelMapping)
+	if mapping == "" || mapping == "{}" {
+		info.UpstreamModelName = request.Model
+		return nil
+	}
+	var table map[string]string
+	if err := common.Unmarshal([]byte(mapping), &table); err != nil {
+		return errors.New("unmarshal_model_mapping_failed")
+	}
+	if mapped := table[request.Model]; mapped != "" {
+		request.SetModelName(mapped)
+		info.IsModelMapped = true
+	}
+	info.UpstreamModelName = request.Model
+	return nil
+}

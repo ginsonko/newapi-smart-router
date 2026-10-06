@@ -1,15 +1,15 @@
-manifest_version: "3.0.0-alpha.1"
+manifest_version: "4.0.0-alpha.1"
 project: "NewAPI Smart Router"
 artifact: "Agent Parts Kit"
 label: "Development Kit / Not runnable"
 runnable: false
-status: "public_alpha_v0_3_candidate"
+status: "public_alpha_v0_4_candidate"
 reference:
   host: "New API"
   organization: "QuantumNous"
-  baseline: "bound_by_v0_3_release_source_receipt"
-  core_sync: "NewAPI R52 accepted pkg/smartrouter snapshot with cache-cost and media route contracts"
-  note: "Public Alpha v0.3 candidate. The release builder binds the exact Full source snapshot. Generic host protocol certification, three-database round trips, external-site validation, and signed image gates remain open."
+  baseline: "bound_by_v0_4_release_source_receipt"
+  core_sync: "Generic R98 standalone core with cache-cost, tier pricing, image health and media recovery contracts"
+  note: "Public Alpha v0.4 candidate. The release builder binds the exact Full source snapshot. Generic host protocol certification, three-database round trips, external-site validation, and signed image gates remain open."
 license:
   default_path: "AGPL-3.0-compatible"
   preserve_upstream_attribution: true

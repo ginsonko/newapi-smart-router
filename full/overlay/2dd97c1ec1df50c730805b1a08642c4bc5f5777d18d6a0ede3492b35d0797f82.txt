@@ -1,0 +1,18 @@
+package model
+
+import "errors"
+
+var ErrImageTaskExists = errors.New("图片操作已存在，请查询原任务")
+
+// ImageTaskContext freezes delivery semantics without retaining request files.
+type ImageTaskContext struct {
+	RouteJobID        int64  `json:"route_job_id,omitempty"`
+	RetryableFailure  bool   `json:"retryable_failure,omitempty"`
+	TerminalAtMS      int64  `json:"terminal_at_ms,omitempty"`
+	HealthOutcome     string `json:"health_outcome,omitempty"`
+	ChannelGeneration string `json:"channel_generation,omitempty"`
+	RequestPath       string `json:"request_path,omitempty"`
+	ResponseFormat    string `json:"response_format,omitempty"`
+	Count             int    `json:"count"`
+	NoRetention       bool   `json:"no_retention,omitempty"`
+}

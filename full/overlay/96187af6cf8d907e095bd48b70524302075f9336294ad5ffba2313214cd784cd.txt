@@ -1,0 +1,27 @@
+package controller
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestSuccessfulRouteRequestPathPreservesRealProtocolAndMapsChannelTests(t *testing.T) {
+	assert.Equal(t, "/v1/responses", successfulRouteRequestPath(
+		"/v1/responses", "", relayconstant.RelayModeResponses,
+	))
+	assert.Equal(t, "/v1/responses", successfulRouteRequestPath(
+		"/api/channel/test/46", "", relayconstant.RelayModeResponses,
+	))
+	assert.Equal(t, "/v1/messages", successfulChannelTestRequestPath(
+		string(constant.EndpointTypeAnthropic), relayconstant.RelayModeChatCompletions,
+	))
+	assert.Equal(t, "/v1/images/edits", successfulChannelTestRequestPath(
+		string(constant.EndpointTypeImageGeneration), relayconstant.RelayModeImagesEdits,
+	))
+	assert.Equal(t, "/v1/chat/completions", successfulChannelTestRequestPath(
+		string(constant.EndpointTypeOpenAI), relayconstant.RelayModeChatCompletions,
+	))
+}

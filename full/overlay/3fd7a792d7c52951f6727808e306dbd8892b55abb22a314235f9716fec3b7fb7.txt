@@ -1,0 +1,954 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type { TFunction } from 'i18next'
+
+import { formatBillingCNYFromUSD } from '@/lib/currency'
+
+import type {
+  SmartRouterEvidenceConfidence,
+  SmartRouterEvidenceFreshness,
+  SmartRouterHealthRoute,
+  SmartRouterPrimaryState,
+  SmartRouterRoutePrice,
+  SmartRouterStatusCoverage,
+  SmartRouterStatusItem,
+} from './types'
+
+function finiteNonNegative(value: number | null | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+/** Format a USD-per-million value as CNY using the administrator's live rate. */
+export function formatSmartRouterInputCostUSD(
+  value: number | null | undefined,
+  suffix = ' / 1M tokens'
+) {
+  return finiteNonNegative(value)
+    ? `${formatBillingCNYFromUSD(value, {
+        digitsLarge: 4,
+        digitsSmall: 6,
+        abbreviate: false,
+      })}${suffix}`
+    : 'No data'
+}
+
+/** Convert Smart Router PPM ordering units (2 USD per ratio unit) to billing display. */
+export function formatSmartRouterInputCostPPM(
+  value: number | null | undefined,
+  suffix = ' / 1M tokens'
+) {
+  return finiteNonNegative(value)
+    ? formatSmartRouterInputCostUSD((value * 2) / 1_000_000, suffix)
+    : 'No data'
+}
+
+export function formatSmartRouterRoutePrice(
+  price: SmartRouterRoutePrice | undefined,
+  t: TFunction
+) {
+  if (!price) return null
+  if (price.billing_mode === 'legacy_ratio') {
+    return t('Legacy group-ratio fallback')
+  }
+  if (!price.static_comparable || !Number.isFinite(price.score_ppm)) {
+    return t('Model price is not directly comparable')
+  }
+  const value = ((price.score_ppm ?? 0) / 1_000_000).toLocaleString(undefined, {
+    maximumFractionDigits: 8,
+  })
+  if (price.billing_mode === 'ratio' && price.scope === 'global') {
+    return t(
+      '{{price}} effective input price ratio (inherits the global model base price)',
+      { price: value }
+    )
+  }
+  if (price.billing_mode === 'ratio') {
+    return t('{{price}} effective input price ratio', { price: value })
+  }
+  if (price.billing_mode === 'tiered_expr') {
+    return t('{{price}} tiered price baseline', { price: value })
+  }
+  if (price.billing_unit === 'per_second') {
+    return t('{{price}} per second', { price: value })
+  }
+  if (price.billing_unit === 'fixed_duration') {
+    return t('{{price}} per {{seconds}} seconds', {
+      price: value,
+      seconds: price.fixed_duration_seconds ?? 0,
+    })
+  }
+  if (price.billing_unit === 'per_request') {
+    return t('{{price}} per request', { price: value })
+  }
+  return `${value} / ${price.billing_unit}`
+}
+
+export type SmartRouterHealthFilter =
+  | 'all'
+  | 'attention'
+  | 'recovering'
+  | 'healthy'
+  | 'pending'
+
+export type SmartRouterStatusSort = 'decision' | 'price' | 'model' | 'activity'
+
+type HealthSource = Partial<
+  Omit<
+    SmartRouterStatusItem & SmartRouterHealthRoute,
+    | 'success_rate'
+    | 'recent_cache_rate_ppm'
+    | 'estimated_input_cost_ppm'
+    | 'estimated_input_usd_per_million'
+  >
+> & {
+  success_rate?: number | null
+  recent_cache_rate_ppm?: number | null
+  estimated_input_cost_ppm?: number | null
+  estimated_input_usd_per_million?: number | null
+}
+
+const PRIMARY_STATES = new Set<SmartRouterPrimaryState>([
+  'needs_review',
+  'unavailable',
+  'unknown',
+  'healthy',
+  'pending_sample',
+  'telemetry_unavailable',
+])
+
+const HEALTH_SORT_RANK: Record<SmartRouterPrimaryState, number> = {
+  needs_review: 0,
+  telemetry_unavailable: 1,
+  unavailable: 2,
+  probing: 3,
+  recovering: 4,
+  degraded_usable: 5,
+  unknown: 6,
+  healthy: 7,
+  pending_sample: 8,
+}
+
+const SMART_ROUTER_ENDPOINT_ORDER = [
+  'openai',
+  'openai-response',
+  'anthropic',
+  'image-generation',
+  'openai-video',
+] as const
+
+export function compareSmartRouterEndpoints(left: string, right: string) {
+  const leftRank = SMART_ROUTER_ENDPOINT_ORDER.indexOf(
+    left as (typeof SMART_ROUTER_ENDPOINT_ORDER)[number]
+  )
+  const rightRank = SMART_ROUTER_ENDPOINT_ORDER.indexOf(
+    right as (typeof SMART_ROUTER_ENDPOINT_ORDER)[number]
+  )
+  const normalizedLeftRank =
+    leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank
+  const normalizedRightRank =
+    rightRank === -1 ? Number.MAX_SAFE_INTEGER : rightRank
+  return normalizedLeftRank - normalizedRightRank || left.localeCompare(right)
+}
+
+export function smartRouterEndpointLabelKey(endpoint: string) {
+  switch (endpoint) {
+    case 'openai':
+      return 'OpenAI Chat Completions'
+    case 'openai-response':
+      return 'OpenAI Responses'
+    case 'anthropic':
+      return 'Anthropic Messages'
+    case 'image-generation':
+      return 'Image Generation'
+    case 'openai-video':
+      return 'Video'
+    default:
+      return endpoint || 'Default endpoint'
+  }
+}
+
+function normalizedState(value?: string) {
+  return value?.trim().toLowerCase().replaceAll('-', '_') ?? ''
+}
+
+export function normalizeUserStatusItem(
+  item: SmartRouterStatusItem
+): SmartRouterStatusItem {
+  const evidence = item.evidence
+  const recovery = item.recovery
+  const constraints = item.constraints
+  const automaticReentry =
+    recovery?.automatic_candidate_reentry ??
+    recovery?.can_become_preferred_after_entry
+  let reasonCode = item.decision_reason_code || item.reason_code
+  if (!reasonCode && constraints?.group_selected === false) {
+    reasonCode = 'group_not_selected'
+  } else if (!reasonCode && constraints?.within_key_price_limit === false) {
+    reasonCode = 'above_price_limit'
+  } else if (!reasonCode && constraints?.endpoint_supported === false) {
+    reasonCode = 'endpoint_unsupported'
+  } else if (!reasonCode && constraints?.capabilities_supported === false) {
+    reasonCode = 'capability_mismatch'
+  } else if (!reasonCode && constraints?.context_supported === false) {
+    reasonCode = 'context_too_large'
+  } else if (!reasonCode && constraints?.ttft_acceptable === false) {
+    reasonCode = 'ttft_slow'
+  }
+
+  return {
+    ...item,
+    primary_state: item.primary_state || item.health_status || item.phase,
+    success_rate: evidence?.success_rate ?? item.success_rate,
+    successes:
+      evidence?.real_successes ?? evidence?.total_successes ?? item.successes,
+    failures:
+      evidence?.real_hard_failures ??
+      evidence?.total_hard_failures ??
+      item.failures,
+    probe_successes: evidence?.probe_successes ?? item.probe_successes,
+    probe_failures:
+      evidence?.current_probe_failures ??
+      evidence?.total_probe_failures ??
+      item.probe_failures,
+    last_observed_at_ms:
+      evidence?.last_observed_at_ms ?? item.last_observed_at_ms,
+    last_real_success_at_ms:
+      evidence?.last_real_success_at_ms ?? item.last_real_success_at_ms,
+    last_probe_at_ms:
+      evidence?.last_probe_completed_at_ms ??
+      evidence?.last_probe_at_ms ??
+      evidence?.last_probe_started_at_ms ??
+      item.last_probe_at_ms,
+    last_probe_outcome: evidence?.last_probe_outcome ?? item.last_probe_outcome,
+    next_probe_at_ms: recovery?.next_action_at_ms ?? item.next_probe_at_ms,
+    requires_admin_review:
+      recovery?.requires_admin_review ?? item.requires_admin_review,
+    evidence_freshness: evidence?.freshness ?? item.evidence_freshness,
+    evidence_confidence: evidence?.confidence ?? item.evidence_confidence,
+    decision_reason_code: reasonCode,
+    next_action: recovery?.next_action ?? item.next_action,
+    next_action_actor: recovery?.next_action_actor ?? item.next_action_actor,
+    automatically_rejoins:
+      automaticReentry === undefined
+        ? item.automatically_rejoins
+        : automaticReentry === true ||
+          automaticReentry === 'yes' ||
+          automaticReentry === 'conditional',
+    selected: item.selected || item.decision === 'preferred',
+  }
+}
+
+export function canonicalHealthState(
+  item: HealthSource
+): SmartRouterPrimaryState {
+  if (item.requires_admin_review || item.quarantined) return 'needs_review'
+
+  if (item.credential_blocked) return 'unavailable'
+
+  const primary = normalizedState(item.primary_state)
+  if (primary === 'serving_with_recovery') return 'degraded_usable'
+  if (PRIMARY_STATES.has(primary as SmartRouterPrimaryState)) {
+    return primary as SmartRouterPrimaryState
+  }
+  // Older workers exposed their internal recovery phases as primary states.
+  // They are compatibility inputs only: an active/queued recovery means the
+  // route is unavailable, while the old "degraded usable" bucket carries no
+  // current failure proof and is therefore neutral/unknown.
+  if (
+    primary === 'probing' ||
+    primary === 'recovering' ||
+    primary === 'open' ||
+    primary === 'half_open'
+  ) {
+    return 'unavailable'
+  }
+  if (
+    primary === 'degraded' ||
+    primary === 'degraded_usable' ||
+    primary === 'bootstrap'
+  ) {
+    return 'unknown'
+  }
+
+  const status = normalizedState(item.status || item.health_status)
+  const phase = normalizedState(item.phase)
+  const availability = normalizedState(item.availability)
+  // Older status responses sometimes carry a neutral `unknown`/`bootstrap`
+  // status alongside a more useful phase or availability. Do not let that
+  // transport-level absence of evidence turn a certified route red.
+  const neutralStatus = status === 'unknown' || status === 'bootstrap'
+  const value =
+    status === 'capacity_limited' || neutralStatus
+      ? phase || availability || status
+      : status || phase || availability
+
+  if (
+    value === 'quarantined' ||
+    value === 'needs_review' ||
+    value === 'waiting_for_admin_review'
+  ) {
+    return 'needs_review'
+  }
+  if (value === 'telemetry_unavailable' || value === 'invalid') {
+    return 'telemetry_unavailable'
+  }
+  if (
+    value === 'credential_blocked' ||
+    value === 'unavailable' ||
+    value === 'open' ||
+    value === 'probing' ||
+    value === 'probe_queued' ||
+    value === 'probe_running' ||
+    value === 'half_open' ||
+    value === 'recovering'
+  ) {
+    return 'unavailable'
+  }
+  if (value === 'warming') {
+    const lastSuccess = Math.max(
+      item.last_success_at_ms ?? 0,
+      item.last_real_success_at_ms ?? 0,
+      item.evidence?.last_real_success_at_ms ?? 0
+    )
+    const lastFailure = Math.max(
+      item.last_failure_at_ms ?? 0,
+      item.evidence?.last_real_failure_at_ms ?? 0
+    )
+    if (lastSuccess > lastFailure) return 'healthy'
+    if (lastFailure > 0) return 'unavailable'
+    return 'unknown'
+  }
+  if (value === 'degraded' || value === 'degraded_usable') {
+    return 'unknown'
+  }
+  if (
+    value === 'unknown' ||
+    value === 'bootstrap' ||
+    value === 'available_unproven' ||
+    value === 'available_recovery' ||
+    value === 'available' ||
+    value === 'usable_degraded'
+  ) {
+    return 'unknown'
+  }
+  if (value === 'healthy') return 'healthy'
+  return 'pending_sample'
+}
+
+export function healthStateLabelKey(state: SmartRouterPrimaryState) {
+  switch (state) {
+    case 'needs_review':
+      return 'Needs administrator review'
+    case 'unavailable':
+      return 'Temporarily unavailable'
+    case 'unknown':
+      return 'Unknown'
+    case 'probing':
+      return 'Recovery check in progress'
+    case 'recovering':
+      return 'Recovering gradually'
+    case 'degraded_usable':
+      return 'Available with recent fluctuation'
+    case 'healthy':
+      return 'Healthy'
+    case 'telemetry_unavailable':
+      return 'Telemetry unavailable'
+    case 'pending_sample':
+    default:
+      return 'Pending sampling'
+  }
+}
+
+export function healthStateBadgeVariant(state: SmartRouterPrimaryState) {
+  if (state === 'healthy') return 'secondary' as const
+  if (state === 'needs_review' || state === 'telemetry_unavailable') {
+    return 'destructive' as const
+  }
+  return 'outline' as const
+}
+
+export function healthSortRank(item: HealthSource) {
+  return HEALTH_SORT_RANK[canonicalHealthState(item)]
+}
+
+export function isCapacityBusy(item: HealthSource, now = Date.now()) {
+  return item.capacity_limited === true || (item.capacity_until_ms ?? 0) > now
+}
+
+export function isSafeTextLastResort(item: HealthSource) {
+  return item.dispatch_eligibility === 'safe_last_resort'
+}
+
+export function isMediaRoute(item: HealthSource) {
+  const endpoint = item.endpoint?.toLowerCase() ?? ''
+  return (
+    item.natural_traffic_only === true ||
+    endpoint.includes('image') ||
+    endpoint.includes('video')
+  )
+}
+
+export function supportsSyntheticProbe(item: HealthSource) {
+  if (item.supports_synthetic_probe !== undefined) {
+    return item.supports_synthetic_probe
+  }
+  return !isMediaRoute(item)
+}
+
+export function evidenceSampleCount(item: HealthSource) {
+  const successes = item.real_successes ?? item.successes
+  const failures = item.real_failures ?? item.failures
+  const probeSuccesses = item.probe_successes
+  const probeFailures = item.probe_failures
+  if (
+    successes === undefined &&
+    failures === undefined &&
+    probeSuccesses === undefined &&
+    probeFailures === undefined
+  ) {
+    return undefined
+  }
+  return (
+    (successes ?? 0) +
+    (failures ?? 0) +
+    (probeSuccesses ?? 0) +
+    (probeFailures ?? 0)
+  )
+}
+
+export function routeSuccessRate(item: HealthSource) {
+  const successes = item.real_successes ?? item.successes
+  const failures = item.real_failures ?? item.failures
+  if (successes !== undefined || failures !== undefined) {
+    const total = (successes ?? 0) + (failures ?? 0)
+    if (total === 0) return null
+    if (Number.isFinite(item.success_rate)) return item.success_rate ?? null
+    return (successes ?? 0) / total
+  }
+
+  const hasObservation = Boolean(
+    item.last_observed_at_ms ||
+    item.last_updated_ms ||
+    item.last_success_at_ms ||
+    item.last_failure_at_ms
+  )
+  if (!hasObservation || !Number.isFinite(item.success_rate)) return null
+  return item.success_rate ?? null
+}
+
+export function latestEvidenceAt(item: HealthSource) {
+  return Math.max(
+    item.last_observed_at_ms ?? 0,
+    item.last_updated_ms ?? 0,
+    item.last_success_at_ms ?? 0,
+    item.last_failure_at_ms ?? 0,
+    item.last_probe_completed_at_ms ?? 0,
+    item.last_probe_at_ms ?? 0,
+    item.last_probe_started_at_ms ?? 0
+  )
+}
+
+export function evidenceFreshness(
+  item: HealthSource,
+  now = Date.now()
+): SmartRouterEvidenceFreshness {
+  if (item.evidence_freshness) return item.evidence_freshness
+  const observedAt = latestEvidenceAt(item)
+  if (!observedAt) return 'none'
+  const age = Math.max(0, now - observedAt)
+  if (age <= 5 * 60_000) return 'fresh'
+  if (age <= 30 * 60_000) return 'recent'
+  return 'stale'
+}
+
+export function evidenceConfidence(
+  item: HealthSource
+): SmartRouterEvidenceConfidence | undefined {
+  if (item.evidence_confidence) return item.evidence_confidence
+  const count = evidenceSampleCount(item)
+  if (count === undefined) return undefined
+  if (count === 0) return 'none'
+  if (count < 5) return 'low'
+  if (count < 20) return 'medium'
+  return 'high'
+}
+
+export function evidenceFreshnessLabelKey(value: SmartRouterEvidenceFreshness) {
+  if (value === 'fresh') return 'Fresh evidence'
+  if (value === 'recent') return 'Recent evidence'
+  if (value === 'stale') return 'Historical evidence'
+  return 'No evidence yet'
+}
+
+export function evidenceConfidenceLabelKey(
+  value?: SmartRouterEvidenceConfidence
+) {
+  if (value === 'high') return 'High confidence'
+  if (value === 'medium') return 'Medium confidence'
+  if (value === 'low') return 'Low confidence'
+  if (value === 'none') return 'No samples'
+  return null
+}
+
+export function matchesHealthFilter(
+  item: HealthSource,
+  filter: SmartRouterHealthFilter
+) {
+  if (filter === 'all') return true
+  const state = canonicalHealthState(item)
+  if (filter === 'attention') {
+    return (
+      state === 'needs_review' ||
+      state === 'unavailable' ||
+      state === 'telemetry_unavailable'
+    )
+  }
+  if (filter === 'recovering') {
+    return state === 'unavailable'
+  }
+  if (filter === 'healthy') return state === 'healthy'
+  return state === 'pending_sample' || state === 'unknown'
+}
+
+export function ratioText(ratioPPM?: number) {
+  if (ratioPPM === undefined || !Number.isFinite(ratioPPM)) return null
+  return `${(ratioPPM / 1_000_000).toLocaleString(undefined, {
+    maximumFractionDigits: 6,
+  })}x`
+}
+
+export function comparableSmartRouterPriceDifference(
+  left?: SmartRouterRoutePrice,
+  right?: SmartRouterRoutePrice
+) {
+  if (
+    !left?.static_comparable ||
+    !right?.static_comparable ||
+    !left.comparison_class ||
+    left.comparison_class !== right.comparison_class ||
+    !Number.isFinite(left.score_ppm) ||
+    !Number.isFinite(right.score_ppm)
+  ) {
+    return undefined
+  }
+  return (left.score_ppm ?? 0) - (right.score_ppm ?? 0)
+}
+
+function smartRouterItemPriceDifference(
+  left: SmartRouterStatusItem,
+  right: SmartRouterStatusItem
+) {
+  const realPriceDifference = comparableSmartRouterPriceDifference(
+    left.price,
+    right.price
+  )
+  if (realPriceDifference !== undefined) return realPriceDifference
+  if (
+    left.price ||
+    right.price ||
+    left.price_comparison !== undefined ||
+    right.price_comparison !== undefined
+  ) {
+    return undefined
+  }
+  if (
+    left.effective_ratio_ppm === undefined ||
+    right.effective_ratio_ppm === undefined
+  ) {
+    return undefined
+  }
+  return left.effective_ratio_ppm - right.effective_ratio_ppm
+}
+
+function selectionRank(item: SmartRouterStatusItem) {
+  return Number.isInteger(item.selection_rank) && (item.selection_rank ?? 0) > 0
+    ? (item.selection_rank as number)
+    : undefined
+}
+
+function smartRouterCandidateRankDifference(
+  left: SmartRouterStatusItem,
+  right: SmartRouterStatusItem
+) {
+  const leftRank = selectionRank(left)
+  const rightRank = selectionRank(right)
+  if (leftRank === undefined && rightRank === undefined) return undefined
+  if (leftRank === undefined) return 1
+  if (rightRank === undefined) return -1
+  return leftRank - rightRank
+}
+
+export function formatSmartRouterTimestamp(value?: number) {
+  if (!value || !Number.isFinite(value)) return null
+  const milliseconds = value > 10_000_000_000 ? value : value * 1000
+  return new Date(milliseconds).toLocaleString()
+}
+
+function minimumFutureTimestamp(values: Array<number | undefined>) {
+  const now = Date.now()
+  const candidates = values.filter((value): value is number =>
+    Boolean(value && value > now)
+  )
+  return candidates.length > 0 ? Math.min(...candidates) : undefined
+}
+
+function maximumTimestamp(values: Array<number | undefined>) {
+  const candidates = values.filter((value): value is number =>
+    Boolean(value && value > 0)
+  )
+  return candidates.length > 0 ? Math.max(...candidates) : undefined
+}
+
+function aggregateUserGroup(items: SmartRouterStatusItem[]) {
+  const ranked = [...items].sort((left, right) => {
+    const rankDifference = smartRouterCandidateRankDifference(left, right)
+    if (rankDifference !== undefined && rankDifference !== 0) {
+      return rankDifference
+    }
+    if (left.selected !== right.selected) return left.selected ? -1 : 1
+    const healthDifference = healthSortRank(left) - healthSortRank(right)
+    if (healthDifference !== 0) return healthDifference
+    return smartRouterItemPriceDifference(left, right) ?? 0
+  })
+  const representative = ranked[0]
+  const states = new Set(items.map(canonicalHealthState))
+  const successes = items.reduce(
+    (total, item) => total + (item.real_successes ?? item.successes ?? 0),
+    0
+  )
+  const failures = items.reduce(
+    (total, item) => total + (item.real_failures ?? item.failures ?? 0),
+    0
+  )
+  const hasCounts = items.some(
+    (item) =>
+      item.real_successes !== undefined ||
+      item.successes !== undefined ||
+      item.real_failures !== undefined ||
+      item.failures !== undefined
+  )
+
+  const selectionRanks = items
+    .map((item) => item.selection_rank)
+    .filter((rank): rank is number => rank !== undefined)
+
+  return {
+    ...representative,
+    selected: items.some((item) => item.selected),
+    selection_rank:
+      selectionRanks.length > 0 ? Math.min(...selectionRanks) : undefined,
+    mixed_evidence: representative.mixed_evidence || states.size > 1,
+    successes: hasCounts ? successes : undefined,
+    failures: hasCounts ? failures : undefined,
+    success_rate:
+      hasCounts && successes + failures > 0
+        ? successes / (successes + failures)
+        : representative.success_rate,
+    last_observed_at_ms: maximumTimestamp(
+      items.map((item) => item.last_observed_at_ms)
+    ),
+    last_real_success_at_ms: maximumTimestamp(
+      items.map((item) => item.last_real_success_at_ms)
+    ),
+    last_probe_at_ms: maximumTimestamp(
+      items.map((item) => item.last_probe_at_ms)
+    ),
+    next_probe_at_ms: minimumFutureTimestamp(
+      items.map((item) => item.next_probe_at_ms ?? item.sample_due_at_ms)
+    ),
+    constraint_labels: [
+      ...new Set(items.flatMap((item) => item.constraint_labels ?? [])),
+    ],
+  } satisfies SmartRouterStatusItem
+}
+
+export type SmartRouterContractView = {
+  id: string
+  contractId?: string
+  model: string
+  endpoint: string
+  items: SmartRouterStatusItem[]
+  preference?: SmartRouterStatusItem
+  cheaperUnavailable: SmartRouterStatusItem[]
+  decisionRank: number
+  latestActivityAt: number
+  minimumRatio: number
+  visibleGroups?: string[]
+  coverage?: SmartRouterStatusCoverage
+  loading?: boolean
+  error?: boolean
+}
+
+export type SmartRouterModelView = {
+  model: string
+  contracts: SmartRouterContractView[]
+  decisionRank: number
+  pendingOnly: boolean
+  latestActivityAt: number
+  minimumRatio: number
+}
+
+function contractDecisionRank(
+  contract: Omit<SmartRouterContractView, 'decisionRank'>
+) {
+  if (!contract.preference) return 0
+  if (contract.cheaperUnavailable.length > 0) return 1
+  if (
+    contract.items.some(
+      (item) =>
+        canonicalHealthState(item) === 'needs_review' ||
+        canonicalHealthState(item) === 'telemetry_unavailable'
+    )
+  ) {
+    return 2
+  }
+  const selectedState = canonicalHealthState(contract.preference)
+  if (
+    selectedState === 'probing' ||
+    selectedState === 'recovering' ||
+    selectedState === 'degraded_usable'
+  ) {
+    return 3
+  }
+  if (selectedState === 'healthy') return 4
+  return 5
+}
+
+export function buildUserModelViews(items: SmartRouterStatusItem[]) {
+  const groupBuckets = new Map<string, SmartRouterStatusItem[]>()
+  for (const rawItem of items) {
+    const item = normalizeUserStatusItem(rawItem)
+    const key = `${item.model ?? ''}\u0000${item.contract_id || item.endpoint || ''}\u0000${item.group}`
+    const current = groupBuckets.get(key)
+    if (current) current.push(item)
+    else groupBuckets.set(key, [item])
+  }
+
+  const contractBuckets = new Map<
+    string,
+    {
+      model: string
+      contractId?: string
+      endpoint: string
+      items: SmartRouterStatusItem[]
+    }
+  >()
+  for (const bucket of groupBuckets.values()) {
+    const item = aggregateUserGroup(bucket)
+    const model = item.model || ''
+    const endpoint = item.endpoint || ''
+    const contractId = item.contract_id
+    const key = `${model}\u0000${contractId || endpoint}`
+    const current = contractBuckets.get(key)
+    if (current) {
+      current.items.push(item)
+    } else {
+      contractBuckets.set(key, { model, contractId, endpoint, items: [item] })
+    }
+  }
+
+  const modelBuckets = new Map<string, SmartRouterContractView[]>()
+  for (const bucket of contractBuckets.values()) {
+    const preference = bucket.items.find((item) => item.selected)
+    const preferredRatio = preference?.effective_ratio_ppm
+    const hasRankingCostComparison = bucket.items.some(
+      (item) => item.ranking_cost_comparison !== undefined
+    )
+    const hasExplicitPriceEvidence = bucket.items.some(
+      (item) => item.price || item.price_comparison !== undefined
+    )
+    const cheaperUnavailable = bucket.items.filter((item) => {
+      if (item.selected) return false
+      if (hasRankingCostComparison) {
+        return item.ranking_cost_comparison === 'cheaper'
+      }
+      if (hasExplicitPriceEvidence) {
+        if (item.cheaper_than_preference !== true) return false
+        if (preference?.price && item.price) {
+          return (
+            (comparableSmartRouterPriceDifference(
+              item.price,
+              preference.price
+            ) ?? 0) < 0
+          )
+        }
+        return item.price_comparison === 'cheaper'
+      }
+      return (
+        item.price_known !== false &&
+        preferredRatio !== undefined &&
+        item.effective_ratio_ppm !== undefined &&
+        item.effective_ratio_ppm < preferredRatio
+      )
+    })
+    const itemsSorted = [...bucket.items].sort((left, right) => {
+      const rankDifference = smartRouterCandidateRankDifference(left, right)
+      if (rankDifference !== undefined && rankDifference !== 0) {
+        return rankDifference
+      }
+      if (left.selected !== right.selected) return left.selected ? -1 : 1
+      const leftCheaper = cheaperUnavailable.includes(left)
+      const rightCheaper = cheaperUnavailable.includes(right)
+      if (leftCheaper !== rightCheaper) return leftCheaper ? -1 : 1
+      const priceDifference = smartRouterItemPriceDifference(left, right)
+      if (priceDifference !== undefined && priceDifference !== 0) {
+        return priceDifference
+      }
+      return (
+        healthSortRank(left) - healthSortRank(right) ||
+        left.group.localeCompare(right.group)
+      )
+    })
+    const incomplete = {
+      id: bucket.contractId || `${bucket.model}\u0000${bucket.endpoint}`,
+      contractId: bucket.contractId,
+      model: bucket.model,
+      endpoint: bucket.endpoint,
+      items: itemsSorted,
+      preference,
+      cheaperUnavailable,
+      latestActivityAt: Math.max(...itemsSorted.map(latestEvidenceAt), 0),
+      minimumRatio: Math.min(
+        ...itemsSorted.map(
+          (item) => item.effective_ratio_ppm ?? Number.MAX_SAFE_INTEGER
+        )
+      ),
+      visibleGroups: [...new Set(itemsSorted.map((item) => item.group))],
+    }
+    const contract: SmartRouterContractView = {
+      ...incomplete,
+      decisionRank: contractDecisionRank(incomplete),
+    }
+    const current = modelBuckets.get(bucket.model)
+    if (current) current.push(contract)
+    else modelBuckets.set(bucket.model, [contract])
+  }
+
+  return [...modelBuckets.entries()].map(([model, contracts]) => ({
+    model,
+    contracts: contracts.sort(
+      (left, right) =>
+        compareSmartRouterEndpoints(left.endpoint, right.endpoint) ||
+        left.id.localeCompare(right.id)
+    ),
+    decisionRank: Math.min(
+      ...contracts.map((contract) => contract.decisionRank)
+    ),
+    pendingOnly: contracts.every((contract) =>
+      contract.items.every(
+        (item) => canonicalHealthState(item) === 'pending_sample'
+      )
+    ),
+    latestActivityAt: Math.max(
+      ...contracts.map((contract) => contract.latestActivityAt),
+      0
+    ),
+    minimumRatio: Math.min(
+      ...contracts.map((contract) => contract.minimumRatio)
+    ),
+  })) satisfies SmartRouterModelView[]
+}
+
+export function recentActualSuccessItem(contract: SmartRouterContractView) {
+  return [...contract.items]
+    .filter((item) => (item.last_real_success_at_ms ?? 0) > 0)
+    .sort(
+      (left, right) =>
+        (right.last_real_success_at_ms ?? 0) -
+        (left.last_real_success_at_ms ?? 0)
+    )[0]
+}
+
+export function cheapestCurrentlyEligibleItem(
+  contract: SmartRouterContractView
+) {
+  const eligible = contract.items.filter((item) => {
+    if (item.price_known === false || item.effective_ratio_ppm === undefined) {
+      return false
+    }
+    if (item.selected) return true
+    if (item.decision !== 'eligible') return false
+    if (item.capacity_limited || item.availability === 'capacity_busy') {
+      return false
+    }
+    const constraints = item.constraints
+    return (
+      !constraints ||
+      Object.values(constraints).every((value) => value !== false)
+    )
+  })
+  if (eligible.length < 2) return eligible[0]
+
+  const ranked = eligible.filter((item) => selectionRank(item) !== undefined)
+  if (ranked.length > 0) {
+    return [...ranked].sort(
+      (left, right) =>
+        (selectionRank(left) ?? Number.MAX_SAFE_INTEGER) -
+          (selectionRank(right) ?? Number.MAX_SAFE_INTEGER) ||
+        left.group.localeCompare(right.group)
+    )[0]
+  }
+
+  const preference = eligible.find((item) => item.selected)
+  const comparisonBase = preference?.price ?? eligible[0]?.price
+  if (comparisonBase) {
+    const comparable = eligible.filter(
+      (item) =>
+        comparableSmartRouterPriceDifference(item.price, comparisonBase) !==
+        undefined
+    )
+    if (comparable.length === 0) return preference
+    return comparable.sort((left, right) => {
+      const difference = smartRouterItemPriceDifference(left, right)
+      return (difference ?? 0) || left.group.localeCompare(right.group)
+    })[0]
+  }
+
+  return [...eligible].sort(
+    (left, right) =>
+      (left.effective_ratio_ppm ?? Number.MAX_SAFE_INTEGER) -
+        (right.effective_ratio_ppm ?? Number.MAX_SAFE_INTEGER) ||
+      left.group.localeCompare(right.group)
+  )[0]
+}
+
+export function sortUserModelViews(
+  models: SmartRouterModelView[],
+  sort: SmartRouterStatusSort
+) {
+  return [...models].sort((left, right) => {
+    if (sort === 'model') return left.model.localeCompare(right.model)
+    if (sort === 'price') {
+      return (
+        left.minimumRatio - right.minimumRatio ||
+        left.model.localeCompare(right.model)
+      )
+    }
+    if (sort === 'activity') {
+      return (
+        right.latestActivityAt - left.latestActivityAt ||
+        left.model.localeCompare(right.model)
+      )
+    }
+    return (
+      left.decisionRank - right.decisionRank ||
+      left.model.localeCompare(right.model)
+    )
+  })
+}

@@ -1,0 +1,61 @@
+package service
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+)
+
+const TaskBillingContextVersion = 1
+
+func SnapshotTaskBillingContext(info *relaycommon.RelayInfo) *model.TaskBillingContext {
+	if info == nil {
+		return nil
+	}
+	price := info.PriceData
+	legacyPerCall := !price.HasTaskBillingProfile && common.StringsContains(constant.TaskPricePatches, info.OriginModelName)
+	snapshot := &model.TaskBillingContext{
+		Version:               TaskBillingContextVersion,
+		ParameterPricing:      price.ParameterPricing,
+		PricingScope:          price.PricingScope,
+		PricingRevision:       price.PricingRevision,
+		PricingGroup:          price.PricingGroup,
+		BillingMode:           price.BillingMode,
+		TaskBillingUnit:       price.TaskBillingUnit,
+		TaskFixedDuration:     price.TaskFixedDuration,
+		HasTaskBillingProfile: price.HasTaskBillingProfile,
+		ModelPrice:            price.ModelPrice,
+		GroupRatio:            price.GroupRatioInfo.GroupRatio,
+		GroupSpecialRatio:     price.GroupRatioInfo.GroupSpecialRatio,
+		HasGroupSpecialRatio:  price.GroupRatioInfo.HasSpecialRatio,
+		ModelRatio:            price.ModelRatio,
+		CompletionRatio:       price.CompletionRatio,
+		CacheRatio:            price.CacheRatio,
+		CacheCreationRatio:    price.CacheCreationRatio,
+		CacheCreation5mRatio:  price.CacheCreation5mRatio,
+		CacheCreation1hRatio:  price.CacheCreation1hRatio,
+		ImageRatio:            price.ImageRatio,
+		AudioRatio:            price.AudioRatio,
+		AudioCompletionRatio:  price.AudioCompletionRatio,
+		UsePrice:              price.UsePrice,
+		OtherRatios:           price.OtherRatios(),
+		OriginModelName:       info.OriginModelName,
+		PerCallBilling:        price.IsTaskPerCallBilling() || legacyPerCall,
+	}
+	if info.TenantCostBinding != nil && info.TenantCostBinding.TenantID != "" {
+		binding := info.TenantCostBinding
+		snapshot.TenantCost = &model.TenantCostTaskContext{
+			BindingID:            binding.BindingID,
+			TenantID:             binding.TenantID,
+			DownstreamRequestId:   info.TenantCostRequestID,
+			ProductPoolID:        binding.ProductPoolID,
+			ServiceTier:          binding.ServiceTier,
+			RouteProfileID:       binding.RouteProfileID,
+			ProfileRevision:      binding.ProfileRevision,
+			ModelCatalogRevision: binding.ModelCatalogRevision,
+			KeyID:                binding.KeyID,
+		}
+	}
+	return snapshot
+}

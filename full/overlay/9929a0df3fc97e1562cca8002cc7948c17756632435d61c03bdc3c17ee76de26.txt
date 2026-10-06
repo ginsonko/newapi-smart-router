@@ -1,0 +1,60 @@
+package controller
+
+import (
+	"context"
+	"os"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+)
+
+func imageRouteUncertainty(job *model.ImageRouteJob) string {
+	if job.State == "dispatching" && job.UpdatedAt < time.Now().Add(-imageRouteDispatchTimeout()-time.Minute).Unix() {
+		return "原绘图发送结果尚未确认，已保留原任务，请勿重复生成"
+	}
+	if job.State == "waiting" && job.CurrentTaskID != "" {
+		child, found, err := model.GetByTaskId(job.UserID, job.CurrentTaskID)
+		if err == nil && found && child.Status == model.TaskStatusUnknown {
+			return "上游受理结果尚未确认，请查询原任务，不会重复扣费重试"
+		}
+	}
+	return ""
+}
+
+func reconcileImageRouteDeliveries(ctx context.Context) {
+	var cursor int64
+	for ctx.Err() == nil {
+		var jobs []model.ImageRouteJob
+		if err := model.DB.WithContext(ctx).Where("id > ? AND state = ? AND result_path <> ?", cursor, "dispatching", "").Order("id").Limit(50).Find(&jobs).Error; err != nil {
+			return
+		}
+		for _, job := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+			cursor = job.ID
+			output, err := os.Open(job.ResultPath)
+			if err != nil {
+				continue
+			}
+			var response dto.ImageResponse
+			err = common.DecodeJson(output, &response)
+			_ = output.Close()
+			if err != nil || len(response.Data) == 0 {
+				continue
+			}
+			for index := range response.Data {
+				response.Data[index].B64Json = ""
+			}
+			data, err := common.Marshal(response)
+			if err == nil {
+				finishImageRouteJob(&job, "succeeded", data, "", job.ResultPath)
+			}
+		}
+		if len(jobs) < 50 {
+			return
+		}
+	}
+}

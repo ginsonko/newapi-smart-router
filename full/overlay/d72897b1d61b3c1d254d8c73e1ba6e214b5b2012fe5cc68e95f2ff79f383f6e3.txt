@@ -1,0 +1,341 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+type imageHealthProjectionFixture struct {
+	clock       *smartRouteTestClock
+	store       *MemorySmartRouteStateStore
+	channel     model.Channel
+	observation SmartRouteExternalSuccess
+	routes      []SmartRouteStateRoute
+}
+
+func newImageHealthProjectionFixture(test *testing.T, endpoint, path string) *imageHealthProjectionFixture {
+	test.Helper()
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(test, err)
+	require.NoError(test, database.AutoMigrate(&model.Channel{}))
+	originalDatabase := model.DB
+	model.DB = database
+	test.Cleanup(func() {
+		model.DB = originalDatabase
+		connection, err := database.DB()
+		if err == nil {
+			_ = connection.Close()
+		}
+	})
+	channel := model.Channel{Id: 71, Key: "mock-image-health-key", Type: 1}
+	require.NoError(test, database.Create(&channel).Error)
+	clock := &smartRouteTestClock{now: time.Now().Add(time.Second)}
+	store := newTestMemorySmartRouteStateStore(test, clock)
+	contractID, fingerprint, err := BuildSmartContractIdentity("image-model", endpoint)
+	require.NoError(test, err)
+	generation := SmartRouteChannelGeneration(channel)
+	routes := []smartrouter.CertifiedRoute{
+		{RouteID: "image-economy", ChannelID: 71, ChannelGeneration: generation, Group: "economy", UpstreamModel: "upstream-image", CapacityDomain: "capacity-71"},
+		{RouteID: "image-plus", ChannelID: 71, ChannelGeneration: generation, Group: "plus", UpstreamModel: "upstream-image", CapacityDomain: "capacity-71"},
+		{RouteID: "other-generation", ChannelID: 71, ChannelGeneration: "old-generation", Group: "plus", UpstreamModel: "upstream-image", CapacityDomain: "old-capacity"},
+		{RouteID: "other-channel", ChannelID: 72, ChannelGeneration: generation, Group: "plus", UpstreamModel: "upstream-image", CapacityDomain: "capacity-72"},
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "image-health-projection", Contracts: map[string]smartrouter.ContractCatalog{
+		contractID: {
+			Contract: smartrouter.RouteContract{ContractID: contractID, CanonicalModel: "image-model", Endpoint: endpoint, CapabilityFingerprint: fingerprint},
+			Pools:    map[string]smartrouter.CertifiedPool{"first": {Candidates: routes}, "duplicate": {Candidates: routes[:2]}},
+		},
+	}}
+	manager := &CatalogManager{}
+	manager.current.Store(&catalog)
+	defaultSmartRouterEngineMu.Lock()
+	originalEngine, originalError := defaultSmartRouterEngine, defaultSmartRouterError
+	defaultSmartRouterEngine, defaultSmartRouterError = &SmartRouterEngine{Catalogs: manager, State: store}, nil
+	defaultSmartRouterEngineMu.Unlock()
+	test.Cleanup(func() {
+		defaultSmartRouterEngineMu.Lock()
+		defaultSmartRouterEngine, defaultSmartRouterError = originalEngine, originalError
+		defaultSmartRouterEngineMu.Unlock()
+	})
+	fixture := &imageHealthProjectionFixture{clock: clock, store: store, channel: channel, observation: SmartRouteExternalSuccess{
+		ChannelID: channel.Id, ChannelGeneration: generation, CanonicalModel: "image-model", UpstreamModel: "upstream-image",
+		RequestPath: path, StartedAtMS: clock.Now().UnixMilli(), AtMS: clock.Now().UnixMilli(),
+	}}
+	for _, route := range routes {
+		fixture.routes = append(fixture.routes, SmartRouteStateRoute{RouteID: route.RouteID, CapacityDomain: route.CapacityDomain})
+	}
+	return fixture
+}
+
+func (fixture *imageHealthProjectionFixture) snapshot(test *testing.T) smartrouter.QualityState {
+	test.Helper()
+	snapshot, err := fixture.store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: fixture.routes})
+	require.NoError(test, err)
+	assert.Equal(test, snapshot.Quality.Routes["image-economy"], snapshot.Quality.Routes["image-plus"])
+	assert.False(test, snapshot.Quality.Routes["other-generation"].ImageHealthTracked)
+	assert.False(test, snapshot.Quality.Routes["other-channel"].ImageHealthTracked)
+	return snapshot.Quality.Routes["image-economy"]
+}
+
+func (fixture *imageHealthProjectionFixture) failures(test *testing.T, prefix string, count int) {
+	test.Helper()
+	for index := 0; index < count; index++ {
+		observation := fixture.observation
+		observation.ObservationID = fmt.Sprintf("%s-%d", prefix, index)
+		observation.StartedAtMS, observation.AtMS = fixture.clock.Now().UnixMilli(), fixture.clock.Now().UnixMilli()
+		affected, err := ObserveSmartRouteExternalFailure(context.Background(), SmartRouteExternalFailure{SmartRouteExternalSuccess: observation, Outcome: smartrouter.OutcomeInfrastructure})
+		require.NoError(test, err)
+		require.Equal(test, 2, affected)
+	}
+}
+
+func (fixture *imageHealthProjectionFixture) task(observationID string, status model.TaskStatus) *model.Task {
+	task := &model.Task{ChannelId: fixture.channel.Id, Status: status, SubmitTime: fixture.clock.Now().Unix(), FinishTime: fixture.clock.Now().Unix()}
+	task.Properties.OriginModelName, task.Properties.UpstreamModelName = fixture.observation.CanonicalModel, fixture.observation.UpstreamModel
+	task.PrivateData.BillingRequestID = observationID
+	task.PrivateData.ImageTask = &model.ImageTaskContext{ChannelGeneration: fixture.observation.ChannelGeneration, RequestPath: fixture.observation.RequestPath, RetryableFailure: true}
+	return task
+}
+
+func TestImageHealthProjectionPendingUsesExactGenerationAndBillingIdentity(t *testing.T) {
+	for _, endpoint := range []struct{ name, path string }{{SmartEndpointImages, "/v1/images/generations"}, {SmartEndpointImageEdits, "/v1/images/edits"}} {
+		t.Run(endpoint.name, func(test *testing.T) {
+			fixture := newImageHealthProjectionFixture(test, endpoint.name, endpoint.path)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: fixture.channel.Id, UpstreamModelName: fixture.observation.UpstreamModel}, OriginModelName: fixture.observation.CanonicalModel, RequestId: "billing-pending"}
+			ObserveImageAttemptPending(info, endpoint.path)
+			ObserveImageAttemptPending(info, endpoint.path)
+			state := fixture.snapshot(test)
+			require.True(test, state.ImageHealthTracked, "pending must match a channel with a nonempty credential")
+			var before map[string]struct {
+				StartedAtMS int64 `json:"started_at_ms"`
+			}
+			require.NoError(test, common.UnmarshalJsonStr(state.ImageAttemptEvidence, &before))
+			require.Len(test, before, 1)
+			fixture.failures(test, "confirmed", 11)
+			state = fixture.snapshot(test)
+			require.False(test, state.ImageUnavailable, "pending participates in total attempts")
+			for _, status := range []model.TaskStatus{model.TaskStatusSubmitted, model.TaskStatusUnknown, model.TaskStatusFinalizing} {
+				ObserveImageTaskTerminal(fixture.task(info.RequestId, status), true)
+				ObserveImageTaskTerminal(fixture.task(info.RequestId, status), false)
+			}
+			assert.Equal(test, state, fixture.snapshot(test))
+			fixture.clock.Advance(time.Second)
+			task := fixture.task(info.RequestId, model.TaskStatusFailure)
+			task.FailReason = "upstream temporarily unavailable"
+			ObserveImageTaskTerminal(task, false)
+			ObserveImageTaskTerminal(task, false)
+			state = fixture.snapshot(test)
+			assert.True(test, state.ImageUnavailable)
+			assert.Equal(test, uint64(12), state.RealHardFailures)
+			for _, route := range fixture.routes[:2] {
+				require.NoError(test, fixture.store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{RouteID: route.RouteID, Endpoint: endpoint.name, ObservationID: smartRouteCanonicalObservationID("request", info.RequestId), Outcome: smartrouter.OutcomeInfrastructure}))
+			}
+			ObserveImageAttemptPending(info, endpoint.path)
+			assert.Equal(test, state, fixture.snapshot(test))
+			var after map[string]struct {
+				StartedAtMS int64 `json:"started_at_ms"`
+			}
+			require.NoError(test, common.UnmarshalJsonStr(state.ImageAttemptEvidence, &after))
+			identity := smartRouteObservationDigest(SmartRouteImageObservationID(info.RequestId))
+			assert.Equal(test, before[identity].StartedAtMS, after[identity].StartedAtMS)
+		})
+	}
+}
+
+func TestImageHealthProjectionFixedSuccessRestoresAliasesAndOldTerminalCannotReopen(t *testing.T) {
+	fixture := newImageHealthProjectionFixture(t, SmartEndpointImages, "/v1/images/generations")
+	fixture.failures(t, "first", 11)
+	require.True(t, fixture.snapshot(t).ImageUnavailable)
+	fixture.clock.Advance(time.Second)
+	success := fixture.observation
+	success.ObservationID, success.AtMS = "fixed-success", fixture.clock.Now().UnixMilli()
+	affected, err := ObserveSmartRouteExternalSuccess(context.Background(), success)
+	require.NoError(t, err)
+	require.Equal(t, 2, affected)
+	state := fixture.snapshot(t)
+	assert.False(t, state.ImageUnavailable)
+	assert.Equal(t, uint64(1), state.RealSuccesses)
+	_, err = ObserveSmartRouteExternalSuccess(context.Background(), success)
+	require.NoError(t, err)
+	assert.Equal(t, state, fixture.snapshot(t))
+	fixture.clock.Advance((time.Duration(smartrouter.DefaultImageFailureWindowMS)*time.Millisecond + time.Second))
+	fixture.failures(t, "later", 11)
+	state = fixture.snapshot(t)
+	require.True(t, state.ImageUnavailable)
+	_, err = ObserveSmartRouteExternalSuccess(context.Background(), success)
+	require.NoError(t, err)
+	oldFailure := fixture.observation
+	oldFailure.ObservationID = "first-0"
+	for repeat := 0; repeat < 2; repeat++ {
+		_, err = ObserveSmartRouteExternalFailure(context.Background(), SmartRouteExternalFailure{SmartRouteExternalSuccess: oldFailure, Outcome: smartrouter.OutcomeInfrastructure})
+		require.NoError(t, err)
+	}
+	assert.Equal(t, state, fixture.snapshot(t))
+	fixture.clock.Advance(time.Second)
+	task := fixture.task("async-success", model.TaskStatusSuccess)
+	ObserveImageTaskTerminal(task, true)
+	state = fixture.snapshot(t)
+	assert.False(t, state.ImageUnavailable)
+	assert.Equal(t, uint64(2), state.RealSuccesses)
+	ObserveImageTaskTerminal(task, true)
+	assert.Equal(t, state, fixture.snapshot(t))
+}
+
+func TestImageHealthProjectionContentRejectionDoesNotBecomeInfrastructure(t *testing.T) {
+	fixture := newImageHealthProjectionFixture(t, SmartEndpointImages, "/v1/images/generations")
+	for index := 0; index < 11; index++ {
+		task := fixture.task(fmt.Sprintf("content-%d", index), model.TaskStatusFailure)
+		task.FailReason = "图片审核未通过"
+		ObserveImageTaskTerminal(task, false)
+	}
+	state := fixture.snapshot(t)
+	assert.False(t, state.ImageUnavailable)
+	assert.Zero(t, state.RealHardFailures)
+}
+
+func TestImageHealthProjectionPersistedTerminalTimeRestoresWithinSameSecond(t *testing.T) {
+	fixture := newImageHealthProjectionFixture(t, SmartEndpointImages, "/v1/images/generations")
+	fixture.clock.now = fixture.clock.Now().Truncate(time.Second).Add(500 * time.Millisecond)
+	fixture.failures(t, "outage", 11)
+	state := fixture.snapshot(t)
+	require.True(t, state.ImageUnavailable)
+	fixture.clock.Advance(time.Millisecond)
+	task := fixture.task("same-second-success", model.TaskStatusSuccess)
+	encoded, err := common.Marshal(map[string]any{"terminal_at_ms": fixture.clock.Now().UnixMilli()})
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(encoded, task.PrivateData.ImageTask))
+	ObserveImageTaskTerminal(task, true)
+	state = fixture.snapshot(t)
+	assert.False(t, state.ImageUnavailable, "persisted terminal milliseconds must preserve ordering within a second")
+	assert.Equal(t, uint64(1), state.RealSuccesses)
+	fixture.clock.Advance((time.Duration(smartrouter.DefaultImageFailureWindowMS)*time.Millisecond + time.Second))
+	fixture.failures(t, "new-outage", 11)
+	state = fixture.snapshot(t)
+	require.True(t, state.ImageUnavailable)
+	ObserveImageTaskTerminal(task, true)
+	assert.Equal(t, state, fixture.snapshot(t), "polling must reuse persisted terminal time")
+}
+
+func TestImageHealthProjectionPendingUnknownAndNeutralDoNotCountAsFailure(t *testing.T) {
+	for _, outcome := range []smartrouter.QualityOutcome{smartrouter.OutcomeImagePending, smartrouter.OutcomeClientCancelled, smartrouter.OutcomeContentRejected, smartrouter.OutcomeUserRejected} {
+		t.Run(string(outcome), func(test *testing.T) {
+			fixture := newImageHealthProjectionFixture(test, SmartEndpointImages, "/v1/images/generations")
+			pending := fixture.observation
+			pending.ObservationID = "pending"
+			_, err := ObserveSmartRouteExternalFailure(context.Background(), SmartRouteExternalFailure{SmartRouteExternalSuccess: pending, Outcome: smartrouter.OutcomeImagePending})
+			require.NoError(test, err)
+			_, err = ObserveSmartRouteExternalFailure(context.Background(), SmartRouteExternalFailure{SmartRouteExternalSuccess: pending, Outcome: outcome})
+			require.NoError(test, err)
+			fixture.failures(test, "other", 11)
+			state := fixture.snapshot(test)
+			assert.False(test, state.ImageUnavailable)
+			assert.Equal(test, uint64(11), state.RealHardFailures)
+			assert.Zero(test, state.RealSuccesses)
+			for repeat := 0; repeat < 2; repeat++ {
+				_, err = ObserveSmartRouteExternalFailure(context.Background(), SmartRouteExternalFailure{SmartRouteExternalSuccess: pending, Outcome: outcome})
+				require.NoError(test, err)
+			}
+			assert.Equal(test, state, fixture.snapshot(test))
+		})
+	}
+}
+
+func TestImageHealthProjectionSessionAndExternalShareOneObservation(t *testing.T) {
+	fixture := newImageHealthProjectionFixture(t, SmartEndpointImages, "/v1/images/generations")
+	engine, err := GetDefaultSmartRouterEngine()
+	require.NoError(t, err)
+	engine.Settings = func() smartroutersetting.Setting { return smartroutersetting.Normalize(smartroutersetting.Setting{}) }
+	catalog, found := engine.Catalogs.Current()
+	require.True(t, found)
+	contractID, fingerprint, err := BuildSmartContractIdentity(fixture.observation.CanonicalModel, SmartEndpointImages)
+	require.NoError(t, err)
+	route := catalog.Contracts[contractID].Pools["first"].Candidates[0]
+	identity := smartRouteCanonicalObservationID("request", "same-billing-request")
+	session := &SmartRoutingSession{
+		engine: engine, startedAt: fixture.clock.Now(), observationID: identity,
+		request: smartrouter.RouteRequest{ContractID: contractID, CanonicalModel: fixture.observation.CanonicalModel, Endpoint: SmartEndpointImages, ReplayClass: smartrouter.ReplaySafeImage, CapabilityFingerprint: fingerprint},
+		policy:  smartrouter.Policy{PoolPolicy: "first"},
+	}
+	handle := &SmartRouteAttemptHandle{Route: route, Plan: smartrouter.PlanResult{CatalogVersion: catalog.Version, Admission: smartrouter.AdmissionNormal}, observationID: identity, stop: make(chan struct{}), done: make(chan struct{})}
+	close(handle.done)
+	pending := fixture.observation
+	pending.ObservationID = "same-billing-request"
+	_, err = ObserveSmartRouteExternalFailure(context.Background(), SmartRouteExternalFailure{SmartRouteExternalSuccess: pending, Outcome: smartrouter.OutcomeImagePending})
+	require.NoError(t, err)
+	session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{Outcome: smartrouter.OutcomeClientCancelled}, 0, 0, false)
+	state := fixture.snapshot(t)
+	assert.Zero(t, state.RealSuccesses)
+	assert.Zero(t, state.RealHardFailures)
+	session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess, AffectsRouteHealth: true}, 0, 0, false)
+	state = fixture.snapshot(t)
+	assert.Equal(t, uint64(1), state.RealSuccesses)
+	_, err = ObserveSmartRouteExternalSuccess(context.Background(), pending)
+	require.NoError(t, err)
+	assert.Equal(t, state, fixture.snapshot(t))
+	var evidence map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(state.ImageAttemptEvidence, &evidence))
+	assert.Len(t, evidence, 1)
+}
+
+func TestImageHealthTaskTerminalPersistsTimeAndClassification(t *testing.T) {
+	for _, item := range []struct {
+		name    string
+		raw     string
+		outcome smartrouter.QualityOutcome
+	}{
+		{"success", `{"status":"completed","data":[{"url":"https://images.example/final.png"}]}`, smartrouter.OutcomeSuccess},
+		{"content", `{"status":"failed","error":{"code":"content_policy_violation","message":"图片审核未通过"}}`, smartrouter.OutcomeContentRejected},
+		{"infrastructure", `{"status":"failed","error":{"code":"server_error","message":"upstream unavailable"}}`, smartrouter.OutcomeInfrastructure},
+	} {
+		t.Run(item.name, func(test *testing.T) {
+			task := imageTaskFixture(test, "https://provider.example")
+			_, err := model.ApplyTaskBillingSubmission(task.ID)
+			require.NoError(test, err)
+			require.NoError(test, ApplyImageTaskResult(context.Background(), task, []byte(item.raw)))
+			stored, found, err := model.GetTaskByRowID(task.ID)
+			require.NoError(test, err)
+			require.True(test, found)
+			require.Positive(test, stored.PrivateData.ImageTask.TerminalAtMS)
+			assert.Equal(test, string(item.outcome), stored.PrivateData.ImageTask.HealthOutcome)
+			assert.Equal(test, task.PrivateData.ImageTask.TerminalAtMS, stored.PrivateData.ImageTask.TerminalAtMS)
+			terminalAtMS := stored.PrivateData.ImageTask.TerminalAtMS
+			require.NoError(test, ApplyImageTaskResult(context.Background(), stored, []byte(item.raw)))
+			require.NoError(test, PollImageTask(context.Background(), stored))
+			stored, found, err = model.GetTaskByRowID(task.ID)
+			require.NoError(test, err)
+			require.True(test, found)
+			assert.Equal(test, terminalAtMS, stored.PrivateData.ImageTask.TerminalAtMS)
+		})
+	}
+}
+
+func TestImageHealthTaskFailureKeepsOriginalClassification(t *testing.T) {
+	for _, item := range []struct {
+		name   string
+		status int
+		raw    string
+		want   smartrouter.QualityOutcome
+	}{
+		{"content", 400, `{"error":{"code":"content_policy_violation","message":"图片审核未通过"}}`, smartrouter.OutcomeContentRejected},
+		{"credential", 401, `{"error":{"message":"invalid credential"}}`, smartrouter.OutcomeCredential},
+		{"capacity", 429, `{"error":{"message":"too many requests"}}`, smartrouter.OutcomeCapacityLimited},
+		{"user", 400, `{"error":{"code":"invalid_request_error","message":"missing required image input"}}`, smartrouter.OutcomeUserRejected},
+		{"unclassified", 0, `{"error":{"message":"new provider-specific failure"}}`, smartrouter.OutcomeClientCancelled},
+	} {
+		t.Run(item.name, func(test *testing.T) {
+			assert.Equal(test, item.want, ClassifyImageTaskFailure(item.status, []byte(item.raw), ""))
+		})
+	}
+}

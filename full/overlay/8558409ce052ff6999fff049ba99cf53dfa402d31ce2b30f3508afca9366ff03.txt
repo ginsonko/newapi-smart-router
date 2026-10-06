@@ -1,0 +1,42 @@
+package dto
+
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestImageDimensionsStrictAdapter(t *testing.T) {
+	m := ImageAdapterModel{StrictDimensions: true, DefaultQuality: "1k", QualityOrder: []string{"1k", "2k", "4k"}, Sizes: map[string]ImageAdapterSize{}, TierSizes: map[string]map[string]string{}}
+	for _, p := range common.Image2DimensionPresets() {
+		m.Sizes[p.Size] = ImageAdapterSize{Quality: p.Resolution, Aspect: p.AspectRatio}
+		if m.TierSizes[p.Resolution] == nil {
+			m.TierSizes[p.Resolution] = map[string]string{}
+		}
+		m.TierSizes[p.Resolution][p.AspectRatio] = p.Size
+	}
+	cfg := &ImageAdapterConfig{Models: map[string]ImageAdapterModel{"gpt-image-2": m}}
+	for _, p := range common.Image2DimensionPresets() {
+		tier, _ := json.Marshal(p.Resolution)
+		req := ImageRequest{Size: p.Size, Extra: map[string]json.RawMessage{"resolution": tier}}
+		got, err := cfg.Normalize(req, "gpt-image-2")
+		require.NoError(t, err)
+		require.Equal(t, p.Size, got.Size)
+		require.Equal(t, p.Resolution, got.Quality)
+		other := "1k"
+		if p.Resolution == other {
+			other = "4k"
+		}
+		req.Extra["resolution"], _ = json.Marshal(other)
+		_, err = cfg.Normalize(req, "gpt-image-2")
+		require.Error(t, err)
+	}
+}
+
+func TestImageDimensionsStrictLegacyPixelPreservation(t *testing.T) {
+	cfg := &ImageAdapterConfig{Models: map[string]ImageAdapterModel{"gpt-image-2": {StrictDimensions: true, DefaultQuality: "1k", QualityOrder: []string{"1k"}, Sizes: map[string]ImageAdapterSize{"1248x832": {Quality: "1k", Aspect: "3:2"}}, TierSizes: map[string]map[string]string{"1k": {"3:2": "1536x1024"}}}}}
+	got, err := cfg.Normalize(ImageRequest{Size: "1248x832"}, "gpt-image-2")
+	require.NoError(t, err)
+	require.Equal(t, "1248x832", got.Size)
+}

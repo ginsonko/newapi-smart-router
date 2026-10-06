@@ -1,3 +1,25 @@
+# v0.4.0-alpha.1 — Alpha version overview
+
+Generic R98 Smart Router reference retaining QuantumNous New API identity and AGPL attribution. Start with the [fixed v0.4 version page](https://github.com/ginsonko/newapi-smart-router/releases/tag/v0.4.0-alpha.1), [capabilities and migration notes](docs/v0.4-contract-delta.md), and [build/run instructions](docs/build-v0.4.md). The version link does not assert publication or a passing CI run; asset availability and build evidence must be read from that version's page, manifest, checksums and receipts.
+
+This version adds per-Key nullable policy memory, current authorization/catalog/quote isolation, durable image jobs with refund-before-fallback, configurable one-hour image health, and reconciliation-only unknown acceptance. Private site configuration/data, shop/courses and Bot relief are excluded. The four forms retain their existing acceptance standards.
+
+| Form | v0.4 adoption | Boundary |
+|---|---|---|
+| Full compatibility distribution | Generic R98 source, both themes, Worker and matching Linux binary | Alpha, not Stable; validate schema/configuration in isolation; remembered-draft editor is default-theme only |
+| Certified Bridge Add-on candidate | `bridge-spi-v1alpha4`, Core and required memory/catalog/image-job Hooks | No official host revision is Certified; unknown revisions do not become certified |
+| Custom Fork Integration Kit | Read-only doctor, contracts, schemas, vectors and checklist | Host integration and semantic evidence required |
+| Agent Parts Kit | Synchronized reference core, specifications and fixtures | Development Kit / Not runnable |
+
+Local build results do not establish remote CI, paid-provider settlement, production upgrade, three-database lifecycle acceptance or signed images. These remain separately evidenced obligations; no automatic certification or production claim follows from the version label.
+
+## Historical records
+
+The following original records are retained in full. Their present-tense wording belongs to the named historical release, not the v0.4 overview.
+
+<details>
+<summary>Expand v0.1–v0.3 release-status history</summary>
+
 # Release status
 
 This tree is the public source repository for `v0.3.0-alpha.1`.
@@ -72,3 +94,5 @@ group colors, exact model mapping, one-Key multimodal discovery and expanded
 retry/error handling. These features do not change the host's actual billing
 formula. Sidecar Lite remains an experimental appendix and is not a fifth
 Full-parity form.
+
+</details>

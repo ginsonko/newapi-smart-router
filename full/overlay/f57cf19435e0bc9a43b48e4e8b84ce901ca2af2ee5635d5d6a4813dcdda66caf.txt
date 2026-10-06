@@ -1,0 +1,95 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func parameterRoutingRules(t *testing.T) string {
+	t.Helper()
+	old := billing_setting.GetParameterPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateParameterPricingFromJSONString(old)
+		require.NoError(t, err)
+	})
+	c, _, err := billing_setting.UpdateParameterPricingFromJSONString(`{"schema_version":1,"rules":[{"id":"r","group":"*","model":"gpt-test","channel_id":0,"conditions":{},"unit":"per_request","unit_price":"0.48","currency":"USD"}]}`)
+	require.NoError(t, err)
+	return c.Revision
+}
+
+func TestParameterRouteOverlayPreservesSharedStateAndReferenceSupport(t *testing.T) {
+	revision := parameterRoutingRules(t)
+	session, _ := managerTestSession(t, &managerOrderingStateStore{})
+	session.request.Media = &smartrouter.MediaRequestShape{Kind: "video", DurationKnown: true, DurationSeconds: 4}
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	prices, err := session.engine.Prices.GetOrRefresh(context.Background(), session.userGroup)
+	require.NoError(t, err)
+	oldVersion := prices.Version
+	resolver := func(req smartrouter.RouteRequest, route smartrouter.CertifiedRoute) (*types.ParameterPriceSnapshot, *smartrouter.MediaCapabilityContract, error) {
+		if route.RouteID == "cheap" {
+			return nil, nil, fmt.Errorf("this supply does not price the selected resolution")
+		}
+		return &types.ParameterPriceSnapshot{Revision: revision, Amount: "1.92"}, &smartrouter.MediaCapabilityContract{ReferenceImage: true, ReferenceVideo: true, ReferenceAudio: true}, nil
+	}
+	next, quoted, err := parameterMediaRoutingSnapshotWithResolver(session.request, catalog, prices, resolver)
+	require.NoError(t, err)
+	assert.Contains(t, prices.RatiosPPM, "cheap")
+	assert.NotContains(t, quoted.RatiosPPM, "cheap")
+	assert.Equal(t, oldVersion, prices.Version)
+	routes := next.Contracts[session.request.ContractID].Pools["balanced-v1"].Candidates
+	assert.Nil(t, catalog.Contracts[session.request.ContractID].Pools["balanced-v1"].Candidates[1].Media)
+	assert.Equal(t, SmartCapabilityReferenceVideo, routes[1].Capabilities&SmartCapabilityReferenceVideo)
+	assert.Equal(t, SmartCapabilityReferenceAudio, routes[1].Capabilities&SmartCapabilityReferenceAudio)
+	requestPrice, rejection := quoted.RoutePrices["fallback"].QuoteMedia(session.request.Media)
+	assert.Empty(t, rejection)
+	assert.Equal(t, int64(1920000), requestPrice.ScorePPM, "duration must not be multiplied twice")
+	_, again, err := parameterMediaRoutingSnapshotWithResolver(session.request, catalog, prices, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, quoted.Version, again.Version)
+	session.request.Media.DurationSeconds = 8
+	_, changed, err := parameterMediaRoutingSnapshotWithResolver(session.request, catalog, prices, resolver)
+	require.NoError(t, err)
+	assert.NotEqual(t, quoted.Version, changed.Version)
+}
+
+func TestParameterRouteNextAndFinalReplanUseTheSameSnapshot(t *testing.T) {
+	revision := parameterRoutingRules(t)
+	previous := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previous })
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.ModelCapabilityCatalogHead{}, &model.ModelCapabilityBundleRecord{}))
+	for _, id := range []int{98001, 98002} {
+		require.NoError(t, model.DB.Create(&model.Channel{Id: id, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}).Error)
+	}
+	t.Cleanup(func() { model.DB.Where("id IN ?", []int{98001, 98002}).Delete(&model.Channel{}) })
+	session, _ := managerTestSession(t, &managerOrderingStateStore{})
+	session.request.Media = &smartrouter.MediaRequestShape{Kind: "image", OutputCountKnown: true, OutputCount: 1}
+	catalog, _ := session.engine.Catalogs.Current()
+	entry := catalog.Contracts[session.request.ContractID]
+	pool := entry.Pools["balanced-v1"]
+	for i := range pool.Candidates {
+		pool.Candidates[i].ChannelID = 98001 + i
+	}
+	entry.Pools["balanced-v1"] = pool
+	catalog.Contracts[session.request.ContractID] = entry
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	handle, err := session.Next(ctx)
+	require.NoError(t, err, "an overlaid price must not loop against a base cache version")
+	defer handle.stopAndRelease()
+	changed, err := session.ReplanIfPriceQuoteChanged(ctx, handle, revision)
+	require.NoError(t, err)
+	assert.False(t, changed)
+}

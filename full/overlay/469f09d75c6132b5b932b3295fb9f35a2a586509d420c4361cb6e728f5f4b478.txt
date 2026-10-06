@@ -1,0 +1,564 @@
+package controller
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+)
+
+const tenantCostSchemaVersion = "upstream-cost.v2"
+
+func tenantCostTenantID(c *gin.Context) string {
+	if c == nil {
+		return model.DefaultTenantCostTenantID
+	}
+	if tenantID := strings.TrimSpace(c.GetString(middleware.TenantCostTenantContextKey)); tenantID != "" {
+		return tenantID
+	}
+	if tenantID := strings.TrimSpace(c.Query("tenant_id")); tenantID != "" {
+		return tenantID
+	}
+	for _, header := range []string{middleware.TenantCostTenantHeader, middleware.TenantCostLegacyTenantHeader} {
+		if tenantID := strings.TrimSpace(c.GetHeader(header)); tenantID != "" {
+			return tenantID
+		}
+	}
+	return model.DefaultTenantCostTenantID
+}
+
+// tenantCostExplicitSelections returns every caller-supplied tenant selector.
+// Root UI requests may use a query parameter or either compatibility header;
+// reporting requests additionally carry an authenticated middleware context.
+// Keeping all values here lets the resolver reject contradictory selectors
+// instead of silently preferring one and making the operator believe another
+// tenant was selected.
+func tenantCostExplicitSelections(c *gin.Context) []string {
+	if c == nil {
+		return nil
+	}
+	values := make([]string, 0, 4)
+	if tenantID := strings.TrimSpace(c.GetString(middleware.TenantCostTenantContextKey)); tenantID != "" {
+		values = append(values, tenantID)
+	}
+	if tenantID := strings.TrimSpace(c.Query("tenant_id")); tenantID != "" {
+		values = append(values, tenantID)
+	}
+	for _, header := range []string{middleware.TenantCostTenantHeader, middleware.TenantCostLegacyTenantHeader} {
+		if tenantID := strings.TrimSpace(c.GetHeader(header)); tenantID != "" {
+			values = append(values, tenantID)
+		}
+	}
+	return values
+}
+
+// resolveTenantCostTenant validates the request-selected namespace against
+// the registered downstream registry. A syntactically valid query value is
+// not enough to authorize a read; this is the common guard for both root UI
+// requests and reporting-token requests.
+func resolveTenantCostTenant(c *gin.Context) (string, bool) {
+	selections := tenantCostExplicitSelections(c)
+	tenantID := model.DefaultTenantCostTenantID
+	if len(selections) > 0 {
+		tenantID = selections[0]
+		for _, supplied := range selections[1:] {
+			if supplied != tenantID {
+				c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户选择冲突"})
+				return "", false
+			}
+		}
+	}
+	if _, err := model.RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		// Do not disclose whether an arbitrary tenant ID exists; both unknown
+		// and disabled/unauthorized selections use the same scope response.
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户不存在或不可访问"})
+		return "", false
+	}
+	return tenantID, true
+}
+
+// resolveTenantCostPathTenant applies the same conflict rule to endpoints
+// whose path contains the tenant ID (for example downstream status). The path
+// remains the resource identity; query/header/context values may confirm it
+// but cannot redirect the mutation to another tenant.
+func resolveTenantCostPathTenant(c *gin.Context, pathTenantID string) (string, bool) {
+	pathTenantID = strings.TrimSpace(pathTenantID)
+	if pathTenantID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户不存在或不可访问"})
+		return "", false
+	}
+	for _, supplied := range tenantCostExplicitSelections(c) {
+		if supplied != pathTenantID {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户选择冲突"})
+			return "", false
+		}
+	}
+	if _, err := model.RequireRegisteredTenantCostDownstream(pathTenantID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "下游租户不存在或不可访问"})
+		return "", false
+	}
+	return pathTenantID, true
+}
+
+func tenantCostCursorEncode(sequence int64) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("tc1:%d", sequence)))
+}
+
+func tenantCostCursorDecode(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid cursor")
+	}
+	parts := strings.Split(string(decoded), ":")
+	if len(parts) != 2 || parts[0] != "tc1" {
+		return 0, fmt.Errorf("invalid cursor")
+	}
+	sequence, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || sequence < 0 {
+		return 0, fmt.Errorf("invalid cursor")
+	}
+	return sequence, nil
+}
+
+func tenantCostETag(value string) string {
+	return `"` + common.Sha1([]byte(value)) + `"`
+}
+
+// tenantCostOpaqueIdentifier keeps a stable partner-facing handle without
+// exposing a raw service key, profile name, or physical route identifier.
+// The server-local HMAC prevents dictionary recovery from public values.
+func tenantCostOpaqueIdentifier(prefix, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return prefix + common.HmacSha256(value, common.SessionSecret)[:16]
+}
+
+func tenantCostPublicPoolID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 || strings.Contains(strings.ToLower(value), "://") || tenantCostContainsSecretMarker(value) {
+		return "other_models"
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.' || r == ':') {
+			return "other_models"
+		}
+	}
+	// Keep a syntactically safe, previously unseen pool visible. The registry
+	// is intentionally open-world; an allowlist here would collapse future
+	// downstream products into one misleading bucket.
+	return value
+}
+
+func tenantCostContainsSecretMarker(value string) bool {
+	lower := strings.ToLower(value)
+	for offset := 0; offset < len(lower); {
+		index := strings.Index(lower[offset:], "sk-")
+		if index < 0 {
+			return false
+		}
+		index += offset
+		if index == 0 || !((lower[index-1] >= 'a' && lower[index-1] <= 'z') ||
+			(lower[index-1] >= '0' && lower[index-1] <= '9')) {
+			return true
+		}
+		offset = index + len("sk-")
+	}
+	return false
+}
+
+func maybeTenantCostNotModified(c *gin.Context, etag string) bool {
+	if strings.TrimSpace(etag) == "" {
+		return false
+	}
+	c.Header("ETag", etag)
+	if c.GetHeader("If-None-Match") == etag {
+		c.Status(http.StatusNotModified)
+		return true
+	}
+	return false
+}
+
+func redactTenantCostValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			lower := strings.ToLower(strings.TrimSpace(key))
+			if lower == "provider_url" || lower == "provider_key" || lower == "physical_channel" ||
+				lower == "prompt" || lower == "response" || lower == "channel_id" || lower == "group" ||
+				lower == "candidate_spec" || lower == "provider_class" || lower == "capability_spec" ||
+				lower == "upstream" {
+				delete(typed, key)
+				continue
+			}
+			switch lower {
+			case "product_pool_id":
+				if value, ok := child.(string); ok {
+					typed[key] = tenantCostPublicPoolID(value)
+					continue
+				}
+			case "key_id":
+				if value, ok := child.(string); ok {
+					typed[key] = tenantCostOpaqueIdentifier("key_", value)
+					continue
+				}
+			case "route_profile_id":
+				if value, ok := child.(string); ok {
+					typed[key] = tenantCostOpaqueIdentifier("profile_", value)
+					continue
+				}
+			case "profile_revision", "model_catalog_revision", "mapping_revision", "site_price_revision", "basis_revision":
+				if value, ok := child.(string); ok {
+					typed[key] = tenantCostOpaqueIdentifier("rev_", value)
+					continue
+				}
+			case "formula":
+				if _, ok := child.(string); ok {
+					typed[key] = "[公式已脱敏]"
+					continue
+				}
+			}
+			typed[key] = redactTenantCostValue(child)
+		}
+		return typed
+	case []interface{}:
+		for i := range typed {
+			typed[i] = redactTenantCostValue(typed[i])
+		}
+		return typed
+	case string:
+		lower := strings.ToLower(typed)
+		if strings.Contains(lower, "sk-") || strings.Contains(lower, "://") {
+			return "[已脱敏]"
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func GetTenantCostHealth(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	reconciliation, err := model.GetTenantCostReconciliation(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本事实健康状态暂不可用"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"schema_version": tenantCostSchemaVersion, "tenant_id": tenantID,
+		"status": "ready", "generated_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"extensions": []string{"parameter-source-price.v1", "provider-cost.v1", "operation-id.v1"},
+		"reconciliation": reconciliation,
+	}})
+}
+
+func GetTenantCostCatalog(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	catalog, err := model.BuildTenantCostCatalogForTenant(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本目录暂不可用"})
+		return
+	}
+	etag := tenantCostETag(fmt.Sprintf("%s:%d:%v", tenantID, len(catalog), catalog))
+	if maybeTenantCostNotModified(c, etag) {
+		return
+	}
+	publicSlots := make([]interface{}, 0, len(catalog))
+	for _, slot := range catalog {
+		encoded, marshalErr := common.Marshal(slot)
+		if marshalErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本目录序列化失败"})
+			return
+		}
+		var value map[string]interface{}
+		if unmarshalErr := common.Unmarshal(encoded, &value); unmarshalErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本目录格式异常"})
+			return
+		}
+		publicSlots = append(publicSlots, redactTenantCostValue(value))
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"schema_version": "tenant-cost-catalog.v1", "tenant_id": tenantID,
+		"revision": etag, "generated_at": time.Now().UTC().Format(time.RFC3339Nano), "slots": publicSlots,
+	}})
+}
+
+func GetTenantCostEvents(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	after, err := tenantCostCursorDecode(c.Query("after"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := model.ListTenantCostEvents(tenantID, after, limit+1)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本事件暂不可用"})
+		return
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	events := make([]json.RawMessage, 0, len(rows))
+	lastSequence := after
+	for _, row := range rows {
+		var payload map[string]interface{}
+		if err := common.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本事件格式异常"})
+			return
+		}
+		// The payload is generated from a server-side allowlisted struct. Keep a
+		// defensive removal here in case a future field is accidentally added.
+		payload = redactTenantCostValue(payload).(map[string]interface{})
+		encoded, err := common.Marshal(payload)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本事件序列化失败"})
+			return
+		}
+		events = append(events, json.RawMessage(encoded))
+		lastSequence = row.Sequence
+	}
+	next := ""
+	if hasMore {
+		next = tenantCostCursorEncode(lastSequence)
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"schema_version": tenantCostSchemaVersion, "tenant_id": tenantID, "events": events,
+		"next_cursor": next, "has_more": hasMore, "generated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}})
+}
+
+func GetTenantCostReconciliationAPI(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	result, err := model.GetTenantCostReconciliation(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本对账暂不可用"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"schema_version": "tenant-cost-reconciliation.v1", "tenant_id": tenantID,
+		"generated_at": time.Now().UTC().Format(time.RFC3339Nano), "reconciliation": result,
+	}})
+}
+
+func GetTenantCostOperationsOverview(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	window := c.DefaultQuery("window", "24h")
+	duration, err := time.ParseDuration(window)
+	if err != nil || duration <= 0 || duration > 30*24*time.Hour {
+		duration = 24 * time.Hour
+	}
+	result, err := model.SummarizeTenantCostEvents(tenantID, time.Now().UTC().Add(-duration).UnixNano(), 5000)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "成本运营概览暂不可用"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{
+		"schema_version": "tenant-cost-operations.v1", "tenant_id": tenantID,
+		"window": duration.String(), "overview": result,
+	}})
+}
+
+// Admin-only handlers intentionally return the same redacted catalog/event
+// projections. Physical candidates remain available only through the normal
+// root diagnostic UI and are never exported by these reporting endpoints.
+func AdminListTenantCostBindings(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantCredentialBindingsForTenant(tenantID, 100)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "获取租户绑定失败"})
+		return
+	}
+	type bindingView struct {
+		ID                   int64  `json:"id"`
+		TenantID             string `json:"tenant_id"`
+		CredentialPurpose    string `json:"credential_purpose"`
+		KeyID                string `json:"key_id"`
+		KeySuffix            string `json:"key_suffix"`
+		ProductPoolID        string `json:"product_pool_id"`
+		ServiceTier          string `json:"service_tier"`
+		RouteProfileID       string `json:"route_profile_id"`
+		ProfileRevision      string `json:"profile_revision"`
+		ModelCatalogRevision string `json:"model_catalog_revision"`
+		BindingStatus        string `json:"binding_status"`
+		CreatedAt            int64  `json:"created_at"`
+		UpdatedAt            int64  `json:"updated_at"`
+		RevokedAt            int64  `json:"revoked_at"`
+	}
+	views := make([]bindingView, 0, len(rows))
+	for _, row := range rows {
+		keyID := strings.TrimSpace(row.KeyID)
+		keyID = tenantCostOpaqueIdentifier("key_", keyID)
+		profileID := tenantCostOpaqueIdentifier("profile_", row.RouteProfileID)
+		views = append(views, bindingView{ID: row.ID, TenantID: row.TenantID, CredentialPurpose: row.CredentialPurpose,
+			KeyID: keyID, KeySuffix: row.KeySuffix, ProductPoolID: tenantCostPublicPoolID(row.ProductPoolID), ServiceTier: row.ServiceTier,
+			RouteProfileID: profileID, ProfileRevision: row.ProfileRevision, ModelCatalogRevision: row.ModelCatalogRevision,
+			BindingStatus: row.BindingStatus, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, RevokedAt: row.RevokedAt})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": views})
+}
+
+func AdminListTenantCostKeyUsage(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantCostKeyUsageForTenant(tenantID, 500)
+	if err != nil {
+		tenantCostAdminError(c, err, "获取租户 Key 用量失败")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": rows})
+}
+
+func AdminListTenantCostProfiles(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantRouteProfilesForTenant(tenantID, 500)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "获取租户路由档位失败"})
+		return
+	}
+	type profileView struct {
+		ID             int64  `json:"id"`
+		TenantID       string `json:"tenant_id"`
+		ProfileID      string `json:"profile_id"`
+		Revision       string `json:"revision"`
+		ProductPoolID  string `json:"product_pool_id"`
+		ServiceTier    string `json:"service_tier"`
+		PublicLabel    string `json:"public_label"`
+		Status         string `json:"status"`
+		DisabledReason string `json:"disabled_reason,omitempty"`
+		CreatedAt      int64  `json:"created_at"`
+		UpdatedAt      int64  `json:"updated_at"`
+	}
+	views := make([]profileView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, profileView{ID: row.ID, TenantID: row.TenantID, ProfileID: row.ProfileID, Revision: row.Revision,
+			ProductPoolID: row.ProductPoolID, ServiceTier: row.ServiceTier, PublicLabel: row.PublicLabel,
+			Status: row.Status, DisabledReason: row.DisabledReason, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": views})
+}
+
+func AdminListTenantCostOutbox(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantCostOutboxForTenant(tenantID, 500)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "获取成本发布队列失败"})
+		return
+	}
+	type outboxView struct {
+		ID            int64  `json:"id"`
+		EventID       string `json:"event_id"`
+		State         string `json:"state"`
+		Attempts      int    `json:"attempts"`
+		NextAttemptAt int64  `json:"next_attempt_at"`
+		UpdatedAt     int64  `json:"updated_at"`
+		PublishedAt   int64  `json:"published_at"`
+		HasError      bool   `json:"has_error"`
+	}
+	views := make([]outboxView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, outboxView{ID: row.ID, EventID: row.EventID, State: row.State, Attempts: row.Attempts,
+			NextAttemptAt: row.NextAttemptAt, UpdatedAt: row.UpdatedAt, PublishedAt: row.PublishedAt, HasError: strings.TrimSpace(row.LastError) != ""})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": views})
+}
+
+func AdminListTenantCostProjectionRetries(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantCostProjectionRetriesForTenant(tenantID, 100)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "获取成本投影补偿队列失败"})
+		return
+	}
+	type retryView struct {
+		ID            int64  `json:"id"`
+		EventID       string `json:"event_id"`
+		State         string `json:"state"`
+		Attempts      int    `json:"attempts"`
+		NextAttemptAt int64  `json:"next_attempt_at"`
+		UpdatedAt     int64  `json:"updated_at"`
+		CompletedAt   int64  `json:"completed_at"`
+		HasError      bool   `json:"has_error"`
+	}
+	views := make([]retryView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, retryView{ID: row.ID, EventID: row.EventID, State: row.State,
+			Attempts: row.Attempts, NextAttemptAt: row.NextAttemptAt, UpdatedAt: row.UpdatedAt,
+			CompletedAt: row.CompletedAt, HasError: strings.TrimSpace(row.LastError) != ""})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": views})
+}
+
+func AdminListTenantCostAuditEvents(c *gin.Context) {
+	tenantID, ok := resolveTenantCostTenant(c)
+	if !ok {
+		return
+	}
+	rows, err := model.ListTenantCostAuditEventsForTenant(tenantID, 500)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "获取成本审计记录失败"})
+		return
+	}
+	type auditView struct {
+		ID          int64  `json:"id"`
+		ActorUserID int    `json:"actor_user_id"`
+		Action      string `json:"action"`
+		SubjectID   string `json:"subject_id,omitempty"`
+		CreatedAt   int64  `json:"created_at"`
+	}
+	views := make([]auditView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, auditView{ID: row.ID, ActorUserID: row.ActorUserID, Action: row.Action, SubjectID: row.SubjectID, CreatedAt: row.CreatedAt})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": views})
+}

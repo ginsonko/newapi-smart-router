@@ -1,0 +1,223 @@
+package model
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupParameterCommission(t *testing.T) int64 {
+	t.Helper()
+	db := setupParameterFinanceDB(t)
+	require.NoError(t, db.AutoMigrate(&Midjourney{}))
+	require.NoError(t, migrateCommissionSchema())
+	require.NoError(t, db.Create(&User{Id: 2, Username: "parameter-inviter", Status: common.UserStatusEnabled, Group: "default", AffCode: "parameter-inviter"}).Error)
+	require.NoError(t, db.Model(&User{}).Where("id = ?", 1).Updates(map[string]any{"inviter_id": 2, "role": common.RoleRootUser}).Error)
+	_, _, err := InitializeCommissionInviterHistory(time.Now().Add(-time.Minute).UnixMilli(), 1)
+	require.NoError(t, err)
+	program, _, err := CreateCommissionProgram("parameter-program", []CommissionTierView{{ThresholdQuota: 0, RateBps: 100}, {ThresholdQuota: 10000, RateBps: 200}}, 1)
+	require.NoError(t, err)
+	_, err = PublishCommissionProgram(program.PublicID, program.Version, 1)
+	require.NoError(t, err)
+	return time.Now().Add(2 * time.Second).Unix()
+}
+
+func TestParameterFinanceCommissionRefundIsAtomicReplayedAndFullyReversible(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		t.Run(fmt.Sprintf("async=%t", async), func(t *testing.T) {
+			finalAt := setupParameterCommission(t)
+			id := "direct:commission-refund"
+			cost := parameterFinanceContext()
+			var task Task
+			if async {
+				_, err := ReserveQuotaTo(context.Background(), quotaReservationWalletSpec(id, 1, 1, false), 18000)
+				require.NoError(t, err)
+				task = Task{TaskID: "task-commission", UserId: 1, ChannelId: 109, Status: TaskStatusInProgress, Quota: 18000, BillingReservationID: id,
+					PrivateData: TaskPrivateData{TokenId: 1, BillingSource: QuotaReservationFundingWallet, BillingRequestID: id, BillingContext: &TaskBillingContext{ParameterPricing: &cost.Quote, TenantCost: &cost.Binding}}}
+				require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+					if err := tx.Create(&task).Error; err != nil {
+						return err
+					}
+					_, err := ensureTaskBillingReceiptTx(tx, &task, false)
+					return err
+				}))
+				_, err = ApplyTaskBillingSubmission(task.ID)
+				require.NoError(t, err)
+				require.NoError(t, StageTaskBillingTerminal(&task, TaskStatusSuccess, 18000))
+				_, err = ApplyTaskBillingTerminal(task.ID)
+				require.NoError(t, err)
+				require.NoError(t, DB.Model(&TaskBillingReceipt{}).Where("task_row_id = ?", task.ID).Update("applied_at", finalAt).Error)
+			} else {
+				reserveParameterFinance(t, id, cost)
+				_, err := SettleQuotaReservation(context.Background(), id, 18000)
+				require.NoError(t, err)
+			}
+			require.NoError(t, DB.Model(&QuotaReservation{}).Where("reservation_id = ?", id).Update("finalized_at", finalAt).Error)
+			projected, err := ProjectCommissionReservation(id)
+			require.NoError(t, err)
+			assert.EqualValues(t, 260, projected.AwardQuota)
+			var original CommissionOperationV1
+			require.NoError(t, DB.First(&original, projected.OperationID).Error)
+			var originalAwards []CommissionLedgerV1
+			require.NoError(t, DB.Where("operation_id = ? AND event_type = ?", projected.OperationID, "commission_awarded").Find(&originalAwards).Error)
+			refund := func(operation string, amount int) (TenantCostAppendResult, error) {
+				if async {
+					return ApplyParameterTaskRefund(context.Background(), DownstreamTenantID, 1, task.ID, operation, amount)
+				}
+				return ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, id, operation, amount)
+			}
+			require.NoError(t, DB.Exec(`CREATE TRIGGER fail_joint_refund BEFORE INSERT ON tenant_cost_events WHEN NEW.event_type = 'refund' BEGIN SELECT RAISE(FAIL, 'joint refund failure'); END`).Error)
+			_, err = refund("first", 5000)
+			require.ErrorContains(t, err, "joint refund failure")
+			assert.EqualValues(t, 260, loadWorkerAccount(t, 2).AvailableQuota)
+			assert.Equal(t, 982000, loadCommissionTestUser(t, 1).Quota)
+			var failedOperation CommissionOperationV1
+			require.NoError(t, DB.First(&failedOperation, projected.OperationID).Error)
+			assert.Nil(t, failedOperation.ReservationCorrections)
+			require.NoError(t, DB.Exec("DROP TRIGGER fail_joint_refund").Error)
+			_, err = refund("first", 5000)
+			require.NoError(t, err)
+			assert.Equal(t, 987000, loadCommissionTestUser(t, 1).Quota)
+			assert.EqualValues(t, 160, loadWorkerAccount(t, 2).AvailableQuota)
+			replay, err := refund("first", 5000)
+			require.NoError(t, err)
+			assert.True(t, replay.Replayed)
+			_, err = ProjectCommissionReservation(id)
+			require.NoError(t, err)
+			_, err = refund("second", 3000)
+			require.NoError(t, err)
+			assert.Equal(t, 990000, loadCommissionTestUser(t, 1).Quota)
+			assert.EqualValues(t, 100, loadWorkerAccount(t, 2).AvailableQuota)
+			_, err = ProjectCommissionReservation(id)
+			require.NoError(t, err)
+			_, err = refund("rest", 10000)
+			require.NoError(t, err)
+			assert.Equal(t, 1000000, loadCommissionTestUser(t, 1).Quota)
+			assert.Zero(t, loadWorkerAccount(t, 2).AvailableQuota)
+			var token Token
+			require.NoError(t, DB.First(&token, 1).Error)
+			assert.Equal(t, 1000000, token.RemainQuota)
+			repeated, err := ProjectCommissionReservation(id)
+			require.NoError(t, err)
+			assert.Equal(t, projected.OperationID, repeated.OperationID)
+			var current CommissionOperationV1
+			require.NoError(t, DB.First(&current, projected.OperationID).Error)
+			assert.Equal(t, original.RequestHash, current.RequestHash)
+			assert.Equal(t, original.FinalizedAt, current.FinalizedAt)
+			assert.Equal(t, original.AwardNumerator, current.CorrectedNumerator)
+			assert.Zero(t, current.FinalTotalQuota)
+			var awards []CommissionLedgerV1
+			require.NoError(t, DB.Where("operation_id = ? AND event_type = ?", projected.OperationID, "commission_awarded").Find(&awards).Error)
+			assert.Equal(t, originalAwards, awards)
+			if async {
+				require.NoError(t, StageTaskBillingTerminal(&task, TaskStatusSuccess, 18000), "the original terminal callback stays idempotent after full refund")
+				r, err := ApplyTaskBillingTerminal(task.ID)
+				require.NoError(t, err)
+				assert.Zero(t, r.AppliedQuota)
+			}
+			var reversal CommissionLedgerV1
+			require.NoError(t, DB.Where("operation_id = ? AND event_type = ?", projected.OperationID, "commission_award_reversed").First(&reversal).Error)
+			require.NoError(t, DB.Model(&reversal).Update("numerator_delta", reversal.NumeratorDelta+1).Error)
+			_, err = ProjectCommissionReservation(id)
+			require.ErrorIs(t, err, ErrCommissionProjectionConflict, "correction support must not weaken legacy tamper detection")
+		})
+	}
+}
+
+func TestParameterFinanceAsyncDispatchFenceAndPersistedContractRecovery(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	id := "direct:async-before-send"
+	cost := parameterFinanceContext()
+	cost.TaskPublicID, cost.SubmissionState = "task-durable-original", "dispatching"
+	cost.Quote.SupplyRevision = "actual-supply-v7"
+	cost.TaskBilling = &TaskBillingContext{Version: 1, ParameterPricing: &cost.Quote, TenantCost: &cost.Binding, OriginModelName: cost.Quote.Model}
+	reserveParameterFinance(t, id, cost)
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), id, 1, 1, cost), ErrParameterTaskSubmissionPending)
+	require.ErrorIs(t, MarkParameterTaskSubmissionRejected(context.Background(), id, 2, cost.TaskPublicID, cost.RequestID), ErrTenantCostScope)
+	require.NoError(t, MarkParameterTaskSubmissionRejected(context.Background(), id, 1, cost.TaskPublicID, cost.RequestID))
+	cost.Quote.SourceUnitPrice, cost.Quote.SourceAmount = "0.025", "0.025"
+	require.NoError(t, PersistParameterReservationCost(context.Background(), id, 1, 1, cost))
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), id, 1, 1, cost), ErrParameterTaskSubmissionPending)
+	task := Task{TaskID: cost.TaskPublicID, UserId: 1, ChannelId: 109, Status: TaskStatusInProgress, Quota: 18000, BillingReservationID: id,
+		PrivateData: TaskPrivateData{TokenId: 1, BillingRequestID: cost.RequestID, BillingContext: &TaskBillingContext{OriginModelName: "changed-runtime"}}}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		_, err := ensureTaskBillingReceiptTx(tx, &task, false)
+		return err
+	}))
+	var restored Task
+	require.NoError(t, db.First(&restored, task.ID).Error)
+	require.NotNil(t, restored.PrivateData.BillingContext)
+	assert.Equal(t, "actual-supply-v7", restored.PrivateData.BillingContext.ParameterPricing.SupplyRevision)
+	assert.Equal(t, "0.025", restored.PrivateData.BillingContext.ParameterPricing.SourceUnitPrice)
+	assert.Equal(t, cost.Quote.Model, restored.PrivateData.BillingContext.OriginModelName)
+	_, err := ApplyTaskBillingSubmission(task.ID)
+	require.NoError(t, err)
+	require.NoError(t, StageTaskBillingTerminal(&restored, TaskStatusSuccess, 18000))
+	r, err := ApplyTaskBillingTerminal(task.ID)
+	require.NoError(t, err)
+	spec, err := BuildParameterTaskCostSpec(&restored, r)
+	require.NoError(t, err)
+	assert.Equal(t, "actual-supply-v7", spec.SourcePrice.RuleRevision)
+	assert.Empty(t, spec.UpstreamModel)
+	var count int64
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count, "the task is the only terminal publication owner")
+	assert.Equal(t, 982000, loadCommissionTestUser(t, 1).Quota)
+}
+
+func TestParameterFinanceAsyncUnknownRefundKeepsOriginalIdentityAndNoSupplierAssumption(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	cost := parameterFinanceContext()
+	cost.TaskPublicID, cost.SubmissionState = "task-unknown-original", "dispatching"
+	cost.TaskBilling = &TaskBillingContext{ParameterPricing: &cost.Quote, TenantCost: &cost.Binding}
+	reserveParameterFinance(t, "direct:unknown-task", cost)
+	_, err := HoldQuotaReservationForReconciliation(context.Background(), "direct:unknown-task", "unknown task acceptance")
+	require.NoError(t, err)
+	_, err = RefundUnknownPendingQuotaReservation(context.Background(), "direct:unknown-task")
+	require.NoError(t, err)
+	spec, err := ReadParameterReservationTerminal(context.Background(), DownstreamTenantID, "direct:unknown-task")
+	require.NoError(t, err)
+	assert.Equal(t, cost.TaskPublicID, spec.TaskPublicID)
+	assert.Equal(t, TenantCostEventObservedZero, spec.EventType)
+	assert.Nil(t, spec.ProviderCost.Amount)
+	assert.Equal(t, "0.03", spec.SourcePrice.EstimatedAmount)
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), "direct:unknown-task", 1, 1, cost), ErrQuotaReservationFinalized)
+	assert.Equal(t, 1000000, loadCommissionTestUser(t, 1).Quota)
+	var tasks int64
+	require.NoError(t, db.Model(&Task{}).Count(&tasks).Error)
+	assert.Zero(t, tasks)
+}
+
+func TestParameterFinanceCommissionSpentAwardCreatesDebtWithoutDoubleRefund(t *testing.T) {
+	finalAt := setupParameterCommission(t)
+	id := "direct:spent-commission"
+	reserveParameterFinance(t, id, parameterFinanceContext())
+	_, err := SettleQuotaReservation(context.Background(), id, 18000)
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(&QuotaReservation{}).Where("reservation_id = ?", id).Update("finalized_at", finalAt).Error)
+	projected, err := ProjectCommissionReservation(id)
+	require.NoError(t, err)
+	account := loadWorkerAccount(t, 2)
+	_, err = TransferCommissionToBalance(CommissionTransferSpec{UserID: 2, AmountQuota: account.AvailableQuota, ExpectedVersion: account.Version, IdempotencyKey: "withdraw-award"})
+	require.NoError(t, err)
+	var operation CommissionOperationV1
+	require.NoError(t, DB.First(&operation, projected.OperationID).Error)
+	_, err = ReconcileCommissionWallet(operation.PublicID, 0)
+	require.ErrorIs(t, err, ErrCommissionOperationConflict, "sidecar may not independently credit the consumer wallet")
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, id, "full-refund", 18000)
+	require.NoError(t, err)
+	assert.Equal(t, 1000000, loadCommissionTestUser(t, 1).Quota)
+	assert.Equal(t, 260, loadCommissionTestUser(t, 2).Quota, "spent award is debt, not a second consumer debit")
+	assert.EqualValues(t, 260, loadWorkerAccount(t, 2).DebtQuota)
+	_, err = ProjectCommissionReservation(id)
+	require.NoError(t, err)
+}

@@ -1,0 +1,142 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type { CurrencyConfig } from '@/stores/system-config-store'
+
+import type { ParameterPrice } from '../types'
+import { formatParameterAmount, parameterPriceAtoms } from './parameter-price'
+
+const SCALE = 10n ** 18n
+
+export type ParameterDisplayOptions = {
+  currency?: CurrencyConfig
+  showRechargePrice?: boolean
+  priceRate?: number
+  usdExchangeRate?: number
+}
+
+function rateAtoms(value: number, allowZero = false): bigint {
+  if (!Number.isFinite(value) || value < 0) throw new Error('Invalid rate')
+  const decimal = value.toLocaleString('en-US', {
+    useGrouping: false,
+    maximumFractionDigits: 18,
+  })
+  const atoms = parameterPriceAtoms(decimal)
+  if (atoms === 0n && (!allowZero || value !== 0)) {
+    throw new Error('Invalid rate')
+  }
+  return atoms
+}
+
+/** Format final contract prices without reapplying a model/group multiplier. */
+export function parameterDisplayAmount(
+  price: ParameterPrice,
+  options: ParameterDisplayOptions = {}
+): { text: string; originalCurrency: boolean } | undefined {
+  try {
+    const amount = parameterPriceAtoms(price.unit_price)
+    const currency = price.currency?.trim()
+    if (!currency) return undefined
+    if (
+      price.unit === 'fixed_duration' &&
+      (!Number.isSafeInteger(price.fixed_duration_seconds) ||
+        (price.fixed_duration_seconds ?? 0) <= 0)
+    ) {
+      return undefined
+    }
+    // No exchange contract exists for arbitrary quote currencies. Preserve them.
+    if (!options.currency || currency !== 'USD') {
+      return {
+        text: `${currency} ${formatParameterAmount(amount)}`,
+        originalCurrency: Boolean(options.currency && currency !== 'USD'),
+      }
+    }
+
+    const config = options.currency
+    let prefix = '$'
+    let exchange = SCALE
+    if (config.quotaDisplayType === 'CNY') {
+      prefix = '¥'
+      exchange = rateAtoms(config.usdExchangeRate)
+    } else if (config.quotaDisplayType === 'CUSTOM') {
+      if (!config.customCurrencySymbol?.trim()) return undefined
+      prefix = `${config.customCurrencySymbol.trim()} `
+      exchange = rateAtoms(config.customCurrencyExchangeRate)
+    }
+    // TOKENS is a quota display mode; monetary model prices remain USD.
+    let numerator = amount * exchange
+    let denominator = SCALE
+    if (options.showRechargePrice) {
+      numerator *= rateAtoms(options.priceRate ?? 1, true)
+      denominator *= rateAtoms(options.usdExchangeRate ?? 1)
+    }
+    const converted = numerator / denominator
+    // Explicitly bound a sub-precision amount instead of inventing a zero/minimum.
+    const text =
+      converted === 0n && numerator > 0n
+        ? `<${prefix}${formatParameterAmount(1n)}`
+        : `${prefix}${formatParameterAmount(converted)}`
+    return { text, originalCurrency: false }
+  } catch {
+    return undefined
+  }
+}
+
+export function parameterConditionEntries(price: ParameterPrice) {
+  return Object.entries(price.conditions ?? {})
+    .filter(
+      ([, value]) => value !== undefined && value !== null && value !== ''
+    )
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => [key, String(value)] as const)
+}
+
+/** Internal revision/supply identities do not create duplicate visible prices. */
+export function distinctParameterPrices(
+  prices: ParameterPrice[]
+): ParameterPrice[] {
+  const unique = new Map<string, ParameterPrice>()
+  for (const price of prices) {
+    const key = JSON.stringify([
+      price.model,
+      price.group,
+      price.unit,
+      price.currency,
+      price.unit_price,
+      price.fixed_duration_seconds,
+      parameterConditionEntries(price),
+    ])
+    if (!unique.has(key)) unique.set(key, price)
+  }
+  return [...unique.values()]
+}
+
+export function parameterUnitLabel(unit: string): string {
+  switch (unit) {
+    case 'per_request':
+      return 'request'
+    case 'per_image':
+      return 'image'
+    case 'per_second':
+      return 'second'
+    case 'fixed_duration':
+      return 'Fixed duration'
+    default:
+      return unit || 'Billing unit unavailable'
+  }
+}

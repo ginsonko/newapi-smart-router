@@ -1,0 +1,89 @@
+package service
+
+import (
+	"context"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGenerateTextOtherInfoUsesSemanticFirstTokenForFRT(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	start := time.Unix(1_700_000_000, 0)
+	info := &relaycommon.RelayInfo{
+		StartTime:         start,
+		FirstResponseTime: start.Add(100 * time.Millisecond),
+		FirstTextTime:     start.Add(350 * time.Millisecond),
+		ChannelMeta:       &relaycommon.ChannelMeta{},
+	}
+
+	other := GenerateTextOtherInfo(ctx, info, 1, 1, 1, 0, 0, 0, 1)
+	assert.Equal(t, float64(350), other["frt"])
+}
+
+func TestGenerateTextOtherInfoOmitsUnknownFRT(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	start := time.Unix(1_700_000_000, 0)
+	info := &relaycommon.RelayInfo{StartTime: start, ChannelMeta: &relaycommon.ChannelMeta{}}
+
+	other := GenerateTextOtherInfo(ctx, info, 1, 1, 1, 0, 0, 0, 1)
+	_, exists := other["frt"]
+	assert.False(t, exists)
+}
+
+func TestAppendStreamStatusSeparatesProviderCompletionFromClientTransport(t *testing.T) {
+	status := relaycommon.NewStreamStatus()
+	status.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+	status.MarkTerminalKind("response.completed")
+	other := map[string]interface{}{}
+
+	appendStreamStatus(&relaycommon.RelayInfo{IsStream: true, StreamStatus: status}, other)
+
+	streamInfo, ok := other["stream_status"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "ok", streamInfo["status"])
+	assert.Equal(t, "completed", streamInfo["provider_status"])
+	assert.Equal(t, "client_gone", streamInfo["transport_status"])
+	assert.Equal(t, true, streamInfo["client_disconnected"])
+	assert.Equal(t, true, streamInfo["semantic_terminal"])
+	assert.Equal(t, true, streamInfo["provider_completed"])
+	assert.Equal(t, "response.completed", streamInfo["terminal_kind"])
+}
+
+func TestAppendStreamStatusKeepsPreTerminalClientGoneNeutralToProvider(t *testing.T) {
+	status := relaycommon.NewStreamStatus()
+	status.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+	other := map[string]interface{}{}
+
+	appendStreamStatus(&relaycommon.RelayInfo{IsStream: true, StreamStatus: status}, other)
+
+	streamInfo, ok := other["stream_status"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "client_disconnected", streamInfo["status"])
+	assert.Equal(t, "unknown", streamInfo["provider_status"])
+	assert.Equal(t, false, streamInfo["provider_completed"])
+}
+
+func TestAppendStreamStatusDoesNotHideRealStreamErrorBehindClientGone(t *testing.T) {
+	status := relaycommon.NewStreamStatus()
+	status.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+	status.RecordError("provider event could not be decoded")
+	other := map[string]interface{}{}
+
+	appendStreamStatus(&relaycommon.RelayInfo{IsStream: true, StreamStatus: status}, other)
+
+	streamInfo, ok := other["stream_status"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "error", streamInfo["status"])
+	assert.Equal(t, "incomplete", streamInfo["provider_status"])
+	assert.Equal(t, "client_gone", streamInfo["transport_status"])
+}

@@ -1,0 +1,38 @@
+package codex
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStandaloneSearchResponsePreservesOpaqueEnvelope(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"encrypted_output":null,"output":"answer","results":[{"future":{"x":1}}],"unknown":true}`
+	result, apiErr := ParseStandaloneSearchResponse(c, &http.Response{Body: io.NopCloser(strings.NewReader(body))})
+	require.Nil(t, apiErr)
+	require.JSONEq(t, body, string(result.([]byte)))
+}
+
+func TestStandaloneSearchResponseRequiresStringOutput(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	_, apiErr := ParseStandaloneSearchResponse(c, &http.Response{Body: io.NopCloser(strings.NewReader(`{"output":null}`))})
+	require.NotNil(t, apiErr)
+}
+
+func TestCodexStandaloneSearchRequestURL(t *testing.T) {
+	url, err := (&Adaptor{}).GetRequestURL(&relaycommon.RelayInfo{
+		RelayMode:   relayconstant.RelayModeStandaloneSearch,
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://chatgpt.com", ChannelType: 48},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "https://chatgpt.com/backend-api/codex/alpha/search", url)
+}

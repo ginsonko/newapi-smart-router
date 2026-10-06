@@ -1,0 +1,167 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type { ParameterPrice, PricingModel } from '../types'
+
+const SCALE = 10n ** 18n
+
+export function parameterPriceAtoms(value: string): bigint {
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,18})?$/.test(value) || value.length > 128) {
+    throw new Error('Invalid parameter price')
+  }
+  const [whole, fraction = ''] = value.split('.')
+  return BigInt(whole) * SCALE + BigInt(fraction.padEnd(18, '0'))
+}
+
+export function formatParameterAmount(atoms: bigint): string {
+  const fraction = (atoms % SCALE)
+    .toString()
+    .padStart(18, '0')
+    .replace(/0+$/, '')
+  return `${atoms / SCALE}${fraction ? `.${fraction}` : ''}`
+}
+
+export function modelParameterPrices(
+  model: PricingModel,
+  group = 'all'
+): ParameterPrice[] {
+  return Object.entries(model.group_pricing ?? {}).flatMap(([name, pricing]) =>
+    group === 'all' || name === group ? (pricing.parameter_prices ?? []) : []
+  )
+}
+
+export function hasModelParameterPricing(
+  model: PricingModel,
+  group = 'all'
+): boolean {
+  if (
+    (group === 'all' || !model.group_pricing?.[group]) &&
+    model.billing_mode === 'parameter_price'
+  ) {
+    return true
+  }
+  return Object.entries(model.group_pricing ?? {}).some(
+    ([name, pricing]) =>
+      (group === 'all' || name === group) &&
+      (pricing.billing_mode === 'parameter_price' ||
+        Boolean(pricing.parameter_prices?.length))
+  )
+}
+
+export type ParameterEstimateInput = {
+  model: string
+  group: string
+  resolution: string
+  quality: string
+  duration: number
+  count: number
+  size?: string
+  resolutionAliases?: Record<string, string>
+}
+
+/** A catalog estimate; the server binds the authoritative offer immediately before each submission. */
+export function estimateParameterPrice(
+  prices: ParameterPrice[],
+  input: ParameterEstimateInput
+):
+  | { offer: ParameterPrice; quantity: number; amount: string; total: string }
+  | undefined {
+  if (!Number.isSafeInteger(input.count) || input.count < 1) return undefined
+  const normalize = (value: string) => value.trim().toLocaleLowerCase()
+  const aliases = Object.fromEntries(
+    Object.entries(input.resolutionAliases ?? {}).map(([key, value]) => [
+      normalize(key),
+      normalize(value),
+    ])
+  )
+  let resolution = normalize(input.resolution)
+  resolution = aliases[resolution] ?? resolution
+  const size = normalize(input.size ?? '')
+  const knownResolutions = prices
+    .map((price) => normalize(price.conditions.resolution ?? ''))
+    .filter(Boolean)
+  const sizeResolution =
+    aliases[size] ?? (knownResolutions.includes(size) ? size : '')
+  if (sizeResolution && resolution && sizeResolution !== resolution) {
+    return undefined
+  }
+  if (sizeResolution) resolution = sizeResolution
+  const matches = prices.filter(
+    (price) =>
+      price.model === input.model &&
+      (price.group === input.group || price.group === '*') &&
+      (!price.conditions.resolution ||
+        normalize(price.conditions.resolution) === resolution) &&
+      (!price.conditions.quality ||
+        normalize(price.conditions.quality) === normalize(input.quality))
+  )
+  if (!matches.length) return undefined
+  const specificity = (price: ParameterPrice) =>
+    price.priority ??
+    (Number(price.group === input.group) * 3 +
+      Object.keys(price.conditions).length)
+  const schedules = new Map<string, ParameterPrice[]>()
+  for (const price of matches) {
+    const identity = price.schedule_id ?? 'legacy'
+    const rows = schedules.get(identity) ?? []
+    rows.push(price)
+    schedules.set(identity, rows)
+  }
+  const candidates = [...schedules.values()].flatMap((rows) => {
+    const level = Math.max(...rows.map(specificity))
+    return rows.filter((price) => specificity(price) === level)
+  })
+  if (new Set(candidates.map((price) => price.currency)).size > 1) {
+    return undefined
+  }
+  const estimates = candidates.flatMap((offer) => {
+    let quantity = 1
+    if (offer.unit === 'per_second') {
+      if (!Number.isSafeInteger(input.duration) || input.duration < 1) {
+        return []
+      }
+      quantity = input.duration
+    } else if (offer.unit === 'fixed_duration') {
+      if (
+        !offer.fixed_duration_seconds ||
+        input.duration !== offer.fixed_duration_seconds
+      ) {
+        return []
+      }
+    } else if (offer.unit !== 'per_image' && offer.unit !== 'per_request') {
+      return []
+    }
+    try {
+      const amount = parameterPriceAtoms(offer.unit_price) * BigInt(quantity)
+      return [
+        {
+          offer,
+          quantity,
+          atoms: amount,
+          amount: formatParameterAmount(amount),
+          total: formatParameterAmount(amount * BigInt(input.count)),
+        },
+      ]
+    } catch {
+      return []
+    }
+  })
+  return estimates.sort((a, b) =>
+    a.atoms < b.atoms ? -1 : Number(a.atoms > b.atoms)
+  )[0]
+}

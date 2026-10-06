@@ -1,0 +1,581 @@
+package billing_setting
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+)
+
+const (
+	GroupModelPricingField     = "group_model_pricing"
+	GroupModelPricingOptionKey = "billing_setting." + GroupModelPricingField
+
+	GroupModelPricingSchemaVersion = 1
+
+	BillingModeInherit    = "inherit"
+	BillingModeFixedPrice = "fixed_price"
+
+	TaskBillingUnitPerRequest    = "per_request"
+	TaskBillingUnitPerSecond     = "per_second"
+	TaskBillingUnitFixedDuration = "fixed_duration"
+
+	maxGroupModelPricingBytes   = 8 << 20
+	maxGroupModelPricingGroups  = 2048
+	maxGroupModelPricingEntries = 50000
+	maxPricingIdentityBytes     = 512
+	maxPricingSourceBytes       = 2048
+	maxPricingRevisionBytes     = 512
+	maxFixedDurationSeconds     = 3600
+	cacheCreation1hMultiplier   = 6 / 3.75
+)
+
+// GroupModelPricingContract is persisted as one option value. Replacing the
+// complete value keeps readers from observing a partially updated price set.
+type GroupModelPricingContract struct {
+	SchemaVersion int                                            `json:"schema_version"`
+	Revision      string                                         `json:"revision"`
+	Groups        map[string]map[string]GroupModelPricingSetting `json:"groups"`
+}
+
+type GroupModelPricingSetting struct {
+	BillingMode            string              `json:"billing_mode"`
+	ModelPrice             *float64            `json:"model_price,omitempty"`
+	ModelRatio             *float64            `json:"model_ratio,omitempty"`
+	CompletionRatio        *float64            `json:"completion_ratio,omitempty"`
+	CacheRatio             *float64            `json:"cache_ratio,omitempty"`
+	CacheCreationRatio     *float64            `json:"cache_creation_ratio,omitempty"`
+	CacheCreation5mRatio   *float64            `json:"cache_creation_5m_ratio,omitempty"`
+	CacheCreation1hRatio   *float64            `json:"cache_creation_1h_ratio,omitempty"`
+	ImageRatio             *float64            `json:"image_ratio,omitempty"`
+	AudioRatio             *float64            `json:"audio_ratio,omitempty"`
+	AudioCompletionRatio   *float64            `json:"audio_completion_ratio,omitempty"`
+	BillingExpr            string              `json:"billing_expr,omitempty"`
+	TaskProfile            *TaskBillingProfile `json:"task_profile,omitempty"`
+	Source                 string              `json:"source,omitempty"`
+	SourceRevision         string              `json:"source_revision,omitempty"`
+	SourceObservedAtUnixMS int64               `json:"source_observed_at_unix_ms,omitempty"`
+}
+
+// TaskBillingProfile controls only duration semantics. Resolution/quality and
+// other adaptor-provided multipliers remain applicable in every unit mode.
+type TaskBillingProfile struct {
+	Unit                 string `json:"unit"`
+	FixedDurationSeconds int    `json:"fixed_duration_seconds,omitempty"`
+}
+
+type ResolvedModelPricing struct {
+	Scope            string `json:"scope"`
+	ContractRevision string `json:"contract_revision,omitempty"`
+	Group            string `json:"group"`
+	Model            string `json:"model"`
+
+	BillingMode string  `json:"billing_mode"`
+	UsePrice    bool    `json:"use_price"`
+	ModelPrice  float64 `json:"model_price"`
+
+	ModelRatio    float64 `json:"model_ratio"`
+	HasModelRatio bool    `json:"has_model_ratio"`
+	// HasExplicitGroupPriceOverride distinguishes an R27 price override from
+	// an inherited billing/unit-only record. The latter still changes billing
+	// semantics but must not make the global model ratio look like a group price.
+	HasExplicitGroupPriceOverride bool    `json:"has_explicit_group_price_override"`
+	ModelRatioMatch               string  `json:"model_ratio_match,omitempty"`
+	CompletionRatio               float64 `json:"completion_ratio"`
+	CacheRatio                    float64 `json:"cache_ratio"`
+	HasCacheRatio                 bool    `json:"has_cache_ratio"`
+	CacheCreationRatio            float64 `json:"cache_creation_ratio"`
+	HasCacheCreationRatio         bool    `json:"has_cache_creation_ratio"`
+	CacheCreation5mRatio          float64 `json:"cache_creation_5m_ratio"`
+	CacheCreation1hRatio          float64 `json:"cache_creation_1h_ratio"`
+	ImageRatio                    float64 `json:"image_ratio"`
+	HasImageRatio                 bool    `json:"has_image_ratio"`
+	AudioRatio                    float64 `json:"audio_ratio"`
+	HasAudioRatio                 bool    `json:"has_audio_ratio"`
+	AudioCompletionRatio          float64 `json:"audio_completion_ratio"`
+	HasAudioCompletionRatio       bool    `json:"has_audio_completion_ratio"`
+	BillingExpr                   string  `json:"billing_expr,omitempty"`
+
+	TaskProfile    TaskBillingProfile `json:"task_profile"`
+	HasTaskProfile bool               `json:"has_task_profile"`
+}
+
+type groupModelPricingSnapshot struct {
+	contract       GroupModelPricingContract
+	normalizedJSON string
+}
+
+var (
+	groupModelPricingState    atomic.Pointer[groupModelPricingSnapshot]
+	groupModelPricingRevision atomic.Uint64
+)
+
+func init() {
+	contract, normalized, err := NormalizeGroupModelPricingContract("")
+	if err != nil {
+		panic(err)
+	}
+	groupModelPricingState.Store(&groupModelPricingSnapshot{contract: contract, normalizedJSON: normalized})
+}
+
+func NormalizeGroupModelPricingContract(raw string) (GroupModelPricingContract, string, error) {
+	if len(raw) > maxGroupModelPricingBytes {
+		return GroupModelPricingContract{}, "", fmt.Errorf("group-model pricing contract exceeds %d bytes", maxGroupModelPricingBytes)
+	}
+
+	contract := GroupModelPricingContract{}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "" {
+		if err := rejectUnknownGroupModelPricingFields(trimmed); err != nil {
+			return GroupModelPricingContract{}, "", err
+		}
+		if err := common.UnmarshalJsonStr(trimmed, &contract); err != nil {
+			return GroupModelPricingContract{}, "", fmt.Errorf("decode group-model pricing contract: %w", err)
+		}
+	}
+	if contract.SchemaVersion == 0 {
+		contract.SchemaVersion = GroupModelPricingSchemaVersion
+	}
+	if contract.SchemaVersion != GroupModelPricingSchemaVersion {
+		return GroupModelPricingContract{}, "", fmt.Errorf("unsupported group-model pricing schema_version %d", contract.SchemaVersion)
+	}
+	if contract.Groups == nil {
+		contract.Groups = make(map[string]map[string]GroupModelPricingSetting)
+	}
+	if len(contract.Groups) > maxGroupModelPricingGroups {
+		return GroupModelPricingContract{}, "", fmt.Errorf("group-model pricing contract has %d groups; maximum is %d", len(contract.Groups), maxGroupModelPricingGroups)
+	}
+
+	totalEntries := 0
+	for group, models := range contract.Groups {
+		if err := validatePricingIdentity("group", group); err != nil {
+			return GroupModelPricingContract{}, "", err
+		}
+		if models == nil {
+			contract.Groups[group] = make(map[string]GroupModelPricingSetting)
+			continue
+		}
+		totalEntries += len(models)
+		if totalEntries > maxGroupModelPricingEntries {
+			return GroupModelPricingContract{}, "", fmt.Errorf("group-model pricing contract has more than %d entries", maxGroupModelPricingEntries)
+		}
+		for modelName, setting := range models {
+			if err := validatePricingIdentity("model", modelName); err != nil {
+				return GroupModelPricingContract{}, "", fmt.Errorf("group %q: %w", group, err)
+			}
+			normalized, err := normalizeGroupModelPricingSetting(setting)
+			if err != nil {
+				return GroupModelPricingContract{}, "", fmt.Errorf("group %q model %q: %w", group, modelName, err)
+			}
+			models[modelName] = normalized
+		}
+	}
+
+	contract.Revision = ""
+	hashPayload, err := common.Marshal(struct {
+		SchemaVersion int                                            `json:"schema_version"`
+		Groups        map[string]map[string]GroupModelPricingSetting `json:"groups"`
+	}{SchemaVersion: contract.SchemaVersion, Groups: contract.Groups})
+	if err != nil {
+		return GroupModelPricingContract{}, "", fmt.Errorf("encode group-model pricing revision: %w", err)
+	}
+	digest := sha256.Sum256(hashPayload)
+	contract.Revision = hex.EncodeToString(digest[:])
+
+	normalizedJSON, err := common.Marshal(contract)
+	if err != nil {
+		return GroupModelPricingContract{}, "", fmt.Errorf("encode normalized group-model pricing contract: %w", err)
+	}
+	return contract, string(normalizedJSON), nil
+}
+
+func normalizeGroupModelPricingSetting(setting GroupModelPricingSetting) (GroupModelPricingSetting, error) {
+	setting.BillingMode = strings.TrimSpace(setting.BillingMode)
+	setting.Source = strings.TrimSpace(setting.Source)
+	setting.SourceRevision = strings.TrimSpace(setting.SourceRevision)
+	if len(setting.Source) > maxPricingSourceBytes {
+		return GroupModelPricingSetting{}, fmt.Errorf("source exceeds %d bytes", maxPricingSourceBytes)
+	}
+	if len(setting.SourceRevision) > maxPricingRevisionBytes {
+		return GroupModelPricingSetting{}, fmt.Errorf("source_revision exceeds %d bytes", maxPricingRevisionBytes)
+	}
+	if setting.SourceObservedAtUnixMS < 0 {
+		return GroupModelPricingSetting{}, fmt.Errorf("source_observed_at_unix_ms cannot be negative")
+	}
+	if setting.BillingMode == "" {
+		setting.BillingMode = BillingModeInherit
+	}
+
+	numericFields := []struct {
+		name  string
+		value *float64
+	}{
+		{"model_price", setting.ModelPrice}, {"model_ratio", setting.ModelRatio},
+		{"completion_ratio", setting.CompletionRatio}, {"cache_ratio", setting.CacheRatio},
+		{"cache_creation_ratio", setting.CacheCreationRatio}, {"cache_creation_5m_ratio", setting.CacheCreation5mRatio},
+		{"cache_creation_1h_ratio", setting.CacheCreation1hRatio}, {"image_ratio", setting.ImageRatio},
+		{"audio_ratio", setting.AudioRatio}, {"audio_completion_ratio", setting.AudioCompletionRatio},
+	}
+	for _, field := range numericFields {
+		if field.value != nil && (*field.value < 0 || math.IsNaN(*field.value) || math.IsInf(*field.value, 0)) {
+			return GroupModelPricingSetting{}, fmt.Errorf("%s must be finite and non-negative", field.name)
+		}
+	}
+
+	switch setting.BillingMode {
+	case BillingModeInherit:
+		if hasAnyPriceField(setting) || strings.TrimSpace(setting.BillingExpr) != "" {
+			return GroupModelPricingSetting{}, fmt.Errorf("inherit mode may only define a task profile or provenance")
+		}
+	case BillingModeFixedPrice:
+		if setting.ModelPrice == nil {
+			return GroupModelPricingSetting{}, fmt.Errorf("fixed_price mode requires model_price")
+		}
+		if hasAnyRatioField(setting) || strings.TrimSpace(setting.BillingExpr) != "" {
+			return GroupModelPricingSetting{}, fmt.Errorf("fixed_price mode cannot contain ratio fields or billing_expr")
+		}
+	case BillingModeRatio:
+		if setting.ModelRatio == nil || setting.CompletionRatio == nil {
+			return GroupModelPricingSetting{}, fmt.Errorf("ratio mode requires model_ratio and completion_ratio")
+		}
+		if setting.ModelPrice != nil || strings.TrimSpace(setting.BillingExpr) != "" {
+			return GroupModelPricingSetting{}, fmt.Errorf("ratio mode cannot contain model_price or billing_expr")
+		}
+	case BillingModeTieredExpr:
+		setting.BillingExpr = strings.TrimSpace(setting.BillingExpr)
+		if setting.BillingExpr == "" {
+			return GroupModelPricingSetting{}, fmt.Errorf("tiered_expr mode requires billing_expr")
+		}
+		if hasAnyPriceField(setting) {
+			return GroupModelPricingSetting{}, fmt.Errorf("tiered_expr mode cannot contain fixed or ratio price fields")
+		}
+		if err := SmokeTestExpr(setting.BillingExpr); err != nil {
+			return GroupModelPricingSetting{}, fmt.Errorf("billing_expr smoke test failed: %w", err)
+		}
+	default:
+		return GroupModelPricingSetting{}, fmt.Errorf("unsupported billing_mode %q", setting.BillingMode)
+	}
+
+	if setting.TaskProfile != nil {
+		profile := *setting.TaskProfile
+		profile.Unit = strings.TrimSpace(profile.Unit)
+		switch profile.Unit {
+		case TaskBillingUnitPerRequest, TaskBillingUnitPerSecond:
+			if profile.FixedDurationSeconds != 0 {
+				return GroupModelPricingSetting{}, fmt.Errorf("task profile %s cannot set fixed_duration_seconds", profile.Unit)
+			}
+		case TaskBillingUnitFixedDuration:
+			if profile.FixedDurationSeconds <= 0 || profile.FixedDurationSeconds > maxFixedDurationSeconds {
+				return GroupModelPricingSetting{}, fmt.Errorf("fixed_duration_seconds must be between 1 and %d", maxFixedDurationSeconds)
+			}
+		default:
+			return GroupModelPricingSetting{}, fmt.Errorf("unsupported task billing unit %q", profile.Unit)
+		}
+		setting.TaskProfile = &profile
+	}
+	return setting, nil
+}
+
+func rejectUnknownGroupModelPricingFields(raw string) error {
+	var root map[string]json.RawMessage
+	if err := common.Unmarshal([]byte(raw), &root); err != nil {
+		return fmt.Errorf("decode group-model pricing contract: %w", err)
+	}
+	if err := rejectUnknownFields("contract", root, map[string]struct{}{
+		"schema_version": {}, "revision": {}, "groups": {},
+	}); err != nil {
+		return err
+	}
+	groupsRaw, ok := root["groups"]
+	if !ok || string(groupsRaw) == "null" {
+		return nil
+	}
+	var groups map[string]json.RawMessage
+	if err := common.Unmarshal(groupsRaw, &groups); err != nil {
+		return fmt.Errorf("groups must be an object: %w", err)
+	}
+	settingFields := map[string]struct{}{
+		"billing_mode": {}, "model_price": {}, "model_ratio": {}, "completion_ratio": {},
+		"cache_ratio": {}, "cache_creation_ratio": {}, "cache_creation_5m_ratio": {},
+		"cache_creation_1h_ratio": {}, "image_ratio": {}, "audio_ratio": {},
+		"audio_completion_ratio": {}, "billing_expr": {}, "task_profile": {}, "source": {},
+		"source_revision": {}, "source_observed_at_unix_ms": {},
+	}
+	for group, modelsRaw := range groups {
+		var models map[string]json.RawMessage
+		if err := common.Unmarshal(modelsRaw, &models); err != nil {
+			return fmt.Errorf("group %q must be an object: %w", group, err)
+		}
+		for modelName, settingRaw := range models {
+			var setting map[string]json.RawMessage
+			if err := common.Unmarshal(settingRaw, &setting); err != nil {
+				return fmt.Errorf("group %q model %q must be an object: %w", group, modelName, err)
+			}
+			path := fmt.Sprintf("groups[%q][%q]", group, modelName)
+			if err := rejectUnknownFields(path, setting, settingFields); err != nil {
+				return err
+			}
+			profileRaw, ok := setting["task_profile"]
+			if !ok || string(profileRaw) == "null" {
+				continue
+			}
+			var profile map[string]json.RawMessage
+			if err := common.Unmarshal(profileRaw, &profile); err != nil {
+				return fmt.Errorf("%s.task_profile must be an object: %w", path, err)
+			}
+			if err := rejectUnknownFields(path+".task_profile", profile, map[string]struct{}{
+				"unit": {}, "fixed_duration_seconds": {},
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func rejectUnknownFields(path string, fields map[string]json.RawMessage, allowed map[string]struct{}) error {
+	for field := range fields {
+		if _, ok := allowed[field]; !ok {
+			return fmt.Errorf("%s contains unknown field %q", path, field)
+		}
+	}
+	return nil
+}
+
+func validatePricingIdentity(kind, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s name cannot be empty", kind)
+	}
+	if len(value) > maxPricingIdentityBytes {
+		return fmt.Errorf("%s name exceeds %d bytes", kind, maxPricingIdentityBytes)
+	}
+	return nil
+}
+
+func hasAnyPriceField(setting GroupModelPricingSetting) bool {
+	return setting.ModelPrice != nil || hasAnyRatioField(setting)
+}
+
+func hasAnyRatioField(setting GroupModelPricingSetting) bool {
+	return setting.ModelRatio != nil || setting.CompletionRatio != nil || setting.CacheRatio != nil ||
+		setting.CacheCreationRatio != nil || setting.CacheCreation5mRatio != nil || setting.CacheCreation1hRatio != nil ||
+		setting.ImageRatio != nil || setting.AudioRatio != nil || setting.AudioCompletionRatio != nil
+}
+
+func UpdateGroupModelPricingFromJSONString(raw string) (GroupModelPricingContract, string, error) {
+	contract, normalized, err := NormalizeGroupModelPricingContract(raw)
+	if err != nil {
+		return GroupModelPricingContract{}, "", err
+	}
+	current := groupModelPricingState.Load()
+	groupModelPricingState.Store(&groupModelPricingSnapshot{contract: contract, normalizedJSON: normalized})
+	if current == nil || current.contract.Revision != contract.Revision {
+		groupModelPricingRevision.Add(1)
+	}
+	return contract, normalized, nil
+}
+
+func GetGroupModelPricingRevision() uint64 {
+	return groupModelPricingRevision.Load()
+}
+
+func GetGroupModelPricingJSONString() string {
+	snapshot := groupModelPricingState.Load()
+	if snapshot == nil {
+		return ""
+	}
+	return snapshot.normalizedJSON
+}
+
+func GetGroupModelPricingContract() GroupModelPricingContract {
+	snapshot := groupModelPricingState.Load()
+	if snapshot == nil {
+		contract, _, _ := NormalizeGroupModelPricingContract("")
+		return contract
+	}
+	var clone GroupModelPricingContract
+	encoded, err := common.Marshal(snapshot.contract)
+	if err != nil || common.Unmarshal(encoded, &clone) != nil {
+		return GroupModelPricingContract{SchemaVersion: GroupModelPricingSchemaVersion, Groups: map[string]map[string]GroupModelPricingSetting{}}
+	}
+	return clone
+}
+
+func ResolveModelPricing(modelName, group string) ResolvedModelPricing {
+	resolved := resolveGlobalModelPricing(modelName, group)
+	snapshot := groupModelPricingState.Load()
+	if snapshot == nil {
+		return resolved
+	}
+	models, ok := snapshot.contract.Groups[group]
+	if !ok {
+		return resolved
+	}
+	setting, ok := models[modelName]
+	if !ok {
+		matchingName := ratio_setting.FormatMatchingModelName(modelName)
+		if matchingName != modelName {
+			setting, ok = models[matchingName]
+		}
+	}
+	if !ok {
+		return resolved
+	}
+
+	resolved.Scope = "group_model"
+	resolved.ContractRevision = snapshot.contract.Revision
+	switch setting.BillingMode {
+	case BillingModeFixedPrice:
+		resolved.BillingMode = BillingModeFixedPrice
+		resolved.UsePrice = true
+		resolved.ModelPrice = *setting.ModelPrice
+		resolved.HasExplicitGroupPriceOverride = true
+		resolved.ModelRatio = 0
+		resolved.HasModelRatio = false
+		resolved.BillingExpr = ""
+	case BillingModeRatio:
+		resolved.BillingMode = BillingModeRatio
+		resolved.UsePrice = false
+		resolved.ModelPrice = -1
+		resolved.ModelRatio = *setting.ModelRatio
+		resolved.HasModelRatio = true
+		resolved.HasExplicitGroupPriceOverride = true
+		resolved.ModelRatioMatch = modelName
+		resolved.CompletionRatio = *setting.CompletionRatio
+		applyOptionalRatios(&resolved, setting)
+		resolved.BillingExpr = ""
+	case BillingModeTieredExpr:
+		resolved.BillingMode = BillingModeTieredExpr
+		resolved.UsePrice = false
+		resolved.ModelPrice = -1
+		resolved.ModelRatio = 0
+		resolved.HasModelRatio = false
+		resolved.HasExplicitGroupPriceOverride = true
+		resolved.BillingExpr = setting.BillingExpr
+	}
+	if setting.TaskProfile != nil {
+		resolved.TaskProfile = *setting.TaskProfile
+		resolved.HasTaskProfile = true
+	}
+	return resolved
+}
+
+// BuildPricingBasisRevision returns the one stable revision used by quotes,
+// smart-route price ordering, asynchronous settlement and tenant-cost facts.
+// It hashes resolved pricing semantics plus the effective group ratio; it does
+// not introduce a second pricing calculation.
+func BuildPricingBasisRevision(resolved ResolvedModelPricing, effectiveGroupRatio float64, groupRatioRevision string) string {
+	payload := struct {
+		Scope                string             `json:"scope"`
+		ContractRevision     string             `json:"contract_revision,omitempty"`
+		Group                string             `json:"group"`
+		Model                string             `json:"model"`
+		BillingMode          string             `json:"billing_mode"`
+		UsePrice             bool               `json:"use_price"`
+		ModelPrice           float64            `json:"model_price"`
+		ModelRatio           float64            `json:"model_ratio"`
+		CompletionRatio      float64            `json:"completion_ratio"`
+		CacheRatio           float64            `json:"cache_ratio"`
+		CacheCreationRatio   float64            `json:"cache_creation_ratio"`
+		CacheCreation5mRatio float64            `json:"cache_creation_5m_ratio"`
+		CacheCreation1hRatio float64            `json:"cache_creation_1h_ratio"`
+		ImageRatio           float64            `json:"image_ratio"`
+		AudioRatio           float64            `json:"audio_ratio"`
+		AudioCompletionRatio float64            `json:"audio_completion_ratio"`
+		BillingExpr          string             `json:"billing_expr,omitempty"`
+		TaskProfile          TaskBillingProfile `json:"task_profile"`
+		HasTaskProfile       bool               `json:"has_task_profile"`
+		EffectiveGroupRatio  float64            `json:"effective_group_ratio"`
+		GroupRatioRevision   string             `json:"group_ratio_revision"`
+		QuotaPerUnit         float64            `json:"quota_per_unit"`
+	}{
+		Scope: resolved.Scope, ContractRevision: resolved.ContractRevision, Group: resolved.Group, Model: resolved.Model,
+		BillingMode: resolved.BillingMode, UsePrice: resolved.UsePrice, ModelPrice: resolved.ModelPrice,
+		ModelRatio: resolved.ModelRatio, CompletionRatio: resolved.CompletionRatio, CacheRatio: resolved.CacheRatio,
+		CacheCreationRatio: resolved.CacheCreationRatio, CacheCreation5mRatio: resolved.CacheCreation5mRatio,
+		CacheCreation1hRatio: resolved.CacheCreation1hRatio, ImageRatio: resolved.ImageRatio,
+		AudioRatio: resolved.AudioRatio, AudioCompletionRatio: resolved.AudioCompletionRatio,
+		BillingExpr: resolved.BillingExpr, TaskProfile: resolved.TaskProfile, HasTaskProfile: resolved.HasTaskProfile,
+		EffectiveGroupRatio: effectiveGroupRatio, GroupRatioRevision: groupRatioRevision, QuotaPerUnit: common.QuotaPerUnit,
+	}
+	encoded, err := common.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func resolveGlobalModelPricing(modelName, group string) ResolvedModelPricing {
+	modelPrice, usePrice := ratio_setting.GetModelPrice(modelName, false)
+	modelRatio, hasModelRatio, matchName := ratio_setting.GetModelRatio(modelName)
+	cacheRatio, hasCacheRatio := ratio_setting.GetCacheRatio(modelName)
+	cacheCreationRatio, hasCacheCreationRatio := ratio_setting.GetCreateCacheRatio(modelName)
+	imageRatio, hasImageRatio := ratio_setting.GetImageRatio(modelName)
+	resolved := ResolvedModelPricing{
+		Scope: "global", Group: group, Model: modelName,
+		BillingMode: GetBillingMode(modelName), UsePrice: usePrice, ModelPrice: modelPrice,
+		ModelRatio: modelRatio, HasModelRatio: hasModelRatio, ModelRatioMatch: matchName,
+		CompletionRatio: ratio_setting.GetCompletionRatio(modelName),
+		CacheRatio:      cacheRatio, HasCacheRatio: hasCacheRatio,
+		CacheCreationRatio: cacheCreationRatio, HasCacheCreationRatio: hasCacheCreationRatio,
+		CacheCreation5mRatio: cacheCreationRatio,
+		CacheCreation1hRatio: cacheCreationRatio * cacheCreation1hMultiplier,
+		ImageRatio:           imageRatio, HasImageRatio: hasImageRatio,
+		AudioRatio: ratio_setting.GetAudioRatio(modelName), HasAudioRatio: ratio_setting.ContainsAudioRatio(modelName),
+		AudioCompletionRatio: ratio_setting.GetAudioCompletionRatio(modelName), HasAudioCompletionRatio: ratio_setting.ContainsAudioCompletionRatio(modelName),
+	}
+	if resolved.BillingMode == BillingModeTieredExpr {
+		resolved.BillingExpr, _ = GetBillingExpr(modelName)
+	} else if usePrice {
+		resolved.BillingMode = BillingModeFixedPrice
+	} else {
+		resolved.BillingMode = BillingModeRatio
+	}
+	return resolved
+}
+
+func applyOptionalRatios(resolved *ResolvedModelPricing, setting GroupModelPricingSetting) {
+	if setting.CacheRatio != nil {
+		resolved.CacheRatio, resolved.HasCacheRatio = *setting.CacheRatio, true
+	}
+	if setting.CacheCreationRatio != nil {
+		resolved.CacheCreationRatio, resolved.HasCacheCreationRatio = *setting.CacheCreationRatio, true
+		resolved.CacheCreation5mRatio = *setting.CacheCreationRatio
+		resolved.CacheCreation1hRatio = *setting.CacheCreationRatio * cacheCreation1hMultiplier
+	}
+	if setting.CacheCreation5mRatio != nil {
+		resolved.CacheCreation5mRatio = *setting.CacheCreation5mRatio
+	}
+	if setting.CacheCreation1hRatio != nil {
+		resolved.CacheCreation1hRatio = *setting.CacheCreation1hRatio
+	}
+	if setting.ImageRatio != nil {
+		resolved.ImageRatio, resolved.HasImageRatio = *setting.ImageRatio, true
+	}
+	if setting.AudioRatio != nil {
+		resolved.AudioRatio, resolved.HasAudioRatio = *setting.AudioRatio, true
+	}
+	if setting.AudioCompletionRatio != nil {
+		resolved.AudioCompletionRatio, resolved.HasAudioCompletionRatio = *setting.AudioCompletionRatio, true
+	}
+}
+
+func (profile TaskBillingProfile) AppliesDurationMultiplier() bool {
+	return profile.Unit == TaskBillingUnitPerSecond
+}
+
+func IsDurationRatioKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "seconds", "second", "duration", "duration_seconds":
+		return true
+	default:
+		return false
+	}
+}

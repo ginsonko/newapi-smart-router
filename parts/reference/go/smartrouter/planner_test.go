@@ -415,8 +415,9 @@ func TestPlanNeverRetriesExactFailedRouteAndUsesSingleAttemptBudget(t *testing.T
 	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectAlreadyAttempted})
 
 	input.Attempt.StartedAttempts = input.Attempt.MaxAttempts
-	_, err = Plan(input)
-	require.ErrorIs(t, err, ErrAttemptBudget)
+	result, err = Plan(input)
+	require.NoError(t, err, "safe text must ignore the legacy numeric cap while an unattempted route remains")
+	assert.Equal(t, "route-plus", result.RouteID)
 
 	input.Attempt.ExhaustEligibleChannels = true
 	result, err = Plan(input)
@@ -424,8 +425,9 @@ func TestPlanNeverRetriesExactFailedRouteAndUsesSingleAttemptBudget(t *testing.T
 	assert.Equal(t, "route-plus", result.RouteID)
 
 	input.Request.ReplayClass = ReplaySideEffecting
-	_, err = Plan(input)
-	require.ErrorIs(t, err, ErrAttemptBudget, "only replay-safe text may bypass the numeric ceiling")
+	result, err = Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID, "an explicitly rejected side-effecting attempt may exhaust the remaining certified channels")
 
 	input.Request.ReplayClass = ReplaySafeText
 	input.Attempt.ExhaustEligibleChannels = false
@@ -494,157 +496,174 @@ func TestStrongAffinityWinsPriceButCapacityOverflowPreservesAffinity(t *testing.
 	})
 }
 
-func TestHealthGuardHandlesBootstrapHalfOpenWarmingAndDegraded(t *testing.T) {
-	t.Run("stable fallback bootstraps while half-open route is excluded", func(t *testing.T) {
-		input := basePlanInput()
-		input.Quality.Routes = map[string]QualityState{
-			"route-cheap": {Phase: QualityHalfOpen},
-		}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-plus", result.RouteID)
-		assert.Equal(t, AdmissionBootstrap, result.Admission)
-		assert.Equal(t, 1, result.MaxInflightHint)
-	})
+func TestHealthGuardUsesUnknownHealthyUnavailableContract(t *testing.T) {
+	tests := []struct {
+		name       string
+		state      QualityState
+		wantRoute  string
+		wantReject bool
+	}{
+		{name: "unknown is immediately usable", state: QualityState{Phase: QualityUnknown}, wantRoute: "route-cheap"},
+		{name: "legacy bootstrap without evidence becomes unknown", state: QualityState{Phase: QualityBootstrap}, wantRoute: "route-cheap"},
+		{name: "healthy is usable", state: QualityState{Phase: QualityHealthy, LastSuccessMS: 10}, wantRoute: "route-cheap"},
+		{name: "legacy warming without evidence becomes unknown", state: QualityState{Phase: QualityWarming}, wantRoute: "route-cheap"},
+		{name: "legacy warming with newer success becomes healthy", state: QualityState{Phase: QualityWarming, LastFailureMS: 9, LastSuccessMS: 10}, wantRoute: "route-cheap"},
+		{name: "degraded with fewer than three failures remains usable", state: QualityState{
+			Phase: QualityDegraded, ConsecutiveHardFailures: 1, LastFailureMS: 100,
+		}, wantRoute: "route-cheap"},
+		{name: "open is unavailable", state: QualityState{Phase: QualityOpen, NextProbeAtMS: 200_000}, wantRoute: "route-plus", wantReject: true},
+		{name: "half open is worker owned", state: QualityState{Phase: QualityHalfOpen}, wantRoute: "route-plus", wantReject: true},
+		{name: "legacy quarantine becomes recoverable unavailable", state: QualityState{Phase: QualityQuarantined}, wantRoute: "route-plus", wantReject: true},
+	}
 
-	t.Run("warming route admits deterministic canary", func(t *testing.T) {
-		input := basePlanInput()
-		input.Policy.RecoveryProfile = RecoveryFast
-		input.Quality.Routes["route-cheap"] = QualityState{
-			Phase:             QualityWarming,
-			WarmingTrafficPPM: 1_000_000,
-			WarmingEpoch:      3,
-			SampleDueAtMS:     200_000,
-		}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionWarming, result.Admission)
-	})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := basePlanInput()
+			input.Policy.FailureThreshold = 99
+			input.Quality.Routes["route-cheap"] = test.state
 
-	t.Run("ordinary request without cache key uses independent admission key", func(t *testing.T) {
-		input := basePlanInput()
-		input.Policy.RecoveryProfile = RecoveryFast
-		input.Request.WarmingKey = ""
-		input.Request.AdmissionKey = "request-42"
-		input.Quality.Routes["route-cheap"] = QualityState{
-			Phase:             QualityWarming,
-			WarmingTrafficPPM: 1_000_000,
-			WarmingEpoch:      1,
-			SampleDueAtMS:     input.NowMS + 30_000,
-		}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionWarming, result.Admission)
-	})
-
-	t.Run("degraded cheap route remains usable below this key threshold", func(t *testing.T) {
-		input := basePlanInput()
-		input.Quality.Routes["route-cheap"] = QualityState{
-			Phase: QualityDegraded, SampleDueAtMS: input.NowMS + 1,
-		}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionDegraded, result.Admission)
-	})
-
-	t.Run("degraded cheap route gets one due recovery sample", func(t *testing.T) {
-		input := basePlanInput()
-		input.Quality.Routes["route-cheap"] = QualityState{
-			Phase: QualityDegraded, SampleDueAtMS: input.NowMS,
-		}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionWarmSample, result.Admission)
-		assert.Equal(t, 1, result.MaxInflightHint)
-	})
-
-	t.Run("suppressed key does not immediately re-dispatch first degraded failure", func(t *testing.T) {
-		input := basePlanInput()
-		input.Policy.FailureThreshold = 1
-		input.Quality.Routes["route-cheap"] = QualityState{
-			Phase:                   QualityDegraded,
-			ConsecutiveHardFailures: 1,
-			SampleDueAtMS:           input.NowMS + 30_000,
-		}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-plus", result.RouteID)
-		assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectKeySuppressed})
-		assert.NotEqual(t, AdmissionProbe, result.Admission)
-
-		input.NowMS += 30_000
-		result, err = Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionProbe, result.Admission)
-	})
-
-	t.Run("legacy open evidence remains usable below this key threshold", func(t *testing.T) {
-		input := basePlanInput()
-		input.Quality.Routes["route-cheap"] = QualityState{Phase: QualityOpen, NextProbeAtMS: input.NowMS + 1}
-		result, err := Plan(input)
-		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionDegraded, result.Admission)
-	})
+			result, err := Plan(input)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantRoute, result.RouteID)
+			wantAdmission := AdmissionNormal
+			if test.state.Phase == QualityDegraded {
+				wantAdmission = AdmissionDegraded
+			}
+			assert.Equal(t, wantAdmission, result.Admission)
+			if test.wantReject {
+				assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+			} else {
+				assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+			}
+		})
+	}
 }
 
-func TestPriceStrategyKeepsRecoverableCheapRouteInOrderWithBackgroundProbes(t *testing.T) {
+func TestSafeTextKeepsUnknownAndWarmingPhysicalRoutesEligible(t *testing.T) {
+	input := basePlanInput()
+	input.BackgroundRecovery = true
+	input.Policy.Strategy = StrategyPrice
+	input.Quality.Routes = map[string]QualityState{
+		"route-cheap": {Phase: QualityWarming, WarmingEpoch: 9, WarmingTrafficPPM: 100_000, SampleDueAtMS: input.NowMS + 60_000},
+		"route-plus":  {Phase: QualityUnknown, Epoch: 1},
+	}
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	// Recovery evidence changes ordering/stability only. It must not make a
+	// certified, priced route disappear from a safe-text candidate pool.
+	assert.Len(t, result.Candidates, 2)
+	assert.Equal(t, "route-cheap", result.Candidates[0].Route.RouteID)
+	assert.Equal(t, AdmissionNormal, result.Candidates[0].Admission)
+	assert.Equal(t, "route-plus", result.Candidates[1].Route.RouteID)
+	assert.Equal(t, AdmissionNormal, result.Candidates[1].Admission)
+}
+
+func TestSafeTextDoesNotUseRecoveryProbeBudgetForRemainingRoutes(t *testing.T) {
+	input := basePlanInput()
+	input.BackgroundRecovery = true
+	input.Quality.Routes = map[string]QualityState{
+		"route-cheap": InitialQuality(false),
+		"route-plus":  InitialQuality(false),
+	}
+	input.Attempt.StartedAttempts = 1
+	input.Attempt.AttemptedRoutes = []string{"route-cheap"}
+	input.Attempt.AttemptedChannels = []int{101}
+	input.Attempt.RecoveryProbeUsed = true
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID)
+	assert.Len(t, result.Candidates, 1)
+	assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-plus", Reason: RejectRecoveryBudget})
+}
+
+func TestMediaUnknownRoutesRemainVisibleWhileControllerOwnsDispatchSafety(t *testing.T) {
+	input := basePlanInput()
+	input.Request.ReplayClass = ReplaySafeVideo
+	input.BackgroundRecovery = true
+	input.Quality.Routes = map[string]QualityState{
+		"route-cheap": InitialQuality(false),
+		"route-plus":  InitialQuality(false),
+	}
+
+	result, err := Plan(input)
+	require.NoError(t, err)
+	assert.Len(t, result.Candidates, 2)
+	assert.Equal(t, AdmissionNormal, result.Admission)
+}
+
+func TestPriceStrategyKeepsDegradedRouteButExcludesOpenUntilProbeSuccess(t *testing.T) {
 	input := basePlanInput()
 	input.BackgroundRecovery = true
 	input.Quality.Routes["route-cheap"] = QualityState{
 		Phase: QualityDegraded, ConsecutiveHardFailures: 1,
-		SampleDueAtMS: input.NowMS + 30_000,
 	}
 	result, err := Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-cheap", result.RouteID)
 	assert.Equal(t, AdmissionDegraded, result.Admission)
+	assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
 
 	input.Quality.Routes["route-cheap"] = QualityState{
-		Phase: QualityDegraded, ConsecutiveHardFailures: 3,
-		FailureWindowUntilMS: input.NowMS + 30_000,
-		SampleDueAtMS:        input.NowMS + 30_000,
+		Phase: QualityOpen, ConsecutiveHardFailures: 3, LastFailureMS: input.NowMS,
+		NextProbeAtMS: input.NowMS + 30_000,
 	}
 	result, err = Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-plus", result.RouteID)
-	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectKeySuppressed})
+	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+
+	input.Quality.Routes["route-cheap"] = ReduceQuality(
+		input.Quality.Routes["route-cheap"],
+		QualityEvent{AtMS: input.NowMS, Outcome: OutcomeSuccess, Probe: true},
+		DefaultQualityConfig(),
+	)
+	result, err = Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-cheap", result.RouteID)
+	assert.Equal(t, AdmissionNormal, result.Admission)
 }
 
-func TestBackgroundRecoveryDoesNotReturnKnownBadRoutesToForeground(t *testing.T) {
+func TestBackgroundRecoveryKeepsUnblockedRoutesEligible(t *testing.T) {
 	for _, phase := range []QualityPhase{QualityUnknown, QualityOpen, QualityHalfOpen} {
 		t.Run(string(phase), func(t *testing.T) {
 			input := basePlanInput()
 			input.BackgroundRecovery = true
 			input.Quality.Routes["route-cheap"] = QualityState{
-				Phase: phase, ConsecutiveHardFailures: 3,
+				Phase: phase,
+				ConsecutiveHardFailures: func() int {
+					if phase == QualityOpen {
+						return 3
+					}
+					return 0
+				}(),
 				FailureWindowUntilMS: input.NowMS + 30_000,
 				NextProbeAtMS:        input.NowMS + 30_000,
 			}
 
 			result, err := Plan(input)
-			require.NoError(t, err)
-			assert.Equal(t, "route-plus", result.RouteID)
-			assert.NotEqual(t, AdmissionLastResort, result.Admission)
-			reason := RejectHealthUnavailable
-			if phase == QualityOpen {
-				reason = RejectKeySuppressed
+			if phase == QualityHalfOpen || phase == QualityOpen {
+				// A worker-owned half-open probe remains isolated until its lease
+				// is released. An open route with a confirmed failure threshold is
+				// also a deliberate key-local hard exclusion.
+				require.NoError(t, err)
+				assert.Equal(t, "route-plus", result.RouteID)
+				if phase == QualityHalfOpen {
+					assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+				} else {
+					assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+				}
+				return
 			}
-			assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: reason})
-
-			input.Policy.MaxEffectiveRatioPPM = 20_000
-			_, err = Plan(input)
-			require.ErrorIs(t, err, ErrNoCandidate)
+			require.NoError(t, err)
+			assert.Equal(t, "route-cheap", result.RouteID)
+			assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
 		})
 	}
 }
 
-func TestBackgroundRecoveryExposesVirginUnknownsButAttemptsOnlyOnePerRequestChain(t *testing.T) {
+func TestBackgroundRecoveryAllowsSafeTextToWalkVirginRoutes(t *testing.T) {
 	input := basePlanInput()
 	input.BackgroundRecovery = true
 	input.Quality.Routes = map[string]QualityState{
@@ -655,19 +674,20 @@ func TestBackgroundRecoveryExposesVirginUnknownsButAttemptsOnlyOnePerRequestChai
 	result, err := Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-cheap", result.RouteID)
-	assert.Equal(t, AdmissionVirginBootstrap, result.Admission)
-	assert.Equal(t, 1, result.MaxInflightHint)
+	assert.Equal(t, AdmissionNormal, result.Admission)
+	assert.Equal(t, 0, result.MaxInflightHint)
 	assert.Len(t, result.Candidates, 2)
 
 	input.Attempt.RecoveryProbeUsed = true
 	input.Attempt.StartedAttempts = 1
 	input.Attempt.AttemptedRoutes = []string{"route-cheap"}
 	input.Attempt.AttemptedChannels = []int{101}
-	_, err = Plan(input)
-	require.ErrorIs(t, err, ErrNoCandidate)
+	result, err = Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID)
 }
 
-func TestVirginBootstrapInitialSelectionIsSingleFlightForTextImageAndVideoRequests(t *testing.T) {
+func TestUnknownInitialSelectionIsUsableForTextImageAndVideoRequests(t *testing.T) {
 	for _, test := range []struct {
 		name               string
 		replayClass        ReplayClass
@@ -675,8 +695,8 @@ func TestVirginBootstrapInitialSelectionIsSingleFlightForTextImageAndVideoReques
 		wantCandidates     int
 	}{
 		{name: "text", replayClass: ReplaySafeText, backgroundRecovery: true, wantCandidates: 2},
-		{name: "image", replayClass: ReplaySafeImage, wantCandidates: 1},
-		{name: "video", replayClass: ReplaySafeVideo, wantCandidates: 1},
+		{name: "image", replayClass: ReplaySafeImage, wantCandidates: 2},
+		{name: "video", replayClass: ReplaySafeVideo, wantCandidates: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			input := basePlanInput()
@@ -689,26 +709,25 @@ func TestVirginBootstrapInitialSelectionIsSingleFlightForTextImageAndVideoReques
 
 			result, err := Plan(input)
 			require.NoError(t, err)
-			assert.Equal(t, AdmissionVirginBootstrap, result.Admission)
-			assert.Equal(t, 1, result.MaxInflightHint)
+			assert.Equal(t, AdmissionNormal, result.Admission)
+			assert.Equal(t, 0, result.MaxInflightHint)
 			assert.Len(t, result.Candidates, test.wantCandidates)
 		})
 	}
 }
 
-func TestOnlyExplicitlyAuthorizedMediaMayAdvanceToNextVirginRoute(t *testing.T) {
+func TestPlannerNeverHidesRemainingUnknownMediaRoutes(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		replayClass ReplayClass
 		authorized  bool
 		wantRoute   string
-		wantErr     error
 	}{
 		{name: "image authorized", replayClass: ReplaySafeImage, authorized: true, wantRoute: "route-plus"},
 		{name: "video authorized", replayClass: ReplaySafeVideo, authorized: true, wantRoute: "route-plus"},
-		{name: "image not authorized", replayClass: ReplaySafeImage, wantErr: ErrNoCandidate},
-		{name: "video not authorized", replayClass: ReplaySafeVideo, wantErr: ErrNoCandidate},
-		{name: "text cannot use media authorization", replayClass: ReplaySafeText, authorized: true, wantErr: ErrNoCandidate},
+		{name: "image not authorized in planner", replayClass: ReplaySafeImage, wantRoute: "route-plus"},
+		{name: "video not authorized in planner", replayClass: ReplaySafeVideo, wantRoute: "route-plus"},
+		{name: "text does not need media authorization", replayClass: ReplaySafeText, authorized: true, wantRoute: "route-plus"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			input := basePlanInput()
@@ -724,13 +743,9 @@ func TestOnlyExplicitlyAuthorizedMediaMayAdvanceToNextVirginRoute(t *testing.T) 
 			input.Attempt.VirginMediaRetryAuthorized = test.authorized
 
 			result, err := Plan(input)
-			if test.wantErr != nil {
-				require.ErrorIs(t, err, test.wantErr)
-				return
-			}
 			require.NoError(t, err)
 			assert.Equal(t, test.wantRoute, result.RouteID)
-			assert.Equal(t, AdmissionVirginBootstrap, result.Admission)
+			assert.Equal(t, AdmissionNormal, result.Admission)
 			assert.Len(t, result.Candidates, 1)
 		})
 	}
@@ -744,7 +759,7 @@ func TestBackgroundPriceExploresCheaperVirginBeforeHealthyRoute(t *testing.T) {
 	result, err := Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-cheap", result.RouteID)
-	assert.Equal(t, AdmissionVirginBootstrap, result.Admission)
+	assert.Equal(t, AdmissionNormal, result.Admission)
 	assert.Len(t, result.Candidates, 2)
 }
 
@@ -758,7 +773,7 @@ func TestStableFallbackRemainsAvailableAfterColdStartSuccessWithoutWarmingKey(t 
 	bootstrap, err := Plan(input)
 	require.NoError(t, err)
 	require.Equal(t, "route-plus", bootstrap.RouteID)
-	require.Equal(t, AdmissionBootstrap, bootstrap.Admission)
+	require.Equal(t, AdmissionNormal, bootstrap.Admission)
 
 	input.Quality.Routes["route-plus"] = ReduceQuality(
 		InitialQuality(true),
@@ -792,17 +807,13 @@ func TestRecoveryProfilesGateRecoveredRoutesForNewSessions(t *testing.T) {
 				WarmingEpoch:  1,
 				StableSinceMS: 10_000,
 			}
-			if test.delayMS > 0 {
-				input.NowMS = 10_000 + test.delayMS - 1
-				result, err := Plan(input)
-				require.NoError(t, err)
-				assert.Equal(t, "route-plus", result.RouteID)
-				assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectRecoveryCooling})
-			}
-			input.NowMS = 10_000 + test.delayMS
+			// Recovery profiles still influence ranking/telemetry, but never hide
+			// a certified route behind an arbitrary time gate.
+			input.NowMS = 10_000 + max64(test.delayMS-1, 0)
 			result, err := Plan(input)
 			require.NoError(t, err)
 			assert.Equal(t, "route-cheap", result.RouteID)
+			assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectRecoveryCooling})
 		})
 	}
 }
@@ -932,7 +943,7 @@ func TestEconomicAffinityDoesNotUseSyntheticPriceEvidence(t *testing.T) {
 	assert.Equal(t, CacheEconomyReasonSyntheticPrice, result.CacheEconomy.Reason)
 }
 
-func TestWarmingSampleLaneRemainsAvailableDuringRecoveryCooldown(t *testing.T) {
+func TestLegacyWarmingWithoutFailureEvidenceBecomesUsableUnknown(t *testing.T) {
 	input := basePlanInput()
 	input.Quality.Routes["route-cheap"] = QualityState{
 		Phase:             QualityWarming,
@@ -945,11 +956,28 @@ func TestWarmingSampleLaneRemainsAvailableDuringRecoveryCooldown(t *testing.T) {
 	result, err := Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-cheap", result.RouteID)
-	assert.Equal(t, AdmissionWarmSample, result.Admission)
-	assert.Equal(t, 1, result.MaxInflightHint)
+	assert.Equal(t, AdmissionNormal, result.Admission)
+	assert.Equal(t, 0, result.MaxInflightHint)
 }
 
-func TestBackgroundRecoveryUsesRealWarmingCanaryInsteadOfWarmSample(t *testing.T) {
+func TestLegacyUnavailablePhaseWithoutFailureEvidenceIsUsableUnknown(t *testing.T) {
+	for _, phase := range []QualityPhase{QualityDegraded, QualityOpen} {
+		t.Run(string(phase), func(t *testing.T) {
+			input := basePlanInput()
+			input.Quality.Routes["route-cheap"] = QualityState{
+				Phase: phase, Epoch: 9,
+			}
+
+			result, err := Plan(input)
+			require.NoError(t, err)
+			assert.Equal(t, "route-cheap", result.RouteID)
+			assert.NotContains(t, result.Rejections,
+				Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+		})
+	}
+}
+
+func TestBackgroundRecoveryDoesNotCreateForegroundWarmingGate(t *testing.T) {
 	t.Run("admitted request becomes a real canary even at failure threshold one", func(t *testing.T) {
 		input := basePlanInput()
 		input.BackgroundRecovery = true
@@ -965,7 +993,7 @@ func TestBackgroundRecoveryUsesRealWarmingCanaryInsteadOfWarmSample(t *testing.T
 		result, err := Plan(input)
 		require.NoError(t, err)
 		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionWarming, result.Admission)
+		assert.Equal(t, AdmissionNormal, result.Admission)
 		assert.NotEqual(t, AdmissionWarmSample, result.Admission)
 	})
 
@@ -982,8 +1010,8 @@ func TestBackgroundRecoveryUsesRealWarmingCanaryInsteadOfWarmSample(t *testing.T
 
 		result, err := Plan(input)
 		require.NoError(t, err)
-		assert.Equal(t, "route-plus", result.RouteID)
-		assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+		assert.Equal(t, "route-cheap", result.RouteID)
+		assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
 	})
 }
 
@@ -1026,7 +1054,7 @@ func TestFreshRecoveryEvidenceAdmissionRespectsStrategy(t *testing.T) {
 		result, err := Plan(input)
 		require.NoError(t, err)
 		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionWarming, result.Admission)
+		assert.Equal(t, AdmissionNormal, result.Admission)
 	})
 
 	t.Run("stability retains reliability preference", func(t *testing.T) {
@@ -1070,7 +1098,7 @@ func TestFreshRecoveryEvidenceAdmissionRespectsStrategy(t *testing.T) {
 				}
 			}
 			require.NotNil(t, cheapCandidate)
-			assert.Equal(t, AdmissionWarming, cheapCandidate.Admission)
+			assert.Equal(t, AdmissionNormal, cheapCandidate.Admission)
 		})
 	}
 
@@ -1089,11 +1117,11 @@ func TestFreshRecoveryEvidenceAdmissionRespectsStrategy(t *testing.T) {
 			result, err := Plan(input)
 			require.NoError(t, err)
 			assert.Equal(t, "route-cheap", result.RouteID)
-			assert.Equal(t, AdmissionWarming, result.Admission)
+			assert.Equal(t, AdmissionNormal, result.Admission)
 		})
 	}
 
-	t.Run("expired success evidence cannot bypass warming admission", func(t *testing.T) {
+	t.Run("expired success evidence still leaves a certified route usable", func(t *testing.T) {
 		input := base
 		input.Quality.Routes = map[string]QualityState{
 			"route-cheap": cheapQuality,
@@ -1108,8 +1136,9 @@ func TestFreshRecoveryEvidenceAdmissionRespectsStrategy(t *testing.T) {
 
 		result, err := Plan(input)
 		require.NoError(t, err)
-		assert.Equal(t, "route-plus", result.RouteID)
-		assert.Contains(t, result.Rejections, Rejection{
+		assert.Equal(t, "route-cheap", result.RouteID)
+		assert.Equal(t, AdmissionNormal, result.Admission)
+		assert.NotContains(t, result.Rejections, Rejection{
 			RouteID: "route-cheap", Reason: RejectHealthUnavailable,
 		})
 	})
@@ -1138,10 +1167,10 @@ func TestBackgroundPriceExploresCheapestVirginThenFallsBackToKnownRoute(t *testi
 	first, err := Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-cheap", first.RouteID)
-	assert.Equal(t, AdmissionVirginBootstrap, first.Admission)
+	assert.Equal(t, AdmissionNormal, first.Admission)
 	require.Len(t, first.Candidates, 3)
 	assert.Equal(t, "route-middle", first.Candidates[1].Route.RouteID)
-	assert.Equal(t, AdmissionVirginBootstrap, first.Candidates[1].Admission)
+	assert.Equal(t, AdmissionNormal, first.Candidates[1].Admission)
 
 	input.Policy.FailureThreshold = 1
 	input.Attempt.StartedAttempts = 1
@@ -1157,13 +1186,13 @@ func TestBackgroundPriceExploresCheapestVirginThenFallsBackToKnownRoute(t *testi
 
 	second, err := Plan(input)
 	require.NoError(t, err)
-	assert.Equal(t, "route-plus", second.RouteID)
-	assert.Contains(t, second.Rejections, Rejection{
+	assert.Equal(t, "route-middle", second.RouteID)
+	assert.NotContains(t, second.Rejections, Rejection{
 		RouteID: "route-middle", Reason: RejectRecoveryBudget,
 	})
 }
 
-func TestDistinctUnknownRoutesCannotFailOverWithinOneAttemptChain(t *testing.T) {
+func TestDistinctUnknownRoutesCanFailOverWithinOneAttemptChain(t *testing.T) {
 	input := basePlanInput()
 	input.Quality.Routes = map[string]QualityState{
 		"route-cheap": {Phase: QualityUnknown},
@@ -1173,16 +1202,17 @@ func TestDistinctUnknownRoutesCannotFailOverWithinOneAttemptChain(t *testing.T) 
 	result, err := Plan(input)
 	require.NoError(t, err)
 	assert.Equal(t, "route-cheap", result.RouteID)
-	assert.Equal(t, AdmissionVirginBootstrap, result.Admission)
-	assert.Len(t, result.Candidates, 1)
-	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-plus", Reason: RejectRecoveryBudget})
+	assert.Equal(t, AdmissionNormal, result.Admission)
+	assert.Len(t, result.Candidates, 2)
+	assert.NotContains(t, result.Rejections, Rejection{RouteID: "route-plus", Reason: RejectRecoveryBudget})
 
 	input.Attempt.StartedAttempts = 1
 	input.Attempt.AttemptedRoutes = []string{"route-cheap"}
 	input.Attempt.AttemptedChannels = []int{101}
 	input.Attempt.RecoveryProbeUsed = true
-	_, err = Plan(input)
-	require.ErrorIs(t, err, ErrNoCandidate)
+	result, err = Plan(input)
+	require.NoError(t, err)
+	assert.Equal(t, "route-plus", result.RouteID)
 }
 
 func TestTTFTDisabledAndUnknownRemainPriceNeutral(t *testing.T) {
@@ -1207,8 +1237,8 @@ func TestTTFTDisabledAndUnknownRemainPriceNeutral(t *testing.T) {
 		input.Request.AdmissionKey = sampledKey
 		result, err := Plan(input)
 		require.NoError(t, err)
-		assert.Equal(t, "route-cheap", result.RouteID)
-		assert.Equal(t, AdmissionVirginBootstrap, result.Admission)
+		assert.Contains(t, []string{"route-cheap", "route-plus"}, result.RouteID)
+		assert.Equal(t, AdmissionNormal, result.Candidates[0].Admission)
 	})
 	t.Run("price strategy never promotes a more expensive unknown route", func(t *testing.T) {
 		input := basePlanInput()
@@ -1424,7 +1454,7 @@ func TestPlanErrorIdentityIsPreserved(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrPolicyDisabled))
 }
 
-func TestActualInputCostColdStartUsesOneInflightThenRestoresNormalCapacity(t *testing.T) {
+func TestActualInputCostRankingUsesUnifiedFormulaEvidence(t *testing.T) {
 	input := basePlanInput()
 	cheapRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[0]
 	plusRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[1]
@@ -1447,16 +1477,15 @@ func TestActualInputCostColdStartUsesOneInflightThenRestoresNormalCapacity(t *te
 
 	first, err := Plan(input)
 	require.NoError(t, err)
-	assert.Equal(t, cheapRoute.RouteID, first.RouteID, "the competitive no-sample route must get a real request")
+	assert.Equal(t, cheapRoute.RouteID, first.RouteID, "the lower unified predicted input cost wins")
 	assert.Equal(t, ActualInputCostOptimistic, first.Candidates[0].ActualInputCostSource)
-	assert.Equal(t, 1, first.MaxInflightHint, "the hidden optimistic prior must be limited to one shared inflight")
 
 	input.Capacity = CapacitySnapshot{Domains: map[string]CapacityState{
 		cheapRoute.CapacityDomain: {Known: true, MaxInflight: 1, Inflight: 1},
 	}}
 	second, err := Plan(input)
 	require.NoError(t, err)
-	assert.Equal(t, plusRoute.RouteID, second.RouteID, "concurrent traffic must spill instead of stampeding the unmeasured route")
+	assert.Equal(t, plusRoute.RouteID, second.RouteID)
 
 	cheapKey := ActualInputCostKey(
 		cheapRoute.CacheNamespaceIdentity(), cheapRoute.UpstreamModel,
@@ -1471,10 +1500,10 @@ func TestActualInputCostColdStartUsesOneInflightThenRestoresNormalCapacity(t *te
 	require.NoError(t, err)
 	assert.Equal(t, cheapRoute.RouteID, measured.RouteID)
 	assert.Equal(t, ActualInputCostObserved, measured.Candidates[0].ActualInputCostSource)
-	assert.Zero(t, measured.MaxInflightHint, "the first reliable sample must immediately restore the route's configured capacity")
+	assert.Zero(t, measured.MaxInflightHint)
 }
 
-func TestActualInputCostLearnerNotReadyAndExplicitOptOutPreserveStaticOrdering(t *testing.T) {
+func TestActualInputCostLearnerNotReadyUsesConfiguredPrior(t *testing.T) {
 	input := basePlanInput()
 	cheapRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[0]
 	plusRoute := input.Catalog.Contracts[testContractID].Pools[testPoolID].Candidates[1]
@@ -1490,8 +1519,10 @@ func TestActualInputCostLearnerNotReadyAndExplicitOptOutPreserveStaticOrdering(t
 
 	notReady, err := Plan(input)
 	require.NoError(t, err)
+	// With actual-input ranking enabled and no current Window evidence, the
+	// configured cache prior still feeds the unified cost formula.
 	assert.Equal(t, plusRoute.RouteID, notReady.RouteID)
-	assert.Equal(t, ActualInputCostStaticFallback, notReady.Candidates[0].ActualInputCostSource)
+	assert.Equal(t, ActualInputCostOptimistic, notReady.Candidates[0].ActualInputCostSource)
 
 	disabled := false
 	input.Policy.ActualInputCostRanking = &disabled
@@ -1500,4 +1531,15 @@ func TestActualInputCostLearnerNotReadyAndExplicitOptOutPreserveStaticOrdering(t
 	require.NoError(t, err)
 	assert.Equal(t, plusRoute.RouteID, optedOut.RouteID)
 	assert.Zero(t, optedOut.MaxInflightHint)
+}
+
+func TestActualInputCostCacheWeightSourcesRemainKnown(t *testing.T) {
+	for _, source := range []string{
+		ActualInputCostObserved,
+	} {
+		assert.True(t, actualInputCostCacheWeightKnown(source), source)
+	}
+	for _, source := range []string{ActualInputCostUnobservable, ""} {
+		assert.False(t, actualInputCostCacheWeightKnown(source), source)
+	}
 }

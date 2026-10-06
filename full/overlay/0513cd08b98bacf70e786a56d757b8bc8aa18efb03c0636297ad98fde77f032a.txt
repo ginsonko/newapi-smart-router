@@ -1,0 +1,23 @@
+package relay
+
+import (
+	"errors"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestConfiguredProviderUncertainResponseKeepsOriginalReservation(t *testing.T) {
+	for _, status := range []int{408, 409, 500, 502, 503, 504} {
+		result := classifyTaskSubmissionError(status, []byte(`{"error":{"message":"temporary failure"}}`), true)
+		require.NotNil(t, result)
+		assert.True(t, errors.Is(result.Error, service.ErrSmartMediaSubmissionAmbiguous))
+		assert.Equal(t, "submission_reconciliation_pending", result.Code)
+	}
+	rejected := classifyTaskSubmissionError(422, []byte(`{"error":{"message":"unsupported reference"}}`), true)
+	require.NotNil(t, rejected)
+	assert.False(t, errors.Is(rejected.Error, service.ErrSmartMediaSubmissionAmbiguous))
+	legacy := classifyTaskSubmissionError(503, []byte(`{}`))
+	assert.False(t, errors.Is(legacy.Error, service.ErrSmartMediaSubmissionAmbiguous))
+}

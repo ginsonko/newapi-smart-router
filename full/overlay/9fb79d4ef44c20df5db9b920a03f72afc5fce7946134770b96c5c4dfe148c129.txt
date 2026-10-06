@@ -1,0 +1,180 @@
+package openai
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+func convertConfiguredImage(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	cfg := info.ImageAdapter()
+	if len(request.Mask) > 0 && string(request.Mask) != "null" {
+		return nil, fmt.Errorf("此渠道支持参考图编辑，暂不支持蒙版局部重绘")
+	}
+	var images []string
+	for _, raw := range []json.RawMessage{request.Image, request.Images, request.Extra["image_urls"]} {
+		if len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		var one string
+		if common.Unmarshal(raw, &one) == nil {
+			images = append(images, one)
+			continue
+		}
+		var many []string
+		if err := common.Unmarshal(raw, &many); err != nil {
+			return nil, fmt.Errorf("参考图必须是图片网址或图片数据地址")
+		}
+		images = append(images, many...)
+	}
+	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
+		form, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			return nil, err
+		}
+		if len(form.File["mask"]) > 0 {
+			return nil, fmt.Errorf("此渠道支持参考图编辑，暂不支持蒙版局部重绘")
+		}
+		keys := make([]string, 0, len(form.File))
+		for key := range form.File {
+			if key == "image" || strings.HasPrefix(key, "image[") {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			for _, header := range form.File[key] {
+				file, err := header.Open()
+				if err != nil {
+					return nil, err
+				}
+				data, err := io.ReadAll(file)
+				_ = file.Close()
+				if err != nil {
+					return nil, err
+				}
+				mime := http.DetectContentType(data)
+				if !strings.HasPrefix(mime, "image/") {
+					return nil, fmt.Errorf("参考素材不是可识别的图片")
+				}
+				images = append(images, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(data))
+			}
+		}
+	}
+	for _, value := range images {
+		if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "data:image/") {
+			return nil, fmt.Errorf("参考图必须使用公开图片网址或图片数据地址")
+		}
+	}
+	data, err := common.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	var wire map[string]any
+	if err := common.Unmarshal(data, &wire); err != nil {
+		return nil, err
+	}
+	delete(wire, "image")
+	delete(wire, "images")
+	delete(wire, "mask")
+	// The upstream completes synchronously; client SSE conversion uses the existing handler.
+	wire["stream"] = false
+	if cfg.Protocol == "generation_references" {
+		if cfg.Async {
+			wire["response_format"] = "url"
+		}
+		field := cfg.ReferenceField
+		if field == "" {
+			field = "image_urls"
+		}
+		if len(images) > 0 {
+			wire[field] = images
+		}
+	} else {
+		content := []any{map[string]any{"type": "text", "text": request.Prompt}}
+		for _, value := range images {
+			content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": value}})
+		}
+		wire["messages"] = []any{map[string]any{"role": "user", "content": content}}
+		delete(wire, "prompt")
+		delete(wire, "response_format")
+		if p, ok := cfg.Models[info.OriginModelName]; ok {
+			aspect := p.Sizes[request.Size].Aspect
+			if aspect == "" {
+				aspect = "1:1"
+			}
+			wire["extra_body"] = map[string]any{"google": map[string]any{"image_config": map[string]any{"image_size": strings.ToUpper(request.Quality), "aspect_ratio": aspect}}}
+		}
+	}
+	c.Request.Header.Set("Content-Type", "application/json")
+	return wire, nil
+}
+
+var markdownImageURL = regexp.MustCompile(`!\[[^\]]*\]\(([^\s]+)\)`)
+
+func configuredChatImageResponse(resp *http.Response) (*http.Response, *types.NewAPIError) {
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed, types.ErrOptionWithSkipRetry())
+	}
+	var body struct {
+		Created int64 `json:"created"`
+		Choices []struct {
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage json.RawMessage `json:"usage"`
+		Error json.RawMessage `json:"error"`
+	}
+	if err := common.Unmarshal(raw, &body); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	if len(body.Error) > 0 && string(body.Error) != "null" {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		return resp, nil
+	}
+	images := []dto.ImageData{}
+	for _, choice := range body.Choices {
+		var content string
+		if common.Unmarshal(choice.Message.Content, &content) != nil {
+			continue
+		}
+		for _, match := range markdownImageURL.FindAllStringSubmatch(content, -1) {
+			value := match[1]
+			if strings.HasPrefix(value, "data:image/") {
+				parts := strings.SplitN(value, ";base64,", 2)
+				if len(parts) == 2 && parts[1] != "" {
+					images = append(images, dto.ImageData{B64Json: parts[1]})
+				}
+			} else if strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://") {
+				images = append(images, dto.ImageData{Url: value})
+			}
+		}
+	}
+	if len(images) == 0 {
+		return nil, types.NewError(fmt.Errorf("上游已返回响应，但没有可交付的图片；请提供请求编号核查"), types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	converted, err := common.Marshal(map[string]any{"created": body.Created, "data": images, "usage": body.Usage})
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(converted))
+	resp.ContentLength = int64(len(converted))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Del("Content-Length")
+	return resp, nil
+}

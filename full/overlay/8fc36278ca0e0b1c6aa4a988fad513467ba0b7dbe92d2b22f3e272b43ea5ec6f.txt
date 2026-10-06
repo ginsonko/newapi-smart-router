@@ -1,0 +1,328 @@
+package billing_setting
+
+import (
+	"math"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func parameterRuleFixture(id, unit, price string) ParameterPriceRule {
+	return ParameterPriceRule{ID: id, Group: "retail", Model: "video-a", Unit: unit, UnitPrice: price, Currency: "USD"}
+}
+
+func parameterContractFixture(t *testing.T, rules ...ParameterPriceRule) string {
+	t.Helper()
+	raw, err := common.Marshal(ParameterPricingContract{SchemaVersion: 1, Rules: rules})
+	require.NoError(t, err)
+	return string(raw)
+}
+
+func useParameterPricingFixture(t *testing.T, rules ...ParameterPriceRule) ParameterPricingContract {
+	t.Helper()
+	previous := GetParameterPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := UpdateParameterPricingFromJSONString(previous)
+		require.NoError(t, err)
+	})
+	contract, _, err := UpdateParameterPricingFromJSONString(parameterContractFixture(t, rules...))
+	require.NoError(t, err)
+	return contract
+}
+
+func TestParameterPricingExactVideoAndSourceAmounts(t *testing.T) {
+	cases := []struct {
+		model, resolution, price, source, amount, sourceAmount string
+		quota                                                  int
+	}{
+		{"video-a", "480p", ".48", ".40", "4.8", "4", 2400000},
+		{"video-a", "720p", ".84", ".70", "8.4", "7", 4200000},
+		{"video-a", "1080p", "1.32", "1.10", "13.2", "11", 6600000},
+		{"video-b", "480p", ".60", ".50", "6", "5", 3000000},
+		{"video-b", "720p", ".996", ".83", "9.96", "8.3", 4980000},
+		{"video-b", "1080p", "1.44", "1.20", "14.4", "12", 7200000},
+	}
+	var rules []ParameterPriceRule
+	for _, tc := range cases {
+		rule := parameterRuleFixture(tc.model+tc.resolution, TaskBillingUnitPerSecond, tc.price)
+		rule.Model = tc.model
+		rule.Conditions = map[string]string{"resolution": tc.resolution}
+		rule.SourceUnitPrice, rule.Source = tc.source, "operator catalog"
+		rule.SourceRevision = "catalog-rev-1"
+		rules = append(rules, rule)
+	}
+	contract := useParameterPricingFixture(t, rules...)
+	for _, tc := range cases {
+		t.Run(tc.model+tc.resolution, func(t *testing.T) {
+			quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: tc.model, Resolution: tc.resolution, DurationSeconds: "10", ChannelID: 109, Count: 1})
+			require.NoError(t, err)
+			require.NotNil(t, quote)
+			assert.Equal(t, tc.amount, quote.Amount)
+			assert.Equal(t, tc.sourceAmount, quote.SourceAmount)
+			assert.Equal(t, "10", quote.Quantity)
+			assert.Equal(t, tc.quota, quote.Quota)
+			assert.Equal(t, contract.Revision, quote.Revision)
+			assert.Equal(t, 109, quote.ChannelID)
+			assert.Equal(t, "USD", quote.SourceCurrency)
+			assert.Equal(t, "catalog-rev-1", quote.SourceRevision)
+			consumer := quote.ConsumerOffer()
+			assert.NotContains(t, consumer, "source_amount")
+			assert.NotContains(t, consumer, "source_unit_price")
+		})
+	}
+}
+
+func TestParameterPricingScopeAndConditionPrecedence(t *testing.T) {
+	base := parameterRuleFixture("global", TaskBillingUnitPerRequest, "1")
+	base.Group = "*"
+	globalChannel := base
+	globalChannel.ID, globalChannel.ChannelID, globalChannel.UnitPrice = "global-channel", 10, "2"
+	group := base
+	group.ID, group.Group, group.UnitPrice = "group", "retail", "3"
+	groupChannel := group
+	groupChannel.ID, groupChannel.ChannelID, groupChannel.UnitPrice = "group-channel", 10, "4"
+	resolution := groupChannel
+	resolution.ID, resolution.UnitPrice = "resolution", "5"
+	resolution.Conditions = map[string]string{"resolution": "720p"}
+	both := resolution
+	both.ID, both.UnitPrice = "both", "6"
+	both.Conditions = map[string]string{"resolution": "720p", "quality": "hd"}
+	useParameterPricingFixture(t, base, globalChannel, group, groupChannel, resolution, both)
+	for _, tc := range []struct {
+		group, resolution, quality, expected string
+		channelID                            int
+	}{
+		{"retail", "720p", "hd", "both", 10},
+		{"retail", "720p", "standard", "resolution", 10},
+		{"retail", "1080p", "hd", "group-channel", 10},
+		{"retail", "720p", "hd", "group", 11},
+		{"other", "720p", "hd", "global-channel", 10},
+		{"other", "720p", "hd", "global", 11},
+	} {
+		quote, err := ResolveParameterPrice(ParameterPriceInput{Group: tc.group, Model: "video-a", ChannelID: tc.channelID, Resolution: tc.resolution, Quality: tc.quality, Count: 1})
+		require.NoError(t, err)
+		require.NotNil(t, quote)
+		assert.Equal(t, tc.expected, quote.RuleID)
+	}
+}
+
+func TestParameterPricingEnabledModelsNeverFallBackOnMissingPrice(t *testing.T) {
+	rule := parameterRuleFixture("conditional", TaskBillingUnitPerRequest, "1")
+	rule.ChannelID, rule.Conditions = 10, map[string]string{"resolution": "720p"}
+	useParameterPricingFixture(t, rule)
+	assert.True(t, HasParameterPricing("video-a", "retail"))
+	assert.False(t, HasParameterPricing("video-a", "other"))
+	for _, input := range []ParameterPriceInput{
+		{Group: "retail", Model: "video-a", ChannelID: 10, Resolution: "1080p", Count: 1},
+		{Group: "retail", Model: "video-a", ChannelID: 11, Resolution: "720p", Count: 1},
+	} {
+		quote, err := ResolveParameterPrice(input)
+		require.ErrorContains(t, err, "no parameter price")
+		assert.Nil(t, quote)
+	}
+	for _, input := range []ParameterPriceInput{
+		{Group: "other", Model: "video-a", Count: -1},
+		{Group: "retail", Model: "legacy-model", DurationSeconds: "not-a-number"},
+	} {
+		quote, err := ResolveParameterPrice(input)
+		require.NoError(t, err)
+		assert.Nil(t, quote)
+	}
+}
+
+func TestParameterPricingQuantityUnitsAndDecimalPrecision(t *testing.T) {
+	request := parameterRuleFixture("request", TaskBillingUnitPerRequest, ".03")
+	request.Model = "image-request"
+	image := parameterRuleFixture("image", TaskBillingUnitPerImage, ".03")
+	image.Model = "image-count"
+	fixed := parameterRuleFixture("fixed", TaskBillingUnitFixedDuration, ".6")
+	fixed.Model, fixed.FixedDurationSeconds = "fixed-video", 6
+	second := parameterRuleFixture("second", TaskBillingUnitPerSecond, "1.245")
+	useParameterPricingFixture(t, request, image, fixed, second)
+	for _, tc := range []struct {
+		model, duration, quantity, amount string
+		count                             int
+	}{
+		{"image-request", "", "1", "0.03", 3},
+		{"image-count", "", "3", "0.09", 3},
+		{"fixed-video", "6", "1", "0.6", 1},
+		{"fixed-video", "", "1", "0.6", 1},
+		{"video-a", "10", "10", "12.45", 1},
+		{"video-a", "4.5", "4.5", "5.6025", 1},
+	} {
+		quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: tc.model, DurationSeconds: tc.duration, Count: tc.count})
+		require.NoError(t, err)
+		require.NotNil(t, quote)
+		assert.Equal(t, tc.quantity, quote.Quantity)
+		assert.Equal(t, tc.amount, quote.Amount)
+	}
+	quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "fixed-video", DurationSeconds: "7", Count: 1})
+	require.ErrorContains(t, err, "exactly 6 seconds")
+	assert.Nil(t, quote)
+}
+
+func TestParameterPricingRejectsUnsafeQuantitiesAndQuotaOverflow(t *testing.T) {
+	useParameterPricingFixture(t, parameterRuleFixture("second", TaskBillingUnitPerSecond, "1"))
+	for _, tc := range []struct {
+		name, duration string
+		count          int
+		channelID      int
+	}{
+		{"zero count", "1", 0, 0}, {"negative count", "1", -1, 0},
+		{"count overflow", "1", dto.MaxImageN + 1, 0},
+		{"duration overflow", "3601", 1, 0}, {"duration zero", "0", 1, 0},
+		{"duration negative", "-1", 1, 0}, {"duration omitted", "", 1, 0},
+		{"duration exponent", "1e1000000000", 1, 0},
+		{"duration precision", "0.0000000000000000001", 1, 0},
+		{"negative channel", "1", 1, -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", DurationSeconds: tc.duration, Count: tc.count, ChannelID: tc.channelID})
+			require.Error(t, err)
+			assert.Nil(t, quote)
+		})
+	}
+	quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", DurationSeconds: "3600", Count: dto.MaxImageN})
+	require.NoError(t, err)
+	assert.Equal(t, "3600", quote.Amount)
+	_, _, err = UpdateParameterPricingFromJSONString(parameterContractFixture(t, parameterRuleFixture("oversized", TaskBillingUnitPerRequest, "999999999999999999")))
+	require.NoError(t, err)
+	quote, err = ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Count: 1})
+	require.ErrorContains(t, err, "quota limit")
+	assert.Nil(t, quote)
+}
+
+func TestParameterPricingRejectsInvalidConfiguration(t *testing.T) {
+	valid := parameterRuleFixture("valid", TaskBillingUnitPerRequest, ".03")
+	for _, tc := range []struct {
+		name string
+		edit func(*ParameterPriceRule)
+	}{
+		{"empty id", func(r *ParameterPriceRule) { r.ID = " " }},
+		{"unknown unit", func(r *ParameterPriceRule) { r.Unit = "per_token" }},
+		{"negative price", func(r *ParameterPriceRule) { r.UnitPrice = "-0" }},
+		{"nan price", func(r *ParameterPriceRule) { r.UnitPrice = "NaN" }},
+		{"inf price", func(r *ParameterPriceRule) { r.UnitPrice = "Inf" }},
+		{"exponent price", func(r *ParameterPriceRule) { r.UnitPrice = "1e1000000000" }},
+		{"overlong price", func(r *ParameterPriceRule) { r.UnitPrice = strings.Repeat("0", 65) }},
+		{"large integer", func(r *ParameterPriceRule) { r.UnitPrice = "1000000000000000000" }},
+		{"excess precision", func(r *ParameterPriceRule) { r.UnitPrice = "0.0000000000000000001" }},
+		{"unsupported currency", func(r *ParameterPriceRule) { r.Currency = "CNY" }},
+		{"source currency without price", func(r *ParameterPriceRule) { r.SourceCurrency = "USD" }},
+		{"source negative", func(r *ParameterPriceRule) { r.SourceUnitPrice = "-1" }},
+		{"source currency unsupported", func(r *ParameterPriceRule) { r.SourceUnitPrice, r.SourceCurrency = "1", "CNY" }},
+		{"negative channel", func(r *ParameterPriceRule) { r.ChannelID = -1 }},
+		{"wildcard model", func(r *ParameterPriceRule) { r.Model = "*" }},
+		{"unknown dimension", func(r *ParameterPriceRule) { r.Conditions = map[string]string{"duration": "10"} }},
+		{"empty dimension", func(r *ParameterPriceRule) { r.Conditions = map[string]string{"quality": " "} }},
+		{"duplicate normalized dimension", func(r *ParameterPriceRule) {
+			r.Conditions = map[string]string{"quality": "hd", " QUALITY ": "standard"}
+		}},
+		{"fixed duration missing", func(r *ParameterPriceRule) { r.Unit = TaskBillingUnitFixedDuration }},
+		{"fixed duration overflow", func(r *ParameterPriceRule) {
+			r.Unit, r.FixedDurationSeconds = TaskBillingUnitFixedDuration, common.MaxTaskDurationSeconds+1
+		}},
+		{"duration on another unit", func(r *ParameterPriceRule) { r.FixedDurationSeconds = 6 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := valid
+			tc.edit(&rule)
+			_, _, err := NormalizeParameterPricingContract(parameterContractFixture(t, rule))
+			require.Error(t, err)
+		})
+	}
+	for _, raw := range []string{
+		`null`, `[]`, `{"schema_version":2,"rules":[]}`, `{"rules":null}`, `{"extra":1}`,
+		`{"rules":[null]}`, `{"rules":[{"unknown":1}]}`,
+		`{"rules":[{"id":"x","group":"retail","model":"video-a","unit":"per_request","currency":"USD","unit_price":0.03}]}`,
+		`{"rules":[{"id":"x","group":"retail","model":"video-a","unit":"per_request","currency":"USD","unit_price":null}]}`,
+	} {
+		_, _, err := NormalizeParameterPricingContract(raw)
+		require.Error(t, err, raw)
+	}
+}
+
+func TestParameterPricingRejectsAmbiguousRules(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		left, right map[string]string
+	}{
+		{"two defaults", nil, nil},
+		{"same dimension value", map[string]string{"resolution": "720p"}, map[string]string{"resolution": "720p"}},
+		{"cross dimension overlap", map[string]string{"resolution": "720p"}, map[string]string{"quality": "hd"}},
+		{"both same", map[string]string{"resolution": "720p", "quality": "hd"}, map[string]string{"quality": "hd", "resolution": "720p"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			left, right := parameterRuleFixture("left", TaskBillingUnitPerRequest, "1"), parameterRuleFixture("right", TaskBillingUnitPerRequest, "2")
+			left.Conditions, right.Conditions = tc.left, tc.right
+			_, _, err := NormalizeParameterPricingContract(parameterContractFixture(t, left, right))
+			require.ErrorContains(t, err, "overlaps")
+		})
+	}
+	left := parameterRuleFixture("same-id", TaskBillingUnitPerRequest, "1")
+	right := left
+	right.Group = "other"
+	_, _, err := NormalizeParameterPricingContract(parameterContractFixture(t, left, right))
+	require.ErrorContains(t, err, "duplicate")
+}
+
+func TestParameterPricingCanonicalRevisionAndImmutableReads(t *testing.T) {
+	left, right := parameterRuleFixture("a", TaskBillingUnitPerRequest, "00.0300"), parameterRuleFixture("b", TaskBillingUnitPerRequest, "0")
+	left.Conditions = map[string]string{" RESOLUTION ": " 720P "}
+	right.Conditions = map[string]string{"resolution": "1080p"}
+	contract := useParameterPricingFixture(t, left, right)
+	normalized := GetParameterPricingJSONString()
+	left.UnitPrice, left.Currency, left.Conditions = ".03", " usd ", map[string]string{"resolution": "720p"}
+	reordered, reorderedJSON, err := NormalizeParameterPricingContract(parameterContractFixture(t, right, left))
+	require.NoError(t, err)
+	assert.Equal(t, contract.Revision, reordered.Revision)
+	assert.Equal(t, normalized, reorderedJSON)
+	assert.Equal(t, contract.Revision, GetParameterPricingRevision())
+	contract.Rules[0].UnitPrice = "999"
+	contract.Rules[0].Conditions["resolution"] = "changed"
+	read := GetParameterPricingContract()
+	read.Rules[0].UnitPrice = "999"
+	read.Rules[0].Conditions["resolution"] = "changed"
+	quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Resolution: "720P", Count: 1})
+	require.NoError(t, err)
+	assert.Equal(t, "0.03", quote.Amount)
+	quote.Parameters["resolution"] = "changed"
+	quoteAgain, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Resolution: "720p", Count: 1})
+	require.NoError(t, err)
+	assert.Equal(t, "720p", quoteAgain.Parameters["resolution"])
+	_, _, err = UpdateParameterPricingFromJSONString(`{"rules":[{"invalid":true}]}`)
+	require.Error(t, err)
+	assert.Equal(t, normalized, GetParameterPricingJSONString())
+	zero, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Resolution: "1080p", Count: 1})
+	require.NoError(t, err)
+	assert.Equal(t, "0", zero.Amount)
+	assert.Zero(t, zero.Quota)
+	left.UnitPrice = "0.06"
+	updated, _, err := UpdateParameterPricingFromJSONString(parameterContractFixture(t, left, right))
+	require.NoError(t, err)
+	assert.NotEqual(t, reordered.Revision, updated.Revision)
+	assert.Equal(t, "0.03", quoteAgain.Amount, "existing frozen quotes survive a configuration update")
+	newQuote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Resolution: "720p", Count: 1})
+	require.NoError(t, err)
+	assert.Equal(t, "0.06", newQuote.Amount)
+}
+
+func TestParameterPricingRoundsOnlyFinalAmountAndRejectsInvalidQuotaUnit(t *testing.T) {
+	useParameterPricingFixture(t, parameterRuleFixture("rounding", TaskBillingUnitPerImage, "0.000001"))
+	quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Count: 3})
+	require.NoError(t, err)
+	assert.Equal(t, "0.000003", quote.Amount)
+	assert.Equal(t, 2, quote.Quota, "1.5 total quota rounds once; three rounded unit quotas would be 3")
+	original := common.QuotaPerUnit
+	t.Cleanup(func() { common.QuotaPerUnit = original })
+	for _, invalid := range []float64{0, -1, math.NaN(), math.Inf(1)} {
+		common.QuotaPerUnit = invalid
+		quote, err := ResolveParameterPrice(ParameterPriceInput{Group: "retail", Model: "video-a", Count: 1})
+		require.ErrorContains(t, err, "quota conversion factor")
+		assert.Nil(t, quote)
+	}
+}

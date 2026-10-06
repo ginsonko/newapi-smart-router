@@ -1,0 +1,485 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useQuery } from '@tanstack/react-query'
+import { useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import type { ApiKey } from '@/features/keys/types'
+import { formatQuotaAsBillingCNY } from '@/lib/format'
+import { useAuthStore } from '@/stores/auth-store'
+
+import { AnalyticsTrendChart } from './analytics-trend-chart'
+import { getSmartRouterKeyUsageAnalytics } from './api'
+import {
+  readLeaderboardPreferencesV3,
+  writeLeaderboardPreferencesV3,
+} from './leaderboard-preferences'
+
+type KeyAnalyticsRange = '1h' | '1d' | '7d'
+
+function percent(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value / 10_000
+    : null
+}
+
+function percentText(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${value.toFixed(1)}%`
+    : '—'
+}
+
+function latencyText(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  if (value >= 1_000) return `${(value / 1_000).toFixed(2)} s`
+  return `${Math.round(value)} ms`
+}
+
+function numberText(value: number) {
+  return new Intl.NumberFormat(undefined, { notation: 'compact' }).format(value)
+}
+
+function UsageMetricCard(props: {
+  label: string
+  value: string
+  detail?: string
+}) {
+  return (
+    <div className='rounded-xl border p-3'>
+      <div className='text-muted-foreground text-xs'>{props.label}</div>
+      <div className='mt-1 text-lg font-semibold tabular-nums'>
+        {props.value}
+      </div>
+      {props.detail && (
+        <div className='text-muted-foreground mt-1 text-xs'>{props.detail}</div>
+      )}
+    </div>
+  )
+}
+
+export function KeyUsageAnalyticsPanel(props: { keys: ApiKey[] }) {
+  const { t } = useTranslation()
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const initial = readLeaderboardPreferencesV3(userId)
+  const [tokenId, setTokenId] = useState<number | undefined>(initial.keyTokenId)
+  const [range, setRange] = useState<KeyAnalyticsRange>(initial.keyRange)
+  const [model, setModel] = useState(initial.keyModel)
+
+  useEffect(() => {
+    if (props.keys.length === 0) {
+      setTokenId(undefined)
+      return
+    }
+    if (!tokenId || !props.keys.some((key) => key.id === tokenId)) {
+      setTokenId(props.keys[0].id)
+    }
+  }, [props.keys, tokenId])
+  useEffect(() => {
+    const preferences = readLeaderboardPreferencesV3(userId)
+    writeLeaderboardPreferencesV3(userId, {
+      ...preferences,
+      keyTokenId: tokenId,
+      keyRange: range,
+      keyModel: model,
+    })
+  }, [model, range, tokenId, userId])
+
+  const allModelsQuery = useQuery({
+    queryKey: ['smart-router-key-usage-analytics', tokenId, range, 'all'],
+    queryFn: () =>
+      getSmartRouterKeyUsageAnalytics({ tokenId: tokenId ?? 0, range }),
+    enabled: Boolean(tokenId),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
+  const filteredQuery = useQuery({
+    queryKey: [
+      'smart-router-key-usage-analytics',
+      tokenId,
+      range,
+      model || 'all',
+    ],
+    queryFn: () =>
+      getSmartRouterKeyUsageAnalytics({
+        tokenId: tokenId ?? 0,
+        range,
+        model: model || undefined,
+      }),
+    enabled: Boolean(tokenId) && Boolean(model),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
+  const activeQuery = model ? filteredQuery : allModelsQuery
+  const report = activeQuery.data?.data
+  const summary = report?.summary
+  const points = report?.points ?? []
+  const modelOptions = useMemo(
+    () => allModelsQuery.data?.data?.models.map((item) => item.model) ?? [],
+    [allModelsQuery.data?.data?.models]
+  )
+
+  return (
+    <section className='space-y-4 rounded-xl border p-3 sm:p-4'>
+      <div>
+        <h2 className='text-base font-semibold'>
+          {t('My key usage analytics')}
+        </h2>
+        <p className='text-muted-foreground mt-1 text-sm'>
+          {t(
+            'Only aggregates belonging to the selected key are shown. No prompt, response, IP, channel ID, or key secret is returned.'
+          )}
+        </p>
+      </div>
+      <div className='grid gap-3 sm:grid-cols-3'>
+        <NativeSelect
+          aria-label={t('API key')}
+          value={tokenId ?? ''}
+          onChange={(event) => {
+            setTokenId(Number(event.target.value) || undefined)
+            setModel('')
+          }}
+        >
+          <NativeSelectOption value=''>
+            {t('Select an API key')}
+          </NativeSelectOption>
+          {props.keys.map((key) => (
+            <NativeSelectOption key={key.id} value={key.id}>
+              {key.name || t('Unnamed key')} · #{key.id}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <NativeSelect
+          aria-label={t('Time range')}
+          value={range}
+          onChange={(event) =>
+            setRange(event.target.value as KeyAnalyticsRange)
+          }
+        >
+          <NativeSelectOption value='1h'>{t('Last 1 hour')}</NativeSelectOption>
+          <NativeSelectOption value='1d'>{t('Last 1 day')}</NativeSelectOption>
+          <NativeSelectOption value='7d'>{t('Last 7 days')}</NativeSelectOption>
+        </NativeSelect>
+        <NativeSelect
+          aria-label={t('Model filter')}
+          value={model}
+          onChange={(event) => setModel(event.target.value)}
+          disabled={!tokenId}
+        >
+          <NativeSelectOption value=''>{t('All models')}</NativeSelectOption>
+          {modelOptions.map((modelName) => (
+            <NativeSelectOption key={modelName} value={modelName}>
+              {modelName}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      </div>
+
+      {activeQuery.isError && (
+        <Alert variant='destructive'>
+          <AlertDescription>
+            {t('Unable to load key usage analytics.')}
+          </AlertDescription>
+        </Alert>
+      )}
+      {report?.coverage.partial && (
+        <Alert>
+          <AlertDescription>
+            {t('Analytics coverage is partial: {{reason}}', {
+              reason: t(
+                report.coverage.missing_reason ?? 'Backfill in progress'
+              ),
+            })}
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {summary && (
+        <>
+          <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-5'>
+            <UsageMetricCard
+              label={t('Net usage')}
+              value={formatQuotaAsBillingCNY(summary.net_quota)}
+              detail={t('Charged {{charged}} · refunded {{refunded}}', {
+                charged: formatQuotaAsBillingCNY(summary.positive_quota),
+                refunded: formatQuotaAsBillingCNY(summary.refund_quota),
+              })}
+            />
+            <UsageMetricCard
+              label={t('Input and output tokens')}
+              value={`${numberText(summary.input_tokens)} / ${numberText(summary.output_tokens)}`}
+              detail={t('Input / output')}
+            />
+            <UsageMetricCard
+              label={t('Real cache rate')}
+              value={percentText(percent(summary.cache_rate_ppm))}
+              detail={t('{{count}} cached input tokens', {
+                count: numberText(summary.cache_read_tokens),
+              })}
+            />
+            <UsageMetricCard
+              label={t('Success rate')}
+              value={percentText(percent(summary.success_rate_ppm))}
+              detail={t('{{success}} success · {{failure}} failed', {
+                success: summary.successes,
+                failure: summary.failures,
+              })}
+            />
+            <UsageMetricCard
+              label={t('Average first-token latency')}
+              value={latencyText(summary.ttft_average_ms)}
+              detail={
+                summary.net_quota_per_100m_input === null
+                  ? t('Cost per 100M input tokens unknown')
+                  : t('{{cost}} per 100M input tokens', {
+                      cost: formatQuotaAsBillingCNY(
+                        summary.net_quota_per_100m_input
+                      ),
+                    })
+              }
+            />
+          </div>
+
+          <div className='grid min-w-0 gap-4 xl:grid-cols-2'>
+            <AnalyticsTrendChart
+              title={t('Net usage trend')}
+              subtitle={t(
+                'Positive usage minus refund adjustments in each time bucket.'
+              )}
+              series={[
+                {
+                  key: 'quota',
+                  label: t('Net usage'),
+                  color: '#2563eb',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: point.has_samples ? point.net_quota : null,
+                    requests: point.logical_requests,
+                    samples: point.logical_requests,
+                  })),
+                },
+              ]}
+              formatValue={formatQuotaAsBillingCNY}
+              formatAxis={formatQuotaAsBillingCNY}
+              area
+              zeroBased
+            />
+            <AnalyticsTrendChart
+              title={t('Key real cache rate trend')}
+              subtitle={t(
+                'Real cached input tokens divided by all input tokens for this key.'
+              )}
+              series={[
+                {
+                  key: 'cache',
+                  label: t('Real cache rate'),
+                  color: '#2563eb',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: percent(point.cache_rate_ppm),
+                    requests: point.logical_requests,
+                    samples: point.input_tokens,
+                  })),
+                },
+              ]}
+              formatValue={(value) => `${value.toFixed(2)}%`}
+              formatAxis={(value) => `${Math.round(value)}%`}
+              zeroBased
+            />
+            <AnalyticsTrendChart
+              title={t('Key success rate trend')}
+              subtitle={t(
+                'Successful logical requests divided by all valid logical requests.'
+              )}
+              series={[
+                {
+                  key: 'success',
+                  label: t('Success rate'),
+                  color: '#7c3aed',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: percent(point.success_rate_ppm),
+                    requests: point.logical_requests,
+                    samples: point.logical_requests,
+                  })),
+                },
+              ]}
+              formatValue={(value) => `${value.toFixed(2)}%`}
+              formatAxis={(value) => `${Math.round(value)}%`}
+              zeroBased
+            />
+            <AnalyticsTrendChart
+              title={t('Key first-token latency trend')}
+              subtitle={t(
+                'Average real semantic first-token latency for successful requests.'
+              )}
+              series={[
+                {
+                  key: 'ttft',
+                  label: t('Average TTFT'),
+                  color: '#d97706',
+                  points: points.map((point) => ({
+                    timeMS: point.bucket_start_ms,
+                    value: point.ttft_average_ms,
+                    requests: point.logical_requests,
+                    samples: point.ttft_samples,
+                  })),
+                },
+              ]}
+              formatValue={latencyText}
+              formatAxis={latencyText}
+              zeroBased
+            />
+          </div>
+
+          <div className='overflow-hidden rounded-xl border'>
+            <div className='border-b px-3 py-2 text-sm font-semibold'>
+              {t('Usage by model')}
+            </div>
+            <div className='overflow-x-auto'>
+              <table className='w-full min-w-[720px] text-sm'>
+                <thead className='bg-muted/30 text-muted-foreground text-left text-xs'>
+                  <tr>
+                    <th className='p-3'>{t('Model')}</th>
+                    <th className='p-3'>{t('Net usage')}</th>
+                    <th className='p-3'>{t('Input / output')}</th>
+                    <th className='p-3'>{t('Real cache rate')}</th>
+                    <th className='p-3'>{t('Success rate')}</th>
+                    <th className='p-3'>{t('Average TTFT')}</th>
+                    <th className='p-3'>{t('Cost per 100M input tokens')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {report.models.map((item) => (
+                    <tr className='border-t' key={item.model}>
+                      <td className='p-3 font-medium'>
+                        {item.model}
+                        {item.endpoint && (
+                          <div className='text-muted-foreground text-xs'>
+                            {item.endpoint}
+                          </div>
+                        )}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {formatQuotaAsBillingCNY(item.summary.net_quota)}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {numberText(item.summary.input_tokens)} /{' '}
+                        {numberText(item.summary.output_tokens)}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {percentText(percent(item.summary.cache_rate_ppm))}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {percentText(percent(item.summary.success_rate_ppm))}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {latencyText(item.summary.ttft_average_ms)}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {item.summary.net_quota_per_100m_input === null
+                          ? '—'
+                          : formatQuotaAsBillingCNY(
+                              item.summary.net_quota_per_100m_input
+                            )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className='overflow-hidden rounded-xl border'>
+            <div className='border-b px-3 py-2 text-sm font-semibold'>
+              {t('Usage by group')}
+            </div>
+            <div className='overflow-x-auto'>
+              <table className='w-full min-w-[720px] text-sm'>
+                <thead className='bg-muted/30 text-muted-foreground text-left text-xs'>
+                  <tr>
+                    <th className='p-3'>{t('Group')}</th>
+                    <th className='p-3'>{t('Net usage')}</th>
+                    <th className='p-3'>{t('Input / output')}</th>
+                    <th className='p-3'>{t('Real cache rate')}</th>
+                    <th className='p-3'>{t('Success rate')}</th>
+                    <th className='p-3'>{t('Average TTFT')}</th>
+                    <th className='p-3'>{t('Cost per 100M input tokens')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(report.groups ?? []).map((item) => (
+                    <tr
+                      className='border-t'
+                      key={`${item.group}-${item.endpoint ?? ''}`}
+                    >
+                      <td className='p-3 font-medium'>
+                        {item.group === 'unknown' ? t('Unknown') : item.group}
+                        {item.endpoint && (
+                          <div className='text-muted-foreground text-xs'>
+                            {item.endpoint}
+                          </div>
+                        )}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {formatQuotaAsBillingCNY(item.summary.net_quota)}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {numberText(item.summary.input_tokens)} /{' '}
+                        {numberText(item.summary.output_tokens)}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {percentText(percent(item.summary.cache_rate_ppm))}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {percentText(percent(item.summary.success_rate_ppm))}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {latencyText(item.summary.ttft_average_ms)}
+                      </td>
+                      <td className='p-3 tabular-nums'>
+                        {item.summary.net_quota_per_100m_input === null
+                          ? '—'
+                          : formatQuotaAsBillingCNY(
+                              item.summary.net_quota_per_100m_input
+                            )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+
+      {activeQuery.isPending && tokenId && (
+        <div className='text-muted-foreground rounded-xl border border-dashed p-8 text-center text-sm'>
+          {t('Loading key usage time buckets...')}
+        </div>
+      )}
+      {!tokenId && (
+        <div className='text-muted-foreground rounded-xl border border-dashed p-8 text-center text-sm'>
+          {t('Select one of your API keys to view usage analytics.')}
+        </div>
+      )}
+    </section>
+  )
+}

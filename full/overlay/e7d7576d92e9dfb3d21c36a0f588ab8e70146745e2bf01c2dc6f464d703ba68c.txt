@@ -1,0 +1,490 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { api, type ApiRequestConfig } from '@/lib/api'
+
+type ApiEnvelope<T> = {
+  success: boolean
+  message?: string
+  data: T
+}
+
+const noStoreHeaders = {
+  'Cache-Control': 'no-store',
+  Pragma: 'no-cache',
+}
+
+function noStoreConfig(config: ApiRequestConfig = {}): ApiRequestConfig {
+  return {
+    ...config,
+    headers: {
+      ...noStoreHeaders,
+      ...(config.headers as Record<string, string> | undefined),
+    },
+    // Tenant control-plane reads contain operational metadata and must not be
+    // served from the generic in-flight GET deduplicator.
+    disableDuplicate: true,
+  }
+}
+
+export type TenantCostSlot = {
+  product_pool_id: string
+  product_family: string
+  service_tier: string
+  public_label: string
+  status: string
+  key_id?: string
+  key_suffix?: string
+  route_profile_id?: string
+  profile_revision?: string
+  model_catalog_revision?: string
+  disabled_reason?: string
+}
+
+export type TenantCostDownstream = {
+  tenant_id: string
+  display_name: string
+  config_key: string
+  status: 'active' | 'disabled' | string
+  created_at: number
+  updated_at: number
+}
+
+export type TenantCostOverview = {
+  generated_at: number
+  expected_events: number
+  published_events: number
+  exact_count: number
+  observed_count: number
+  estimated_count: number
+  fallback_count: number
+  unknown_count: number
+  pending_outbox: number
+  oldest_pending_at: number
+  pending_projection_retries: number
+  oldest_projection_retry_at: number
+  conflict_count: number
+  last_sequence: number
+  blocker?: string
+}
+
+export type TenantCostEvent = {
+  event_id: string
+  sequence: number
+  event_type: string
+  status: string
+  evidence: string
+  binding: {
+    product_pool_id: string
+    service_tier: string
+    route_profile_id?: string
+    profile_revision?: string
+    key_id?: string
+  }
+  model: {
+    requested: string
+    canonical: string
+    upstream?: string
+    mapping_revision?: string
+  }
+  billing: {
+    gateway_charge_amount: string
+    currency: string
+    usage?: Record<string, string>
+  }
+  correlation?: {
+    reservation_id?: string
+    task_public_id?: string
+  }
+  created_at?: number
+}
+
+export type TenantCostOutbox = {
+  event_id: string
+  state: string
+  attempts: number
+  next_attempt_at: number
+  last_error?: string
+  updated_at: number
+}
+
+export type TenantCostProjectionRetry = {
+  event_id: string
+  state: string
+  attempts: number
+  next_attempt_at: number
+  updated_at: number
+  completed_at: number
+  has_error: boolean
+}
+
+export type TenantCostAudit = {
+  id: number
+  actor_user_id: number
+  action: string
+  subject_id?: string
+  details?: string
+  created_at: number
+}
+
+export type TenantCostBinding = {
+  id: number
+  tenant_id: string
+  credential_purpose: string
+  key_id: string
+  key_suffix: string
+  product_pool_id: string
+  service_tier: string
+  route_profile_id: string
+  profile_revision: string
+  model_catalog_revision: string
+  binding_status: string
+  created_at: number
+  updated_at: number
+  revoked_at: number
+}
+
+export type TenantCostProfile = {
+  id: number
+  tenant_id: string
+  profile_id: string
+  revision: string
+  product_pool_id: string
+  service_tier: string
+  public_label: string
+  status: string
+  disabled_reason?: string
+  created_at: number
+  updated_at: number
+}
+
+export type TenantCostProvisionedSlot = {
+  id: number
+  tenant_id: string
+  product_pool_id: string
+  product_family: string
+  service_tier: string
+  public_label: string
+  sort_order: number
+  created_at: number
+  updated_at: number
+}
+
+export type TenantReportingToken = {
+  id: number
+  tenant_id: string
+  token_id: string
+  permission: string
+  expires_at: number
+  revoked_at: number
+  last_used_at: number
+  created_at: number
+}
+
+export type TenantCostWorkerControl = {
+  tenant_id: string
+  paused: boolean
+  updated_by: number
+  updated_at: number
+}
+
+export type OneTimeTenantSecret = {
+  token: TenantReportingToken
+  secret: string
+}
+
+export type TenantCostProvisionResult = {
+  slot: TenantCostProvisionedSlot
+  profile: TenantCostProfile
+  binding?: TenantCostBinding
+  binding_created: boolean
+  secret?: string
+  replayed?: boolean
+}
+
+export type TenantCostSlotProvisionInput = {
+  request_id: string
+  product_pool_id: string
+  product_family: string
+  service_tier: string
+  public_label: string
+  sort_order: number
+  profile_id: string
+  profile_revision: string
+  model_selector: string
+  min_ratio_ppm: number
+  max_ratio_ppm: number
+  provider_class: string
+  candidate_spec: string
+  capability_spec: string
+  profile_status: string
+  disabled_reason: string
+  token_id?: number
+  model_catalog_revision: string
+  binding_status: string
+}
+
+export type TenantCostBindingKeyRotationResult = {
+  binding: TenantCostBinding
+  already_rotated: boolean
+  secret?: string
+  cache_warning?: string
+}
+
+function tenantParams(tenantId?: string) {
+  const value = tenantId?.trim()
+  return noStoreConfig(value ? { params: { tenant_id: value } } : {})
+}
+
+export async function getTenantCostDownstreams() {
+  const response = await api.get<ApiEnvelope<TenantCostDownstream[]>>(
+    '/api/tenant-cost/downstreams',
+    noStoreConfig()
+  )
+  return response.data.data
+}
+
+export async function upsertTenantCostDownstream(input: {
+  tenant_id: string
+  display_name: string
+  config_key?: string
+  status?: string
+}) {
+  const response = await api.post<ApiEnvelope<TenantCostDownstream>>(
+    '/api/tenant-cost/downstreams',
+    input,
+    noStoreConfig()
+  )
+  return response.data.data
+}
+
+export async function setTenantCostDownstreamStatus(
+  tenantId: string,
+  status: string
+) {
+  const response = await api.patch<
+    ApiEnvelope<{ tenant_id: string; status: string }>
+  >(
+    `/api/tenant-cost/downstreams/${encodeURIComponent(tenantId)}/status`,
+    {
+      status,
+    },
+    noStoreConfig()
+  )
+  return response.data.data
+}
+
+export async function getTenantCostCatalog(tenantId?: string) {
+  const response = await api.get<
+    ApiEnvelope<{ slots: TenantCostSlot[]; revision: string }>
+  >('/api/tenant-cost/catalog', tenantParams(tenantId))
+  return response.data.data
+}
+
+export async function getTenantCostProfiles(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantCostProfile[]>>(
+    '/api/tenant-cost/profiles',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function getTenantCostOverview(tenantId?: string) {
+  const response = await api.get<
+    ApiEnvelope<{ reconciliation: TenantCostOverview }>
+  >('/api/tenant-cost/reconciliation', tenantParams(tenantId))
+  return response.data.data.reconciliation
+}
+
+export async function getTenantCostOutbox(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantCostOutbox[]>>(
+    '/api/tenant-cost/outbox',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function getTenantCostProjectionRetries(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantCostProjectionRetry[]>>(
+    '/api/tenant-cost/projection-retries',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function getTenantCostAudit(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantCostAudit[]>>(
+    '/api/tenant-cost/audit',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function getTenantCostEvents(tenantId?: string) {
+  const params: Record<string, string | number> = { limit: 100 }
+  const value = tenantId?.trim()
+  if (value) {
+    params.tenant_id = value
+  }
+  const response = await api.get<
+    ApiEnvelope<{ events: TenantCostEvent[]; has_more: boolean }>
+  >('/api/tenant-cost/events', noStoreConfig({ params }))
+  return response.data.data
+}
+
+export async function getTenantCostBindings(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantCostBinding[]>>(
+    '/api/tenant-cost/bindings',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function setTenantCostBindingStatus(
+  id: number,
+  status: string,
+  tenantId?: string
+) {
+  const response = await api.patch<
+    ApiEnvelope<{ binding_id: number; status: string }>
+  >(
+    `/api/tenant-cost/bindings/${id}/status`,
+    { status },
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function getTenantReportingTokens(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantReportingToken[]>>(
+    '/api/tenant-cost/reporting-tokens',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function createTenantReportingToken(
+  expiresAt?: number,
+  tenantId?: string,
+  requestId?: string
+) {
+  const body: { request_id: string; expires_at?: number } = {
+    request_id: requestId?.trim() || crypto.randomUUID(),
+  }
+  if (expiresAt) body.expires_at = expiresAt
+  const response = await api.post<ApiEnvelope<OneTimeTenantSecret>>(
+    '/api/tenant-cost/reporting-tokens',
+    body,
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}
+
+export async function rotateTenantReportingToken(
+  tokenId: string,
+  expiresAt?: number,
+  tenantId?: string,
+  requestId?: string
+) {
+  const body: { request_id: string; expires_at?: number } = {
+    request_id: requestId?.trim() || crypto.randomUUID(),
+  }
+  if (expiresAt) body.expires_at = expiresAt
+  const response = await api.post<ApiEnvelope<OneTimeTenantSecret>>(
+    `/api/tenant-cost/reporting-tokens/${encodeURIComponent(tokenId)}/rotate`,
+    body,
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}
+
+export async function revokeTenantReportingToken(
+  tokenId: string,
+  tenantId?: string
+) {
+  const response = await api.post<ApiEnvelope<{ revoked: boolean }>>(
+    `/api/tenant-cost/reporting-tokens/${encodeURIComponent(tokenId)}/revoke`,
+    undefined,
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}
+
+export async function replayTenantCostOutbox(
+  eventIds: string[],
+  tenantId?: string
+) {
+  const response = await api.post<
+    ApiEnvelope<{ replayed: number; bounded: boolean }>
+  >(
+    '/api/tenant-cost/outbox/replay',
+    {
+      event_ids: eventIds.slice(0, 100),
+      limit: Math.min(eventIds.length, 100) || 100,
+    },
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}
+
+export async function getTenantCostWorkerControl(tenantId?: string) {
+  const response = await api.get<ApiEnvelope<TenantCostWorkerControl>>(
+    '/api/tenant-cost/worker',
+    tenantParams(tenantId)
+  )
+  return response.data.data
+}
+
+export async function setTenantCostWorkerControl(
+  paused: boolean,
+  tenantId?: string
+) {
+  const response = await api.post<ApiEnvelope<{ paused: boolean }>>(
+    '/api/tenant-cost/worker',
+    { paused },
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}
+
+export async function provisionTenantCostSlot(
+  tenantId: string,
+  input: TenantCostSlotProvisionInput
+) {
+  const response = await api.post<ApiEnvelope<TenantCostProvisionResult>>(
+    '/api/tenant-cost/slots/provision',
+    input,
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}
+
+export async function rotateTenantCostBindingKey(
+  tenantId: string,
+  bindingId: number,
+  requestId: string
+) {
+  const response = await api.post<
+    ApiEnvelope<TenantCostBindingKeyRotationResult>
+  >(
+    `/api/tenant-cost/bindings/${bindingId}/rotate-key`,
+    { request_id: requestId },
+    noStoreConfig(tenantParams(tenantId))
+  )
+  return response.data.data
+}

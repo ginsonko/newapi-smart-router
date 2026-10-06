@@ -1,0 +1,83 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRecoveryFallbackRelayUsesOneReservationForSuccessAndAllFailure(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	for _, succeeds := range []bool{false, true} {
+		t.Run(fmt.Sprint(succeeds), func(t *testing.T) {
+			h := newSmartRelayTestHarness(t, 10_000)
+			setting := h.setting
+			setting.TextRecoveryProbeAfterSeconds = nil
+			h.engine.Settings = func() smartroutersetting.Setting { return setting }
+			catalog, _ := h.engine.Catalogs.Current()
+			contractID, _, err := service.BuildSmartContractIdentity(smartRelayTestModel, service.SmartEndpointChat)
+			require.NoError(t, err)
+			pool := catalog.Contracts[contractID].Pools[smartrouter.AutomaticPoolID]
+			for _, route := range pool.Candidates {
+				require.NoError(t, h.state.RecordAttempt(context.Background(), service.SmartRouteAttemptRecord{
+					CatalogVersion: catalog.Version, RouteID: route.RouteID, Group: route.Group,
+					Model: smartRelayTestModel, ChannelID: route.ChannelID, ContractID: contractID,
+					Endpoint: service.SmartEndpointChat, CapacityDomain: route.CapacityDomain,
+					CredentialDomain: smartrouter.RouteCredentialDomain(route),
+					Outcome:          smartrouter.OutcomeInfrastructure, Admission: smartrouter.AdmissionNormal,
+					DemandRecovery: true, ObservationID: "prior-failure-" + route.RouteID,
+				}))
+				require.NoError(t, h.state.QuarantineRoute(context.Background(), service.SmartRouteQuarantineRequest{
+					CatalogVersion: catalog.Version, RouteID: route.RouteID,
+					FailureScope: service.SmartFailureRouteModel, TTL: time.Minute,
+				}))
+			}
+			requestID := "recovery-fallback-" + fmt.Sprint(succeeds)
+			ctx, _, request := h.newRequest(t, requestID)
+			var attempted []int
+			result := h.relay(ctx, request, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+				channel := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+				attempted = append(attempted, channel)
+				if succeeds && channel == smartRelayTestPlusChannel {
+					require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+					return nil
+				}
+				return types.WithOpenAIError(types.OpenAIError{Message: "Request payload is too large", Type: "openai_error"}, http.StatusRequestEntityTooLarge, types.ErrOptionWithUpstreamResponseReceived())
+			})
+			require.Len(t, uniqueSmartRelayChannels(attempted), 2, "same physical channel in another group is not an extra fallback")
+			reservation := h.reservation(t, requestID)
+			if succeeds {
+				require.Nil(t, result)
+				require.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, attempted)
+				require.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+				require.Equal(t, "plus", reservation.Group)
+				require.Equal(t, reservation.QuotedQuota, reservation.FinalQuota)
+				require.Positive(t, reservation.FinalQuota)
+			} else {
+				require.NotNil(t, result)
+				require.Len(t, attempted, 4, "baseline single confirmation retry per channel is preserved")
+				require.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+				require.Zero(t, reservation.FinalQuota)
+			}
+			require.Equal(t, len(attempted), reservation.AttemptCount)
+			require.Equal(t, h.quota-reservation.FinalQuota, h.userQuota(t))
+			var count int64
+			require.NoError(t, h.db.Model(&model.QuotaReservation{}).Count(&count).Error)
+			require.EqualValues(t, 1, count)
+		})
+	}
+}

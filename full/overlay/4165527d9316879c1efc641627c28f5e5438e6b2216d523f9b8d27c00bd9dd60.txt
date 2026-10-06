@@ -1,0 +1,1129 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type smartRouteTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newSmartRouteTestClock() *smartRouteTestClock {
+	return &smartRouteTestClock{now: time.Unix(1_700_000_000, 0)}
+}
+
+func (clock *smartRouteTestClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *smartRouteTestClock) Advance(duration time.Duration) {
+	clock.mu.Lock()
+	clock.now = clock.now.Add(duration)
+	clock.mu.Unlock()
+}
+
+func newTestMemorySmartRouteStateStore(t *testing.T, clock *smartRouteTestClock) *MemorySmartRouteStateStore {
+	t.Helper()
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+	return store
+}
+
+func recordDistinctSmartRouteFailures(
+	t *testing.T,
+	store SmartRouteStateStore,
+	base SmartRouteAttemptRecord,
+	count int,
+) {
+	t.Helper()
+	for index := 0; index < count; index++ {
+		record := base
+		record.ObservationID = fmt.Sprintf("%s-confirmed-%d", base.RouteID, index)
+		require.NoError(t, store.RecordAttempt(context.Background(), record))
+	}
+}
+
+func TestMemorySmartRouteAttemptCanSkipHealthUpdate(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	route := SmartRouteStateRoute{RouteID: "contract-route", CapacityDomain: "contract-capacity"}
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes[route.RouteID].Phase)
+
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: route.RouteID, Outcome: smartrouter.OutcomeInfrastructure, SkipHealthUpdate: true,
+	}))
+	snapshot, err = store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes[route.RouteID].Phase)
+
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: route.RouteID, Outcome: smartrouter.OutcomeInfrastructure,
+	}))
+	snapshot, err = store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityDegraded, snapshot.Quality.Routes[route.RouteID].Phase)
+}
+
+func TestSmartRouteRecentMetricsUseBoundedRecencyWeightedRealTraffic(t *testing.T) {
+	nowMS := time.Unix(1_700_000_000, 0).UnixMilli()
+	metrics := calculateSmartRouteRecentMetrics(
+		[]smartRouteTTFTSample{
+			{AtMS: nowMS - int64(61*time.Minute/time.Millisecond), MS: 50},
+			{AtMS: nowMS - int64(50*time.Minute/time.Millisecond), MS: 100},
+			{AtMS: nowMS, MS: 1_000},
+			{AtMS: nowMS, MS: 1, Synthetic: true},
+		},
+		[]smartRouteOutcomeSample{
+			{AtMS: nowMS - int64(61*time.Minute/time.Millisecond), Success: false},
+			{AtMS: nowMS - int64(50*time.Minute/time.Millisecond), Success: false},
+			{AtMS: nowMS, Success: true},
+		},
+		smartRouteRecentHistory{},
+		nowMS,
+	)
+	assert.Equal(t, 2, metrics.TTFTSamples)
+	assert.Equal(t, int64(784), metrics.TTFTRecentAverageMS)
+	assert.Equal(t, int64(9_816), metrics.TTFTAverageMS,
+		"two real observations contribute exactly 2% before a route history batch exists")
+	assert.Equal(t, int64(20_000), metrics.TTFTConfidencePPM)
+	assert.Equal(t, 2, metrics.StabilitySamples)
+	assert.Equal(t, 1, metrics.StabilitySuccesses)
+	assert.Equal(t, 1, metrics.StabilityFailures)
+	assert.InDelta(t, 0.98050935, metrics.StabilityRate, 0.000001)
+	assert.Equal(t, int64(20_000), metrics.StabilityConfidencePPM)
+	assert.Equal(t, nowMS, metrics.LastObservedAtMS)
+}
+
+func TestSmartRouteRecentMetricsHistoryMixMatrix(t *testing.T) {
+	nowMS := time.Unix(1_700_000_000, 0).UnixMilli()
+	history := smartRouteRecentHistory{
+		TTFT: smartRouteMetricHistory{
+			Version: "route-history-v1", Value: 2_000, P50: 1_800, P95: 3_000,
+			EffectiveSamples: 200, TotalSamples: 200, LastEventMS: nowMS - 1,
+		},
+		Stability: smartRouteMetricHistory{
+			Version: "route-history-v1", Value: 0.25,
+			EffectiveSamples: 200, TotalSamples: 200, LastEventMS: nowMS - 1,
+		},
+	}
+	for _, sampleCount := range []int{0, 1, 9, 10, 20, 99, 100} {
+		t.Run(fmt.Sprintf("samples_%d", sampleCount), func(t *testing.T) {
+			ttft := make([]smartRouteTTFTSample, 0, sampleCount)
+			outcomes := make([]smartRouteOutcomeSample, 0, sampleCount)
+			for index := 0; index < sampleCount; index++ {
+				ttft = append(ttft, smartRouteTTFTSample{AtMS: nowMS, MS: 1_000})
+				outcomes = append(outcomes, smartRouteOutcomeSample{AtMS: nowMS, Success: true})
+			}
+			metrics := calculateSmartRouteRecentMetrics(ttft, outcomes, history, nowMS)
+			share := float64(sampleCount) / 100
+			assert.Equal(t, int64(math.Round(1_000*share+2_000*(1-share))), metrics.TTFTAverageMS)
+			assert.InDelta(t, share+0.25*(1-share), metrics.StabilityRate, 1e-12)
+			assert.Equal(t, int64(sampleCount)*10_000, metrics.TTFTConfidencePPM)
+			assert.Equal(t, int64(sampleCount)*10_000, metrics.StabilityConfidencePPM)
+			assert.Equal(t, int64(200), metrics.TTFTHistoricalSamples)
+			assert.Equal(t, int64(200), metrics.StabilityHistoricalSamples)
+			if sampleCount == 0 {
+				assert.Equal(t, "route_history", metrics.TTFTSource)
+				assert.Equal(t, "route_history", metrics.StabilitySource)
+			} else if sampleCount == 100 {
+				assert.Equal(t, "recent", metrics.TTFTSource)
+				assert.Equal(t, "recent", metrics.StabilitySource)
+			} else {
+				assert.Equal(t, "recent_route_history", metrics.TTFTSource)
+				assert.Equal(t, "recent_route_history", metrics.StabilitySource)
+			}
+		})
+	}
+}
+
+func TestSmartRouteRecentMetricsDropsHistoryOlderThanTwentyFourHours(t *testing.T) {
+	nowMS := time.Unix(1_700_000_000, 0).UnixMilli()
+	history := smartRouteRecentHistory{
+		TTFT: smartRouteMetricHistory{
+			Version: "route-history-v1", Value: 2_000, P50: 1_800, P95: 3_000,
+			EffectiveSamples: 200, TotalSamples: 200,
+			LastEventMS: nowMS - smartRouteLeaderboardHistoryHorizon.Milliseconds() - 1,
+		},
+		Stability: smartRouteMetricHistory{
+			Version: "route-history-v1", Value: 0.25,
+			EffectiveSamples: 200, TotalSamples: 200,
+			LastEventMS: nowMS - smartRouteLeaderboardHistoryHorizon.Milliseconds() - 1,
+		},
+	}
+	metrics := calculateSmartRouteRecentMetrics(nil, nil, history, nowMS)
+	assert.Equal(t, int64(10_000), metrics.TTFTAverageMS)
+	assert.Equal(t, "system_reference", metrics.TTFTSource)
+	assert.Equal(t, int64(0), metrics.TTFTHistoricalSamples)
+	assert.InDelta(t, 0.985, metrics.StabilityRate, 1e-12)
+	assert.Equal(t, "system_reference", metrics.StabilitySource)
+	assert.Equal(t, int64(0), metrics.StabilityHistoricalSamples)
+}
+
+func TestSmartRouteHistoryBatchesTrimTTFTButNeverStabilityFailures(t *testing.T) {
+	ttftHistory := smartRouteMetricHistory{}
+	stabilityHistory := smartRouteMetricHistory{}
+	for index := 0; index < smartRouteLeaderboardHistoryBatchSize; index++ {
+		value := 1_000.0
+		if index == 0 {
+			value = 0
+		} else if index == smartRouteLeaderboardHistoryBatchSize-1 {
+			value = 100_000
+		}
+		ttftHistory = updateSmartRouteMetricHistory(ttftHistory, value, int64(1_000+index), false)
+		success := 1.0
+		if index == 0 {
+			success = 0
+		}
+		stabilityHistory = updateSmartRouteMetricHistory(stabilityHistory, success, int64(1_000+index), true)
+	}
+	assert.Equal(t, int64(20), ttftHistory.TotalSamples)
+	assert.InDelta(t, 1_000, ttftHistory.Value, 1e-9)
+	assert.Equal(t, int64(20), stabilityHistory.TotalSamples)
+	assert.InDelta(t, 0.95, stabilityHistory.Value, 1e-6,
+		"the one confirmed failure remains in the history batch")
+}
+
+func TestSmartRouteRecentStabilityExcludesProbeCancellationAndUserRejection(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	route := SmartRouteStateRoute{RouteID: "leaderboard-route", CapacityDomain: "leaderboard-capacity"}
+
+	for _, record := range []SmartRouteAttemptRecord{
+		{RouteID: route.RouteID, Outcome: smartrouter.OutcomeClientCancelled},
+		{RouteID: route.RouteID, Outcome: smartrouter.OutcomeUserRejected},
+		{RouteID: route.RouteID, Outcome: smartrouter.OutcomeSuccess, Admission: smartrouter.AdmissionProbe, SyntheticProbe: true},
+		{RouteID: route.RouteID, Outcome: smartrouter.OutcomeInfrastructure},
+		{RouteID: route.RouteID, Outcome: smartrouter.OutcomeSuccess},
+	} {
+		require.NoError(t, store.RecordAttempt(context.Background(), record))
+	}
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	metrics := snapshot.Recent.Routes[route.RouteID]
+	assert.Equal(t, 2, metrics.StabilitySamples)
+	assert.Equal(t, 1, metrics.StabilitySuccesses)
+	assert.Equal(t, 1, metrics.StabilityFailures)
+	assert.InDelta(t, 0.9753, metrics.StabilityRate, 0.000001,
+		"two fresh real outcomes contribute exactly 2% and no failure is trimmed")
+}
+
+func TestMemorySmartRouteHistoricalEvidenceIsIdempotentAndDoesNotChangeHealth(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	route := SmartRouteStateRoute{RouteID: "history-route", CapacityDomain: "history-capacity"}
+	evidence := []SmartRouteHistoricalEvidence{{
+		RouteID: route.RouteID, ObservationID: "request-1", EventMS: clock.Now().UnixMilli(),
+		OutcomeObserved: true, Success: true, TTFTObserved: true, TTFTMS: 2_000,
+	}}
+
+	accepted, err := store.ImportRecentEvidence(context.Background(), evidence)
+	require.NoError(t, err)
+	assert.Equal(t, 1, accepted)
+	accepted, err = store.ImportRecentEvidence(context.Background(), evidence)
+	require.NoError(t, err)
+	assert.Zero(t, accepted)
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes[route.RouteID].Phase)
+	assert.Equal(t, 1, snapshot.Recent.Routes[route.RouteID].TTFTSamples)
+	assert.Equal(t, 1, snapshot.Recent.Routes[route.RouteID].StabilitySamples)
+	assert.Equal(t, int64(9_920), snapshot.Recent.Routes[route.RouteID].TTFTAverageMS)
+}
+
+func TestRedisSmartRouteHistoricalEvidenceIsReplicaIdempotent(t *testing.T) {
+	server, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(server.Close)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store, err := NewRedisSmartRouteStateStore(client, DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	nowMS := time.Now().UnixMilli()
+	evidence := []SmartRouteHistoricalEvidence{{
+		RouteID: "redis-history", ObservationID: "request-1", EventMS: nowMS,
+		OutcomeObserved: true, Success: true, TTFTObserved: true, TTFTMS: 1_500,
+	}}
+
+	accepted, err := store.ImportRecentEvidence(context.Background(), evidence)
+	require.NoError(t, err)
+	assert.Equal(t, 1, accepted)
+	accepted, err = store.ImportRecentEvidence(context.Background(), evidence)
+	require.NoError(t, err)
+	assert.Zero(t, accepted)
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: "redis-history", CapacityDomain: "redis-history-capacity",
+	}}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["redis-history"].Phase)
+	assert.Equal(t, 1, snapshot.Recent.Routes["redis-history"].TTFTSamples)
+	assert.Equal(t, 1, snapshot.Recent.Routes["redis-history"].StabilitySamples)
+}
+
+func TestNormalizeSmartRouteHistoricalEvidenceKeepsNewestMetricWindows(t *testing.T) {
+	nowMS := time.Now().UnixMilli()
+	evidence := make([]SmartRouteHistoricalEvidence, 0, 150)
+	for index := 0; index < 150; index++ {
+		evidence = append(evidence, SmartRouteHistoricalEvidence{
+			RouteID: "bounded-history", ObservationID: fmt.Sprintf("request-%03d", index),
+			EventMS: nowMS - int64(index), OutcomeObserved: true, Success: true,
+			TTFTObserved: true, TTFTMS: int64(index),
+		})
+	}
+
+	normalized := normalizeSmartRouteHistoricalEvidence(evidence, nowMS)
+	require.Len(t, normalized, smartRouteLeaderboardWindowSize)
+	assert.Equal(t, nowMS-99, normalized[0].EventMS)
+	assert.Equal(t, nowMS, normalized[len(normalized)-1].EventMS)
+	for _, item := range normalized {
+		assert.True(t, item.OutcomeObserved)
+		assert.True(t, item.TTFTObserved)
+	}
+}
+
+func TestMemorySmartRouteProbeIsSingleFlightAcrossConcurrentCallers(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	const callers = 100
+	start := make(chan struct{})
+	results := make(chan *SmartRouteLease, callers)
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			<-start
+			lease, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+				RouteID: "cheap-route",
+				TTL:     time.Minute,
+			})
+			if err != nil {
+				errorsSeen <- err
+				return
+			}
+			if acquired {
+				results <- lease
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	close(errorsSeen)
+	require.Empty(t, errorsSeen)
+	var leases []*SmartRouteLease
+	for lease := range results {
+		leases = append(leases, lease)
+	}
+	require.Len(t, leases, 1)
+	assert.Len(t, leases[0].ID, 43)
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: "cheap-route", CapacityDomain: "cheap-capacity",
+	}}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHalfOpen, snapshot.Quality.Routes["cheap-route"].Phase)
+}
+
+func TestMemorySmartRouteProbeLeaseIsSingleFlightAcrossRouteAliases(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	config.ProbeBudgetLimit = 100
+	config.ProbeMaxConcurrency = 10
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+
+	first, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "group-cheap", LeaseKey: "channel:7:model:gpt:contract:responses",
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: "group-cheap", Outcome: smartrouter.OutcomeSuccess,
+		Admission: smartrouter.AdmissionProbe, RouteEpoch: first.Epoch, ProbeLeaseID: first.ID,
+	}))
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "group-cheap", CapacityDomain: "cheap-capacity"},
+		{RouteID: "group-pro", CapacityDomain: "pro-capacity"},
+	}})
+	require.NoError(t, err)
+	assert.NotEqual(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["group-cheap"].Phase)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["group-pro"].Phase,
+		"sharing a physical probe lease must not merge route-local health evidence")
+
+	second, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "group-pro", LeaseKey: "channel:7:model:gpt:contract:responses",
+	})
+	require.NoError(t, err)
+	assert.False(t, acquired)
+	assert.Nil(t, second)
+
+	require.NoError(t, first.Release(context.Background()))
+	second, acquired, err = store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "group-pro", LeaseKey: "channel:7:model:gpt:contract:responses",
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, second.Release(context.Background()))
+}
+
+func TestMemorySmartRoutePhysicalProbeLeaseCannotBeBypassedByBudgetNamespace(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	config.ProbeBudgetLimit = 100
+	config.ProbeMaxConcurrency = 10
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+
+	recovery, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "recovery-alias", LeaseKey: "physical-upstream",
+		BudgetNamespace: SmartRouteProbeBudgetRecovery,
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	coldStart, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "cold-start-alias", LeaseKey: "physical-upstream",
+		BudgetNamespace: SmartRouteProbeBudgetColdStart,
+	})
+	require.NoError(t, err)
+	assert.False(t, acquired)
+	assert.Nil(t, coldStart)
+	require.NoError(t, recovery.Release(context.Background()))
+}
+
+func TestMemorySmartRouteProbeRouteGuardRejectsDifferentLeaseKeys(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	config.ProbeBudgetLimit = 100
+	config.ProbeMaxConcurrency = 10
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+
+	first, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "same-route", LeaseKey: "physical-a",
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	second, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "same-route", LeaseKey: "physical-b",
+		BudgetNamespace: SmartRouteProbeBudgetColdStart,
+	})
+	require.NoError(t, err)
+	assert.False(t, acquired)
+	assert.Nil(t, second)
+	require.NoError(t, first.Release(context.Background()))
+}
+
+func TestRedisSmartRouteProbeKeyUsesPhysicalLeaseKey(t *testing.T) {
+	config := DefaultSmartRouteStateConfig()
+	store := &RedisSmartRouteStateStore{config: config}
+
+	physical := store.redisProbeKey("channel:7:model:gpt:contract:responses")
+	route := store.redisProbeKey("route-in-group-cheap")
+	assert.NotEqual(t, route, physical)
+	assert.Contains(t, physical, ":probe:")
+	assert.Contains(t, store.redisProbeRouteKey("route-in-group-cheap"), ":probe-route:")
+	assert.Contains(t, redisAcquireSmartRouteProbeScript, "EXISTS', KEYS[6]",
+		"the Redis route guard must reject a second lease key for the same RouteID")
+	assert.Contains(t, redisResetSmartRouteScript, "DEL', KEYS[5]",
+		"reset must remove the route guard together with the physical lease")
+	assert.Contains(t, redisReleaseSmartRouteProbeScript, "DEL', KEYS[3]",
+		"release must remove the route guard together with the physical lease")
+}
+
+func TestMemoryProbeBudgetsAreIndependentForRecoveryAndColdStart(t *testing.T) {
+	config := DefaultSmartRouteStateConfig()
+	config.ProbeBudgetLimit = 1
+	config.ProbeMaxConcurrency = 1
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+	acquire := func(routeID, namespace string, budget, concurrency int) (*SmartRouteLease, bool) {
+		lease, acquired, acquireErr := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+			RouteID: routeID, SubjectKey: routeID, BudgetNamespace: namespace,
+			BudgetLimit: budget, MaxConcurrency: concurrency,
+		})
+		require.NoError(t, acquireErr)
+		return lease, acquired
+	}
+	recovery, acquired := acquire("recovery-1", SmartRouteProbeBudgetRecovery, 1, 1)
+	require.True(t, acquired)
+	coldOne, acquired := acquire("cold-1", SmartRouteProbeBudgetColdStart, 60, 2)
+	require.True(t, acquired, "cold-start does not wait behind the ordinary recovery namespace")
+	_, acquired = acquire("recovery-2", SmartRouteProbeBudgetRecovery, 1, 1)
+	assert.False(t, acquired)
+	coldTwo, acquired := acquire("cold-2", SmartRouteProbeBudgetColdStart, 60, 2)
+	require.True(t, acquired)
+	_, acquired = acquire("cold-3", SmartRouteProbeBudgetColdStart, 60, 2)
+	assert.False(t, acquired)
+	require.NoError(t, recovery.Release(context.Background()))
+	require.NoError(t, coldOne.Release(context.Background()))
+	require.NoError(t, coldTwo.Release(context.Background()))
+}
+
+func TestMemorySmartRouteCapacityNeverExceedsLimit(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	const (
+		callers = 100
+		limit   = 7
+	)
+	start := make(chan struct{})
+	leases := make(chan *SmartRouteLease, callers)
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			<-start
+			acquisition, err := store.TryAcquireCapacity(context.Background(), SmartRouteCapacityRequest{
+				CapacityDomain: "shared-team-account",
+				MaxInflight:    limit,
+				QueueMode:      smartrouter.QueueModeNoQueue,
+				TTL:            time.Minute,
+			})
+			if err != nil {
+				errorsSeen <- err
+				return
+			}
+			if acquisition.Granted() {
+				leases <- acquisition.Lease
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(leases)
+	close(errorsSeen)
+	require.Empty(t, errorsSeen)
+	var granted []*SmartRouteLease
+	for lease := range leases {
+		granted = append(granted, lease)
+	}
+	require.Len(t, granted, limit)
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: "route", CapacityDomain: "shared-team-account", MaxInflight: limit,
+	}}})
+	require.NoError(t, err)
+	assert.Equal(t, limit, snapshot.Capacity.Domains["shared-team-account"].Inflight)
+	for _, lease := range granted {
+		require.NoError(t, lease.Release(context.Background()))
+		require.NoError(t, lease.Release(context.Background()))
+	}
+}
+
+func TestOptimisticActualInputCostHintAllowsOnlyOneSharedInflight(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	limit := strictSmartRouteAttemptLimit(20, 1)
+	require.Equal(t, 1, limit)
+
+	const callers = 20
+	start := make(chan struct{})
+	leases := make(chan *SmartRouteLease, callers)
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			<-start
+			acquisition, err := store.TryAcquireCapacity(context.Background(), SmartRouteCapacityRequest{
+				CapacityDomain: "optimistic-unobserved-route", MaxInflight: limit,
+				QueueMode: smartrouter.QueueModeNoQueue, TTL: time.Minute,
+			})
+			if err != nil {
+				errorsSeen <- err
+				return
+			}
+			if acquisition.Granted() {
+				leases <- acquisition.Lease
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(leases)
+	close(errorsSeen)
+	require.Empty(t, errorsSeen)
+
+	var granted []*SmartRouteLease
+	for lease := range leases {
+		granted = append(granted, lease)
+	}
+	require.Len(t, granted, 1, "only one request may sample an optimistic route before evidence returns")
+	require.NoError(t, granted[0].Release(context.Background()))
+}
+
+func TestMemorySmartRouteLeaseTTLAndExactIdempotentRelease(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	request := SmartRouteCapacityRequest{
+		CapacityDomain: "one-slot-domain",
+		MaxInflight:    1,
+		TTL:            time.Second,
+	}
+	first, err := store.TryAcquireCapacity(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, first.Granted())
+	blocked, err := store.TryAcquireCapacity(context.Background(), request)
+	require.NoError(t, err)
+	assert.Equal(t, SmartRouteCapacitySpill, blocked.Disposition)
+
+	clock.Advance(time.Second)
+	second, err := store.TryAcquireCapacity(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, second.Granted())
+	assert.NotEqual(t, first.Lease.ID, second.Lease.ID)
+	require.ErrorIs(t, first.Lease.Renew(context.Background()), ErrSmartRouteLeaseNotOwned)
+	require.NoError(t, first.Lease.Release(context.Background()))
+	require.NoError(t, first.Lease.Release(context.Background()))
+
+	stillBlocked, err := store.TryAcquireCapacity(context.Background(), request)
+	require.NoError(t, err)
+	assert.Equal(t, SmartRouteCapacitySpill, stillBlocked.Disposition,
+		"an expired lease release must not delete its successor")
+	require.NoError(t, second.Lease.Release(context.Background()))
+}
+
+func TestMemorySmartRouteLeaseSupportsConcurrentHeartbeats(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	request := SmartRouteCapacityRequest{
+		CapacityDomain: "streaming-domain",
+		MaxInflight:    1,
+		TTL:            time.Second,
+	}
+	acquisition, err := store.TryAcquireCapacity(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, acquisition.Granted())
+	originalExpiry := acquisition.Lease.ExpiresAtMS()
+	clock.Advance(750 * time.Millisecond)
+
+	const heartbeats = 100
+	start := make(chan struct{})
+	errorsSeen := make(chan error, heartbeats)
+	var wait sync.WaitGroup
+	wait.Add(heartbeats)
+	for index := 0; index < heartbeats; index++ {
+		go func() {
+			defer wait.Done()
+			<-start
+			if renewErr := acquisition.Lease.Renew(context.Background()); renewErr != nil {
+				errorsSeen <- renewErr
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsSeen)
+	require.Empty(t, errorsSeen)
+	assert.Greater(t, acquisition.Lease.ExpiresAtMS(), originalExpiry)
+
+	clock.Advance(500 * time.Millisecond)
+	blocked, err := store.TryAcquireCapacity(context.Background(), request)
+	require.NoError(t, err)
+	assert.Equal(t, SmartRouteCapacitySpill, blocked.Disposition,
+		"heartbeats must keep a long-running request inside the capacity count")
+	require.NoError(t, acquisition.Lease.Release(context.Background()))
+}
+
+func TestMemorySmartRouteExpiredProbeCanBeReacquired(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	request := SmartRouteProbeRequest{RouteID: "recoverable-route", TTL: time.Second}
+	first, acquired, err := store.TryAcquireProbe(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	clock.Advance(time.Second)
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: "recoverable-route", CapacityDomain: "recoverable-capacity",
+	}}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityOpen, snapshot.Quality.Routes["recoverable-route"].Phase)
+	second, acquired, err := store.TryAcquireProbe(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.ErrorIs(t, first.Renew(context.Background()), ErrSmartRouteLeaseNotOwned)
+	require.NoError(t, first.Release(context.Background()))
+
+	blockedBySecond, acquired, err := store.TryAcquireProbe(context.Background(), request)
+	require.NoError(t, err)
+	assert.False(t, acquired)
+	assert.Nil(t, blockedBySecond)
+	require.NoError(t, second.Release(context.Background()))
+}
+
+func TestMemorySmartRouteRecoveryProbeIsSingleFlightAndOneSuccessRestoresHealth(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	const routeID = "recovering-route"
+
+	recordDistinctSmartRouteFailures(t, store, SmartRouteAttemptRecord{
+		RouteID: routeID, Outcome: smartrouter.OutcomeInfrastructure,
+	}, smartrouter.DefaultSharedOpenFailureThreshold)
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: routeID, CapacityDomain: "recovering-capacity",
+	}}})
+	require.NoError(t, err)
+	opened := snapshot.Quality.Routes[routeID]
+	require.Equal(t, smartrouter.QualityOpen, opened.Phase)
+	clock.Advance(time.Duration(opened.NextProbeAtMS-clock.Now().UnixMilli()) * time.Millisecond)
+
+	const callers = 100
+	start := make(chan struct{})
+	results := make(chan *SmartRouteLease, callers)
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for range callers {
+		go func() {
+			defer wait.Done()
+			<-start
+			lease, won, acquireErr := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{RouteID: routeID})
+			if acquireErr != nil {
+				errorsSeen <- acquireErr
+				return
+			}
+			if won {
+				results <- lease
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	close(errorsSeen)
+	require.Empty(t, errorsSeen)
+	var leases []*SmartRouteLease
+	for lease := range results {
+		leases = append(leases, lease)
+	}
+	require.Len(t, leases, 1)
+
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: routeID, Outcome: smartrouter.OutcomeSuccess, Admission: smartrouter.AdmissionProbe,
+		RouteEpoch: leases[0].Epoch, ProbeLeaseID: leases[0].ID,
+	}))
+	require.NoError(t, leases[0].Release(context.Background()))
+	snapshot, err = store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: routeID, CapacityDomain: "recovering-capacity",
+	}}})
+	require.NoError(t, err)
+	recovered := snapshot.Quality.Routes[routeID]
+	assert.Equal(t, smartrouter.QualityHealthy, recovered.Phase)
+	assert.Zero(t, recovered.NextProbeAtMS)
+	assert.Zero(t, recovered.SampleDueAtMS)
+
+	lease, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{RouteID: routeID})
+	require.NoError(t, err)
+	assert.False(t, acquired, "the first successful probe must stop further automatic recovery probes")
+	assert.Nil(t, lease)
+}
+
+func TestMemorySmartRouteThreeFailuresOpenAndOneProbeSuccessRecovers(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	const routeID = "failed-cheap-route"
+	success := SmartRouteAttemptRecord{RouteID: routeID, Outcome: smartrouter.OutcomeSuccess}
+	require.NoError(t, store.RecordAttempt(context.Background(), success))
+	recordDistinctSmartRouteFailures(t, store, SmartRouteAttemptRecord{
+		RouteID: routeID, Outcome: smartrouter.OutcomeInfrastructure,
+	}, smartrouter.DefaultSharedOpenFailureThreshold)
+
+	snapshotRequest := SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: routeID, CapacityDomain: "degraded-capacity",
+	}}}
+	snapshot, err := store.Snapshot(context.Background(), snapshotRequest)
+	require.NoError(t, err)
+	opened := snapshot.Quality.Routes[routeID]
+	require.Equal(t, smartrouter.QualityOpen, opened.Phase)
+	assert.GreaterOrEqual(t, opened.NextProbeAtMS, clock.Now().UnixMilli())
+	assert.LessOrEqual(t, opened.NextProbeAtMS-clock.Now().UnixMilli(), smartrouter.MaximumRecoveryProbeIntervalMS)
+
+	clock.Advance(time.Duration(opened.NextProbeAtMS-clock.Now().UnixMilli()) * time.Millisecond)
+	lease, acquired, acquireErr := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{RouteID: routeID})
+	require.NoError(t, acquireErr)
+	require.True(t, acquired)
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: routeID, Outcome: smartrouter.OutcomeSuccess, Admission: smartrouter.AdmissionProbe,
+		RouteEpoch: lease.Epoch, ProbeLeaseID: lease.ID,
+	}))
+	require.NoError(t, lease.Release(context.Background()))
+	snapshot, err = store.Snapshot(context.Background(), snapshotRequest)
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes[routeID].Phase)
+}
+
+func TestMemorySmartRouteRealSuccessFencesAnOlderProbeFailure(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	routeID := "real-success-wins"
+	route := SmartRouteStateRoute{RouteID: routeID, CapacityDomain: "capacity-real-success-wins"}
+	recordDistinctSmartRouteFailures(t, store, SmartRouteAttemptRecord{
+		RouteID: routeID, CapacityDomain: route.CapacityDomain, Outcome: smartrouter.OutcomeInfrastructure,
+	}, smartrouter.DefaultSharedOpenFailureThreshold)
+
+	opened, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	require.Equal(t, smartrouter.QualityOpen, opened.Quality.Routes[routeID].Phase)
+
+	probe, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{RouteID: routeID})
+	require.NoError(t, err)
+	require.True(t, acquired)
+	oldEpoch := probe.Epoch
+
+	clock.Advance(time.Millisecond)
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: routeID, CapacityDomain: route.CapacityDomain, Outcome: smartrouter.OutcomeSuccess,
+		ObservationID: "foreground-success", StartedAtMS: clock.Now().Add(-time.Millisecond).UnixMilli(),
+	}))
+
+	clock.Advance(time.Millisecond)
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: routeID, CapacityDomain: route.CapacityDomain, Outcome: smartrouter.OutcomeInfrastructure,
+		Admission: smartrouter.AdmissionProbe, SyntheticProbe: true,
+		RouteEpoch: oldEpoch, ProbeLeaseID: probe.ID, HTTPStatus: 503,
+	}))
+	require.NoError(t, probe.Release(context.Background()))
+
+	after, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, after.Quality.Routes[routeID].Phase)
+	assert.Equal(t, 0, after.Quality.Routes[routeID].ConsecutiveHardFailures)
+	assert.Greater(t, after.Quality.Routes[routeID].Epoch, oldEpoch)
+	assert.Zero(t, after.Quality.Routes[routeID].NextProbeAtMS)
+}
+
+func TestMemorySmartRouteProbeBudgetsLimitGlobalAndRepeatedSubjectTraffic(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	config.ProbeBudgetLimit = 2
+	config.ProbeBudgetWindow = time.Minute
+	config.ProbeSubjectCooldown = time.Minute
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+
+	first, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "budget-route-1", SubjectKey: "token-a",
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	blocked, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "budget-route-2", SubjectKey: "token-a",
+	})
+	require.NoError(t, err)
+	assert.False(t, acquired)
+	assert.Nil(t, blocked)
+
+	second, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "budget-route-2", SubjectKey: "token-b",
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	blocked, acquired, err = store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "budget-route-3", SubjectKey: "token-c",
+	})
+	require.NoError(t, err)
+	assert.False(t, acquired)
+	assert.Nil(t, blocked)
+
+	clock.Advance(time.Minute + time.Millisecond)
+	third, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{
+		RouteID: "budget-route-3", SubjectKey: "token-c",
+	})
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, first.Release(context.Background()))
+	require.NoError(t, second.Release(context.Background()))
+	require.NoError(t, third.Release(context.Background()))
+}
+
+func TestMemorySmartRouteThreeCapacityFailuresOpenAndOneProbeSuccessRecovers(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	route := SmartRouteStateRoute{
+		RouteID: "stable-route", CapacityDomain: "stable-capacity", StableFallback: true, MaxInflight: 2,
+	}
+	success := SmartRouteAttemptRecord{RouteID: route.RouteID, StableFallback: true, Outcome: smartrouter.OutcomeSuccess}
+	require.NoError(t, store.RecordAttempt(context.Background(), success))
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	healthy := snapshot.Quality.Routes[route.RouteID]
+	require.Equal(t, smartrouter.QualityHealthy, healthy.Phase)
+
+	recordDistinctSmartRouteFailures(t, store, SmartRouteAttemptRecord{
+		RouteID: route.RouteID, CapacityDomain: route.CapacityDomain, StableFallback: true,
+		Outcome: smartrouter.OutcomeCapacityLimited, RetryAfter: 5 * time.Second,
+	}, smartrouter.DefaultSharedOpenFailureThreshold)
+	snapshot, err = store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	afterCapacity := snapshot.Quality.Routes[route.RouteID]
+	assert.Equal(t, smartrouter.QualityOpen, afterCapacity.Phase,
+		"a route-attributable capacity refusal must remove only this physical route until one probe succeeds")
+	assert.Equal(t, smartrouter.OutcomeCapacityLimited, afterCapacity.LastOutcome)
+	assert.Greater(t, snapshot.Capacity.Domains[route.CapacityDomain].BlockedUntilMS, clock.Now().UnixMilli())
+
+	clock.Advance(time.Duration(afterCapacity.NextProbeAtMS-clock.Now().UnixMilli()) * time.Millisecond)
+	probe, acquired, err := store.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{RouteID: route.RouteID})
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: route.RouteID, CapacityDomain: route.CapacityDomain,
+		StableFallback: true, Outcome: smartrouter.OutcomeSuccess,
+		Admission: smartrouter.AdmissionProbe, RouteEpoch: probe.Epoch, ProbeLeaseID: probe.ID,
+	}))
+	require.NoError(t, probe.Release(context.Background()))
+	snapshot, err = store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{route}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes[route.RouteID].Phase)
+	assert.Zero(t, snapshot.Capacity.Domains[route.CapacityDomain].BlockedUntilMS,
+		"one proven success must clear the old capacity block immediately")
+}
+
+func TestMemorySmartRouteTTFTUsesBoundedFreshP95Window(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	config.TTFTWindowSize = 20
+	config.TTFTFreshness = time.Minute
+	store, err := NewMemorySmartRouteStateStore(config)
+	require.NoError(t, err)
+	const routeID = "ttft-route"
+	for sample := 0; sample < 25; sample++ {
+		require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+			RouteID: routeID, Outcome: smartrouter.OutcomeSuccess,
+			TTFTObserved: true, TTFT: time.Duration(sample) * time.Millisecond,
+		}))
+	}
+	request := SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{{
+		RouteID: routeID, CapacityDomain: "ttft-capacity", StableFallback: true,
+	}}}
+	snapshot, err := store.Snapshot(context.Background(), request)
+	require.NoError(t, err)
+	state := snapshot.TTFT.Routes[routeID]
+	assert.Equal(t, 20, state.Samples)
+	assert.Equal(t, int64(23), state.P95MS)
+	assert.Equal(t, clock.Now().Add(time.Minute).UnixMilli(), state.FreshUntilMS)
+
+	clock.Advance(time.Minute + time.Millisecond)
+	snapshot, err = store.Snapshot(context.Background(), request)
+	require.NoError(t, err)
+	_, fresh := snapshot.TTFT.Routes[routeID]
+	assert.False(t, fresh)
+}
+
+func TestMemorySmartRouteQuarantineIsScopedVersionedAndExpires(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	store := newTestMemorySmartRouteStateStore(t, clock)
+	routes := []SmartRouteStateRoute{{RouteID: "route-a", CapacityDomain: "capacity-a"}}
+	require.NoError(t, store.QuarantineRoute(context.Background(), SmartRouteQuarantineRequest{
+		CatalogVersion: "catalog-v1",
+		RouteID:        "route-a",
+		FailureScope:   SmartFailureRouteModel,
+		TTL:            time.Minute,
+	}))
+
+	modelExclusions, err := store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v1",
+		Routes:         routes,
+		FailureScopes:  []SmartRouteFailureScope{SmartFailureRouteModel},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"route-a"}, modelExclusions.RouteIDs)
+	require.Len(t, modelExclusions.Entries, 1)
+	assert.Equal(t, SmartFailureRouteModel, modelExclusions.Entries[0].FailureScope)
+
+	contractExclusions, err := store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v1",
+		Routes:         routes,
+		FailureScopes:  []SmartRouteFailureScope{SmartFailureRouteContract},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, contractExclusions.RouteIDs)
+	newCatalogExclusions, err := store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v2",
+		Routes:         routes,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, newCatalogExclusions.RouteIDs)
+
+	require.NoError(t, store.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		CatalogVersion: "catalog-v1",
+		RouteID:        "route-a",
+		Outcome:        smartrouter.OutcomeSuccess,
+	}))
+	recovered, err := store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v1",
+		Routes:         routes,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, recovered.RouteIDs, "a real success must remove stale route-model/contract quarantine immediately")
+
+	clock.Advance(time.Minute)
+	expired, err := store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v1",
+		Routes:         routes,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, expired.RouteIDs)
+}
+
+func TestRedisSmartRouteSnapshotFallsBackUniformlyWithoutPrivilegedRoute(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	var dials atomic.Int64
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:       "unavailable.test:6379",
+		MaxRetries: -1,
+		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			dials.Add(1)
+			return nil, errors.New("redis unavailable")
+		},
+	})
+	t.Cleanup(func() { _ = redisClient.Close() })
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	store, err := NewRedisSmartRouteStateStore(redisClient, config)
+	require.NoError(t, err)
+
+	snapshot, err := store.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "cheap", CapacityDomain: "cheap-domain"},
+		{RouteID: "standard", CapacityDomain: "standard-domain", MaxInflight: 3},
+	}})
+	require.NoError(t, err)
+	require.True(t, snapshot.FailClosed)
+	require.Error(t, snapshot.StoreError)
+	assert.Positive(t, dials.Load())
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["cheap"].Phase)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["standard"].Phase)
+	assert.Zero(t, snapshot.Quality.Routes["cheap"].NextProbeAtMS)
+	assert.Zero(t, snapshot.Quality.Routes["standard"].NextProbeAtMS)
+	assert.Zero(t, snapshot.Capacity.Domains["cheap-domain"].BlockedUntilMS)
+	assert.Zero(t, snapshot.Capacity.Domains["standard-domain"].BlockedUntilMS)
+}
+
+func TestRedisSmartRouteExclusionsFallBackToLocallyKnownBlocksWithoutPrivilegedRoute(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:       "unavailable.test:6379",
+		MaxRetries: -1,
+		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("redis unavailable")
+		},
+	})
+	t.Cleanup(func() { _ = redisClient.Close() })
+	config := DefaultSmartRouteStateConfig()
+	config.Clock = clock.Now
+	store, err := NewRedisSmartRouteStateStore(redisClient, config)
+	require.NoError(t, err)
+
+	exclusions, err := store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v1",
+		Routes: []SmartRouteStateRoute{
+			{RouteID: "route-a", CapacityDomain: "capacity-a"},
+			{RouteID: "route-b", CapacityDomain: "capacity-b"},
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, exclusions.FailClosed)
+	require.Error(t, exclusions.StoreError)
+	assert.Empty(t, exclusions.RouteIDs)
+
+	require.Error(t, store.QuarantineRoute(context.Background(), SmartRouteQuarantineRequest{
+		CatalogVersion: "catalog-v1",
+		RouteID:        "route-b",
+		FailureScope:   SmartFailureRouteContract,
+		TTL:            time.Minute,
+	}))
+	exclusions, err = store.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+		CatalogVersion: "catalog-v1",
+		Routes: []SmartRouteStateRoute{
+			{RouteID: "route-a", CapacityDomain: "capacity-a"},
+			{RouteID: "route-b", CapacityDomain: "capacity-b"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"route-b"}, exclusions.RouteIDs,
+		"a locally known bad route must remain excluded during a Redis outage")
+}
+
+func TestSmartRouteStateStoresApplyRuntimeConfigUpdates(t *testing.T) {
+	clock := newSmartRouteTestClock()
+	initial := DefaultSmartRouteStateConfig()
+	initial.Clock = clock.Now
+	memory, err := NewMemorySmartRouteStateStore(initial)
+	require.NoError(t, err)
+
+	updated := initial
+	updated.Quality.OpenBackoffMS = []int64{5_000}
+	updated.Quality.FastRecoveryIntervalMS = 5_000
+	updated.Quality.HardFailureWindowMS = 15_000
+	updated.MaxProbeFailures = 2
+	updated.MaxOutage = 30 * time.Second
+	require.NoError(t, memory.UpdateConfig(updated))
+	recordDistinctSmartRouteFailures(t, memory, SmartRouteAttemptRecord{
+		RouteID: "hot-memory", Outcome: smartrouter.OutcomeInfrastructure,
+	}, updated.Quality.SharedOpenFailureThreshold)
+	opened, err := memory.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "hot-memory", CapacityDomain: "hot-memory-capacity"},
+	}})
+	require.NoError(t, err)
+	lease, acquired, err := memory.TryAcquireProbe(context.Background(), SmartRouteProbeRequest{RouteID: "hot-memory"})
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, memory.RecordAttempt(context.Background(), SmartRouteAttemptRecord{
+		RouteID: "hot-memory", Outcome: smartrouter.OutcomeInfrastructure,
+		Admission: smartrouter.AdmissionProbe, SyntheticProbe: true,
+		RouteEpoch: opened.Quality.Routes["hot-memory"].Epoch, ProbeLeaseID: lease.ID,
+	}))
+	require.NoError(t, lease.Release(context.Background()))
+	snapshot, err := memory.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "hot-memory", CapacityDomain: "hot-memory-capacity"},
+	}})
+	require.NoError(t, err)
+	assert.InDelta(t, clock.Now().Add(5*time.Second).UnixMilli(), snapshot.Quality.Routes["hot-memory"].NextProbeAtMS, 500,
+		"hot-updated backoff is applied before the bounded per-route jitter")
+
+	redisClient := redis.NewClient(&redis.Options{Addr: "unavailable.test:6379", MaxRetries: -1})
+	t.Cleanup(func() { _ = redisClient.Close() })
+	redisStore, err := NewRedisSmartRouteStateStore(redisClient, initial)
+	require.NoError(t, err)
+	require.NoError(t, redisStore.UpdateConfig(updated))
+	assert.Equal(t, updated.Quality.OpenBackoffMS, redisStore.runtimeConfigSnapshot().Quality.OpenBackoffMS)
+	assert.Equal(t, updated.MaxProbeFailures, redisStore.runtimeConfigSnapshot().MaxProbeFailures)
+	assert.Equal(t, updated.MaxOutage, redisStore.fallback.runtimeConfigSnapshot().MaxOutage)
+}

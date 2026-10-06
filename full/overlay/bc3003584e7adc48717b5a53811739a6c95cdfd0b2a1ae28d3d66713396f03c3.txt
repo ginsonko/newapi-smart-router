@@ -1,0 +1,66 @@
+package controller
+
+import (
+	"net/http"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/gin-gonic/gin"
+)
+
+// GetImageTask reads an owned task without route selection or another paid POST.
+func GetImageTask(c *gin.Context) {
+	if job, found, err := model.GetImageRouteJob(c.Param("task_id"), c.GetInt("id")); err == nil && found {
+		response := gin.H{"id": job.PublicTaskID, "task_id": job.PublicTaskID, "object": "image", "status": "in_progress", "data": []any{}}
+		if message := imageRouteUncertainty(job); message != "" {
+			response["status"], response["error"] = "unknown", gin.H{"message": message}
+			c.JSON(http.StatusOK, response)
+			return
+		}
+		if job.State == "succeeded" {
+			raw, err := imageRouteJobResponse(job)
+			if err != nil {
+				common.ApiError(c, err)
+				return
+			}
+			var output map[string]any
+			if common.Unmarshal(raw, &output) != nil {
+				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "图片交付数据不可读取"}})
+				return
+			}
+			response["status"], response["data"] = "completed", output["data"]
+		} else if job.State == "failed" || job.State == "unknown" {
+			response["status"] = job.State
+			response["error"] = gin.H{"message": job.LastError}
+		}
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	task, found, err := model.GetByTaskId(c.GetInt("id"), c.Param("task_id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !found || task == nil || task.Platform != constant.TaskPlatformOpenAIImage {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "图片任务不存在或不属于当前账户"}})
+		return
+	}
+	response := gin.H{"id": task.TaskID, "task_id": task.TaskID, "object": "image", "created": task.SubmitTime, "status": task.Status.ToVideoStatus(), "data": []any{}}
+	if task.Status == model.TaskStatusSuccess {
+		raw, err := service.ImageTaskResponse(task)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": err.Error()}, "task_id": task.TaskID})
+			return
+		}
+		var output map[string]any
+		if common.Unmarshal(raw, &output) == nil {
+			response["data"] = output["data"]
+		}
+	}
+	if task.FailReason != "" {
+		response["error"] = gin.H{"message": task.FailReason}
+	}
+	c.JSON(http.StatusOK, response)
+}

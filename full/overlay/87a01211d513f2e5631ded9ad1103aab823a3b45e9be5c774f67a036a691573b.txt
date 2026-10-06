@@ -1,0 +1,35 @@
+package controller
+
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestImageDimensionsQuoteMatrix(t *testing.T) {
+	for _, mode := range []string{"images", "image-edits"} {
+		endpoint := "openai-images-generations-v1"
+		if mode == "image-edits" {
+			endpoint = "openai-images-edits-v1"
+		}
+		cap := media.ResolveCapabilityForRoute(987654, constant.ChannelTypeOpenAI, "gpt-image-2", endpoint, "")
+		for _, p := range common.Image2DimensionPresets() {
+			size, _ := json.Marshal(p.Size)
+			resolution, _ := json.Marshal(p.Resolution)
+			req := parameterQuoteRequest{Mode: mode, Group: "dimension-test", Fields: map[string]json.RawMessage{"model": json.RawMessage("\"gpt-image-2\""), "size": size, "resolution": resolution}}
+			in, err := parameterQuoteInput(req, cap, 987654)
+			require.NoError(t, err)
+			require.Equal(t, p.Resolution, in.Resolution)
+			wrong := "1k"
+			if wrong == p.Resolution {
+				wrong = "4k"
+			}
+			req.Fields["resolution"], _ = json.Marshal(wrong)
+			_, err = parameterQuoteInput(req, cap, 987654)
+			require.Error(t, err)
+		}
+	}
+}

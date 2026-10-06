@@ -1,0 +1,455 @@
+package model
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+type commissionTestUsers struct {
+	root    User
+	inviter User
+	invitee User
+}
+
+func setupCommissionFinanceTest(t *testing.T) commissionTestUsers {
+	t.Helper()
+	previousDB := DB
+	previousLogDB := LOG_DB
+	previousRedisEnabled := common.RedisEnabled
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	LOG_DB = db
+	common.RedisEnabled = false
+	t.Cleanup(func() {
+		DB = previousDB
+		LOG_DB = previousLogDB
+		common.RedisEnabled = previousRedisEnabled
+	})
+	require.NoError(t, DB.AutoMigrate(&User{}))
+	require.NoError(t, migrateCommissionSchema())
+
+	users := commissionTestUsers{
+		root: User{Id: 1, Username: "root", Password: "password", Role: common.RoleRootUser,
+			Status: common.UserStatusEnabled, Quota: 0, Group: "default", AffCode: "root-code"},
+		inviter: User{Id: 2, Username: "seller", Password: "password", Role: common.RoleCommonUser,
+			Status: common.UserStatusEnabled, Quota: 0, Group: "default", AffCode: "seller-code", InviterId: 1},
+		invitee: User{Id: 3, Username: "buyer", Password: "password", Role: common.RoleCommonUser,
+			Status: common.UserStatusEnabled, Quota: 100_000, Group: "default", AffCode: "buyer-code", InviterId: 2},
+	}
+	require.NoError(t, DB.Create(&users.root).Error)
+	require.NoError(t, DB.Create(&users.inviter).Error)
+	require.NoError(t, DB.Create(&users.invitee).Error)
+	return users
+}
+
+func activateCommissionProgram(t *testing.T, actorID int, sellerIDs ...int) *CommissionProgramV1 {
+	t.Helper()
+	program, replayed, err := CreateCommissionProgram("default sales", []CommissionTierView{
+		{ThresholdQuota: 0, RateBps: 100},
+		{ThresholdQuota: 50_000, RateBps: 200},
+	}, actorID)
+	require.NoError(t, err)
+	require.False(t, replayed)
+	program, err = PublishCommissionProgram(program.PublicID, program.Version, actorID)
+	require.NoError(t, err)
+	_ = sellerIDs
+	return program
+}
+
+func reserveCommissionTestOperation(t *testing.T, key string, userID int, target int64) CommissionFundingSnapshot {
+	t.Helper()
+	snapshot, handled, err := ReserveCommissionWallet(CommissionReserveSpec{
+		OperationKey: key, RequestIdentity: key, Source: "http", SourceStableID: key,
+		ConsumerUserID: userID, TargetQuota: target,
+	})
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.NotNil(t, snapshot)
+	return *snapshot
+}
+
+func loadCommissionTestUser(t *testing.T, id int) User {
+	t.Helper()
+	var user User
+	require.NoError(t, DB.First(&user, id).Error)
+	return user
+}
+
+func loadCommissionTestAccount(t *testing.T, userID int) CommissionAccountV1 {
+	t.Helper()
+	var account CommissionAccountV1
+	require.NoError(t, DB.Where("user_id = ?", userID).First(&account).Error)
+	return account
+}
+
+func TestCommissionOrdinarySpendAwardsInviterOnce(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.inviter.Id)
+
+	reserved := reserveCommissionTestOperation(t, "ordinary-award", users.invitee.Id, 10_000)
+	assert.EqualValues(t, 10_000, reserved.ReservedOrdinaryQuota)
+	assert.Zero(t, reserved.ReservedCommissionQuota)
+	settled, err := SettleCommissionWallet(reserved.OperationPublicID, 10_000)
+	require.NoError(t, err)
+	assert.EqualValues(t, 100, settled.AwardQuota)
+	assert.EqualValues(t, 10_000, settled.EligibleOrdinaryQuota)
+
+	replayed, err := SettleCommissionWallet(reserved.OperationPublicID, 10_000)
+	require.NoError(t, err)
+	assert.Equal(t, settled, replayed)
+	assert.Zero(t, loadCommissionTestUser(t, users.inviter.Id).Quota)
+	account := loadCommissionTestAccount(t, users.inviter.Id)
+	assert.EqualValues(t, 100, account.AvailableQuota)
+	assert.EqualValues(t, 100, account.LifetimeEarnedQuota)
+	var awardEvents int64
+	require.NoError(t, DB.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type = ?", account.ID, "commission_awarded").Count(&awardEvents).Error)
+	assert.EqualValues(t, 1, awardEvents)
+}
+
+func TestCommissionMustBeTransferredBeforeItCanFundOrdinaryUsage(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.root.Id, users.inviter.Id)
+
+	childSpend := reserveCommissionTestOperation(t, "earn-seller-commission", users.invitee.Id, 10_000)
+	_, err := SettleCommissionWallet(childSpend.OperationPublicID, 10_000)
+	require.NoError(t, err)
+	assert.Zero(t, loadCommissionTestUser(t, users.inviter.Id).Quota)
+	account := loadCommissionTestAccount(t, users.inviter.Id)
+	assert.EqualValues(t, 100, account.AvailableQuota)
+
+	_, _, err = ReserveCommissionWallet(CommissionReserveSpec{
+		OperationKey: "commission-is-not-spendable", RequestIdentity: "commission-is-not-spendable",
+		Source: "http", SourceStableID: "commission-is-not-spendable", ConsumerUserID: users.inviter.Id, TargetQuota: 100,
+	})
+	require.ErrorIs(t, err, ErrCommissionInsufficientOrdinary)
+
+	transferred, err := TransferCommissionToBalance(CommissionTransferSpec{UserID: users.inviter.Id,
+		AmountQuota: 100, ExpectedVersion: account.Version, IdempotencyKey: "transfer-earned-commission"})
+	require.NoError(t, err)
+	assert.EqualValues(t, 100, transferred.OrdinaryBalanceQuota)
+	assert.Zero(t, transferred.Account.AvailableQuota)
+
+	sellerSpend := reserveCommissionTestOperation(t, "spend-transferred-balance", users.inviter.Id, 100)
+	settled, err := SettleCommissionWallet(sellerSpend.OperationPublicID, 100)
+	require.NoError(t, err)
+	assert.Zero(t, settled.FinalCommissionQuota)
+	assert.EqualValues(t, 100, settled.FinalOrdinaryQuota)
+	assert.EqualValues(t, 100, settled.EligibleOrdinaryQuota)
+	rootAccount := loadCommissionTestAccount(t, users.root.Id)
+	assert.EqualValues(t, 1, rootAccount.AvailableQuota)
+}
+
+func TestCommissionReservationRefundRestoresEveryWalletExactlyOnce(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.inviter.Id)
+
+	reserved := reserveCommissionTestOperation(t, "refund-ordinary", users.invitee.Id, 7_500)
+	assert.EqualValues(t, 92_500, loadCommissionTestUser(t, users.invitee.Id).Quota)
+	refunded, err := RefundCommissionWallet(reserved.OperationPublicID, "upstream_failed")
+	require.NoError(t, err)
+	assert.Equal(t, CommissionFinancialRefunded, refunded.FinancialStatus)
+	assert.EqualValues(t, 100_000, loadCommissionTestUser(t, users.invitee.Id).Quota)
+
+	replayed, err := RefundCommissionWallet(reserved.OperationPublicID, "upstream_failed")
+	require.NoError(t, err)
+	assert.Equal(t, refunded, replayed)
+	assert.EqualValues(t, 100_000, loadCommissionTestUser(t, users.invitee.Id).Quota)
+	var accountCount int64
+	require.NoError(t, DB.Model(&CommissionAccountV1{}).Where("user_id = ?", users.invitee.Id).Count(&accountCount).Error)
+	assert.Zero(t, accountCount)
+}
+
+func TestCommissionUsageCorrectionRevaluesOnlyTheOriginalOrdinarySpend(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.inviter.Id)
+
+	reserved := reserveCommissionTestOperation(t, "corrected-usage", users.invitee.Id, 10_000)
+	settled, err := SettleCommissionWallet(reserved.OperationPublicID, 10_000)
+	require.NoError(t, err)
+	assert.EqualValues(t, 100, settled.AwardQuota)
+
+	correctedDown, err := ReconcileCommissionWallet(reserved.OperationPublicID, 5_000)
+	require.NoError(t, err)
+	assert.EqualValues(t, 5_000, correctedDown.FinalOrdinaryQuota)
+	assert.EqualValues(t, 50, correctedDown.AwardQuota)
+	assert.EqualValues(t, 95_000, loadCommissionTestUser(t, users.invitee.Id).Quota)
+	assert.Zero(t, loadCommissionTestUser(t, users.inviter.Id).Quota)
+	assert.EqualValues(t, 50, loadCommissionTestAccount(t, users.inviter.Id).AvailableQuota)
+
+	correctedUp, err := ReconcileCommissionWallet(reserved.OperationPublicID, 20_000)
+	require.NoError(t, err)
+	assert.EqualValues(t, 20_000, correctedUp.FinalOrdinaryQuota)
+	assert.EqualValues(t, 200, correctedUp.AwardQuota)
+	assert.EqualValues(t, 80_000, loadCommissionTestUser(t, users.invitee.Id).Quota)
+	assert.Zero(t, loadCommissionTestUser(t, users.inviter.Id).Quota)
+	assert.EqualValues(t, 200, loadCommissionTestAccount(t, users.inviter.Id).AvailableQuota)
+
+	replayed, err := ReconcileCommissionWallet(reserved.OperationPublicID, 20_000)
+	require.NoError(t, err)
+	assert.Equal(t, correctedUp, replayed)
+	assert.EqualValues(t, 200, loadCommissionTestAccount(t, users.inviter.Id).AvailableQuota)
+}
+
+func TestCommissionCostExportIsSignedRedactedAndCursorStable(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.inviter.Id)
+
+	reserved := reserveCommissionTestOperation(t, "cost-export", users.invitee.Id, 10_000)
+	_, err := SettleCommissionWallet(reserved.OperationPublicID, 10_000)
+	require.NoError(t, err)
+	_, err = ReconcileCommissionWallet(reserved.OperationPublicID, 5_000)
+	require.NoError(t, err)
+
+	events, err := ListCommissionCostEventsSince(0, 100)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	assert.Equal(t, "r29-commission-cost-v1", events[0].SchemaVersion)
+	assert.Equal(t, "commission_awarded", events[0].EventType)
+	assert.EqualValues(t, 100, events[0].AmountQuota)
+	assert.Equal(t, users.inviter.Id, events[0].BeneficiaryUserID)
+	assert.Equal(t, users.invitee.Id, events[0].ConsumerUserID)
+	assert.Equal(t, "http", events[0].OperationSource)
+	assert.Equal(t, "cost-export", events[0].SourceStableID)
+	assert.Equal(t, "commission_award_reversed", events[1].EventType)
+	assert.EqualValues(t, -50, events[1].AmountQuota)
+	assert.Equal(t, events[0].EventUUID, events[1].RelatedEventUUID)
+
+	next, err := ListCommissionCostEventsSince(events[0].ID, 100)
+	require.NoError(t, err)
+	require.Len(t, next, 1)
+	assert.Equal(t, events[1].EventUUID, next[0].EventUUID)
+	_, err = ListCommissionCostEventsSince(-1, 100)
+	assert.ErrorIs(t, err, ErrCommissionInvalidInput)
+}
+
+func TestOrdinaryQuotaAdjustmentPreservesCommissionComponent(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+
+	credit, err := ApplyCommissionAdjustment(CommissionAdjustmentSpec{
+		UserID: users.inviter.Id, Mode: CommissionAdjustmentAdd, ValueQuota: 500,
+		ExpectedVersion: 0, ActorUserID: users.root.Id, ReasonCode: "test_credit",
+		IdempotencyKey: "ordinary-component-credit",
+	})
+	require.NoError(t, err)
+	assert.EqualValues(t, 500, credit.Account.AvailableQuota)
+
+	added, err := AdjustOrdinaryUserQuota(users.inviter.Id, CommissionAdjustmentAdd, 1_000, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1_000, added.TotalQuota)
+	assert.EqualValues(t, 1_000, added.OrdinaryQuota)
+	assert.EqualValues(t, 500, added.CommissionAvailableQuota)
+
+	_, err = AdjustOrdinaryUserQuota(users.inviter.Id, CommissionAdjustmentSubtract, 1_001, false)
+	require.ErrorIs(t, err, ErrCommissionInsufficientOrdinary)
+	assert.EqualValues(t, 1_000, loadCommissionTestUser(t, users.inviter.Id).Quota)
+	assert.EqualValues(t, 500, loadCommissionTestAccount(t, users.inviter.Id).AvailableQuota)
+
+	overridden, err := AdjustOrdinaryUserQuota(users.inviter.Id, OrdinaryQuotaOverride, 2_000, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2_000, overridden.TotalQuota)
+	assert.EqualValues(t, 2_000, overridden.OrdinaryQuota)
+	assert.EqualValues(t, 500, overridden.CommissionAvailableQuota)
+
+	legacy, err := AdjustOrdinaryUserQuota(users.inviter.Id, OrdinaryQuotaOverride, 1_200, true)
+	require.NoError(t, err)
+	assert.False(t, legacy.LegacyTotalOverride)
+	assert.EqualValues(t, 1_200, legacy.TotalQuota)
+	assert.EqualValues(t, 1_200, legacy.OrdinaryQuota)
+	assert.EqualValues(t, 500, legacy.CommissionAvailableQuota)
+
+	belowCommission, err := AdjustOrdinaryUserQuota(users.inviter.Id, OrdinaryQuotaOverride, 499, true)
+	require.NoError(t, err)
+	assert.EqualValues(t, 499, belowCommission.OrdinaryQuota)
+	assert.EqualValues(t, 499, loadCommissionTestUser(t, users.inviter.Id).Quota)
+	assert.EqualValues(t, 500, loadCommissionTestAccount(t, users.inviter.Id).AvailableQuota)
+}
+
+func TestOrdinaryQuotaAdjustmentWithoutCommissionAccountAndLargeWallet(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+
+	result, err := AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentSubtract, 25_000, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, 75_000, result.TotalQuota)
+	assert.EqualValues(t, 75_000, result.OrdinaryQuota)
+	assert.Zero(t, result.CommissionAvailableQuota)
+
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, OrdinaryQuotaOverride, 0, false)
+	require.NoError(t, err)
+	assert.Zero(t, result.TotalQuota)
+	assert.Zero(t, result.OrdinaryQuota)
+
+	largeWallet := int64(common.MaxQuota) + 10_000
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, OrdinaryQuotaOverride, largeWallet, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, largeWallet, result.OrdinaryQuota)
+
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentAdd, 250, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, largeWallet+250, result.OrdinaryQuota)
+
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentSubtract, 100, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, largeWallet+150, result.OrdinaryQuota)
+
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, OrdinaryQuotaOverride, largeWallet+500, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, largeWallet+500, result.OrdinaryQuota)
+
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentAdd, int64(common.MaxQuota)+1, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, largeWallet+500+int64(common.MaxQuota)+1, result.OrdinaryQuota)
+	result, err = AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentSubtract, int64(common.MaxQuota)+1, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, largeWallet+500, loadCommissionTestUser(t, users.invitee.Id).Quota)
+
+	maxWallet := int64(^uint(0) >> 1)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", users.invitee.Id).
+		UpdateColumn("quota", maxWallet).Error)
+	_, err = AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentAdd, 1, false)
+	require.ErrorIs(t, err, ErrCommissionInvariant)
+	assert.EqualValues(t, maxWallet, loadCommissionTestUser(t, users.invitee.Id).Quota)
+}
+
+func TestLegacyModeCannotSuspendOrdinaryBilling(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id)
+
+	settings, err := GetCommissionSettings()
+	require.NoError(t, err)
+	settings, err = UpdateCommissionSettings(
+		settings.Version, CommissionModeCapture, CommissionSpendFirst, users.root.Id,
+	)
+	require.NoError(t, err)
+
+	settings, err = UpdateCommissionSettings(
+		settings.Version, CommissionModeSuspended, CommissionSpendFirst, users.root.Id,
+	)
+	require.NoError(t, err)
+	enabled, err := CommissionBillableAdmission()
+	require.NoError(t, err)
+	assert.True(t, enabled)
+	require.NoError(t, ValidateLegacyMidjourneyCommissionAdmission())
+
+	snapshot, handled, err := ReserveCommissionWallet(CommissionReserveSpec{
+		OperationKey: "suspended-direct-reserve", RequestIdentity: "suspended-direct-reserve",
+		Source: "http", SourceStableID: "suspended-direct-reserve", ConsumerUserID: users.invitee.Id,
+		TargetQuota: 100,
+	})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.EqualValues(t, 100, snapshot.ReservedOrdinaryQuota)
+}
+
+func TestCommissionTransferAllowsExistingWalletAboveRequestLimit(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	largeWallet := common.MaxQuota + 10_000
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", users.inviter.Id).
+		UpdateColumn("quota", largeWallet).Error)
+	require.NoError(t, DB.Create(&CommissionAccountV1{
+		PublicID: commissionPublicID("cca"), UserID: users.inviter.Id,
+		AvailableQuota: 500, NetEntitledQuota: 500, LifetimeEarnedQuota: 500, Version: 1,
+	}).Error)
+
+	result, err := TransferCommissionToBalance(CommissionTransferSpec{
+		UserID: users.inviter.Id, AmountQuota: 250, ExpectedVersion: 1,
+		IdempotencyKey: "large-wallet-transfer",
+	})
+	require.NoError(t, err)
+	assert.EqualValues(t, int64(largeWallet)+250, result.OrdinaryBalanceQuota)
+	assert.EqualValues(t, 250, result.Account.AvailableQuota)
+}
+
+func TestCommissionReferencesBlockHardDeletingInviter(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.inviter.Id)
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		return CommissionUserDeletionBlockedTx(tx, users.inviter.Id)
+	})
+	assert.ErrorIs(t, err, ErrCommissionInviterReferenced)
+}
+
+func TestCommissionAdjustmentAndTransferAreSeparateAndIdempotent(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	activateCommissionProgram(t, users.root.Id, users.inviter.Id)
+
+	account, err := loadCommissionAccountForUpdateTx(DB, users.inviter.Id)
+	require.NoError(t, err)
+	adjusted, err := ApplyCommissionAdjustment(CommissionAdjustmentSpec{
+		UserID: users.inviter.Id, Mode: CommissionAdjustmentAdd, ValueQuota: 1_000,
+		ExpectedVersion: account.Version, ActorUserID: users.root.Id,
+		ReasonCode: "offline_settlement_test", IdempotencyKey: "adjust-1",
+	})
+	require.NoError(t, err)
+	assert.EqualValues(t, 1_000, adjusted.Account.AvailableQuota)
+	assert.Zero(t, adjusted.UserQuota)
+
+	transferred, err := TransferCommissionToBalance(CommissionTransferSpec{
+		UserID: users.inviter.Id, AmountQuota: 600, ExpectedVersion: adjusted.Account.Version,
+		IdempotencyKey: "transfer-1",
+	})
+	require.NoError(t, err)
+	assert.False(t, transferred.Replayed)
+	assert.EqualValues(t, 400, transferred.Account.AvailableQuota)
+	assert.EqualValues(t, 600, transferred.OrdinaryBalanceQuota)
+
+	replayed, err := TransferCommissionToBalance(CommissionTransferSpec{
+		UserID: users.inviter.Id, AmountQuota: 600, ExpectedVersion: adjusted.Account.Version,
+		IdempotencyKey: "transfer-1",
+	})
+	require.NoError(t, err)
+	assert.True(t, replayed.Replayed)
+	assert.EqualValues(t, 400, replayed.Account.AvailableQuota)
+	assert.EqualValues(t, 600, replayed.OrdinaryBalanceQuota)
+	assert.EqualValues(t, 600, loadCommissionTestUser(t, users.inviter.Id).Quota)
+
+	var transferEvents int64
+	require.NoError(t, DB.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type = ?", replayed.Account.ID, "commission_transferred_to_balance").
+		Count(&transferEvents).Error)
+	assert.EqualValues(t, 1, transferEvents)
+}
+
+func TestOrdinaryQuotaAdminLargeAdjustmentAndAtomicFailure(t *testing.T) {
+	users := setupCommissionFinanceTest(t)
+	const tenThousandCNY int64 = 5_000_000_000
+	for _, amount := range []int64{tenThousandCNY, 50_000_000_000} {
+		before := int64(loadCommissionTestUser(t, users.invitee.Id).Quota)
+		added, err := AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentAdd, amount, false)
+		require.NoError(t, err)
+		assert.EqualValues(t, before+amount, added.OrdinaryQuota)
+		_, err = AdjustOrdinaryUserQuota(users.invitee.Id, CommissionAdjustmentSubtract, before+amount+1, false)
+		require.ErrorIs(t, err, ErrCommissionInsufficientOrdinary)
+		assert.EqualValues(t, before+amount, loadCommissionTestUser(t, users.invitee.Id).Quota)
+		err = DB.Transaction(func(tx *gorm.DB) error {
+			_, e := AdjustOrdinaryUserQuotaTx(tx, users.invitee.Id, CommissionAdjustmentSubtract, amount, false)
+			return e
+		})
+		require.NoError(t, err)
+		assert.EqualValues(t, before, loadCommissionTestUser(t, users.invitee.Id).Quota)
+	}
+	before := loadCommissionTestUser(t, users.invitee.Id).Quota
+	for _, mode := range []string{CommissionAdjustmentAdd, CommissionAdjustmentSubtract} {
+		for _, amount := range []int64{0, -1} {
+			_, err := AdjustOrdinaryUserQuota(users.invitee.Id, mode, amount, false)
+			require.ErrorIs(t, err, ErrCommissionInvalidInput)
+		}
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		_, e := AdjustOrdinaryUserQuotaTx(tx, users.invitee.Id, CommissionAdjustmentAdd, tenThousandCNY, false)
+		require.NoError(t, e)
+		return fmt.Errorf("force rollback")
+	})
+	require.Error(t, err)
+	assert.EqualValues(t, before, loadCommissionTestUser(t, users.invitee.Id).Quota)
+}

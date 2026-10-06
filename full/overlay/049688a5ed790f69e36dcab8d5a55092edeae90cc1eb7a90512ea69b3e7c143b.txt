@@ -1,0 +1,703 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  ChevronDown,
+  CircleAlert,
+  CircleCheck,
+  CircleDollarSign,
+  DatabaseZap,
+  Route,
+} from 'lucide-react'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { Badge } from '@/components/ui/badge'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import { Progress } from '@/components/ui/progress'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
+
+import {
+  canonicalHealthState,
+  evidenceConfidence,
+  evidenceConfidenceLabelKey,
+  evidenceFreshness,
+  evidenceFreshnessLabelKey,
+  formatSmartRouterRoutePrice,
+  formatSmartRouterInputCostUSD,
+  formatSmartRouterTimestamp,
+  healthStateBadgeVariant,
+  healthStateLabelKey,
+  isCapacityBusy,
+  isMediaRoute,
+  isSafeTextLastResort,
+  ratioText,
+  cheapestCurrentlyEligibleItem,
+  recentActualSuccessItem,
+  routeSuccessRate,
+  smartRouterEndpointLabelKey,
+  type SmartRouterContractView,
+  type SmartRouterModelView,
+} from './health-view-model'
+import { RouteReason } from './route-reason'
+import type { SmartRouterStatusItem, SmartRouterStrategy } from './types'
+
+function validMetric(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+function cacheRateText(value?: number | null) {
+  if (!validMetric(value) || value > 1_000_000) return null
+  return `${(value / 10_000).toLocaleString(undefined, {
+    maximumFractionDigits: 1,
+  })}%`
+}
+
+function estimatedInputCostText(value?: number | null) {
+  if (!validMetric(value)) return null
+  return formatSmartRouterInputCostUSD(value, '')
+}
+
+function rankingBasisLabelKey(item: SmartRouterStatusItem) {
+  if (item.ranking_cost_basis === 'manual_order') return 'Manual group order'
+  if (item.ranking_cost_basis === 'recent_actual_input_cost') {
+    return 'Recent actual input cost'
+  }
+  if (item.ranking_cost_source === 'unobservable_static') {
+    return 'No current one-hour input sample'
+  }
+  if (item.ranking_cost_basis === 'static_price') {
+    return item.ranking_cost_source === 'observed'
+      ? 'Static price ordering; formula shown when observed'
+      : 'Static price ordering (formula unavailable)'
+  }
+  return null
+}
+
+function StatusRow(props: {
+  item: SmartRouterStatusItem
+  preferred: boolean
+  cheaperThanPreference: boolean
+}) {
+  const { t } = useTranslation()
+  const state = canonicalHealthState(props.item)
+  const ratio =
+    props.item.price_known === false
+      ? t('Price pending synchronization')
+      : ratioText(props.item.effective_ratio_ppm)
+  const realPrice = formatSmartRouterRoutePrice(props.item.price, t)
+  const successRate = routeSuccessRate(props.item)
+  const freshness = evidenceFreshness(props.item)
+  const confidence = evidenceConfidenceLabelKey(evidenceConfidence(props.item))
+  const lastObserved = formatSmartRouterTimestamp(
+    props.item.last_observed_at_ms
+  )
+  const lastProbe = formatSmartRouterTimestamp(props.item.last_probe_at_ms)
+  const nextProbe = formatSmartRouterTimestamp(
+    props.item.next_probe_at_ms ?? props.item.sample_due_at_ms
+  )
+  const cacheRate = cacheRateText(props.item.recent_cache_rate_ppm)
+  const estimatedInput = estimatedInputCostText(
+    props.item.estimated_input_usd_per_million
+  )
+  const costObserved = formatSmartRouterTimestamp(
+    props.item.actual_input_cost_last_observed_at_ms
+  )
+  const rankingBasis = rankingBasisLabelKey(props.item)
+  const safeTextLastResort = isSafeTextLastResort(props.item)
+
+  return (
+    <div
+      className={cn(
+        'relative min-w-0 px-3 py-3 pl-4',
+        props.preferred && 'bg-primary/[0.035]'
+      )}
+    >
+      <span
+        className={cn(
+          'absolute inset-y-3 left-0 w-0.5 rounded-full bg-border',
+          props.preferred && 'bg-primary',
+          props.cheaperThanPreference && 'bg-amber-500',
+          state === 'healthy' && !props.preferred && 'bg-emerald-500',
+          (state === 'needs_review' || state === 'unavailable') &&
+            !safeTextLastResort &&
+            'bg-red-500',
+          safeTextLastResort && 'bg-amber-500'
+        )}
+        aria-hidden='true'
+      />
+      <div className='min-w-0 space-y-2.5'>
+        <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
+          <span className='min-w-0 truncate text-sm font-medium'>
+            {props.item.group || t('Unknown group')}
+          </span>
+          {realPrice ? (
+            <Badge variant={props.preferred ? 'secondary' : 'outline'}>
+              {t('Model price: {{price}}', { price: realPrice })}
+            </Badge>
+          ) : null}
+          {ratio ? (
+            <Badge variant='outline'>
+              {t('Key price ceiling: {{ratio}}', { ratio })}
+            </Badge>
+          ) : null}
+          {props.item.selection_rank ? (
+            <Badge variant={props.preferred ? 'secondary' : 'outline'}>
+              {t('Candidate #{{rank}}', { rank: props.item.selection_rank })}
+            </Badge>
+          ) : null}
+          {props.preferred ? (
+            <Badge variant='secondary'>{t('Next request selection')}</Badge>
+          ) : null}
+          {props.cheaperThanPreference ? (
+            <Badge variant='outline'>{t('Lower ordering cost, waiting')}</Badge>
+          ) : null}
+          {props.item.price_comparison === 'incomparable' ? (
+            <Badge variant='outline'>{t('Different billing basis')}</Badge>
+          ) : null}
+          {isCapacityBusy(props.item) ? (
+            <Badge variant='outline'>{t('Temporarily busy')}</Badge>
+          ) : null}
+          {props.item.mixed_evidence ? (
+            <Badge variant='outline'>{t('Mixed route evidence')}</Badge>
+          ) : null}
+          {safeTextLastResort ? (
+            <Badge
+              variant='outline'
+              className='border-amber-500/40 bg-amber-500/[0.06] text-amber-800 dark:text-amber-200'
+            >
+              {t('Health abnormal, but this route can still be safely tried')}
+            </Badge>
+          ) : null}
+          <Badge variant={healthStateBadgeVariant(state)}>
+            {t(healthStateLabelKey(state))}
+          </Badge>
+        </div>
+
+        {rankingBasis || cacheRate || estimatedInput ? (
+          <div className='text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs'>
+            {rankingBasis ? (
+              <span className='font-medium'>{t(rankingBasis)}</span>
+            ) : null}
+            {cacheRate ? (
+              <span
+                className='inline-flex items-center gap-1 whitespace-nowrap'
+                title={t(
+                  'Cache rate is the cache-read share. Estimated cost also includes regular input and cache creation.'
+                )}
+              >
+                <DatabaseZap className='size-3.5' aria-hidden='true' />
+                {t('Recent cache {{rate}}', { rate: cacheRate })}
+              </span>
+            ) : null}
+            {estimatedInput ? (
+              <span className='inline-flex items-center gap-1 font-medium whitespace-nowrap'>
+                <CircleDollarSign className='size-3.5' aria-hidden='true' />
+                {t('Estimated input {{price}} / 1M', {
+                  price: estimatedInput,
+                })}
+              </span>
+            ) : null}
+            {(props.item.actual_input_cost_samples ?? 0) > 0 ? (
+              <span className='text-muted-foreground/75 whitespace-nowrap'>
+                {t('{{count}} samples', {
+                  count: props.item.actual_input_cost_samples,
+                })}
+                {costObserved ? ` · ${costObserved}` : ''}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className='grid min-w-0 gap-x-4 gap-y-2 text-xs sm:grid-cols-2 xl:grid-cols-4'>
+          <div className='min-w-0'>
+            <p className='text-muted-foreground'>{t('Success rate')}</p>
+            <div className='mt-0.5 flex items-center gap-2'>
+              <span className='shrink-0 font-medium tabular-nums'>
+                {successRate === null
+                  ? t('No samples')
+                  : `${(successRate * 100).toFixed(1)}%`}
+              </span>
+              {successRate !== null ? (
+                <Progress
+                  value={successRate * 100}
+                  className='max-w-24 flex-1 gap-0'
+                  aria-label={t('{{rate}} success', {
+                    rate: `${(successRate * 100).toFixed(1)}%`,
+                  })}
+                />
+              ) : null}
+            </div>
+          </div>
+          <div className='min-w-0'>
+            <p className='text-muted-foreground'>{t('Evidence')}</p>
+            <p className='mt-0.5 truncate font-medium'>
+              {t(evidenceFreshnessLabelKey(freshness))}
+              {confidence ? ` / ${t(confidence)}` : ''}
+            </p>
+          </div>
+          <div className='min-w-0'>
+            <p className='text-muted-foreground'>
+              {t('Last real observation')}
+            </p>
+            <p className='mt-0.5 truncate font-medium'>
+              {lastObserved || t('No real observation yet')}
+            </p>
+          </div>
+          <div className='min-w-0'>
+            <p className='text-muted-foreground'>{t('Last recovery probe')}</p>
+            <p className='mt-0.5 truncate font-medium'>
+              {lastProbe || t('No probe recorded yet')}
+            </p>
+          </div>
+        </div>
+
+        {nextProbe ? (
+          <p className='text-muted-foreground text-xs'>
+            {t('Next recovery check {{time}}', { time: nextProbe })}
+          </p>
+        ) : null}
+        {isMediaRoute(props.item) ? (
+          <p className='text-muted-foreground text-xs'>
+            {t('Image and video recovery is sampled from natural traffic')}
+          </p>
+        ) : null}
+        <RouteReason item={props.item} preferred={props.preferred} />
+      </div>
+    </div>
+  )
+}
+
+function ContractStatus(props: {
+  contract: SmartRouterContractView
+  strategy?: SmartRouterStrategy
+  maxRatioPPM?: number
+}) {
+  const { t } = useTranslation()
+  const preferredRatio = props.contract.preference
+    ? ratioText(props.contract.preference.effective_ratio_ppm)
+    : null
+  const preferredPrice = props.contract.preference
+    ? formatSmartRouterRoutePrice(props.contract.preference.price, t)
+    : null
+  const priceLimited = props.contract.items.filter(
+    (item) =>
+      item.decision_reason_code === 'above_price_limit' ||
+      item.reason_code === 'above_price_limit' ||
+      item.constraints?.within_key_price_limit === false
+  )
+  const knownRecovering = props.contract.items.filter((item) => {
+    const state = canonicalHealthState(item)
+    return (
+      state === 'needs_review' ||
+      state === 'unavailable' ||
+      state === 'probing' ||
+      state === 'recovering'
+    )
+  })
+  const hasCheaperWaiting = props.contract.cheaperUnavailable.length > 0
+  const recentActual = recentActualSuccessItem(props.contract)
+  const cheapestAvailable = cheapestCurrentlyEligibleItem(props.contract)
+  const coverageCandidates = props.contract.coverage?.candidates ?? []
+  const otherCandidates = coverageCandidates
+    .filter((candidate) => !candidate.selected)
+    .slice(0, 3)
+  const rankingAware = Boolean(
+    props.contract.preference?.ranking_cost_basis ||
+    props.contract.items.some((item) => item.ranking_cost_basis)
+  )
+  const firstRanked = props.contract.items.find(
+    (item) => item.selection_rank === 1
+  )
+  const selectedSafeFallback = Boolean(
+    props.contract.preference && isSafeTextLastResort(props.contract.preference)
+  )
+
+  let explanation = t(
+    'No group is currently admitted for this contract. Recovery checks continue in the background when available.'
+  )
+  if (props.contract.preference && selectedSafeFallback) {
+    explanation = t(
+      'The health signal is abnormal, but safe text requests can still try {{group}} and continue through the remaining authorized candidates if it fails.',
+      { group: props.contract.preference.group }
+    )
+  } else if (props.contract.preference && rankingAware) {
+    const basisKey = rankingBasisLabelKey(props.contract.preference)
+    const basis = basisKey ? t(basisKey) : t('Current policy order')
+    const selectedRank = props.contract.preference.selection_rank ?? 1
+    if (
+      selectedRank > 1 &&
+      firstRanked &&
+      firstRanked.group !== props.contract.preference.group
+    ) {
+      explanation = t(
+        'Current ordering: {{basis}}. Candidate #1 {{first}} is temporarily unavailable, so the next basic request would choose candidate #{{rank}} {{group}}.',
+        {
+          basis,
+          first: firstRanked.group,
+          rank: selectedRank,
+          group: props.contract.preference.group,
+        }
+      )
+    } else {
+      explanation = t(
+        'Current ordering: {{basis}}. The next basic request would choose candidate #{{rank}} {{group}}.',
+        {
+          basis,
+          rank: selectedRank,
+          group: props.contract.preference.group,
+        }
+      )
+    }
+  } else if (
+    props.contract.preference &&
+    props.contract.cheaperUnavailable.length > 0
+  ) {
+    explanation = t(
+      'For the next request, the current planner would choose {{group}} at model price {{price}} (Key ceiling {{ratio}}). {{count}} cheaper comparable groups are waiting because they do not currently meet the admission conditions for this key.',
+      {
+        group: props.contract.preference.group,
+        price: preferredPrice ?? t('price pending'),
+        ratio: preferredRatio ?? t('price pending'),
+        count: props.contract.cheaperUnavailable.length,
+      }
+    )
+  } else if (props.contract.preference) {
+    explanation = t(
+      'For the next request, the current planner would choose {{group}} at model price {{price}} (Key ceiling {{ratio}}). No cheaper comparable eligible group is waiting.',
+      {
+        group: props.contract.preference.group,
+        price: preferredPrice ?? t('price pending'),
+        ratio: preferredRatio ?? t('price pending'),
+      }
+    )
+  } else if (priceLimited.length > 0) {
+    explanation = t(
+      'No healthy group is available within this key ratio limit{{limit}}. Higher-priced groups remain protected by your cap; raise the limit in this key settings if you want to admit them.',
+      {
+        limit: props.maxRatioPPM ? ` (${ratioText(props.maxRatioPPM)})` : '',
+      }
+    )
+  } else if (knownRecovering.length > 0) {
+    explanation = t(
+      'Known unhealthy groups are handled by background recovery checks and can automatically re-enter candidate ordering after recovery.'
+    )
+  }
+  let decisionIcon = (
+    <CircleAlert className='mt-0.5 size-4 shrink-0 text-red-600 dark:text-red-300' />
+  )
+  if (props.contract.preference && selectedSafeFallback) {
+    decisionIcon = (
+      <CircleAlert className='mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-300' />
+    )
+  } else if (props.contract.preference && hasCheaperWaiting) {
+    decisionIcon = (
+      <CircleDollarSign className='mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-300' />
+    )
+  } else if (props.contract.preference) {
+    decisionIcon = (
+      <CircleCheck className='mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300' />
+    )
+  }
+
+  return (
+    <div className='border-t first:border-t-0'>
+      <div className='bg-muted/15 flex min-w-0 flex-wrap items-center gap-2 px-3 py-2.5'>
+        <Badge variant='outline'>
+          {t(smartRouterEndpointLabelKey(props.contract.endpoint))}
+        </Badge>
+        {props.strategy ? (
+          <span className='text-muted-foreground text-xs'>
+            {t('Strategy: {{strategy}}', { strategy: t(props.strategy) })}
+          </span>
+        ) : null}
+      </div>
+      <div
+        className={cn(
+          'mx-3 mt-3 flex items-start gap-2 rounded-md border px-3 py-2.5 text-xs leading-relaxed',
+          !props.contract.preference && 'border-red-500/30 bg-red-500/[0.04]',
+          props.contract.preference &&
+            (hasCheaperWaiting || selectedSafeFallback) &&
+            'border-amber-500/30 bg-amber-500/[0.04]',
+          props.contract.preference &&
+            !hasCheaperWaiting &&
+            !selectedSafeFallback &&
+            'border-emerald-500/30 bg-emerald-500/[0.04]'
+        )}
+      >
+        {decisionIcon}
+        <p className='min-w-0'>{explanation}</p>
+      </div>
+      {props.contract.preference || recentActual || cheapestAvailable ? (
+        <div className='mx-3 mt-3 grid min-w-0 gap-2 border-t pt-3 text-xs sm:grid-cols-2 xl:grid-cols-3'>
+          {props.contract.preference ? (
+            <div className='flex min-w-0 items-center gap-2'>
+              <Route
+                className='text-primary size-4 shrink-0'
+                aria-hidden='true'
+              />
+              <span className='text-muted-foreground shrink-0'>
+                {t('Next request current selection')}
+              </span>
+              <span className='min-w-0 truncate font-medium'>
+                {props.contract.preference.selection_rank
+                  ? `#${props.contract.preference.selection_rank} / `
+                  : ''}
+                {props.contract.preference.group} /{' '}
+                {formatSmartRouterRoutePrice(
+                  props.contract.preference.price,
+                  t
+                ) ?? t('price pending')}{' '}
+                / {t('Key ceiling')}:{' '}
+                {ratioText(props.contract.preference.effective_ratio_ppm)}
+              </span>
+            </div>
+          ) : null}
+          {recentActual ? (
+            <div className='flex min-w-0 items-center gap-2'>
+              <span className='text-muted-foreground shrink-0'>
+                {t('Most recent successful group')}
+              </span>
+              <span className='min-w-0 truncate font-medium'>
+                {recentActual.group} /{' '}
+                {formatSmartRouterRoutePrice(recentActual.price, t) ??
+                  t('price pending')}
+                {recentActual.last_real_success_at_ms
+                  ? ` · ${formatSmartRouterTimestamp(recentActual.last_real_success_at_ms)}`
+                  : ''}
+              </span>
+            </div>
+          ) : null}
+          {cheapestAvailable ? (
+            <div className='flex min-w-0 items-center gap-2'>
+              <span className='text-muted-foreground shrink-0'>
+                {t(
+                  rankingAware
+                    ? 'First currently selectable candidate'
+                    : 'Lowest-priced currently eligible'
+                )}
+              </span>
+              <span className='min-w-0 truncate font-medium'>
+                {cheapestAvailable.selection_rank
+                  ? `#${cheapestAvailable.selection_rank} / `
+                  : ''}
+                {cheapestAvailable.group} /{' '}
+                {estimatedInputCostText(
+                  cheapestAvailable.estimated_input_usd_per_million
+                ) ??
+                  formatSmartRouterRoutePrice(cheapestAvailable.price, t) ??
+                  ratioText(cheapestAvailable.effective_ratio_ppm)}
+              </span>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {props.contract.coverage && coverageCandidates.length > 0 ? (
+        <div className='mx-3 mt-3 flex min-w-0 flex-wrap items-center gap-x-5 gap-y-2 border-t pt-3 text-xs'>
+          <div className='flex min-w-0 items-center gap-2'>
+            <Route
+              className='text-primary size-4 shrink-0'
+              aria-hidden='true'
+            />
+            <span className='text-muted-foreground shrink-0'>
+              {t('Current eligible candidates')}
+            </span>
+            <span className='min-w-0 truncate font-medium'>
+              {t('{{count}} candidates', { count: coverageCandidates.length })}
+            </span>
+          </div>
+          {otherCandidates.map((candidate) => (
+            <div
+              key={`${candidate.position}:${candidate.group}`}
+              className='flex min-w-0 items-center gap-2'
+            >
+              <span className='text-muted-foreground shrink-0'>
+                {t('Other eligible candidate')}
+              </span>
+              <span className='min-w-0 truncate font-medium'>
+                {candidate.group} /{' '}
+                {estimatedInputCostText(
+                  candidate.estimated_input_usd_per_million
+                ) ??
+                  formatSmartRouterRoutePrice(candidate.price, t) ??
+                  ratioText(candidate.effective_ratio_ppm)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div className='mt-3 divide-y border-t'>
+        {props.contract.items.map((item) => (
+          <StatusRow
+            key={`${props.contract.id}:${item.group}`}
+            item={item}
+            preferred={item.selected === true}
+            cheaperThanPreference={props.contract.cheaperUnavailable.includes(
+              item
+            )}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export function ModelStatusSection(props: {
+  model: SmartRouterModelView
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  strategy?: SmartRouterStrategy
+  maxRatioPPM?: number
+  loading?: boolean
+  error?: boolean
+}) {
+  const { t } = useTranslation()
+  const firstContractId = props.model.contracts[0]?.id ?? ''
+  const [requestedContractId, setRequestedContractId] =
+    useState(firstContractId)
+  const activeContractId = props.model.contracts.some(
+    (contract) => contract.id === requestedContractId
+  )
+    ? requestedContractId
+    : firstContractId
+  const preferenceCount = props.model.contracts.filter(
+    (contract) => contract.preference
+  ).length
+  const cheaperCount = props.model.contracts.reduce(
+    (total, contract) => total + contract.cheaperUnavailable.length,
+    0
+  )
+  const singlePreference =
+    preferenceCount === 1
+      ? props.model.contracts.find((contract) => contract.preference)
+          ?.preference
+      : undefined
+  const singlePreferenceRatio = ratioText(singlePreference?.effective_ratio_ppm)
+  const singlePreferencePrice = formatSmartRouterRoutePrice(
+    singlePreference?.price,
+    t
+  )
+  const singlePreferenceSummary =
+    singlePreferencePrice ?? singlePreferenceRatio ?? ''
+
+  return (
+    <Collapsible open={props.open} onOpenChange={props.onOpenChange}>
+      <section className='overflow-hidden rounded-lg border shadow-xs [contain-intrinsic-size:0_180px] [content-visibility:auto]'>
+        <CollapsibleTrigger className='hover:bg-muted/30 flex w-full min-w-0 items-center gap-3 px-3 py-3 text-left transition-colors'>
+          <div className='min-w-0 flex-1'>
+            <div className='flex min-w-0 flex-wrap items-center gap-2'>
+              <span className='min-w-0 truncate text-sm font-semibold'>
+                {props.model.model || t('Unknown model')}
+              </span>
+              {props.model.pendingOnly ? (
+                <Badge variant='outline'>{t('Pending sampling')}</Badge>
+              ) : null}
+              {cheaperCount > 0 ? (
+                <Badge
+                  className='border-amber-500/35 bg-amber-500/[0.06] text-amber-800 dark:text-amber-200'
+                  variant='outline'
+                >
+                  {t('{{count}} cheaper waiting', { count: cheaperCount })}
+                </Badge>
+              ) : null}
+              {singlePreference ? (
+                <span className='text-muted-foreground max-w-full truncate text-xs'>
+                  {singlePreference.group}
+                  {singlePreferenceSummary
+                    ? ` / ${singlePreferenceSummary}`
+                    : ''}
+                </span>
+              ) : null}
+            </div>
+            <p className='text-muted-foreground mt-1 text-xs'>
+              {t(
+                '{{contracts}} endpoint contracts, {{preferences}} ready for the next request',
+                {
+                  contracts: props.model.contracts.length,
+                  preferences: preferenceCount,
+                }
+              )}
+            </p>
+          </div>
+          <ChevronDown
+            className={cn(
+              'text-muted-foreground size-4 shrink-0 transition-transform',
+              props.open && 'rotate-180'
+            )}
+            aria-hidden='true'
+          />
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <Tabs
+            value={activeContractId || firstContractId}
+            onValueChange={setRequestedContractId}
+            className='gap-0 border-t'
+          >
+            <div className='overflow-x-auto border-b px-3 py-2'>
+              <TabsList className='h-auto min-w-max justify-start'>
+                {props.model.contracts.map((contract) => (
+                  <TabsTrigger key={contract.id} value={contract.id}>
+                    {t(smartRouterEndpointLabelKey(contract.endpoint))}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </div>
+            {props.model.contracts.map((contract) => {
+              let contractContent = (
+                <ContractStatus
+                  contract={contract}
+                  strategy={props.strategy}
+                  maxRatioPPM={props.maxRatioPPM}
+                />
+              )
+              if (props.loading || contract.loading) {
+                contractContent = (
+                  <p className='text-muted-foreground px-3 py-4 text-sm'>
+                    {t('Loading route decisions...')}
+                  </p>
+                )
+              } else if (props.error || contract.error) {
+                contractContent = (
+                  <p className='text-muted-foreground px-3 py-4 text-sm'>
+                    {t(
+                      'Unable to load this contract decision. Other contract tabs remain available.'
+                    )}
+                  </p>
+                )
+              }
+              return (
+                <TabsContent
+                  key={contract.id}
+                  value={contract.id}
+                  className='mt-0'
+                >
+                  {contractContent}
+                </TabsContent>
+              )
+            })}
+          </Tabs>
+        </CollapsibleContent>
+      </section>
+    </Collapsible>
+  )
+}

@@ -1,0 +1,39 @@
+package service
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	smartsetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestMappedVideoDiscoveryIncludesAuthorizedSeedance(t *testing.T) {
+	old := rootsetting.UserUsableGroups2JSONString()
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"video":"video"}`))
+	t.Cleanup(func() { _ = rootsetting.UpdateUserUsableGroupsByJSONString(old) })
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAIVideo}
+	setting.DefaultPolicy.MaxEffectiveRatioPPM = 1000000
+	mapping := `{"Seedance 2.5-720":"3.5"}`
+	base := "https://provider.example"
+	source := &staticCatalogSource{abilities: []model.Ability{{Group: "video", Model: "Seedance 2.5-720", ChannelId: 109, Enabled: true}}, channels: []model.Channel{{Id: 109, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, BaseURL: &base, ModelMapping: &mapping}}}
+	catalogs := NewCatalogManager(source, func() smartsetting.Setting { return setting })
+	defer catalogs.Close()
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	report, _ := catalogs.LastReport()
+	t.Logf("contracts=%d rejections=%+v", len(catalog.Contracts), report.Rejections)
+	prices := NewPriceSnapshotManager(catalogs, &fakeSmartRatioSource{revision: 1, ratios: map[string]map[string]int64{"default": {"video": 1000000}}})
+	defer prices.Close()
+	engine := &SmartRouterEngine{Catalogs: catalogs, Prices: prices, Settings: func() smartsetting.Setting { return setting }}
+	policy := setting.DefaultPolicy
+	policy.Version = smartrouter.PolicyVersion
+	models, err := engine.EligibleModelsForEndpoints(context.Background(), "default", policy, SmartEndpointVideos)
+	require.NoError(t, err)
+	require.Contains(t, models, "Seedance 2.5-720")
+}

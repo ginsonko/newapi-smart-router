@@ -1,0 +1,1692 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	SmartEndpointChat               = "openai-chat-v1"
+	SmartEndpointCompletions        = "openai-completions-v1"
+	SmartEndpointMessages           = "anthropic-messages-v1"
+	SmartEndpointResponses          = "openai-responses-v1"
+	SmartEndpointStandaloneSearch   = "codex-standalone-search-v1"
+	SmartEndpointImages             = "openai-images-generations-v1"
+	SmartEndpointImageEdits         = "openai-images-edits-v1"
+	SmartEndpointVideos             = "openai-videos-v1"
+	SmartEndpointVideoTasks         = "newapi-video-generations-v1"
+	SmartEndpointAudioSpeech        = "openai-audio-speech-v1"
+	SmartEndpointAudioTranscription = "openai-audio-transcriptions-v1"
+	SmartEndpointAudioTranslation   = "openai-audio-translations-v1"
+)
+
+const smartMultipartFormContextKey = "smart_router_reusable_multipart_form"
+
+const (
+	SmartCapabilityText             = smartroutersetting.CapabilityText
+	SmartCapabilityStream           = smartroutersetting.CapabilityStreaming
+	SmartCapabilityTools            = smartroutersetting.CapabilityTools
+	SmartCapabilityVision           = smartroutersetting.CapabilityVision
+	SmartCapabilityStructuredOutput = smartroutersetting.CapabilityStructuredOutput
+	SmartCapabilityReasoning        = smartroutersetting.CapabilityReasoning
+	SmartCapabilityPromptCache      = smartroutersetting.CapabilityPromptCache
+	SmartCapabilityImageGeneration  = smartroutersetting.CapabilityImageGeneration
+	SmartCapabilityVideoGeneration  = smartroutersetting.CapabilityVideoGeneration
+	SmartCapabilityAsyncTask        = smartroutersetting.CapabilityAsyncTask
+	SmartCapabilityReferenceImage   = smartroutersetting.CapabilityReferenceImage
+	SmartCapabilityReferenceVideo   = smartroutersetting.CapabilityReferenceVideo
+	SmartCapabilityReferenceAudio   = smartroutersetting.CapabilityReferenceAudio
+	SmartCapabilityAudioSpeech      = smartroutersetting.CapabilityAudioSpeech
+	SmartCapabilityAudioTranscript  = smartroutersetting.CapabilityAudioTranscription
+)
+
+var (
+	ErrInvalidSmartRouteRequest      = errors.New("smart router: invalid request")
+	ErrUnsupportedSmartRouteEndpoint = errors.New("smart router: unsupported endpoint")
+	ErrSmartMediaSubmissionAmbiguous = errors.New("smart router: media submission acceptance is unknown")
+	ErrSmartMediaRouteNotAccepted    = errors.New("smart router: media route rejected before submission")
+)
+
+type SmartMediaAttemptDisposition uint8
+
+const (
+	SmartMediaAttemptTerminal SmartMediaAttemptDisposition = iota
+	// SmartMediaAttemptNotAccepted means no generation job can have been
+	// created, so another certified route may be attempted.
+	SmartMediaAttemptNotAccepted
+	// SmartMediaAttemptAcceptanceUnknown covers transport failures and errors
+	// while parsing a successful response. Replaying could duplicate cost.
+	SmartMediaAttemptAcceptanceUnknown
+)
+
+// ClassifySmartMediaAttempt applies the conservative replay boundary shared
+// by synchronous image generation and asynchronous video submission.
+func ClassifySmartMediaAttempt(apiErr *types.NewAPIError) SmartMediaAttemptDisposition {
+	if apiErr == nil {
+		return SmartMediaAttemptTerminal
+	}
+	if errors.Is(apiErr, ErrSmartMediaSubmissionAmbiguous) {
+		return SmartMediaAttemptAcceptanceUnknown
+	}
+	if isSmartMediaPreConnectFailure(apiErr) {
+		return SmartMediaAttemptNotAccepted
+	}
+	switch apiErr.GetErrorCode() {
+	case types.ErrorCodeDoRequestFailed,
+		types.ErrorCodeReadResponseBodyFailed,
+		types.ErrorCodeBadResponse,
+		types.ErrorCodeBadResponseBody,
+		types.ErrorCodeEmptyResponse:
+		return SmartMediaAttemptAcceptanceUnknown
+	case types.ErrorCodeInvalidRequest,
+		types.ErrorCodeReadRequestBodyFailed,
+		types.ErrorCodeConvertRequestFailed,
+		types.ErrorCodeChannelModelMappedError,
+		types.ErrorCodeChannelParamOverrideInvalid,
+		types.ErrorCodeChannelHeaderOverrideInvalid,
+		types.ErrorCodeInvalidApiType:
+		return SmartMediaAttemptNotAccepted
+	}
+	status := apiErr.GetOriginalStatusCode()
+	if status > 0 && (status < http.StatusOK || status >= http.StatusMultipleChoices) {
+		// An explicit non-success response proves that the request was rejected.
+		return SmartMediaAttemptNotAccepted
+	}
+	// A 2xx parse failure or an unclassified transport-layer failure must fail
+	// closed: the upstream may already be rendering the media.
+	return SmartMediaAttemptAcceptanceUnknown
+}
+
+func MarkSmartMediaSubmissionAmbiguous(apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr == nil || errors.Is(apiErr, ErrSmartMediaSubmissionAmbiguous) {
+		return apiErr
+	}
+	status := apiErr.StatusCode
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	marked := types.NewErrorWithStatusCode(
+		fmt.Errorf("%w: %v", ErrSmartMediaSubmissionAmbiguous, apiErr),
+		apiErr.GetErrorCode(),
+		status,
+		types.ErrOptionWithSkipRetry(),
+	)
+	marked.SetOriginalStatusCode(apiErr.GetOriginalStatusCode())
+	return marked
+}
+
+func IsSmartMediaRoutePreparationFailure(apiErr *types.NewAPIError) bool {
+	if apiErr == nil {
+		return false
+	}
+	if errors.Is(apiErr, types.ErrParameterCandidateUnavailable) {
+		return true
+	}
+	if isSmartMediaPreConnectFailure(apiErr) {
+		return true
+	}
+	switch apiErr.GetErrorCode() {
+	case types.ErrorCodeConvertRequestFailed,
+		types.ErrorCodeChannelModelMappedError,
+		types.ErrorCodeChannelParamOverrideInvalid,
+		types.ErrorCodeChannelHeaderOverrideInvalid,
+		types.ErrorCodeInvalidApiType:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSmartMediaPreConnectFailure(apiErr *types.NewAPIError) bool {
+	if apiErr == nil || apiErr.GetErrorCode() != types.ErrorCodeDoRequestFailed {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(apiErr, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(apiErr, &opErr) && strings.EqualFold(strings.TrimSpace(opErr.Op), "dial")
+}
+
+func MarkSmartMediaRouteNotAccepted(apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr == nil || errors.Is(apiErr, ErrSmartMediaRouteNotAccepted) {
+		return apiErr
+	}
+	marked := types.NewErrorWithStatusCode(
+		fmt.Errorf("%w: %v", ErrSmartMediaRouteNotAccepted, apiErr),
+		apiErr.GetErrorCode(), apiErr.StatusCode,
+	)
+	marked.SetOriginalStatusCode(apiErr.GetOriginalStatusCode())
+	return marked
+}
+
+// BuildSmartContractIdentity is shared by request classification and catalog
+// construction. Capabilities and context limits deliberately remain outside
+// the identity so one protocol contract can filter any required feature set.
+func BuildSmartContractIdentity(canonicalModel, endpoint string) (contractID, fingerprint string, err error) {
+	canonicalModel = strings.TrimSpace(canonicalModel)
+	endpoint = strings.TrimSpace(endpoint)
+	if canonicalModel == "" {
+		return "", "", fmt.Errorf("%w: canonical model is required", ErrInvalidSmartRouteRequest)
+	}
+	if !isSupportedSmartEndpoint(endpoint) {
+		return "", "", fmt.Errorf("%w: %q", ErrUnsupportedSmartRouteEndpoint, endpoint)
+	}
+
+	payload, err := common.Marshal(struct {
+		CanonicalModel string `json:"canonical_model"`
+		Endpoint       string `json:"endpoint"`
+	}{CanonicalModel: canonicalModel, Endpoint: endpoint})
+	if err != nil {
+		return "", "", fmt.Errorf("marshal smart contract identity: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return "contract_sha256_" + hex.EncodeToString(digest[:]), endpoint, nil
+}
+
+// SmartContractIdentity maps a public request path to its versioned protocol
+// identity before delegating to BuildSmartContractIdentity.
+func SmartContractIdentity(canonicalModel, requestPath string) (contractID, endpoint, fingerprint string, err error) {
+	endpoint, ok := smartEndpointForPath(requestPath)
+	if !ok {
+		return "", "", "", fmt.Errorf("%w: %q", ErrUnsupportedSmartRouteEndpoint, requestPath)
+	}
+	contractID, fingerprint, err = BuildSmartContractIdentity(canonicalModel, endpoint)
+	return contractID, endpoint, fingerprint, err
+}
+
+// BuildSmartRouteRequest classifies a request without consuming its reusable
+// BodyStorage. Unsupported methods and paths fail closed as ReplayUnsupported;
+// malformed requests return an error and are never sent through smart routing.
+func BuildSmartRouteRequest(c *gin.Context, canonicalModel string, estimatedContext int) (smartrouter.RouteRequest, error) {
+	request := smartrouter.RouteRequest{
+		CanonicalModel:   strings.TrimSpace(canonicalModel),
+		EstimatedContext: estimatedContext,
+		ReplayClass:      smartrouter.ReplayUnsupported,
+	}
+	if c == nil || c.Request == nil {
+		return request, fmt.Errorf("%w: HTTP request is required", ErrInvalidSmartRouteRequest)
+	}
+	// RequestId is stable across an attempt chain and across the relay's
+	// internal replay, so it is suitable for recovery sampling. It remains
+	// separate from prompt_cache_key, which is reserved for cache affinity.
+	request.AdmissionKey = strings.TrimSpace(c.GetString(common.RequestIdKey))
+	if request.AdmissionKey == "" {
+		request.AdmissionKey = strings.TrimSpace(c.GetHeader(common.RequestIdKey))
+	}
+	if userAgent := strings.ToLower(strings.TrimSpace(c.Request.UserAgent())); userAgent != "" {
+		if len(userAgent) > 256 {
+			userAgent = userAgent[:256]
+		}
+		request.ClientClass = "client-" + common.GenerateHMAC(userAgent)
+	}
+	if estimatedContext < 0 {
+		return request, fmt.Errorf("%w: estimated context cannot be negative", ErrInvalidSmartRouteRequest)
+	}
+	if c.Request.Method != http.MethodPost {
+		return request, nil
+	}
+
+	contractID, endpoint, fingerprint, err := SmartContractIdentity(request.CanonicalModel, c.Request.URL.Path)
+	if err != nil {
+		if errors.Is(err, ErrUnsupportedSmartRouteEndpoint) {
+			return request, nil
+		}
+		return request, err
+	}
+	request.ContractID = contractID
+	request.Endpoint = endpoint
+	request.CapabilityFingerprint = fingerprint
+	if deadline, ok := c.Request.Context().Deadline(); ok {
+		request.DeadlineMS = deadline.UnixMilli()
+	}
+	// OpenAI video creation commonly uses multipart/form-data. The distributor
+	// has already parsed and validated its model without consuming BodyStorage;
+	// do not run a JSON decoder over the multipart stream. Request-specific
+	// duration/size validation and pricing remain in the task adaptor.
+	if endpoint == SmartEndpointVideos || endpoint == SmartEndpointVideoTasks {
+		request.RequiredCapabilities = SmartCapabilityVideoGeneration | SmartCapabilityAsyncTask
+		request.ReplayClass = smartrouter.ReplaySafeVideo
+		if !strings.HasPrefix(strings.ToLower(c.GetHeader("Content-Type")), "application/json") {
+			form, cleanup, formErr := smartMultipartFormForRequest(c)
+			if formErr != nil {
+				return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, formErr)
+			}
+			defer cleanup()
+			request.RequiredCapabilities |= multipartMediaReferenceCapabilities(form)
+			request.Media, err = buildMultipartSmartMediaShape(form, endpoint, request.CanonicalModel, estimatedContext)
+			if err != nil {
+				return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, err)
+			}
+			return request, nil
+		}
+	}
+	if endpoint == SmartEndpointImageEdits {
+		request.RequiredCapabilities = SmartCapabilityImageGeneration | SmartCapabilityReferenceImage
+		request.ReplayClass = smartrouter.ReplaySafeImage
+		if !strings.HasPrefix(strings.ToLower(c.GetHeader("Content-Type")), "application/json") {
+			form, cleanup, formErr := smartMultipartFormForRequest(c)
+			if formErr != nil {
+				return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, formErr)
+			}
+			defer cleanup()
+			request.Media, err = buildMultipartSmartMediaShape(form, endpoint, request.CanonicalModel, estimatedContext)
+			if err != nil {
+				return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, err)
+			}
+			return request, nil
+		}
+	}
+	if endpoint == SmartEndpointAudioTranscription || endpoint == SmartEndpointAudioTranslation {
+		request.RequiredCapabilities = SmartCapabilityAudioTranscript
+		request.ReplayClass = smartrouter.ReplaySafeAudio
+		if !strings.HasPrefix(strings.ToLower(c.GetHeader("Content-Type")), "application/json") {
+			form, cleanup, formErr := smartMultipartFormForRequest(c)
+			if formErr != nil {
+				return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, formErr)
+			}
+			defer cleanup()
+			request.Media, err = buildMultipartSmartMediaShape(form, endpoint, request.CanonicalModel, estimatedContext)
+			if err != nil {
+				return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, err)
+			}
+			return request, nil
+		}
+	}
+
+	payload, err := readReusableSmartRequestBody(c)
+	if err != nil {
+		return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, err)
+	}
+	if bodyModel, exists := payload["model"]; exists {
+		modelString, ok := bodyModel.(string)
+		if !ok || strings.TrimSpace(modelString) == "" {
+			return request, fmt.Errorf("%w: model must be a non-empty string", ErrInvalidSmartRouteRequest)
+		}
+		if strings.TrimSpace(modelString) != request.CanonicalModel {
+			return request, fmt.Errorf("%w: body model does not match canonical model", ErrInvalidSmartRouteRequest)
+		}
+	}
+
+	request.RequiredCapabilities = requiredSmartCapabilities(payload)
+	request.WarmingKey = smartString(payload["prompt_cache_key"])
+	switch endpoint {
+	case SmartEndpointStandaloneSearch:
+		request.RequiredCapabilities = SmartCapabilityText | SmartCapabilityTools
+		request.WarmingKey = ""
+		request.ReplayClass = smartrouter.ReplaySideEffecting
+	case SmartEndpointImages:
+		request.RequiredCapabilities = SmartCapabilityImageGeneration | requiredMediaReferenceCapabilities(payload)
+		request.WarmingKey = ""
+		request.ReplayClass = smartrouter.ReplaySafeImage
+	case SmartEndpointVideos, SmartEndpointVideoTasks:
+		request.RequiredCapabilities = SmartCapabilityVideoGeneration | SmartCapabilityAsyncTask |
+			requiredMediaReferenceCapabilities(payload)
+		request.WarmingKey = ""
+		request.ReplayClass = smartrouter.ReplaySafeVideo
+	case SmartEndpointImageEdits:
+		request.RequiredCapabilities = SmartCapabilityImageGeneration | SmartCapabilityReferenceImage
+		request.WarmingKey = ""
+		request.ReplayClass = smartrouter.ReplaySafeImage
+	case SmartEndpointAudioSpeech:
+		request.RequiredCapabilities = SmartCapabilityAudioSpeech
+		request.WarmingKey = ""
+		request.ReplayClass = smartrouter.ReplaySafeAudio
+	case SmartEndpointAudioTranscription, SmartEndpointAudioTranslation:
+		request.RequiredCapabilities = SmartCapabilityAudioTranscript
+		request.WarmingKey = ""
+		request.ReplayClass = smartrouter.ReplaySafeAudio
+	default:
+		request.ReplayClass = classifySmartReplay(payload)
+	}
+	request.Media, err = buildJSONSmartMediaShape(endpoint, request.CanonicalModel, estimatedContext, payload)
+	if err != nil {
+		return request, fmt.Errorf("%w: %v", ErrInvalidSmartRouteRequest, err)
+	}
+	return request, nil
+}
+
+func requiredMediaReferenceCapabilities(payload map[string]any) uint64 {
+	if payload == nil {
+		return 0
+	}
+	capabilities := uint64(0)
+	if smartValuePresent(payload["image"]) || smartCollectionPresent(payload["images"]) ||
+		smartValuePresent(payload["input_reference"]) {
+		capabilities |= SmartCapabilityReferenceImage
+	}
+	if smartValuePresent(payload["video_url"]) {
+		capabilities |= SmartCapabilityReferenceVideo
+	}
+	if smartValuePresent(payload["audio_url"]) {
+		capabilities |= SmartCapabilityReferenceAudio
+	}
+	references, ok := payload["references"].([]any)
+	if !ok {
+		return capabilities
+	}
+	for _, raw := range references {
+		reference, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(smartString(reference["type"])) {
+		case "image":
+			capabilities |= SmartCapabilityReferenceImage
+		case "video":
+			capabilities |= SmartCapabilityReferenceVideo
+		case "audio":
+			capabilities |= SmartCapabilityReferenceAudio
+		}
+	}
+	return capabilities
+}
+
+func multipartMediaReferenceCapabilities(form *multipart.Form) uint64 {
+	if form == nil {
+		return 0
+	}
+	capabilities := uint64(0)
+	for _, field := range []string{"input_reference", "image", "images"} {
+		if len(form.File[field]) > 0 || len(form.Value[field]) > 0 {
+			capabilities |= SmartCapabilityReferenceImage
+		}
+	}
+	if values := form.Value["references"]; len(values) > 0 {
+		var references []map[string]any
+		if common.Unmarshal([]byte(values[0]), &references) == nil {
+			for _, reference := range references {
+				switch strings.ToLower(smartString(reference["type"])) {
+				case "image":
+					capabilities |= SmartCapabilityReferenceImage
+				case "video":
+					capabilities |= SmartCapabilityReferenceVideo
+				case "audio":
+					capabilities |= SmartCapabilityReferenceAudio
+				}
+			}
+		}
+	}
+	return capabilities
+}
+
+func buildJSONSmartMediaShape(
+	endpoint string,
+	canonicalModel string,
+	estimatedContext int,
+	payload map[string]any,
+) (*smartrouter.MediaRequestShape, error) {
+	shape := newSmartMediaRequestShape(endpoint, estimatedContext)
+	if shape == nil {
+		return nil, nil
+	}
+	metadata, _ := payload["metadata"].(map[string]any)
+	shape.References = jsonSmartMediaReferences(payload)
+
+	switch shape.Kind {
+	case smartrouter.MediaKindImage:
+		count, known, err := positiveSmartInteger(payload["n"])
+		if err != nil {
+			return nil, fmt.Errorf("n must be a positive integer: %w", err)
+		}
+		if !known {
+			count, known = 1, true
+		}
+		shape.OutputCount, shape.OutputCountKnown = count, known
+		shape.RawResolution, shape.RawSize = smartString(payload["resolution"]), smartString(payload["size"])
+		shape.Resolution = normalizeSmartMediaValue(smartString(payload["size"]))
+		shape.Quality = normalizeSmartMediaValue(smartString(payload["quality"]))
+		shape.AspectRatio = normalizeSmartMediaValue(smartString(payload["aspect_ratio"]))
+		shape.RequestPriceMultiplier = smartImagePriceMultiplierPPM(
+			canonicalModel, shape.Resolution, shape.Quality,
+		)
+	case smartrouter.MediaKindVideo:
+		count, known, err := positiveSmartInteger(payload["n"])
+		if err != nil {
+			return nil, fmt.Errorf("n must be a positive integer: %w", err)
+		}
+		if !known {
+			count, known = 1, true
+		}
+		shape.OutputCount, shape.OutputCountKnown = count, known
+		duration, durationKnown, err := firstPositiveSmartInteger(
+			payload["duration"], payload["seconds"], payload["mySeconds"],
+			metadataValue(metadata, "durationSeconds"), metadataValue(metadata, "duration"), metadataValue(metadata, "seconds"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("media duration must be a positive integer: %w", err)
+		}
+		shape.DurationSeconds, shape.DurationKnown = duration, durationKnown
+		size := smartString(payload["size"])
+		resolution := firstSmartString(payload["resolution"], metadataValue(metadata, "resolution"))
+		shape.RawResolution, shape.RawSize = resolution, size
+		shape.Resolution = normalizeSmartVideoResolution(resolution, size)
+		shape.AspectRatio = normalizeSmartMediaValue(firstSmartString(
+			payload["aspect_ratio"], metadataValue(metadata, "aspect_ratio"), metadataValue(metadata, "aspectRatio"),
+		))
+		if shape.AspectRatio == "" {
+			shape.AspectRatio = smartAspectRatioFromSize(size)
+		}
+	case smartrouter.MediaKindAudio:
+		shape.OutputCount, shape.OutputCountKnown = 1, true
+	}
+	if err := shape.Validate(); err != nil {
+		return nil, err
+	}
+	return shape, nil
+}
+
+func buildMultipartSmartMediaShape(
+	form *multipart.Form,
+	endpoint string,
+	canonicalModel string,
+	estimatedContext int,
+) (*smartrouter.MediaRequestShape, error) {
+	shape := newSmartMediaRequestShape(endpoint, estimatedContext)
+	if shape == nil {
+		return nil, nil
+	}
+	values := func(key string) []string {
+		if form == nil {
+			return nil
+		}
+		return form.Value[key]
+	}
+	firstValue := func(key string) string {
+		for _, value := range values(key) {
+			if strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
+	}
+
+	count, known, err := positiveSmartInteger(firstValue("n"))
+	if err != nil {
+		return nil, fmt.Errorf("n must be a positive integer: %w", err)
+	}
+	if !known {
+		count, known = 1, true
+	}
+	shape.OutputCount, shape.OutputCountKnown = count, known
+	if shape.Kind == smartrouter.MediaKindVideo {
+		duration, durationKnown, err := firstPositiveSmartInteger(firstValue("duration"), firstValue("seconds"), firstValue("mySeconds"))
+		if err != nil {
+			return nil, fmt.Errorf("media duration must be a positive integer: %w", err)
+		}
+		shape.DurationSeconds, shape.DurationKnown = duration, durationKnown
+		size := firstValue("size")
+		shape.RawResolution, shape.RawSize = firstValue("resolution"), size
+		shape.Resolution = normalizeSmartVideoResolution(firstValue("resolution"), size)
+		shape.AspectRatio = normalizeSmartMediaValue(firstValue("aspect_ratio"))
+		if shape.AspectRatio == "" {
+			shape.AspectRatio = smartAspectRatioFromSize(size)
+		}
+	}
+	if shape.Kind == smartrouter.MediaKindImage {
+		shape.RawResolution, shape.RawSize = firstValue("resolution"), firstValue("size")
+		shape.Resolution = normalizeSmartMediaValue(firstValue("size"))
+		shape.Quality = normalizeSmartMediaValue(firstValue("quality"))
+		shape.AspectRatio = normalizeSmartMediaValue(firstValue("aspect_ratio"))
+		shape.RequestPriceMultiplier = smartImagePriceMultiplierPPM(
+			canonicalModel, shape.Resolution, shape.Quality,
+		)
+	}
+	shape.References = multipartSmartMediaReferences(form, endpoint)
+	if err := shape.Validate(); err != nil {
+		return nil, err
+	}
+	return shape, nil
+}
+
+// EnsureSmartMultipartForm lets the distributor parse a multipart request once
+// and retain only its temporary form for the lifetime of the current request.
+// The reusable body remains untouched for the selected relay adaptor.
+func EnsureSmartMultipartForm(c *gin.Context) (*multipart.Form, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("HTTP request is required")
+	}
+	if value, exists := c.Get(smartMultipartFormContextKey); exists {
+		if form, ok := value.(*multipart.Form); ok && form != nil {
+			return form, nil
+		}
+	}
+	form, err := common.ParseMultipartFormReusable(c)
+	if err != nil {
+		return nil, err
+	}
+	c.Set(smartMultipartFormContextKey, form)
+	return form, nil
+}
+
+func ReleaseSmartMultipartForm(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, exists := c.Get(smartMultipartFormContextKey)
+	if !exists {
+		return
+	}
+	if form, ok := value.(*multipart.Form); ok && form != nil {
+		_ = form.RemoveAll()
+	}
+	c.Set(smartMultipartFormContextKey, nil)
+}
+
+func smartMultipartFormForRequest(c *gin.Context) (*multipart.Form, func(), error) {
+	if c != nil {
+		if value, exists := c.Get(smartMultipartFormContextKey); exists {
+			if form, ok := value.(*multipart.Form); ok && form != nil {
+				return form, func() {}, nil
+			}
+		}
+	}
+	form, err := EnsureSmartMultipartForm(c)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return form, func() { ReleaseSmartMultipartForm(c) }, nil
+}
+
+func newSmartMediaRequestShape(endpoint string, estimatedContext int) *smartrouter.MediaRequestShape {
+	kind := ""
+	switch endpoint {
+	case SmartEndpointImages, SmartEndpointImageEdits:
+		kind = smartrouter.MediaKindImage
+	case SmartEndpointVideos, SmartEndpointVideoTasks:
+		kind = smartrouter.MediaKindVideo
+	case SmartEndpointAudioSpeech, SmartEndpointAudioTranscription, SmartEndpointAudioTranslation:
+		kind = smartrouter.MediaKindAudio
+	default:
+		return nil
+	}
+	shape := &smartrouter.MediaRequestShape{
+		Kind: kind, QuotaPerUnit: int64(math.Round(common.QuotaPerUnit)),
+		RequestPriceMultiplier: smartrouter.PriceScoreScale,
+	}
+	if estimatedContext > 0 {
+		shape.EstimatedTokens = int64(estimatedContext)
+		shape.EstimatedTokensKnown = true
+	}
+	return shape
+}
+
+func jsonSmartMediaReferences(payload map[string]any) []smartrouter.MediaReferenceShape {
+	if payload == nil {
+		return nil
+	}
+	result := make([]smartrouter.MediaReferenceShape, 0)
+	if references, ok := payload["references"].([]any); ok && len(references) > 0 {
+		for _, raw := range references {
+			reference, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			result = append(result, smartrouter.MediaReferenceShape{
+				Type: normalizeSmartMediaValue(smartString(reference["type"])),
+				Role: normalizeSmartMediaValue(smartString(reference["role"])),
+			})
+		}
+		return result
+	}
+	imageCount := smartMediaValueCount(payload["images"])
+	if imageCount == 0 && (smartValuePresent(payload["image"]) || smartValuePresent(payload["input_reference"])) {
+		imageCount = 1
+	}
+	for index := 0; index < imageCount; index++ {
+		result = append(result, smartrouter.MediaReferenceShape{Type: smartrouter.MediaKindImage, Role: "reference"})
+	}
+	if smartValuePresent(payload["video_url"]) {
+		result = append(result, smartrouter.MediaReferenceShape{Type: smartrouter.MediaKindVideo, Role: "reference"})
+	}
+	if smartValuePresent(payload["audio_url"]) {
+		result = append(result, smartrouter.MediaReferenceShape{Type: smartrouter.MediaKindAudio, Role: "reference"})
+	}
+	return result
+}
+
+func multipartSmartMediaReferences(form *multipart.Form, endpoint string) []smartrouter.MediaReferenceShape {
+	if form == nil {
+		return nil
+	}
+	if values := form.Value["references"]; len(values) > 0 {
+		var references []map[string]any
+		if common.Unmarshal([]byte(values[0]), &references) == nil && len(references) > 0 {
+			result := make([]smartrouter.MediaReferenceShape, 0, len(references))
+			for _, reference := range references {
+				result = append(result, smartrouter.MediaReferenceShape{
+					Type: normalizeSmartMediaValue(smartString(reference["type"])),
+					Role: normalizeSmartMediaValue(smartString(reference["role"])),
+				})
+			}
+			return result
+		}
+	}
+	result := make([]smartrouter.MediaReferenceShape, 0)
+	appendFiles := func(field, mediaType string) {
+		for _, file := range form.File[field] {
+			if file == nil {
+				continue
+			}
+			result = append(result, smartrouter.MediaReferenceShape{
+				Type: mediaType, Role: "reference", SizeBytes: file.Size, MetadataTrusted: true,
+			})
+		}
+	}
+	if endpoint == SmartEndpointImageEdits {
+		appendFiles("image", smartrouter.MediaKindImage)
+		return result
+	}
+	if endpoint == SmartEndpointVideos || endpoint == SmartEndpointVideoTasks {
+		for _, field := range []string{"input_reference", "image", "images"} {
+			appendFiles(field, smartrouter.MediaKindImage)
+			if len(form.Value[field]) > 0 && len(form.File[field]) == 0 {
+				result = append(result, smartrouter.MediaReferenceShape{Type: smartrouter.MediaKindImage, Role: "reference"})
+			}
+		}
+	}
+	return result
+}
+
+func smartMediaValueCount(value any) int {
+	switch typed := value.(type) {
+	case []any:
+		count := 0
+		for _, item := range typed {
+			if smartValuePresent(item) {
+				count++
+			}
+		}
+		return count
+	case []string:
+		count := 0
+		for _, item := range typed {
+			if strings.TrimSpace(item) != "" {
+				count++
+			}
+		}
+		return count
+	default:
+		if smartValuePresent(value) {
+			return 1
+		}
+		return 0
+	}
+}
+
+func firstPositiveSmartInteger(values ...any) (int64, bool, error) {
+	for _, value := range values {
+		parsed, known, err := positiveSmartInteger(value)
+		if err != nil {
+			return 0, false, err
+		}
+		if known {
+			return parsed, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func positiveSmartInteger(value any) (int64, bool, error) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, false, nil
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" || text == "0" {
+			return 0, false, nil
+		}
+		parsed, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || parsed <= 0 {
+			return 0, false, fmt.Errorf("invalid integer %q", text)
+		}
+		return parsed, true, nil
+	case float64:
+		if typed == 0 {
+			return 0, false, nil
+		}
+		if typed <= 0 || math.Trunc(typed) != typed || typed > math.MaxInt64 {
+			return 0, false, fmt.Errorf("invalid number %v", typed)
+		}
+		return int64(typed), true, nil
+	case float32:
+		return positiveSmartInteger(float64(typed))
+	case int:
+		return positiveSmartInteger(int64(typed))
+	case int64:
+		if typed == 0 {
+			return 0, false, nil
+		}
+		if typed < 0 {
+			return 0, false, fmt.Errorf("invalid number %d", typed)
+		}
+		return typed, true, nil
+	case int32:
+		return positiveSmartInteger(int64(typed))
+	case uint:
+		if uint64(typed) > math.MaxInt64 {
+			return 0, false, fmt.Errorf("integer is too large")
+		}
+		return positiveSmartInteger(int64(typed))
+	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, false, fmt.Errorf("integer is too large")
+		}
+		return positiveSmartInteger(int64(typed))
+	default:
+		return 0, false, fmt.Errorf("unsupported numeric type %T", value)
+	}
+}
+
+func metadataValue(metadata map[string]any, key string) any {
+	if metadata == nil {
+		return nil
+	}
+	return metadata[key]
+}
+
+func firstSmartString(values ...any) string {
+	for _, value := range values {
+		if text := smartString(value); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func normalizeSmartMediaValue(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func smartImagePriceMultiplierPPM(model, size, quality string) int64 {
+	meta := (&dto.ImageRequest{Model: model, Size: size, Quality: quality}).GetTokenCountMeta()
+	ratio := meta.ImagePriceRatio
+	if ratio <= 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return smartrouter.PriceScoreScale
+	}
+	scaled := ratio * float64(smartrouter.PriceScoreScale)
+	if scaled >= float64(math.MaxInt64) {
+		return smartrouter.PriceScoreScale
+	}
+	return int64(math.Floor(scaled + 0.5))
+}
+
+func normalizeSmartVideoResolution(resolution, size string) string {
+	if value := normalizeSmartMediaValue(resolution); value != "" {
+		return value
+	}
+	width, height, ok := smartSizeDimensions(size)
+	if !ok {
+		return normalizeSmartMediaValue(size)
+	}
+	short := width
+	if height < short {
+		short = height
+	}
+	switch short {
+	case 360, 480, 512, 720, 768, 1080, 2160:
+		return strconv.Itoa(short) + "p"
+	default:
+		return normalizeSmartMediaValue(size)
+	}
+}
+
+func smartAspectRatioFromSize(size string) string {
+	width, height, ok := smartSizeDimensions(size)
+	if !ok || width <= 0 || height <= 0 {
+		return ""
+	}
+	divisor := greatestCommonDivisor(width, height)
+	return fmt.Sprintf("%d:%d", width/divisor, height/divisor)
+}
+
+func smartSizeDimensions(size string) (int, int, bool) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(size)), "x")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	width, widthErr := strconv.Atoi(strings.TrimSpace(parts[0]))
+	height, heightErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+	return width, height, widthErr == nil && heightErr == nil && width > 0 && height > 0
+}
+
+func greatestCommonDivisor(left, right int) int {
+	for right != 0 {
+		left, right = right, left%right
+	}
+	if left <= 0 {
+		return 1
+	}
+	return left
+}
+
+func readReusableSmartRequestBody(c *gin.Context) (payload map[string]any, err error) {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, seekErr := storage.Seek(0, io.SeekStart)
+		c.Request.Body = io.NopCloser(storage)
+		if err == nil && seekErr != nil {
+			err = seekErr
+		}
+	}()
+
+	if storage.IsDisk() {
+		err = common.DecodeJson(storage, &payload)
+	} else {
+		var body []byte
+		body, err = storage.Bytes()
+		if err == nil {
+			err = common.Unmarshal(body, &payload)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		return nil, errors.New("request body must be a JSON object")
+	}
+	return payload, nil
+}
+
+func classifySmartReplay(payload map[string]any) smartrouter.ReplayClass {
+	if containsUnsupportedSmartInput(payload["messages"]) || containsUnsupportedSmartInput(payload["input"]) {
+		return smartrouter.ReplayUnsupported
+	}
+	if smartValuePresent(payload["previous_response_id"]) || smartValuePresent(payload["conversation"]) ||
+		containsBoundSmartFile(payload["messages"]) || containsBoundSmartFile(payload["input"]) {
+		return smartrouter.ReplayStateBound
+	}
+	if smartBool(payload["store"]) || smartBool(payload["background"]) || containsHostedSmartTool(payload["tools"]) {
+		return smartrouter.ReplaySideEffecting
+	}
+	return smartrouter.ReplaySafeText
+}
+
+func requiredSmartCapabilities(payload map[string]any) uint64 {
+	capabilities := uint64(SmartCapabilityText)
+	if smartBool(payload["stream"]) {
+		capabilities |= SmartCapabilityStream
+	}
+	if smartCollectionPresent(payload["tools"]) {
+		capabilities |= SmartCapabilityTools
+	}
+	if containsSmartVision(payload["messages"]) || containsSmartVision(payload["input"]) {
+		capabilities |= SmartCapabilityVision
+	}
+	if containsSmartStructuredOutput(payload) {
+		capabilities |= SmartCapabilityStructuredOutput
+	}
+	if smartValuePresent(payload["reasoning"]) || smartValuePresent(payload["reasoning_effort"]) ||
+		smartValuePresent(payload["thinking"]) || smartBool(payload["enable_thinking"]) {
+		capabilities |= SmartCapabilityReasoning
+	}
+	if smartString(payload["prompt_cache_key"]) != "" || containsSmartKey(payload, "cache_control") {
+		capabilities |= SmartCapabilityPromptCache
+	}
+	return capabilities
+}
+
+func containsSmartVision(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if _, exists := typed["image_url"]; exists {
+			return true
+		}
+		typeName := strings.ToLower(smartString(typed["type"]))
+		switch typeName {
+		case "image", "image_url", "input_image", "input_image_url":
+			return true
+		}
+		for _, child := range typed {
+			if containsSmartVision(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsSmartVision(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsSmartStructuredOutput(payload map[string]any) bool {
+	for _, key := range []string{"response_format", "text", "output_config"} {
+		if containsSmartJSONSchema(payload[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSmartJSONSchema(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		typeName := strings.ToLower(smartString(typed["type"]))
+		if typeName == "json_schema" || typeName == "json_object" {
+			return true
+		}
+		if schema, exists := typed["json_schema"]; exists && smartValuePresent(schema) {
+			return true
+		}
+		for _, child := range typed {
+			if containsSmartJSONSchema(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsSmartJSONSchema(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsHostedSmartTool(value any) bool {
+	var tools []any
+	switch typed := value.(type) {
+	case []any:
+		tools = typed
+	case map[string]any:
+		tools = []any{typed}
+	default:
+		return false
+	}
+	for _, tool := range tools {
+		definition, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName := strings.ToLower(smartString(definition["type"]))
+		// Claude client tools omit type; OpenAI client tools use function or
+		// custom. Every other non-empty type is provider-hosted and fails closed,
+		// including tool kinds introduced after this release.
+		if typeName != "" && typeName != "function" && typeName != "custom" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsUnsupportedSmartInput(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		switch strings.ToLower(smartString(typed["type"])) {
+		case "audio", "input_audio", "video", "input_video", "file", "input_file", "document":
+			return true
+		}
+		for _, child := range typed {
+			if containsUnsupportedSmartInput(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsUnsupportedSmartInput(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsBoundSmartFile(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if fileID, exists := typed["file_id"]; exists && smartValuePresent(fileID) {
+			return true
+		}
+		for _, child := range typed {
+			if containsBoundSmartFile(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsBoundSmartFile(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsSmartKey(value any, wanted string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if found, exists := typed[wanted]; exists && smartValuePresent(found) {
+			return true
+		}
+		for _, child := range typed {
+			if containsSmartKey(child, wanted) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsSmartKey(child, wanted) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func smartCollectionPresent(value any) bool {
+	switch typed := value.(type) {
+	case []any:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	default:
+		return false
+	}
+}
+
+func smartValuePresent(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	default:
+		return true
+	}
+}
+
+func smartBool(value any) bool {
+	result, ok := value.(bool)
+	return ok && result
+}
+
+func smartString(value any) string {
+	result, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(result)
+}
+
+func smartEndpointForPath(requestPath string) (string, bool) {
+	switch requestPath {
+	case "/v1/chat/completions":
+		return SmartEndpointChat, true
+	case "/v1/completions":
+		return SmartEndpointCompletions, true
+	case "/v1/messages":
+		return SmartEndpointMessages, true
+	case "/v1/responses":
+		return SmartEndpointResponses, true
+	case "/v1/alpha/search":
+		return SmartEndpointStandaloneSearch, true
+	case "/v1/images/generations":
+		return SmartEndpointImages, true
+	case "/v1/images/edits":
+		return SmartEndpointImageEdits, true
+	case "/v1/videos":
+		return SmartEndpointVideos, true
+	case "/v1/video/generations":
+		return SmartEndpointVideoTasks, true
+	case "/v1/audio/speech":
+		return SmartEndpointAudioSpeech, true
+	case "/v1/audio/transcriptions":
+		return SmartEndpointAudioTranscription, true
+	case "/v1/audio/translations":
+		return SmartEndpointAudioTranslation, true
+	default:
+		return "", false
+	}
+}
+
+func isSupportedSmartEndpoint(endpoint string) bool {
+	switch endpoint {
+	case SmartEndpointChat, SmartEndpointCompletions, SmartEndpointMessages, SmartEndpointResponses,
+		SmartEndpointStandaloneSearch,
+		SmartEndpointImages, SmartEndpointImageEdits, SmartEndpointVideos, SmartEndpointVideoTasks,
+		SmartEndpointAudioSpeech, SmartEndpointAudioTranscription, SmartEndpointAudioTranslation:
+		return true
+	default:
+		return false
+	}
+}
+
+type SmartRouteFailureScope string
+
+const (
+	SmartFailureNone           SmartRouteFailureScope = "none"
+	SmartFailureRouteModel     SmartRouteFailureScope = "route_model"
+	SmartFailureRouteContract  SmartRouteFailureScope = "route_contract"
+	SmartFailureCapacity       SmartRouteFailureScope = "capacity"
+	SmartFailureCredential     SmartRouteFailureScope = "credential"
+	SmartFailureInfrastructure SmartRouteFailureScope = "infrastructure"
+	SmartFailureUser           SmartRouteFailureScope = "user"
+	SmartFailureContent        SmartRouteFailureScope = "content"
+	SmartFailureCancellation   SmartRouteFailureScope = "cancellation"
+)
+
+const (
+	SmartRouteModelQuarantineMS    int64 = 5 * 60 * 1_000
+	SmartRouteContractQuarantineMS int64 = 30 * 60 * 1_000
+)
+
+// SmartRouteOutcome keeps request-local retry authority separate from shared
+// health accounting. Every explicit upstream rejection may advance the current
+// request, while only route/provider-attributable failures mark that exact
+// physical route unavailable. Generic payload/context rejections stay neutral.
+type SmartRouteOutcome struct {
+	Outcome            smartrouter.QualityOutcome
+	FailureScope       SmartRouteFailureScope
+	RouteFailure       bool
+	RetryNextRoute     bool
+	AffectsRouteHealth bool
+	RouteQuarantineMS  int64
+	HTTPStatus         int
+	ErrorSummary       string
+}
+
+func (outcome SmartRouteOutcome) CanTryNextRoute() bool {
+	return outcome.RouteFailure && outcome.RetryNextRoute
+}
+
+func (outcome SmartRouteOutcome) ShouldQuarantineRoute() bool {
+	return outcome.RouteFailure && outcome.RouteQuarantineMS > 0 &&
+		(outcome.FailureScope == SmartFailureRouteModel || outcome.FailureScope == SmartFailureRouteContract)
+}
+
+// ClassifySmartRouteOutcome is intentionally independent of legacy RetryTimes.
+// Its result is the sole pre-commit authority for trying another smart route.
+func ClassifySmartRouteOutcome(apiErr *types.NewAPIError, contextErr error) (result SmartRouteOutcome) {
+	if contextErr == nil && errors.Is(apiErr, types.ErrParameterCandidateUnavailable) {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureRouteContract, false)
+	}
+	defer func() {
+		if apiErr != nil {
+			result.HTTPStatus = apiErr.GetOriginalStatusCode()
+			result.ErrorSummary = smartRouteErrorSummary(apiErr)
+		} else if contextErr != nil {
+			result.ErrorSummary = sanitizeSmartRouteErrorSummary(contextErr.Error())
+		}
+		// Once an upstream HTTP/SSE response has been observed, the provider has
+		// made the rejection decision for this physical route. Every such failure
+		// (including explicit 4xx field, context, permission, quota, and content
+		// errors) must yield to the next certified route before semantic commit.
+		// Keep the classification and health scope selected below, but do not let
+		// a provider skip-retry marker become a global smart-route stop condition.
+		// The controller still applies replay, commit, and client-cancel boundaries.
+		if apiErr != nil && apiErr.HasUpstreamResponse() &&
+			!errors.Is(apiErr, ErrSmartMediaSubmissionAmbiguous) &&
+			strings.ToLower(strings.TrimSpace(string(apiErr.GetErrorCode()))) != string(types.ErrorCodeSmartResponsesSingleRoute) &&
+			result.FailureScope != SmartFailureCancellation {
+			result.RouteFailure = true
+			result.RetryNextRoute = true
+		}
+	}()
+	// Only the original downstream request context can prove that the client
+	// went away. If an upstream HTTP/SSE error was already received, preserve
+	// that provider evidence even when the attempt is cancelled in the same
+	// scheduling window; otherwise a real 400/429/5xx would be relabelled as a
+	// client cancellation and failover would stop prematurely.
+	if (apiErr == nil || !apiErr.HasUpstreamResponse()) &&
+		(errors.Is(contextErr, context.Canceled) || errors.Is(contextErr, context.DeadlineExceeded)) {
+		return neutralSmartOutcome(smartrouter.OutcomeClientCancelled, SmartFailureCancellation)
+	}
+	if apiErr == nil {
+		return SmartRouteOutcome{
+			Outcome: smartrouter.OutcomeSuccess, FailureScope: SmartFailureNone,
+			AffectsRouteHealth: true,
+		}
+	}
+	if errors.Is(apiErr, ErrSmartMediaSubmissionAmbiguous) {
+		return SmartRouteOutcome{
+			Outcome:            smartrouter.OutcomeInfrastructure,
+			FailureScope:       SmartFailureInfrastructure,
+			RouteFailure:       true,
+			RetryNextRoute:     false,
+			AffectsRouteHealth: true,
+		}
+	}
+	if errors.Is(apiErr, ErrSmartMediaRouteNotAccepted) {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureRouteContract, true)
+	}
+
+	code := strings.ToLower(strings.TrimSpace(string(apiErr.GetErrorCode())))
+	details := smartErrorDetails(apiErr)
+	status := apiErr.GetOriginalStatusCode()
+	if code == string(types.ErrorCodeSmartResponsesSingleRoute) {
+		return neutralSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureInfrastructure)
+	}
+
+	if code == string(types.ErrorCodePromptBlocked) || code == string(types.ErrorCodeSensitiveWordsDetected) ||
+		code == string(types.ErrorCodeViolationFeeGrokCSAM) || containsAnySmartError(details,
+		"prompt_blocked", "content_policy_violation", "content_filter", "safety_blocked") {
+		return neutralSmartOutcome(smartrouter.OutcomeContentRejected, SmartFailureContent)
+	}
+	if code == string(types.ErrorCodeInsufficientUserQuota) || code == string(types.ErrorCodePreConsumeTokenQuotaFailed) {
+		return neutralSmartOutcome(smartrouter.OutcomeUserRejected, SmartFailureUser)
+	}
+	if isSmartUpstreamAccountBalanceError(apiErr, details) {
+		return retryableSmartOutcome(smartrouter.OutcomeCredential, SmartFailureCredential, true)
+	}
+	if code == string(types.ErrorCodeModelNotFound) || code == string(types.ErrorCodeChannelModelMappedError) ||
+		(status == http.StatusNotFound && containsAnySmartError(details, "model_not_found", "model not found")) ||
+		(status == http.StatusForbidden && isSmartModelAccessError(details)) {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureRouteModel, true)
+	}
+	if containsAnySmartError(code+" "+details, "unsupported_parameter", "unsupported parameter") {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureRouteContract, true)
+	}
+	if status == http.StatusTooManyRequests || code == string(types.ErrorCodeChannelNoAvailableKey) ||
+		containsAnySmartError(code+" "+details,
+			"rate_limit", "rate limit", "too_many_requests", "too many pending", "pending requests", "capacity", "overload", "overloaded") {
+		return retryableSmartOutcome(smartrouter.OutcomeCapacityLimited, SmartFailureCapacity, true)
+	}
+	if status == http.StatusUnauthorized || status == http.StatusProxyAuthRequired ||
+		code == string(types.ErrorCodeChannelInvalidKey) || containsAnySmartError(code+" "+details,
+		"invalid_api_key", "authentication_error", "unauthorized", "invalid credential") {
+		return retryableSmartOutcome(smartrouter.OutcomeCredential, SmartFailureCredential, true)
+	}
+	// Some upstream gateways surface their own routing/configuration failures as
+	// HTTP 403. They are not user authorization failures: mark only the exact
+	// physical route unavailable and let its bounded background probe recover it.
+	// Other models and genuinely user-specific 403 responses remain unaffected.
+	if status == http.StatusForbidden && isSmartRouteContractRefusal(details) {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureRouteContract, true)
+	}
+	// Conversion happens before an upstream request is dispatched. Treat an
+	// adapter mismatch as an exact route-contract failure so a replay-safe
+	// request can continue without degrading the whole channel.
+	if apiErr.GetErrorCode() == types.ErrorCodeConvertRequestFailed {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureRouteContract, true)
+	}
+	// Some locally-created errors use the default HTTP 500 status even though
+	// they describe a malformed client request. Classify the explicit error
+	// code before the generic 5xx branch so they cannot trigger route failover.
+	if (!apiErr.HasUpstreamResponse() && isSmartUserErrorCode(apiErr.GetErrorCode())) ||
+		(apiErr.HasUpstreamResponse() && isSmartExplicitUserRequestError(apiErr)) {
+		return neutralSmartOutcome(smartrouter.OutcomeUserRejected, SmartFailureUser)
+	}
+	if status == http.StatusRequestTimeout || status >= http.StatusInternalServerError || isSmartInfrastructureCode(apiErr.GetErrorCode()) {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureInfrastructure, true)
+	}
+	// Explicit route/model/contract classifications above intentionally retain
+	// their failover semantics even when their adapters marked the error
+	// skip-retry. For everything else, that marker is authoritative and must
+	// beat the provider-specific unknown 4xx fallback below.
+	if types.IsSkipRetryError(apiErr) {
+		return neutralSmartOutcome(smartrouter.OutcomeUserRejected, SmartFailureUser)
+	}
+	// An upstream response that was dispatched but does not match any known
+	// provider/user error is safe to try on another certified route. Keep the
+	// route health neutral: an unknown provider-specific 4xx must not poison a
+	// shared channel or trigger a long quarantine. Local NewAPI errors retain the
+	// existing terminal behavior below.
+	if isSmartUnclassifiedUpstreamError(apiErr) {
+		return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureInfrastructure, false)
+	}
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+		return neutralSmartOutcome(smartrouter.OutcomeUserRejected, SmartFailureUser)
+	}
+	// Unknown local errors are still eligible for the existing infrastructure
+	// retry path, but are not assigned a new health meaning here.
+	return retryableSmartOutcome(smartrouter.OutcomeInfrastructure, SmartFailureInfrastructure, false)
+}
+
+// PreserveSmartRouteUpstreamResponseEvidence attaches the request-local HTTP
+// response boundary to an adaptor-produced error. It is intentionally called
+// after a relay attempt returns: local validation/setup errors never pass the
+// common HTTP transport and therefore remain unmarked.
+func PreserveSmartRouteUpstreamResponseEvidence(c *gin.Context, apiErr *types.NewAPIError) *types.NewAPIError {
+	if c == nil || apiErr == nil || !common.GetContextKeyBool(c, constant.ContextKeyUpstreamResponseReceived) {
+		return apiErr
+	}
+	CaptureUpstreamRequestIDFromError(c, apiErr)
+	upstreamStatus := common.GetContextKeyInt(c, constant.ContextKeyUpstreamStatusCode)
+	// A 200 response header can exist before the downstream disappears. Do not
+	// let that transport marker relabel a write/client-cancellation failure as a
+	// provider failure: the caller can no longer receive a fallback result, and
+	// the selected route's health must stay neutral. A genuine provider 4xx/5xx
+	// must keep its evidence even when an adaptor joined context.Canceled while
+	// unwinding the already-received response. The previous implementation
+	// returned early for every cancellation and consequently reclassified a real
+	// upstream 400 as a local/client cancellation.
+	if c.Request != nil && c.Request.Context().Err() != nil &&
+		(errors.Is(apiErr, context.Canceled) || errors.Is(apiErr, context.DeadlineExceeded)) {
+		if upstreamStatus == 0 || upstreamStatus < http.StatusMultipleChoices {
+			return apiErr
+		}
+	}
+	apiErr.MarkUpstreamResponseReceived()
+	if upstreamStatus != 0 {
+		apiErr.SetOriginalStatusCode(upstreamStatus)
+		// Preserve the real provider status for the public error whenever the
+		// adaptor only left an empty or generic 5xx status behind.  A mapped
+		// 2xx or an explicit 4xx is intentional and must remain untouched, but
+		// a generic 502/500 would otherwise hide a real provider 400 and make
+		// the caller see the wrong local parameter classification.
+		if upstreamStatus >= http.StatusBadRequest && upstreamStatus <= 599 &&
+			(apiErr.StatusCode == 0 || apiErr.StatusCode >= http.StatusInternalServerError) {
+			apiErr.StatusCode = upstreamStatus
+		}
+	}
+	return apiErr
+}
+
+// SmartRouteUpstreamResponseReceived reports the current attempt's transport
+// boundary. The marker is request-local and is reset by the smart controller
+// before selecting each physical route.
+func SmartRouteUpstreamResponseReceived(c *gin.Context) bool {
+	return c != nil && common.GetContextKeyBool(c, constant.ContextKeyUpstreamResponseReceived)
+}
+
+func isSmartUnclassifiedUpstreamError(apiErr *types.NewAPIError) bool {
+	if apiErr == nil {
+		return false
+	}
+	// Standard, recognizably client-authored 4xx responses remain terminal. A
+	// provider-specific 4xx with no known request/user signal is the default
+	// fallback case: try another certified route, but keep health neutral.
+	status := apiErr.GetOriginalStatusCode()
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+	details := smartErrorDetails(apiErr)
+	code := strings.ToLower(strings.TrimSpace(string(apiErr.GetErrorCode())))
+	if status == http.StatusTeapot || status == http.StatusTooEarly || status == http.StatusConflict {
+		return true
+	}
+	if isSmartExplicitUserRequestError(apiErr) || containsAnySmartError(code+" "+details,
+		"permission denied", "access denied", "not authorized", "unauthorized", "forbidden",
+		"resource not found", "not found", "insufficient balance") {
+		return false
+	}
+	return apiErr.GetErrorType() == types.ErrorTypeOpenAIError ||
+		apiErr.GetErrorType() == types.ErrorTypeClaudeError ||
+		apiErr.GetErrorType() == types.ErrorTypeUpstreamError
+}
+
+// IsSmartExplicitUserRequestError is exported for the controller's final
+// message selection and health-neutral failure summaries. Retry authority is
+// independent: every upstream-evidenced failure may continue to another
+// certified route before the semantic commit boundary.
+func IsSmartExplicitUserRequestError(apiErr *types.NewAPIError) bool {
+	return isSmartExplicitUserRequestError(apiErr)
+}
+
+func isSmartExplicitUserRequestError(apiErr *types.NewAPIError) bool {
+	if apiErr == nil {
+		return false
+	}
+	if !apiErr.HasUpstreamResponse() {
+		details := smartErrorDetails(apiErr)
+		return isSmartUserErrorCode(apiErr.GetErrorCode()) || containsAnySmartError(
+			details,
+			"invalid_request", "invalid request", "bad_request", "bad request", "unprocessable",
+			"invalid parameter", "missing parameter", "required parameter", "malformed", "validation",
+		)
+	}
+	status := apiErr.GetOriginalStatusCode()
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	details := smartErrorDetails(apiErr)
+	// A concrete indexed input/field error or an explicit required/shape
+	// validation is attributable to the caller. Do not treat a bare
+	// `invalid_request` code, the word "parameter", `input[` or `expected`
+	// alone as sufficient evidence; providers also use those for transient
+	// gateway conditions. The indexed forms require an explicit invalid/shape
+	// marker so a provider message such as "expected input[route] to be ready"
+	// remains eligible for a different certified route.
+	if containsAnySmartError(details,
+		"invalid 'input[", "invalid \"input[", "invalid input[",
+		"input item at index", "input item id is invalid") {
+		return true
+	}
+	return containsAnySmartError(details,
+		"missing required", "missing parameter", "required parameter", "is required",
+		"must be provided", "must be a ", "must be one of ", "must contain ",
+		"unknown parameter", "unrecognized parameter", "extra fields not permitted",
+		"max_tokens is invalid", "max_completion_tokens is invalid", "temperature is invalid",
+		"top_p is invalid", "the parameter is invalid", "unprocessable")
+}
+
+func neutralSmartOutcome(outcome smartrouter.QualityOutcome, scope SmartRouteFailureScope) SmartRouteOutcome {
+	return SmartRouteOutcome{Outcome: outcome, FailureScope: scope}
+}
+
+func retryableSmartOutcome(outcome smartrouter.QualityOutcome, scope SmartRouteFailureScope, affectsHealth bool) SmartRouteOutcome {
+	return SmartRouteOutcome{
+		Outcome:            outcome,
+		FailureScope:       scope,
+		RouteFailure:       true,
+		RetryNextRoute:     true,
+		AffectsRouteHealth: affectsHealth,
+	}
+}
+
+func retryableQuarantinedSmartOutcome(
+	outcome smartrouter.QualityOutcome,
+	scope SmartRouteFailureScope,
+	quarantineMS int64,
+) SmartRouteOutcome {
+	result := retryableSmartOutcome(outcome, scope, false)
+	result.RouteQuarantineMS = quarantineMS
+	return result
+}
+
+func smartErrorDetails(apiErr *types.NewAPIError) string {
+	if apiErr == nil {
+		return ""
+	}
+	openAIError := apiErr.ToOpenAIError()
+	return strings.ToLower(strings.Join([]string{
+		apiErr.Error(), openAIError.Message, openAIError.Type,
+		fmt.Sprint(openAIError.Code), openAIError.Param, openAIError.RequestID,
+	}, " "))
+}
+
+func smartRouteErrorSummary(apiErr *types.NewAPIError) string {
+	if apiErr == nil {
+		return ""
+	}
+	openAIError := apiErr.ToOpenAIError()
+	for _, value := range []string{openAIError.Message, apiErr.Error()} {
+		if value = strings.TrimSpace(value); value != "" {
+			return sanitizeSmartRouteErrorSummary(value)
+		}
+	}
+	fallback := strings.TrimSpace(strings.Join([]string{
+		openAIError.Type,
+		fmt.Sprint(openAIError.Code),
+	}, " "))
+	return sanitizeSmartRouteErrorSummary(fallback)
+}
+
+func sanitizeSmartRouteErrorSummary(value string) string {
+	// Upstream errors are untrusted and can be arbitrarily large. Bound the
+	// work before normalization, then redact in one forward pass. Repeatedly
+	// searching a replacement such as "sk-[redacted]" would find its own
+	// prefix forever.
+	const maxSummaryScanBytes = 4096
+	if len(value) > maxSummaryScanBytes {
+		value = value[:maxSummaryScanBytes]
+	}
+	value = strings.ToValidUTF8(value, "")
+	lower := strings.ToLower(value)
+	var redacted strings.Builder
+	redacted.Grow(len(value))
+	for cursor := 0; cursor < len(value); {
+		relativeStart := strings.Index(lower[cursor:], "sk-")
+		if relativeStart < 0 {
+			redacted.WriteString(value[cursor:])
+			break
+		}
+		start := cursor + relativeStart
+		redacted.WriteString(value[cursor:start])
+		redacted.WriteString("sk-[redacted]")
+		end := start + 3
+		for end < len(value) && !isSmartRouteSecretDelimiter(value[end]) {
+			end++
+		}
+		cursor = end
+	}
+	value = strings.Join(strings.Fields(strings.TrimSpace(redacted.String())), " ")
+	const maxSummaryRunes = 512
+	runes := []rune(value)
+	if len(runes) > maxSummaryRunes {
+		value = string(runes[:maxSummaryRunes])
+	}
+	return value
+}
+
+func isSmartRouteSecretDelimiter(value byte) bool {
+	switch value {
+	case ' ', '\t', '\r', '\n', '"', '\'', ',', ';', ':', '=', ')', '}', ']':
+		return true
+	default:
+		return false
+	}
+}
+
+func containsAnySmartError(value string, needles ...string) bool {
+	value = strings.ToLower(value)
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSmartUpstreamAccountBalanceError(apiErr *types.NewAPIError, details string) bool {
+	if apiErr == nil {
+		return false
+	}
+	openAIError := apiErr.ToOpenAIError()
+	for _, value := range []string{string(apiErr.GetErrorCode()), fmt.Sprint(openAIError.Code)} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "insufficient_account_balance", "insufficient_balance", "account_balance_insufficient":
+			return true
+		}
+	}
+	return containsAnySmartError(details,
+		"insufficient account balance",
+		"account balance is insufficient",
+	)
+}
+
+func isSmartModelAccessError(details string) bool {
+	return containsAnySmartError(details,
+		"model_not_found", "model not found", "unsupported model", "model is not available",
+		"model access", "access to this model", "does not have access to model",
+		"model permission", "model permissions", "model unavailable")
+}
+
+func isSmartRouteContractRefusal(details string) bool {
+	if containsAnySmartError(details,
+		"image generation is not enabled for this group",
+		"channel selected by channel affinity has been disabled",
+		"selected by channel affinity has been disabled",
+		"retry was stopped by rule",
+		"api key group has been deleted",
+		"api key 所属分组已删除",
+		"no permission to access this group",
+		"no permission to access group",
+		"no permission for this group",
+		"group access denied",
+		"group has been deleted",
+		"group was deleted",
+		"group not found",
+		"group does not exist",
+		"分组已删除",
+		"分组不存在",
+		"无权访问该分组",
+		"无权访问此分组",
+		"无权访问分组",
+	) {
+		return true
+	}
+	// Some gateways emit only a generic denial plus the affected group. Keep
+	// this conjunction strict so an ordinary user-level 403 remains terminal.
+	return containsAnySmartError(details, "group", "分组") &&
+		containsAnySmartError(details,
+			"permission denied", "access denied", "not authorized", "unauthorized",
+			"forbidden", "no permission", "无权", "没有权限", "权限不足", "deleted", "已删除")
+}
+
+// IsSmartResponsesConversationStateError identifies the Responses API state
+// mismatch that cannot be repaired by choosing another physical channel. The
+// caller should preserve the 400 and suggest a fresh conversation instead of
+// replaying the same stale item IDs.
+func IsSmartResponsesConversationStateError(apiErr *types.NewAPIError) bool {
+	if apiErr == nil {
+		return false
+	}
+	details := smartErrorDetails(apiErr)
+	if !containsAnySmartError(details,
+		"expected an id that begins with 'rs'",
+		"expected an id that begins with \"rs\"",
+		"expected an id that begins with rs",
+	) {
+		return false
+	}
+	// The Responses contract points at a concrete indexed input item's id.
+	// Requiring both delimiters prevents unrelated 400s such as input[].type,
+	// or prose that merely mentions an input item's id, from being rewritten.
+	return strings.Contains(details, "input[") && strings.Contains(details, "].id")
+}
+
+func isSmartInfrastructureCode(code types.ErrorCode) bool {
+	switch code {
+	case types.ErrorCodeDoRequestFailed,
+		types.ErrorCodeGetChannelFailed,
+		types.ErrorCodeChannelResponseTimeExceeded,
+		types.ErrorCodeReadResponseBodyFailed,
+		types.ErrorCodeBadResponseStatusCode,
+		types.ErrorCodeBadResponse,
+		types.ErrorCodeBadResponseBody,
+		types.ErrorCodeEmptyResponse,
+		types.ErrorCodeAwsInvokeError:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSmartUserErrorCode(code types.ErrorCode) bool {
+	switch code {
+	case types.ErrorCodeInvalidRequest,
+		types.ErrorCodeReadRequestBodyFailed,
+		types.ErrorCodeAccessDenied,
+		types.ErrorCodeBadRequestBody:
+		return true
+	default:
+		return false
+	}
+}

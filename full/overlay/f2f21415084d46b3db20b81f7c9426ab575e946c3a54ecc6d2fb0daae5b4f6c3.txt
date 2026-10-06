@@ -1,0 +1,482 @@
+/*
+Copyright (C) 2025 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Button,
+  Card,
+  Input,
+  InputNumber,
+  Modal,
+  Space,
+  Spin,
+  Table,
+  Tabs,
+  Tag,
+  Typography,
+} from '@douyinfe/semi-ui';
+import { Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { API, renderQuota, showError, showSuccess } from '../../../helpers';
+import {
+  displayAmountToQuota,
+  quotaToDisplayAmount,
+} from '../../../helpers/quota';
+import CommissionAdjustmentModal from '../../../components/commission/CommissionAdjustmentModal';
+
+function idempotencyHeaders() {
+  const value =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return { 'Idempotency-Key': `commission-classic-admin-${value}` };
+}
+
+const SettingsCommission = () => {
+  const { t } = useTranslation();
+  const [settings, setSettings] = useState(null);
+  const [programs, setPrograms] = useState([]);
+  const [accounts, setAccounts] = useState([]);
+  const [accountTotal, setAccountTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [programName, setProgramName] = useState('全员邀请阶梯');
+  const [tiers, setTiers] = useState([
+    { threshold: 0, rate: 1 },
+    { threshold: 100, rate: 1.5 },
+  ]);
+  const [previewKey, setPreviewKey] = useState('');
+  const [programBusy, setProgramBusy] = useState(false);
+  const [adjustUserId, setAdjustUserId] = useState(null);
+  const [rebindUserId, setRebindUserId] = useState(null);
+  const [expectedInviterId, setExpectedInviterId] = useState('');
+  const [newInviterId, setNewInviterId] = useState('');
+  const [rebindReason, setRebindReason] = useState('');
+  const [rebindBusy, setRebindBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const responses = await Promise.all([
+        API.get('/api/commission/admin/settings'),
+        API.get('/api/commission/admin/programs?p=1&page_size=50'),
+        API.get('/api/commission/admin/accounts/ranking?p=1&page_size=50'),
+      ]);
+      const failed = responses.find((response) => !response.data.success);
+      if (failed)
+        throw new Error(failed.data.message || t('加载佣金管理数据失败'));
+      setSettings(responses[0].data.data);
+      setPrograms(responses[1].data.data?.items || []);
+      setAccounts(responses[2].data.data?.items || []);
+      setAccountTotal(responses[2].data.data?.total || 0);
+    } catch (error) {
+      showError(error.message || t('加载佣金管理数据失败'));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const parsedTiers = useMemo(
+    () =>
+      tiers
+        .map((tier) => ({
+          threshold_quota: displayAmountToQuota(tier.threshold),
+          rate_bps: Math.round(Number(tier.rate) * 100),
+        }))
+        .sort((a, b) => a.threshold_quota - b.threshold_quota),
+    [tiers],
+  );
+  const programKey = JSON.stringify({
+    name: programName.trim(),
+    tiers: parsedTiers,
+  });
+  const validProgram =
+    programName.trim() &&
+    parsedTiers[0]?.threshold_quota === 0 &&
+    parsedTiers.every(
+      (tier, index) =>
+        tier.rate_bps >= 0 &&
+        tier.rate_bps <= 10000 &&
+        (index === 0 ||
+          parsedTiers[index - 1].threshold_quota < tier.threshold_quota),
+    );
+  const previewProgram = async () => {
+    if (!validProgram) return;
+    setProgramBusy(true);
+    try {
+      const response = await API.post(
+        '/api/commission/admin/programs/preview',
+        { name: programName.trim(), tiers: parsedTiers },
+      );
+      if (!response.data.success)
+        throw new Error(response.data.message || t('阶梯规则校验失败'));
+      setPreviewKey(programKey);
+      showSuccess(t('阶梯规则校验通过'));
+    } catch (error) {
+      showError(error.message || t('阶梯规则校验失败'));
+    } finally {
+      setProgramBusy(false);
+    }
+  };
+  const createProgram = async () => {
+    if (previewKey !== programKey) return;
+    setProgramBusy(true);
+    try {
+      const response = await API.post(
+        '/api/commission/admin/programs',
+        { name: programName.trim(), tiers: parsedTiers },
+        { headers: idempotencyHeaders() },
+      );
+      if (!response.data.success)
+        throw new Error(response.data.message || t('创建佣金方案失败'));
+      setPreviewKey('');
+      showSuccess(t('佣金方案草稿已创建'));
+      await refresh();
+    } catch (error) {
+      showError(error.message || t('创建佣金方案失败'));
+    } finally {
+      setProgramBusy(false);
+    }
+  };
+  const publishProgram = async (program) => {
+    try {
+      const response = await API.post(
+        `/api/commission/admin/programs/${program.public_id}/publish`,
+        { expected_version: program.version },
+        { headers: idempotencyHeaders() },
+      );
+      if (!response.data.success)
+        throw new Error(response.data.message || t('发布佣金方案失败'));
+      showSuccess(t('佣金方案已发布'));
+      await refresh();
+    } catch (error) {
+      showError(error.message || t('发布佣金方案失败'));
+    }
+  };
+  const openRebind = (userId) => {
+    setRebindUserId(userId);
+    setExpectedInviterId('');
+    setNewInviterId('');
+    setRebindReason('');
+  };
+  const rebind = async () => {
+    const expected = expectedInviterId.trim()
+      ? Number(expectedInviterId)
+      : null;
+    const next = newInviterId.trim() ? Number(newInviterId) : null;
+    if (
+      !rebindUserId ||
+      !rebindReason.trim() ||
+      (!Number.isInteger(expected ?? 0) && expected !== null) ||
+      (!Number.isInteger(next ?? 0) && next !== null)
+    )
+      return;
+    setRebindBusy(true);
+    try {
+      const response = await API.put(
+        `/api/commission/admin/users/${rebindUserId}/inviter`,
+        {
+          inviter_id: next,
+          expected_inviter_id: expected,
+          reason: rebindReason.trim(),
+        },
+        { headers: idempotencyHeaders() },
+      );
+      if (!response.data.success)
+        throw new Error(response.data.message || t('修改邀请关系失败'));
+      showSuccess(t('邀请关系已更新'));
+      setRebindUserId(null);
+      await refresh();
+    } catch (error) {
+      showError(error.message || t('修改邀请关系失败'));
+    } finally {
+      setRebindBusy(false);
+    }
+  };
+  const programColumns = [
+    { title: t('方案'), dataIndex: 'name' },
+    {
+      title: t('阶梯'),
+      dataIndex: 'tiers_json',
+      render: (value) => {
+        try {
+          return JSON.parse(value)
+            .map(
+              (tier) =>
+                `${quotaToDisplayAmount(tier.threshold_quota)} @ ${(tier.rate_bps / 100).toFixed(2)}%`,
+            )
+            .join(' / ');
+        } catch {
+          return '-';
+        }
+      },
+    },
+    {
+      title: t('状态'),
+      dataIndex: 'status',
+      render: (value) => <Tag>{t(value)}</Tag>,
+    },
+    {
+      title: t('操作'),
+      render: (_, row) =>
+        row.status === 'draft' && (
+          <Button size='small' onClick={() => publishProgram(row)}>
+            {t('发布')}
+          </Button>
+        ),
+    },
+  ];
+  const rankingColumns = [
+    { title: t('排名'), render: (_, __, index) => index + 1 },
+    {
+      title: t('用户'),
+      render: (_, row) =>
+        `${row.display_name || row.username} (#${row.user_id})`,
+    },
+    { title: t('可用佣金'), dataIndex: 'available_quota', render: renderQuota },
+    {
+      title: t('累计获得'),
+      dataIndex: 'lifetime_earned_quota',
+      render: renderQuota,
+    },
+    {
+      title: t('操作'),
+      render: (_, row) => (
+        <Space>
+          <Button size='small' onClick={() => setAdjustUserId(row.user_id)}>
+            {t('调整佣金')}
+          </Button>
+          <Button
+            size='small'
+            theme='borderless'
+            onClick={() => openRebind(row.user_id)}
+          >
+            {t('改绑邀请人')}
+          </Button>
+        </Space>
+      ),
+    },
+  ];
+  const currentProgram = programs.find(
+    (program) => program.id === settings?.current_program_id,
+  );
+
+  return (
+    <Spin spinning={loading}>
+      <Card className='!rounded-lg shadow-sm border-0'>
+        <div className='flex flex-wrap justify-between gap-3 mb-4'>
+          <div>
+            <Typography.Title heading={5}>{t('消费佣金')}</Typography.Title>
+            <Typography.Text type='tertiary' size='small'>
+              {t(
+                '每个人天然拥有邀请资格；仅按已发布阶梯为直接邀请关系结算佣金。',
+              )}
+            </Typography.Text>
+          </div>
+          <Button icon={<RefreshCw size={15} />} onClick={refresh}>
+            {t('刷新')}
+          </Button>
+        </div>
+        <div className='grid grid-cols-2 gap-3 mb-5'>
+          <div className='rounded-lg border p-3'>
+            <Typography.Text type='tertiary' size='small'>
+              {t('当前方案')}
+            </Typography.Text>
+            <div className='font-semibold mt-1'>
+              {currentProgram?.name || t('暂无已发布方案')}
+            </div>
+          </div>
+          <div className='rounded-lg border p-3'>
+            <Typography.Text type='tertiary' size='small'>
+              {t('佣金账户')}
+            </Typography.Text>
+            <div className='font-semibold mt-1'>{accountTotal}</div>
+          </div>
+        </div>
+        <Tabs type='card'>
+          <Tabs.TabPane tab={t('发布阶梯')} itemKey='programs'>
+            <div className='space-y-4 pt-4'>
+              <Input
+                value={programName}
+                maxLength={128}
+                prefix={t('方案名称')}
+                onChange={(value) => {
+                  setProgramName(value);
+                  setPreviewKey('');
+                }}
+              />
+              {tiers.map((tier, index) => (
+                <div
+                  key={index}
+                  className='grid grid-cols-[1fr_1fr_auto] gap-2 items-end'
+                >
+                  <InputNumber
+                    value={tier.threshold}
+                    min={0}
+                    precision={6}
+                    disabled={index === 0}
+                    prefix={t('起始消费')}
+                    onChange={(value) => {
+                      setTiers((rows) =>
+                        rows.map((row, rowIndex) =>
+                          rowIndex === index
+                            ? { ...row, threshold: value }
+                            : row,
+                        ),
+                      );
+                      setPreviewKey('');
+                    }}
+                    style={{ width: '100%' }}
+                  />
+                  <InputNumber
+                    value={tier.rate}
+                    min={0}
+                    max={100}
+                    precision={2}
+                    suffix='%'
+                    prefix={t('佣金比例')}
+                    onChange={(value) => {
+                      setTiers((rows) =>
+                        rows.map((row, rowIndex) =>
+                          rowIndex === index ? { ...row, rate: value } : row,
+                        ),
+                      );
+                      setPreviewKey('');
+                    }}
+                    style={{ width: '100%' }}
+                  />
+                  <Button
+                    icon={<Trash2 size={15} />}
+                    disabled={index === 0 || tiers.length === 1}
+                    onClick={() => {
+                      setTiers((rows) =>
+                        rows.filter((_, rowIndex) => rowIndex !== index),
+                      );
+                      setPreviewKey('');
+                    }}
+                  />
+                </div>
+              ))}
+              <div className='flex flex-wrap justify-between gap-2'>
+                <Button
+                  icon={<Plus size={15} />}
+                  onClick={() => {
+                    const last = tiers[tiers.length - 1];
+                    setTiers((rows) => [
+                      ...rows,
+                      {
+                        threshold: Number(last?.threshold || 0) + 100,
+                        rate: last?.rate || 1,
+                      },
+                    ]);
+                    setPreviewKey('');
+                  }}
+                >
+                  {t('增加阶梯')}
+                </Button>
+                <Space>
+                  <Button
+                    onClick={previewProgram}
+                    disabled={!validProgram}
+                    loading={programBusy}
+                  >
+                    {t('校验阶梯')}
+                  </Button>
+                  <Button
+                    type='primary'
+                    theme='solid'
+                    onClick={createProgram}
+                    disabled={previewKey !== programKey}
+                    loading={programBusy}
+                  >
+                    {t('创建草稿')}
+                  </Button>
+                </Space>
+              </div>
+              <Table
+                columns={programColumns}
+                dataSource={programs}
+                pagination={false}
+                rowKey='public_id'
+              />
+            </div>
+          </Tabs.TabPane>
+          <Tabs.TabPane tab={t('佣金排行')} itemKey='ranking'>
+            <div className='pt-4'>
+              <Table
+                columns={rankingColumns}
+                dataSource={accounts}
+                pagination={false}
+                rowKey='public_id'
+              />
+            </div>
+          </Tabs.TabPane>
+        </Tabs>
+      </Card>
+      {adjustUserId && (
+        <CommissionAdjustmentModal
+          visible
+          userId={adjustUserId}
+          onCancel={() => setAdjustUserId(null)}
+          onSuccess={refresh}
+        />
+      )}
+      <Modal
+        visible={Boolean(rebindUserId)}
+        title={t('改绑邀请人')}
+        onCancel={() => setRebindUserId(null)}
+        onOk={rebind}
+        confirmLoading={rebindBusy}
+        okButtonProps={{ disabled: !rebindReason.trim() }}
+        centered
+      >
+        <div className='space-y-3'>
+          <Typography.Text type='tertiary' size='small'>
+            {t(
+              '填写当前邀请人可避免覆盖其他管理员刚刚完成的修改；留空表示当前未绑定。新邀请人留空则解除绑定。',
+            )}
+          </Typography.Text>
+          <Input
+            value={expectedInviterId}
+            type='number'
+            prefix={t('当前邀请人 ID')}
+            onChange={setExpectedInviterId}
+          />
+          <Input
+            value={newInviterId}
+            type='number'
+            prefix={t('新邀请人 ID')}
+            onChange={setNewInviterId}
+          />
+          <Input
+            value={rebindReason}
+            maxLength={200}
+            prefix={t('修改原因')}
+            onChange={setRebindReason}
+          />
+        </div>
+      </Modal>
+    </Spin>
+  );
+};
+
+export default SettingsCommission;

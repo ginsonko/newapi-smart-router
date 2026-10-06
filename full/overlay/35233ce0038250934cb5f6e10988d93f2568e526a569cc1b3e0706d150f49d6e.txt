@@ -1,0 +1,87 @@
+package controller
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/Calcium-Ion/go-epay/epay"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestEpayAtomicHTTPAckAfterCommit(t *testing.T) {
+	confirmPaymentComplianceForTest(t)
+	oldDB, oldLog, oldRedis, oldType := model.DB, model.LOG_DB, common.RedisEnabled, common.MainDatabaseType()
+	oldAddr, oldID, oldKey, oldMethods := operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey, operation_setting.PayMethods
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = oldDB, oldLog, oldRedis
+		common.SetMainDatabaseType(oldType)
+		operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey, operation_setting.PayMethods = oldAddr, oldID, oldKey, oldMethods
+	})
+	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://payment.invalid", "test-merchant", "isolated-test-key"
+	operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
+	common.RedisEnabled = false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	db, err := gorm.Open(sqlite.Open("file:epay-http?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = db, db
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.TopUp{}, &model.Log{}))
+	u := model.User{Id: 1, Username: "epay-http", Password: "test", AffCode: "epay-http", Quota: 50}
+	require.NoError(t, db.Create(&u).Error)
+	router := gin.New()
+	router.GET("/notify", EpayNotify)
+	router.POST("/notify", EpayNotify)
+	invoke := func(method, trade, money string, valid bool) string {
+		params := epay.GenerateParams(map[string]string{"out_trade_no": trade, "trade_no": "provider-test", "trade_status": epay.StatusTradeSuccess, "money": money, "type": "wxpay", "pid": "test-merchant"}, operation_setting.EpayKey)
+		if !valid {
+			params["sign"] = "invalid"
+		}
+		v := url.Values{}
+		for k, s := range params {
+			v.Set(k, s)
+		}
+		var request *http.Request
+		if method == "GET" {
+			request = httptest.NewRequest(method, "/notify?"+v.Encode(), nil)
+		} else {
+			request = httptest.NewRequest(method, "/notify", strings.NewReader(v.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, request)
+		require.Equal(t, 200, w.Code)
+		return w.Body.String()
+	}
+	for _, method := range []string{"GET", "POST"} {
+		o := model.TopUp{TradeNo: method, UserId: 1, Money: 20, Amount: 20, PaymentProvider: model.PaymentProviderEpay, PaymentMethod: "alipay", Status: common.TopUpStatusPending}
+		require.NoError(t, db.Create(&o).Error)
+		require.Equal(t, "fail", invoke(method, method, "20", false))
+		require.Equal(t, "fail", invoke(method, method, "19.9", true))
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register("epay_http_fail", func(tx *gorm.DB) {
+			if tx.Statement.Table == "users" {
+				tx.AddError(fmt.Errorf("injected failure"))
+			}
+		}))
+		require.Equal(t, "fail", invoke(method, method, "20", true))
+		require.NoError(t, db.Callback().Update().Remove("epay_http_fail"))
+		require.NoError(t, db.First(&o, o.Id).Error)
+		require.Equal(t, common.TopUpStatusPending, o.Status)
+		require.Equal(t, "success", invoke(method, method, "20", true))
+		require.Equal(t, "success", invoke(method, method, "20", true))
+		require.NoError(t, db.First(&o, o.Id).Error)
+		require.Equal(t, common.TopUpStatusSuccess, o.Status)
+		require.Positive(t, o.CompleteTime)
+	}
+	require.Equal(t, "fail", invoke("GET", "nonexistent", "20", true))
+	require.NoError(t, db.First(&u, 1).Error)
+	require.Equal(t, 20000050, u.Quota)
+}

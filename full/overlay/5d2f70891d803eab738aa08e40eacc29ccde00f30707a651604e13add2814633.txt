@@ -1,0 +1,97 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type storedVideoCompletionAdaptor struct{ taskPollingFetchAdaptor }
+
+func (a *storedVideoCompletionAdaptor) ParseTaskResult(raw []byte) (*relaycommon.TaskInfo, error) {
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := common.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	status := model.TaskStatusInProgress
+	if result.Status == "completed" {
+		status = model.TaskStatusSuccess
+	}
+	return &relaycommon.TaskInfo{Status: status}, nil
+}
+
+func TestVideoDeliveryResumesWithoutScheduledPolling(t *testing.T) {
+	truncate(t)
+	configureDeliveryFixture(t)
+	adaptor := &storedVideoCompletionAdaptor{}
+	previous := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previous })
+	var downloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/videos/provider-video/content", r.URL.Path)
+		assert.Equal(t, "Bearer saved-key", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("\x00\x00\x00\x14ftypisom\x00\x00\x00\x00isom"))
+	}))
+	defer server.Close()
+	task := seedFinalizationTask(t, "resume-public", model.TaskStatusFinalizing)
+	task.PrivateData = model.TaskPrivateData{UpstreamTaskID: "provider-video", Key: "saved-key", BillingSource: model.QuotaReservationFundingSubscription}
+	task.Quota = 100
+	task.Data = []byte(`{"status":"completed","content_url":"/v1/videos/provider-video/content"}`)
+	require.NoError(t, model.DB.Save(task).Error)
+	seedSubscription(t, 1, task.UserId, 1000, 100)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", task.UserId).Updates(map[string]any{"used_quota": 100, "request_count": 1}).Error)
+	require.NoError(t, model.DB.Create(&model.TaskBillingReceipt{TaskRowID: task.ID, UserID: task.UserId, SubscriptionID: 1, FundingSource: model.QuotaReservationFundingSubscription, SubmissionQuota: 100, PreConsumedQuota: 100, AppliedQuota: 100, UsageAppliedQuota: 100, RequestCountApplied: true, State: model.TaskBillingReceiptTracking, Version: 1}).Error)
+	require.NoError(t, model.DB.Create(&model.TaskDeliverySnapshot{TaskRowID: task.ID, UpstreamBaseURL: server.URL, UpstreamTaskID: task.TaskID, CredentialRef: "task.private_data.key"}).Error)
+	blob, artifact, err := media.SaveRemoteArtifact(media.RemoteArtifactInput{UserID: task.UserId, TaskRowID: task.ID, TaskPublicID: task.TaskID, SourceURL: "task://" + task.TaskID, Type: "video", ProviderOutputIdentity: "task.result_url", MimeType: "video/mp4"})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(blob).Update("materialize_status", model.MediaMaterializeDisabled).Error)
+	require.ErrorIs(t, ResumeFinalizingVideoTask(context.Background(), task), ErrTaskArtifactsNotReady)
+	claimed, err := model.ClaimNextMediaMaterialization("resume-worker", time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, blob.ID, claimed.ID)
+	materializeRemoteMediaBlob(context.Background(), claimed, "resume-worker")
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, task.Status, "materialization itself must finish the task on a slave Web")
+	require.NoError(t, ResumeFinalizingVideoTask(context.Background(), task))
+	assert.EqualValues(t, 1, downloads.Load())
+	assert.Zero(t, adaptor.fetchCount())
+	assert.Equal(t, 1, adaptor.adjustmentCount())
+	assets, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+	require.NoError(t, err)
+	require.Len(t, assets, 1)
+	assert.Equal(t, artifact.PublicAssetID, assets[0].PublicAssetID)
+	receipt, err := model.GetTaskBillingReceipt(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskBillingReceiptApplied, receipt.State)
+	assert.Equal(t, 100, receipt.AppliedQuota)
+	assert.EqualValues(t, 100, getSubscriptionUsed(t, 1))
+	for _, status := range []model.TaskStatus{model.TaskStatusUnknown, model.TaskStatusInProgress} {
+		task.Status = status
+		task.Data = []byte("not JSON")
+		require.NoError(t, ResumeFinalizingVideoTask(context.Background(), task))
+	}
+	task.Status = model.TaskStatusFinalizing
+	for _, raw := range []string{`{"status":"in_progress"}`, `{"status":"failed"}`, `not JSON`} {
+		task.Data = []byte(raw)
+		require.Error(t, ResumeFinalizingVideoTask(context.Background(), task), fmt.Sprint(raw))
+	}
+	assert.Zero(t, adaptor.fetchCount())
+}

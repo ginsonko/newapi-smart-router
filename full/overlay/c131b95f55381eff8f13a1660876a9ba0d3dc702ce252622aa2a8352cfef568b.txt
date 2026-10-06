@@ -1,0 +1,847 @@
+package openai
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	appconstant "github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	smartResponsesPreludeMemoryLimit = int64(256 << 10)
+	smartResponsesPreludeHardLimit   = int64(8 << 20)
+	smartResponsesPingWindowKey      = "smart_responses_semantic_ping_window"
+	smartResponsesSingleRouteKey     = "smart_responses_semantic_single_route"
+	smartResponsesCommittedKey       = "smart_responses_semantic_committed"
+	smartResponsesTerminalKey        = "smart_responses_terminal_seen"
+	smartResponsesCompletedKey       = "smart_responses_completed_seen"
+	smartResponsesBoundaryKey        = "smart_responses_semantic_boundary_active"
+	responsesTerminalErrorKey        = "responses_provider_terminal_error"
+)
+
+type smartResponsesPingWindow struct {
+	info     *relaycommon.RelayInfo
+	original bool
+	once     sync.Once
+}
+
+func (w *smartResponsesPingWindow) restore() {
+	if w == nil || w.info == nil {
+		return
+	}
+	w.once.Do(func() {
+		w.info.DisablePing = w.original
+	})
+}
+
+// BeginSmartResponsesSemanticWindow suppresses downstream keepalive writes
+// while a Smart Router Responses request is waiting for its first semantic
+// upstream event. The stream guard restores the original setting as soon as
+// it commits to the current route; the returned cleanup is an idempotent
+// fallback for early request failures.
+func BeginSmartResponsesSemanticWindow(c *gin.Context, info *relaycommon.RelayInfo) func() {
+	if !isSmartResponsesRequest(c) || info == nil || !info.IsStream {
+		return func() {}
+	}
+	resetSmartResponsesAttemptState(c)
+	// The downstream request may be /v1/chat/completions even though this
+	// attempt is converted to the Responses protocol upstream. Keep an
+	// explicit request-local marker so the post-handler stream guard applies to
+	// both direct and converted Responses paths.
+	c.Set(smartResponsesBoundaryKey, true)
+	window := &smartResponsesPingWindow{info: info, original: info.DisablePing}
+	info.DisablePing = true
+	ensureSmartResponsesEventStreamHeaders(c)
+	c.Set(smartResponsesPingWindowKey, window)
+	return window.restore
+}
+
+// resetSmartResponsesAttemptState clears only per-attempt stream markers. A
+// Smart Router reuses the gin context while trying a second certified route;
+// stale terminal markers from the previous route must not turn an abrupt EOF
+// on the replacement route into a false success.
+func resetSmartResponsesAttemptState(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(smartResponsesCommittedKey, false)
+	c.Set(smartResponsesTerminalKey, false)
+	c.Set(smartResponsesCompletedKey, false)
+	c.Set(smartResponsesSingleRouteKey, false)
+	c.Set(responsesTerminalErrorKey, (*types.NewAPIError)(nil))
+}
+
+// ResetSmartResponsesAttemptState clears all request-local semantic markers
+// before a smart-router physical-channel attempt. The controller may reuse the
+// same Gin context for a fallback route; stale completion/commit markers must
+// never make a later client cancellation look like a successful attempt.
+func ResetSmartResponsesAttemptState(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	resetSmartResponsesAttemptState(c)
+	c.Set(smartResponsesBoundaryKey, false)
+	c.Set(smartResponsesPingWindowKey, nil)
+}
+
+func ensureSmartResponsesEventStreamHeaders(c *gin.Context) {
+	if c == nil || c.Writer == nil {
+		return
+	}
+	// A failed Smart Router attempt restores the original Header map, while
+	// Gin's event_stream_headers_set marker remains request-scoped. Reapply the
+	// headers for every Responses attempt so a successful fallback cannot lose
+	// its SSE contract because of that stale marker.
+	headers := c.Writer.Header()
+	headers.Set("Content-Type", "text/event-stream")
+	headers.Set("Cache-Control", "no-cache")
+	headers.Set("Connection", "keep-alive")
+	headers.Set("Transfer-Encoding", "chunked")
+	headers.Set("X-Accel-Buffering", "no")
+}
+
+func smartResponsesPingRestore(c *gin.Context, info *relaycommon.RelayInfo) func() {
+	if c != nil {
+		if value, ok := c.Get(smartResponsesPingWindowKey); ok {
+			if window, ok := value.(*smartResponsesPingWindow); ok && window.info == info {
+				return window.restore
+			}
+		}
+	}
+	if info == nil {
+		return func() {}
+	}
+	original := info.DisablePing
+	info.DisablePing = true
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			info.DisablePing = original
+		})
+	}
+}
+
+func isSmartResponsesRequest(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := common.GetContextKey(c, appconstant.ContextKeyTokenRoutingPolicy)
+	return ok
+}
+
+// SmartResponsesSemanticCommitted reports whether a Responses stream has sent
+// meaningful output (text/reasoning/tool/media), rather than only protocol
+// prelude events such as response.created. The smart-router controller uses
+// this boundary to decide whether an incomplete stream may be replayed.
+func SmartResponsesSemanticCommitted(c *gin.Context) bool {
+	return c != nil && c.GetBool(smartResponsesCommittedKey)
+}
+
+// SmartResponsesTerminalSeen reports whether the current Responses attempt
+// emitted an explicit provider terminal event (completed, incomplete, failed,
+// or error). EOF alone is never a terminal event.
+func SmartResponsesTerminalSeen(c *gin.Context) bool {
+	return c != nil && c.GetBool(smartResponsesTerminalKey)
+}
+
+func SmartResponsesCompletedSeen(c *gin.Context) bool {
+	return c != nil && c.GetBool(smartResponsesCompletedKey)
+}
+
+// ResponsesTerminalError reports a provider failure even when the ordinary
+// relay successfully forwarded its terminal event and settled partial usage.
+// Transport completion is not evidence that the model request succeeded.
+func ResponsesTerminalError(c *gin.Context) *types.NewAPIError {
+	if c == nil {
+		return nil
+	}
+	value, _ := c.Get(responsesTerminalErrorKey)
+	apiErr, _ := value.(*types.NewAPIError)
+	return apiErr
+}
+
+func markSmartResponsesTerminal(c *gin.Context, completed bool) {
+	if c == nil {
+		return
+	}
+	c.Set(smartResponsesTerminalKey, true)
+	if completed {
+		c.Set(smartResponsesCompletedKey, true)
+	}
+}
+
+// SmartResponsesSemanticBoundaryActive is true only for smart-routed
+// Responses-compatible streams. Fixed keys and ordinary non-Responses relays
+// keep their existing c.Writer.Written() commit semantics.
+func SmartResponsesSemanticBoundaryActive(c *gin.Context) bool {
+	if !isSmartResponsesRequest(c) || c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	// A reset writes an explicit false marker before each physical route. That
+	// marker must override the URL fallback until the selected handler starts
+	// its own Responses/Chat conversion window; otherwise setup failures can
+	// look like a semantic Responses prelude and become incorrectly replayable.
+	if value, exists := c.Get(smartResponsesBoundaryKey); exists {
+		active, _ := value.(bool)
+		return active
+	}
+	path := strings.TrimRight(c.Request.URL.Path, "/")
+	return path == "/v1/responses" || strings.HasSuffix(path, "/responses")
+}
+
+// observeSmartResponsesStreamEvent records the request-local terminal
+// boundary shared by direct Responses relays and Chat/Responses conversion
+// relays. Downstream commitment is recorded separately, only after the
+// corresponding event/chunk has actually been written.
+func observeSmartResponsesStreamEvent(c *gin.Context, info *relaycommon.RelayInfo, event *dto.ResponsesStreamResponse) (terminal, completed bool) {
+	if event == nil {
+		return false, false
+	}
+	eventType := strings.ToLower(strings.TrimSpace(event.Type))
+	switch eventType {
+	case "response.completed":
+		terminal, completed = true, true
+	case "response.done":
+		terminal, completed = true, smartResponsesDoneCompleted(event)
+	case "response.incomplete":
+		terminal = true
+	case "response.failed", "response.error", "error":
+		terminal = true
+	}
+	if !terminal {
+		return false, false
+	}
+	if info != nil && info.StreamStatus != nil {
+		info.StreamStatus.MarkSemanticTerminal(eventType, completed)
+	}
+	if apiErr := smartResponsesStreamSemanticError(event); apiErr != nil {
+		if c != nil {
+			c.Set(responsesTerminalErrorKey, apiErr)
+		}
+		message := common.LocalLogPreview(fmt.Sprintf("provider terminal %s: code=%s %s", eventType, apiErr.GetErrorCode(), apiErr.MaskSensitiveErrorWithStatusCode()))
+		if info != nil && info.StreamStatus != nil {
+			info.StreamStatus.RecordError(message)
+		}
+		logger.LogWarn(c, message)
+	}
+	// Provider completion is a protocol fact, not a Smart-Key-only routing
+	// decision. Fixed-group and ordinary-Key requests publish the same marker
+	// so their proven success can enter the shared exact-route evidence layer.
+	// Smart retry/commit behavior remains gated separately by
+	// isSmartResponsesRequest and SmartResponsesSemanticBoundaryActive.
+	markSmartResponsesTerminal(c, completed)
+	return terminal, completed
+}
+
+func smartResponsesDoneCompleted(event *dto.ResponsesStreamResponse) bool {
+	if event == nil {
+		return false
+	}
+	statuses := make([]string, 0, 2)
+	if event.Response != nil {
+		statuses = append(statuses, smartResponsesStatus(event.Response.Status))
+	}
+	statuses = append(statuses, smartResponsesStatus(event.Status))
+
+	completed := false
+	for _, status := range statuses {
+		switch status {
+		case "failed", "incomplete", "cancelled", "canceled":
+			return false
+		case "completed":
+			completed = true
+		}
+	}
+	return completed
+}
+
+// MarkSmartResponsesUpstreamError preserves evidence that a smart Responses
+// attempt reached the provider. It is intentionally exported for the relay
+// package's stream-status guard; callers must use it only for provider/body
+// failures, never for a downstream client-cancel or write error.
+func MarkSmartResponsesUpstreamError(c *gin.Context, apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr != nil && isSmartResponsesRequest(c) {
+		service.CaptureUpstreamRequestIDFromError(c, apiErr)
+		apiErr.MarkUpstreamResponseReceived()
+	}
+	return apiErr
+}
+
+func markSmartResponsesSemanticCommitted(c *gin.Context) {
+	if c != nil {
+		c.Set(smartResponsesCommittedKey, true)
+	}
+}
+
+func markSmartResponsesSingleRoute(c *gin.Context) {
+	if c != nil {
+		c.Set(smartResponsesSingleRouteKey, true)
+	}
+}
+
+// PreserveSmartResponsesSingleRouteError is retained as a rolling-upgrade
+// compatibility shim. A pre-semantic Responses parse/replay failure is still
+// safe for a replay-safe smart request: the controller must be allowed to try
+// the next certified physical route. The legacy marker is only preserved
+// after semantic output was committed, where replay is already suppressed.
+func PreserveSmartResponsesSingleRouteError(c *gin.Context, apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr == nil || c == nil || !c.GetBool(smartResponsesSingleRouteKey) ||
+		!SmartResponsesSemanticCommitted(c) {
+		return apiErr
+	}
+	statusCode := apiErr.GetOriginalStatusCode()
+	if statusCode == 0 {
+		statusCode = http.StatusBadGateway
+	}
+	singleRouteErr := types.NewErrorWithStatusCode(
+		apiErr,
+		types.ErrorCodeSmartResponsesSingleRoute,
+		statusCode,
+		types.ErrOptionWithSkipRetry(),
+	)
+	singleRouteErr.Metadata = apiErr.Metadata
+	singleRouteErr.RetryAfter = apiErr.RetryAfter
+	return singleRouteErr
+}
+
+func smartResponsesSingleRouteGuardError(c *gin.Context, apiErr *types.NewAPIError) *types.NewAPIError {
+	markSmartResponsesSingleRoute(c)
+	return PreserveSmartResponsesSingleRouteError(c, apiErr)
+}
+
+type smartResponsesPreludeSpool struct {
+	memory bytes.Buffer
+	file   *os.File
+	path   string
+	size   int64
+}
+
+func (s *smartResponsesPreludeSpool) write(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if s.file == nil && s.size+int64(len(data)) <= smartResponsesPreludeMemoryLimit {
+		written, err := s.memory.Write(data)
+		s.size += int64(written)
+		return err
+	}
+	if s.file == nil {
+		file, err := os.CreateTemp("", "new-api-r32-responses-*.sse")
+		if err != nil {
+			return err
+		}
+		s.file = file
+		s.path = file.Name()
+		if s.memory.Len() > 0 {
+			written, writeErr := file.Write(s.memory.Bytes())
+			if writeErr != nil || written != s.memory.Len() {
+				if writeErr == nil {
+					writeErr = io.ErrShortWrite
+				}
+				s.cleanup()
+				return writeErr
+			}
+			s.memory.Reset()
+		}
+	}
+	written, err := s.file.Write(data)
+	s.size += int64(written)
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+func (s *smartResponsesPreludeSpool) reader() (io.Reader, error) {
+	if s.file == nil {
+		return bytes.NewReader(s.memory.Bytes()), nil
+	}
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return s.file, nil
+}
+
+func (s *smartResponsesPreludeSpool) cleanup() error {
+	if s == nil {
+		return nil
+	}
+	var closeErr error
+	if s.file != nil {
+		closeErr = s.file.Close()
+		s.file = nil
+	}
+	var removeErr error
+	if s.path != "" {
+		removeErr = os.Remove(s.path)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		s.path = ""
+	}
+	return errors.Join(closeErr, removeErr)
+}
+
+type smartResponsesReplayBody struct {
+	reader   io.Reader
+	original io.ReadCloser
+	spool    *smartResponsesPreludeSpool
+	once     sync.Once
+	closeErr error
+}
+
+func (b *smartResponsesReplayBody) Read(data []byte) (int, error) {
+	return b.reader.Read(data)
+}
+
+func (b *smartResponsesReplayBody) Close() error {
+	b.once.Do(func() {
+		b.closeErr = errors.Join(b.original.Close(), b.spool.cleanup())
+	})
+	return b.closeErr
+}
+
+func installSmartResponsesReplayBody(resp *http.Response, spool *smartResponsesPreludeSpool, reader *bufio.Reader, pending []byte) error {
+	prefix, err := spool.reader()
+	if err != nil {
+		return err
+	}
+	readers := []io.Reader{prefix}
+	if len(pending) > 0 {
+		readers = append(readers, bytes.NewReader(pending))
+	}
+	readers = append(readers, reader)
+	resp.Body = &smartResponsesReplayBody{
+		reader:   io.MultiReader(readers...),
+		original: resp.Body,
+		spool:    spool,
+	}
+	return nil
+}
+
+type smartResponsesSSEEvent struct {
+	raw       []byte
+	eventName string
+	data      string
+	hasData   bool
+	done      bool
+}
+
+func readSmartResponsesSSEEvent(reader *bufio.Reader, alreadyBuffered int64, progress chan<- struct{}) (smartResponsesSSEEvent, bool, error) {
+	var raw bytes.Buffer
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			select {
+			case progress <- struct{}{}:
+			default:
+			}
+			_, _ = raw.Write(fragment)
+			if alreadyBuffered+int64(raw.Len()) > smartResponsesPreludeHardLimit {
+				return smartResponsesSSEEvent{raw: raw.Bytes()}, true, nil
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return smartResponsesSSEEvent{raw: raw.Bytes()}, false, err
+		}
+		line := fragment
+		line = bytes.TrimSuffix(line, []byte("\n"))
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		candidate := parseSmartResponsesSSEEvent(raw.Bytes())
+		if candidate.done || smartResponsesSSEDataIsComplete(candidate.data) {
+			return candidate, false, nil
+		}
+		if len(line) == 0 || errors.Is(err, io.EOF) {
+			if raw.Len() == 0 {
+				return smartResponsesSSEEvent{}, false, io.EOF
+			}
+			event := parseSmartResponsesSSEEvent(raw.Bytes())
+			return event, false, nil
+		}
+	}
+}
+
+func smartResponsesSSEDataIsComplete(data string) bool {
+	if strings.TrimSpace(data) == "" {
+		return false
+	}
+	var value any
+	return common.UnmarshalJsonStr(data, &value) == nil
+}
+
+func parseSmartResponsesSSEEvent(raw []byte) smartResponsesSSEEvent {
+	event := smartResponsesSSEEvent{raw: raw}
+	var dataLines []string
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := strings.TrimSuffix(rawLine, "\r")
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			event.eventName = strings.TrimSpace(line[len("event:"):])
+		case strings.HasPrefix(line, "data:"):
+			value := line[len("data:"):]
+			value = strings.TrimPrefix(value, " ")
+			dataLines = append(dataLines, value)
+		}
+	}
+	if len(dataLines) > 0 {
+		event.hasData = true
+		event.data = strings.Join(dataLines, "\n")
+		event.done = strings.TrimSpace(event.data) == "[DONE]"
+	}
+	return event
+}
+
+// guardSmartResponsesStream stages only pre-semantic Responses events. A
+// structural failure can therefore return through the existing Smart Router
+// retry boundary without committing a byte to the client.
+func guardSmartResponsesStream(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) *types.NewAPIError {
+	if !isSmartResponsesRequest(c) || resp == nil || resp.Body == nil {
+		return nil
+	}
+	restorePing := smartResponsesPingRestore(c, info)
+	defer restorePing()
+
+	reader := bufio.NewReaderSize(resp.Body, 64<<10)
+	spool := &smartResponsesPreludeSpool{}
+	idleTimeout := time.Duration(appconstant.StreamingTimeout) * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = 5 * time.Minute
+	}
+	idleTimer := time.NewTimer(idleTimeout)
+	absoluteTimer := time.NewTimer(2 * idleTimeout)
+	defer idleTimer.Stop()
+	defer absoluteTimer.Stop()
+	resetIdleTimer := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleTimeout)
+	}
+	for {
+		if c != nil && c.Request != nil {
+			if err := c.Request.Context().Err(); err != nil {
+				_ = spool.cleanup()
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+			}
+		}
+		type readResult struct {
+			event    smartResponsesSSEEvent
+			overflow bool
+			err      error
+		}
+		resultChannel := make(chan readResult, 1)
+		progress := make(chan struct{}, 1)
+		go func() {
+			event, overflow, err := readSmartResponsesSSEEvent(reader, spool.size, progress)
+			resultChannel <- readResult{event: event, overflow: overflow, err: err}
+		}()
+
+		var result readResult
+		reading := true
+		for reading {
+			select {
+			case result = <-resultChannel:
+				resetIdleTimer()
+				reading = false
+			case <-progress:
+				resetIdleTimer()
+			case <-idleTimer.C:
+				_ = resp.Body.Close()
+				<-resultChannel
+				_ = spool.cleanup()
+				return MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+					fmt.Errorf("smart Responses semantic prelude idle timeout after %s", idleTimeout),
+					types.ErrorCodeChannelResponseTimeExceeded,
+					http.StatusGatewayTimeout,
+				))
+			case <-absoluteTimer.C:
+				_ = resp.Body.Close()
+				<-resultChannel
+				_ = spool.cleanup()
+				return MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+					fmt.Errorf("smart Responses semantic prelude exceeded %s", 2*idleTimeout),
+					types.ErrorCodeChannelResponseTimeExceeded,
+					http.StatusGatewayTimeout,
+				))
+			case <-c.Request.Context().Done():
+				_ = resp.Body.Close()
+				<-resultChannel
+				_ = spool.cleanup()
+				return types.NewErrorWithStatusCode(c.Request.Context().Err(), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+			}
+		}
+		event, overflow, err := result.event, result.overflow, result.err
+		if overflow {
+			markSmartResponsesSingleRoute(c)
+			if replayErr := installSmartResponsesReplayBody(resp, spool, reader, event.raw); replayErr != nil {
+				_ = spool.cleanup()
+				return smartResponsesSingleRouteGuardError(c, types.NewErrorWithStatusCode(replayErr, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+			}
+			return nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && spool.size == 0 {
+				_ = spool.cleanup()
+				return MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(io.ErrUnexpectedEOF, types.ErrorCodeEmptyResponse, http.StatusBadGateway))
+			}
+			if len(event.raw) > 0 {
+				if replayErr := installSmartResponsesReplayBody(resp, spool, reader, event.raw); replayErr == nil {
+					markSmartResponsesSingleRoute(c)
+					return nil
+				}
+			}
+			_ = spool.cleanup()
+			return MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+		}
+		if event.done {
+			_ = spool.cleanup()
+			// [DONE] without a semantic event means the provider closed the
+			// stream before response.completed. It is still pre-commit, so a
+			// replay-safe smart request may try the next certified route.
+			return MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(io.ErrUnexpectedEOF, types.ErrorCodeEmptyResponse, http.StatusBadGateway))
+		}
+		if !event.hasData {
+			if err := spool.write(event.raw); err != nil {
+				_ = spool.cleanup()
+				return smartResponsesSingleRouteGuardError(c, types.NewErrorWithStatusCode(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+			}
+			continue
+		}
+
+		var streamResponse dto.ResponsesStreamResponse
+		if err := common.UnmarshalJsonStr(event.data, &streamResponse); err != nil {
+			markSmartResponsesSingleRoute(c)
+			if replayErr := installSmartResponsesReplayBody(resp, spool, reader, event.raw); replayErr != nil {
+				_ = spool.cleanup()
+				return smartResponsesSingleRouteGuardError(c, types.NewErrorWithStatusCode(replayErr, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+			}
+			return nil
+		}
+		if streamResponse.Type == "" {
+			streamResponse.Type = event.eventName
+		}
+		if semanticErr := smartResponsesStreamSemanticError(&streamResponse); semanticErr != nil {
+			_ = spool.cleanup()
+			return semanticErr
+		}
+		if isSmartResponsesPreludeControl(&streamResponse) {
+			if err := spool.write(event.raw); err != nil {
+				_ = spool.cleanup()
+				return smartResponsesSingleRouteGuardError(c, types.NewErrorWithStatusCode(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+			}
+			continue
+		}
+		if err := spool.write(event.raw); err != nil {
+			_ = spool.cleanup()
+			return smartResponsesSingleRouteGuardError(c, types.NewErrorWithStatusCode(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+		}
+		if err := installSmartResponsesReplayBody(resp, spool, reader, nil); err != nil {
+			_ = spool.cleanup()
+			return smartResponsesSingleRouteGuardError(c, types.NewErrorWithStatusCode(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+		}
+		return nil
+	}
+}
+
+func isSmartResponsesPreludeControl(event *dto.ResponsesStreamResponse) bool {
+	if event == nil {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(event.Type)) {
+	case "", "response.created", "response.in_progress", "response.queued":
+		return true
+	case "response.output_item.added", "response.output_item.done":
+		if event.Item == nil {
+			return true
+		}
+		if !strings.EqualFold(event.Item.Type, "message") && !strings.EqualFold(event.Item.Type, "reasoning") {
+			return false
+		}
+		// IDs and empty reasoning/message shells are protocol bookkeeping.
+		// Populated content (including encrypted reasoning) is not replayable.
+		return len(event.Item.Content) == 0 && len(event.Item.Summary) == 0 && event.Item.EncryptedContent == ""
+	case "response.content_part.added", "response.content_part.done":
+		return event.Part == nil || (strings.EqualFold(event.Part.Type, "output_text") && event.Part.Text == "")
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		return event.Part == nil || event.Part.Text == ""
+	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+		"response.refusal.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		return event.Delta == ""
+	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		return true
+	default:
+		return false
+	}
+}
+
+func smartResponsesResponseSemanticError(response *dto.OpenAIResponsesResponse) *types.NewAPIError {
+	if response == nil {
+		return nil
+	}
+	status := smartResponsesStatus(response.Status)
+	errorValue := response.GetOpenAIError()
+	if !smartResponsesMeaningfulError(errorValue) && status != "failed" {
+		return nil
+	}
+	return normalizedSmartResponsesError(errorValue, "response_failed", response.IncompleteDetails)
+}
+
+func smartResponsesStreamSemanticError(event *dto.ResponsesStreamResponse) *types.NewAPIError {
+	if event == nil {
+		return nil
+	}
+	eventType := strings.ToLower(strings.TrimSpace(event.Type))
+	forcedFailure := eventType == "response.failed" || eventType == "response.error" || eventType == "error" ||
+		smartResponsesStatus(event.Status) == "failed"
+	if event.Response != nil {
+		if responseErr := smartResponsesResponseSemanticError(event.Response); responseErr != nil {
+			return responseErr
+		}
+	}
+	errorValue := dto.GetOpenAIError(event.Error)
+	if !smartResponsesMeaningfulError(errorValue) && (event.Message != "" || event.Code != nil || event.Param != "") {
+		errorValue = &types.OpenAIError{
+			Message: event.Message,
+			Type:    eventType,
+			Code:    event.Code,
+			Param:   event.Param,
+		}
+	}
+	if forcedFailure || smartResponsesMeaningfulError(errorValue) {
+		return normalizedSmartResponsesError(errorValue, strings.ReplaceAll(eventType, ".", "_"), nil)
+	}
+	if eventType == "response.incomplete" && event.Response != nil && event.Response.IncompleteDetails != nil &&
+		isSmartResponsesCapacityText(event.Response.IncompleteDetails.Reason) {
+		return normalizedSmartResponsesError(nil, "response_incomplete", event.Response.IncompleteDetails)
+	}
+	return nil
+}
+
+func smartResponsesStatus(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var status string
+	if err := common.Unmarshal(raw, &status); err == nil {
+		return strings.ToLower(strings.TrimSpace(status))
+	}
+	return strings.ToLower(strings.Trim(strings.TrimSpace(string(raw)), `"`))
+}
+
+func smartResponsesMeaningfulError(err *types.OpenAIError) bool {
+	if err == nil {
+		return false
+	}
+	return strings.TrimSpace(err.Message) != "" || strings.TrimSpace(err.Type) != "" ||
+		smartResponsesAnyString(err.Code) != "" || strings.TrimSpace(err.Param) != ""
+}
+
+func smartResponsesAnyString(value any) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func normalizedSmartResponsesError(source *types.OpenAIError, fallbackCode string, incomplete *dto.IncompleteDetails) *types.NewAPIError {
+	openAIError := types.OpenAIError{}
+	if source != nil {
+		openAIError = *source
+	}
+	details := strings.Join([]string{
+		openAIError.Message,
+		openAIError.Type,
+		smartResponsesAnyString(openAIError.Code),
+		func() string {
+			if incomplete == nil {
+				return ""
+			}
+			return incomplete.Reason
+		}(),
+	}, " ")
+	if isSmartResponsesCapacityText(details) {
+		if strings.TrimSpace(openAIError.Message) == "" {
+			openAIError.Message = "upstream model is temporarily at capacity"
+		}
+		openAIError.Type = "capacity_error"
+		openAIError.Code = "capacity"
+		return types.WithOpenAIError(
+			openAIError,
+			http.StatusTooManyRequests,
+			types.ErrOptionWithUpstreamResponseReceived(),
+		)
+	}
+	if strings.TrimSpace(openAIError.Message) == "" {
+		openAIError.Message = "upstream Responses request failed"
+	}
+	if strings.TrimSpace(openAIError.Type) == "" {
+		openAIError.Type = "upstream_error"
+	}
+	if smartResponsesAnyString(openAIError.Code) == "" {
+		if fallbackCode == "" {
+			fallbackCode = "responses_failed"
+		}
+		openAIError.Code = fallbackCode
+	}
+	return types.WithOpenAIError(
+		openAIError,
+		smartResponsesSemanticStatus(details),
+		types.ErrOptionWithUpstreamResponseReceived(),
+	)
+}
+
+func isSmartResponsesCapacityText(value string) bool {
+	value = strings.ToLower(value)
+	if strings.TrimSpace(value) == "capacity" {
+		return true
+	}
+	for _, marker := range []string{
+		"at capacity", "capacity_error", "capacity_limited", "model capacity", "server capacity",
+		"server_is_overloaded", "server overloaded", "overloaded",
+		"high demand", "rate_limit", "rate limit", "too many requests",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func smartResponsesSemanticStatus(details string) int {
+	details = strings.ToLower(details)
+	if strings.Contains(details, "authentication") || strings.Contains(details, "unauthorized") ||
+		strings.Contains(details, "invalid_api_key") || strings.Contains(details, "invalid api key") {
+		return http.StatusUnauthorized
+	}
+	if strings.Contains(details, "model_not_found") || strings.Contains(details, "model not found") {
+		return http.StatusNotFound
+	}
+	if strings.Contains(details, "invalid_request") || strings.Contains(details, "bad_request") ||
+		strings.Contains(details, "unsupported_parameter") || strings.Contains(details, "content_filter") ||
+		strings.Contains(details, "content policy") {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}

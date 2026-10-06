@@ -1,0 +1,352 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { Copy, Trash2 } from 'lucide-react'
+import { useId, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { Button } from '@/components/ui/button'
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+
+import {
+  multiplyParameterPrice,
+  type ParameterPricingRuleForm,
+} from './parameter-pricing-contract'
+
+type ParameterPricingEntryEditorProps = {
+  value: ParameterPricingRuleForm
+  groupCandidates: string[]
+  modelCandidates: string[]
+  disabled: boolean
+  onChange: (value: ParameterPricingRuleForm) => void
+  onCopy: () => void
+  onRemove: () => void
+}
+
+export function ParameterPricingEntryEditor(
+  props: ParameterPricingEntryEditorProps
+) {
+  const { t } = useTranslation()
+  const id = useId()
+  const [multiplier, setMultiplier] = useState('')
+  const [calculationError, setCalculationError] = useState('')
+  const update = <Key extends keyof ParameterPricingRuleForm>(
+    key: Key,
+    value: ParameterPricingRuleForm[Key]
+  ) => props.onChange({ ...props.value, [key]: value })
+
+  return (
+    <fieldset disabled={props.disabled} className='min-w-0 space-y-5'>
+      <div className='flex flex-wrap items-center justify-between gap-2'>
+        <h3 className='text-sm font-semibold'>
+          {t('Edit parameter price rule')}
+        </h3>
+        <div className='flex gap-2'>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            onClick={props.onCopy}
+          >
+            <Copy data-icon='inline-start' />
+            {t('Duplicate rule')}
+          </Button>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            onClick={props.onRemove}
+          >
+            <Trash2 data-icon='inline-start' />
+            {t('Delete rule')}
+          </Button>
+        </div>
+      </div>
+      <p className='text-muted-foreground text-xs'>
+        {t('Changes remain local until the complete contract is saved.')}
+      </p>
+      <div className='grid min-w-0 gap-4 md:grid-cols-2'>
+        <Field>
+          <FieldLabel htmlFor={`${id}-group`}>{t('Target group')}</FieldLabel>
+          <Input
+            id={`${id}-group`}
+            list={`${id}-groups`}
+            autoComplete='off'
+            value={props.value.group}
+            onChange={(event) => update('group', event.target.value)}
+          />
+          <datalist id={`${id}-groups`}>
+            {props.groupCandidates.map((group) => (
+              <option key={group} value={group} />
+            ))}
+          </datalist>
+          <FieldDescription>
+            {t(
+              'Use * for a global model default. Group names can be entered manually.'
+            )}
+          </FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor={`${id}-model`}>{t('Model')}</FieldLabel>
+          <Input
+            id={`${id}-model`}
+            list={`${id}-models`}
+            autoComplete='off'
+            value={props.value.model}
+            onChange={(event) => update('model', event.target.value)}
+          />
+          <datalist id={`${id}-models`}>
+            {props.modelCandidates.map((model) => (
+              <option key={model} value={model} />
+            ))}
+          </datalist>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor={`${id}-channel`}>
+            {t('Supply channel ID')}
+          </FieldLabel>
+          <Input
+            id={`${id}-channel`}
+            inputMode='numeric'
+            value={props.value.channel_id}
+            onChange={(event) => update('channel_id', event.target.value)}
+          />
+          <FieldDescription>
+            {t(
+              '0 applies to any channel. A specific ID scopes both price and source cost to that supply.'
+            )}
+          </FieldDescription>
+        </Field>
+      </div>
+      <div className='space-y-3 rounded-lg border p-3'>
+        <h4 className='text-sm font-medium'>{t('Parameter conditions')}</h4>
+        <p className='text-muted-foreground text-xs'>
+          {t(
+            'Enter the exact normalized value, or leave blank to match any value. Both filled conditions must match.'
+          )}
+        </p>
+        <div className='grid gap-4 md:grid-cols-2'>
+          <Field>
+            <FieldLabel htmlFor={`${id}-resolution`}>
+              {t('Resolution')}
+            </FieldLabel>
+            <Input
+              id={`${id}-resolution`}
+              value={props.value.resolution}
+              onChange={(event) => update('resolution', event.target.value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`${id}-quality`}>{t('Quality')}</FieldLabel>
+            <Input
+              id={`${id}-quality`}
+              value={props.value.quality}
+              onChange={(event) => update('quality', event.target.value)}
+            />
+          </Field>
+        </div>
+      </div>
+      <div className='grid gap-4 md:grid-cols-2'>
+        <Field>
+          <FieldLabel htmlFor={`${id}-unit`}>{t('Billing unit')}</FieldLabel>
+          <NativeSelect
+            id={`${id}-unit`}
+            className='w-full'
+            value={props.value.unit}
+            onChange={(event) =>
+              update(
+                'unit',
+                event.target.value as ParameterPricingRuleForm['unit']
+              )
+            }
+          >
+            <NativeSelectOption value='per_request'>
+              {t('Per request')}
+            </NativeSelectOption>
+            <NativeSelectOption value='per_image'>
+              {t('Per image')}
+            </NativeSelectOption>
+            <NativeSelectOption value='per_second'>
+              {t('Per second')}
+            </NativeSelectOption>
+            <NativeSelectOption value='fixed_duration'>
+              {t('Fixed duration')}
+            </NativeSelectOption>
+          </NativeSelect>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor={`${id}-price`}>
+            {t('Final group unit price (USD)')}
+          </FieldLabel>
+          <Input
+            id={`${id}-price`}
+            inputMode='decimal'
+            value={props.value.unit_price}
+            onChange={(event) => update('unit_price', event.target.value)}
+          />
+          <FieldDescription>
+            {t(
+              'This is the final unit price. The existing group ratio is not applied again.'
+            )}
+          </FieldDescription>
+        </Field>
+        {props.value.unit === 'fixed_duration' ? (
+          <Field>
+            <FieldLabel htmlFor={`${id}-duration`}>
+              {t('Fixed duration seconds')}
+            </FieldLabel>
+            <Input
+              id={`${id}-duration`}
+              inputMode='numeric'
+              value={props.value.fixed_duration_seconds}
+              onChange={(event) =>
+                update('fixed_duration_seconds', event.target.value)
+              }
+            />
+          </Field>
+        ) : null}
+      </div>
+      <p className='text-muted-foreground text-xs'>
+        {t(
+          'Per request charges once; per image multiplies by image count; per second multiplies by generated duration. Units are applied only once.'
+        )}
+      </p>
+      <div className='space-y-3 rounded-lg border p-3'>
+        <h4 className='text-sm font-medium'>
+          {t('Source cost and price calculator')}
+        </h4>
+        <p className='text-muted-foreground text-xs'>
+          {t(
+            'Source costs are visible only to authorized administrators and tenants. They are not published in the model catalog.'
+          )}
+        </p>
+        <div className='grid gap-4 md:grid-cols-2'>
+          <Field>
+            <FieldLabel htmlFor={`${id}-source-price`}>
+              {t('Upstream unit price (USD, optional)')}
+            </FieldLabel>
+            <Input
+              id={`${id}-source-price`}
+              inputMode='decimal'
+              value={props.value.source_unit_price ?? ''}
+              onChange={(event) =>
+                props.onChange({
+                  ...props.value,
+                  source_unit_price: event.target.value || undefined,
+                  source_currency: event.target.value ? 'USD' : undefined,
+                })
+              }
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`${id}-multiplier`}>
+              {t('Custom markup multiplier')}
+            </FieldLabel>
+            <div className='flex gap-2'>
+              <Input
+                id={`${id}-multiplier`}
+                inputMode='decimal'
+                value={multiplier}
+                onChange={(event) => {
+                  setMultiplier(event.target.value)
+                  setCalculationError('')
+                }}
+              />
+              <Button
+                type='button'
+                variant='outline'
+                onClick={() => {
+                  try {
+                    update(
+                      'unit_price',
+                      multiplyParameterPrice(
+                        props.value.source_unit_price ?? '',
+                        multiplier
+                      )
+                    )
+                    setCalculationError('')
+                  } catch {
+                    setCalculationError(
+                      t(
+                        'Use non-negative prices and a multiplier whose exact result fits 18 decimal places. No rounding is applied.'
+                      )
+                    )
+                  }
+                }}
+              >
+                {t('Fill sale price')}
+              </Button>
+            </div>
+          </Field>
+        </div>
+        <p className='text-muted-foreground text-xs'>
+          {t(
+            'The calculator fills the sale price exactly. You can edit the result; future source-price changes do not silently recalculate it.'
+          )}
+        </p>
+        {calculationError ? (
+          <p role='alert' className='text-destructive text-xs'>
+            {calculationError}
+          </p>
+        ) : null}
+      </div>
+      <details className='rounded-lg border'>
+        <summary className='hover:bg-muted/30 cursor-pointer px-3 py-2.5 text-sm font-medium'>
+          {t('Source and audit details')}
+        </summary>
+        <div className='grid gap-4 border-t p-3 md:grid-cols-2'>
+          <Field>
+            <FieldLabel htmlFor={`${id}-source`}>{t('Source')}</FieldLabel>
+            <Input
+              id={`${id}-source`}
+              value={props.value.source ?? ''}
+              onChange={(event) =>
+                update('source', event.target.value || undefined)
+              }
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`${id}-source-revision`}>
+              {t('Source revision')}
+            </FieldLabel>
+            <Input
+              id={`${id}-source-revision`}
+              value={props.value.source_revision ?? ''}
+              onChange={(event) =>
+                update('source_revision', event.target.value || undefined)
+              }
+            />
+          </Field>
+          <Field className='md:col-span-2'>
+            <FieldLabel htmlFor={`${id}-rule-id`}>
+              {t('Stable rule ID')}
+            </FieldLabel>
+            <Input
+              id={`${id}-rule-id`}
+              readOnly
+              value={props.value.id}
+              className='font-mono text-xs'
+            />
+          </Field>
+        </div>
+      </details>
+    </fieldset>
+  )
+}

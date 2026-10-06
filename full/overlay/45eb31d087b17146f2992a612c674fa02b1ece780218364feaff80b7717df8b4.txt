@@ -1,0 +1,846 @@
+package model
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"gorm.io/gorm"
+)
+
+const (
+	ModelCapabilityContractSchema = "relayops.model-capability-contract/v1"
+	ModelCapabilityBundleSchema   = "gateway.model-capability-bundle/v1"
+	ModelCapabilityCatalogSchema  = "gateway.model-capability-catalog/v1"
+	ModelCapabilityStatusStaged   = "staged"
+	ModelCapabilityStatusActive   = "active"
+	ModelCapabilityStatusStale    = "stale"
+)
+
+type CapabilityEndpoint struct {
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+	PathTemplate string `json:"path_template,omitempty"`
+}
+
+type CapabilityProvider struct {
+	ReferenceDurationField string             `json:"reference_duration_field,omitempty"`
+	SubmitIdempotency      bool               `json:"submit_idempotency,omitempty"`
+	Name                   string             `json:"name"`
+	Protocol               string             `json:"protocol"`
+	Contract               string             `json:"contract,omitempty"`
+	ReferenceEncoding      map[string]string  `json:"reference_encoding,omitempty"`
+	GenerationFields       map[string]string  `json:"generation_fields,omitempty"`
+	ReferenceFields        map[string]string  `json:"reference_fields,omitempty"`
+	ReferenceURLField      string             `json:"reference_url_field,omitempty"`
+	MaxRequestBytes        int64              `json:"max_request_bytes,omitempty"`
+	EndpointTypes          []string           `json:"endpoint_types,omitempty"`
+	Create                 CapabilityEndpoint `json:"create,omitempty"`
+	Query                  CapabilityEndpoint `json:"query,omitempty"`
+	Upload                 CapabilityEndpoint `json:"upload,omitempty"`
+}
+
+type CapabilityDuration struct {
+	Mode    string `json:"mode"`
+	Min     int    `json:"min,omitempty"`
+	Max     int    `json:"max,omitempty"`
+	Step    int    `json:"step,omitempty"`
+	Fixed   int    `json:"fixed,omitempty"`
+	Default int    `json:"default,omitempty"`
+}
+
+type CapabilityGeneration struct {
+	DurationsByResolution map[string][]int   `json:"durations_by_resolution,omitempty"`
+	Duration              CapabilityDuration `json:"duration"`
+	Resolutions           []string           `json:"resolutions,omitempty"`
+	Quality               string             `json:"quality,omitempty"`
+	AspectRatios          []string           `json:"aspect_ratios,omitempty"`
+	AllowedModes          []string           `json:"allowed_modes,omitempty"`
+	ForbiddenModes        []string           `json:"forbidden_modes,omitempty"`
+	SizeAspectRatios      map[string]string  `json:"size_aspect_ratios,omitempty"`
+	ResolutionAliases     map[string]string  `json:"resolution_aliases,omitempty"`
+	DefaultResolution     string             `json:"default_resolution,omitempty"`
+	RequireResolution     bool               `json:"require_resolution,omitempty"`
+}
+
+type CapabilityReferenceLimit struct {
+	Enabled                 *bool    `json:"enabled,omitempty"`
+	Roles                   []string `json:"roles,omitempty"`
+	Max                     int      `json:"max,omitempty"`
+	MaxRemoteBytes          int64    `json:"max_remote_bytes,omitempty"`
+	MaxTotalBytes           int64    `json:"max_total_bytes,omitempty"`
+	MIMETypes               []string `json:"mime_types,omitempty"`
+	MaxBytes                int64    `json:"max_bytes,omitempty"`
+	MinDurationSeconds      int      `json:"min_duration_seconds,omitempty"`
+	MaxDurationSeconds      int      `json:"max_duration_seconds,omitempty"`
+	MaxTotalDurationSeconds int      `json:"max_total_duration_seconds,omitempty"`
+}
+
+type CapabilityReferences struct {
+	MinImages         int                        `json:"min_images,omitempty"`
+	MinVisual         int                        `json:"min_visual,omitempty"`
+	Images            CapabilityReferenceLimit   `json:"images,omitempty"`
+	Videos            CapabilityReferenceLimit   `json:"videos,omitempty"`
+	Audios            CapabilityReferenceLimit   `json:"audios,omitempty"`
+	MaxTotal          int                        `json:"max_total,omitempty"`
+	PromptMaxChars    int                        `json:"prompt_max_chars,omitempty"`
+	Mixed             *bool                      `json:"mixed,omitempty"`
+	NativeHumanImages *bool                      `json:"native_human_images,omitempty"`
+	ForbiddenRoles    []string                   `json:"forbidden_roles,omitempty"`
+	PromptReference   *CapabilityPromptReference `json:"prompt_reference,omitempty"`
+}
+
+// Templates are administrator-supplied literal provider tokens containing
+// {index}. No supplier syntax is inferred from a model name or ordinary words.
+type CapabilityPromptReference struct {
+	Required   bool              `json:"required"`
+	Templates  map[string]string `json:"templates,omitempty"`
+	IndexScope string            `json:"index_scope,omitempty"`
+	IndexBase  int               `json:"index_base"`
+}
+
+type CapabilityPrice struct {
+	Currency    string `json:"currency"`
+	BillingUnit string `json:"billing_unit"`
+	UnitPrice   string `json:"unit_price"`
+	Group       string `json:"group,omitempty"`
+}
+
+type CapabilityCommercial struct {
+	SourceOffer   CapabilityPrice `json:"source_offer,omitempty"`
+	ConsumerOffer CapabilityPrice `json:"consumer_offer,omitempty"`
+}
+
+type CapabilityRouting struct {
+	AutomaticEligible            bool   `json:"automatic_eligible"`
+	ModerationFallback           string `json:"moderation_fallback,omitempty"`
+	Expensive                    bool   `json:"expensive"`
+	ManualOnly                   bool   `json:"manual_only"`
+	RequiresExplicitConfirmation bool   `json:"requires_explicit_confirmation"`
+}
+
+type CapabilityProvenance struct {
+	SourceKind        string    `json:"source_kind"`
+	SourceRefs        []string  `json:"source_refs,omitempty"`
+	ObservedAt        time.Time `json:"observed_at,omitempty"`
+	GeneratedAt       time.Time `json:"generated_at"`
+	TemplateRevision  string    `json:"template_revision,omitempty"`
+	ValidationStatus  string    `json:"validation_status"`
+	ValidationMessage string    `json:"validation_message,omitempty"`
+}
+
+type CapabilityFieldEvidence struct {
+	State      string   `json:"state"`
+	SourceRefs []string `json:"source_refs,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
+}
+
+type CapabilityTarget struct {
+	SiteID int64  `json:"site_id"`
+	Group  string `json:"group"`
+	Model  string `json:"model"`
+}
+
+type CapabilitySource struct {
+	SupplierID int64  `json:"supplier_id,omitempty"`
+	Group      string `json:"group,omitempty"`
+	Model      string `json:"model,omitempty"`
+	ChannelIDs []int  `json:"channel_ids,omitempty"`
+}
+
+type ModelCapabilityContract struct {
+	SchemaVersion   string                             `json:"schema_version"`
+	ContractID      string                             `json:"contract_id"`
+	Revision        string                             `json:"revision,omitempty"`
+	RuntimeEnforced bool                               `json:"runtime_enforced,omitempty"`
+	Target          CapabilityTarget                   `json:"target"`
+	Source          CapabilitySource                   `json:"source,omitempty"`
+	Provider        CapabilityProvider                 `json:"provider"`
+	Generation      CapabilityGeneration               `json:"generation"`
+	References      CapabilityReferences               `json:"references,omitempty"`
+	Commercial      CapabilityCommercial               `json:"commercial,omitempty"`
+	Routing         CapabilityRouting                  `json:"routing"`
+	Provenance      CapabilityProvenance               `json:"provenance"`
+	FieldEvidence   map[string]CapabilityFieldEvidence `json:"field_evidence,omitempty"`
+}
+
+type ModelCapabilityBundle struct {
+	SchemaVersion string                    `json:"schema_version"`
+	Revision      string                    `json:"revision,omitempty"`
+	GeneratedAt   time.Time                 `json:"generated_at"`
+	Contracts     []ModelCapabilityContract `json:"contracts"`
+}
+
+type ModelCapabilityBundleRecord struct {
+	ID            int64      `json:"id" gorm:"primaryKey"`
+	Revision      string     `json:"revision" gorm:"type:varchar(128);uniqueIndex"`
+	SchemaVersion string     `json:"schema_version" gorm:"type:varchar(128)"`
+	OperationKey  string     `json:"operation_key" gorm:"type:varchar(192);uniqueIndex"`
+	Status        string     `json:"status" gorm:"type:varchar(32);index"`
+	Payload       string     `json:"-" gorm:"type:text"`
+	CreatedAt     time.Time  `json:"created_at"`
+	ActivatedAt   *time.Time `json:"activated_at,omitempty"`
+}
+
+type ModelCapabilityCatalogHead struct {
+	ID             int       `json:"id" gorm:"primaryKey"`
+	ActiveBundleID *int64    `json:"active_bundle_id,omitempty"`
+	Revision       string    `json:"revision" gorm:"type:varchar(128);index"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type ModelCapabilityChangeSet struct {
+	ID             int64      `json:"id" gorm:"primaryKey"`
+	OperationKey   string     `json:"operation_key" gorm:"type:varchar(192);uniqueIndex"`
+	Status         string     `json:"status" gorm:"type:varchar(32);index"`
+	BeforeRevision string     `json:"before_revision,omitempty"`
+	AfterRevision  string     `json:"after_revision,omitempty"`
+	Error          string     `json:"error,omitempty" gorm:"type:text"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	RolledBackAt   *time.Time `json:"rolled_back_at,omitempty"`
+}
+
+type ModelCapabilityApplyResult struct {
+	Bundle    ModelCapabilityBundle    `json:"bundle"`
+	ChangeSet ModelCapabilityChangeSet `json:"change_set"`
+	Replayed  bool                     `json:"replayed"`
+}
+
+type capabilityCache struct {
+	bundle    ModelCapabilityBundle
+	byGroup   map[string]map[string]ModelCapabilityContract
+	checkedAt time.Time
+}
+
+var (
+	activeCapability  atomic.Pointer[capabilityCache]
+	capabilityCacheMu sync.Mutex
+)
+
+func (ModelCapabilityBundleRecord) TableName() string { return "model_capability_bundles" }
+func (ModelCapabilityCatalogHead) TableName() string  { return "model_capability_catalog_heads" }
+func (ModelCapabilityChangeSet) TableName() string    { return "model_capability_change_sets" }
+
+func DecodeModelCapabilityBundle(raw []byte) (ModelCapabilityBundle, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var bundle ModelCapabilityBundle
+	if err := decoder.Decode(&bundle); err != nil {
+		return ModelCapabilityBundle{}, fmt.Errorf("decode model capability bundle: %w", err)
+	}
+	return NormalizeModelCapabilityBundle(bundle)
+}
+
+func NormalizeModelCapabilityBundle(bundle ModelCapabilityBundle) (ModelCapabilityBundle, error) {
+	if bundle.SchemaVersion == "" {
+		bundle.SchemaVersion = ModelCapabilityBundleSchema
+	}
+	if bundle.SchemaVersion != ModelCapabilityBundleSchema {
+		return ModelCapabilityBundle{}, fmt.Errorf("unsupported model capability bundle schema %q", bundle.SchemaVersion)
+	}
+	if len(bundle.Contracts) > 50000 {
+		return ModelCapabilityBundle{}, errors.New("model capability bundle contains too many contracts")
+	}
+	if bundle.GeneratedAt.IsZero() {
+		bundle.GeneratedAt = time.Now().UTC()
+	}
+	sort.Slice(bundle.Contracts, func(i, j int) bool {
+		left, right := bundle.Contracts[i], bundle.Contracts[j]
+		if left.Target.Group != right.Target.Group {
+			return left.Target.Group < right.Target.Group
+		}
+		return left.Target.Model < right.Target.Model
+	})
+	seen := make(map[string]struct{}, len(bundle.Contracts))
+	for index := range bundle.Contracts {
+		contract, err := normalizeModelCapabilityContract(bundle.Contracts[index])
+		if err != nil {
+			return ModelCapabilityBundle{}, fmt.Errorf("contract %d: %w", index, err)
+		}
+		key := contract.Target.Group + "\x00" + contract.Target.Model
+		if _, exists := seen[key]; exists {
+			return ModelCapabilityBundle{}, fmt.Errorf("duplicate capability contract for %q/%q", contract.Target.Group, contract.Target.Model)
+		}
+		seen[key] = struct{}{}
+		bundle.Contracts[index] = contract
+	}
+	computed := modelCapabilityBundleRevision(bundle)
+	if bundle.Revision != "" && bundle.Revision != computed {
+		return ModelCapabilityBundle{}, fmt.Errorf("model capability bundle revision mismatch: expected %s, computed %s", bundle.Revision, computed)
+	}
+	bundle.Revision = computed
+	return bundle, nil
+}
+
+func normalizeModelCapabilityContract(contract ModelCapabilityContract) (ModelCapabilityContract, error) {
+	if contract.SchemaVersion == "" {
+		contract.SchemaVersion = ModelCapabilityContractSchema
+	}
+	if contract.SchemaVersion != ModelCapabilityContractSchema {
+		return ModelCapabilityContract{}, fmt.Errorf("unsupported contract schema %q", contract.SchemaVersion)
+	}
+	contract.ContractID = strings.TrimSpace(contract.ContractID)
+	contract.Target.Group = strings.TrimSpace(contract.Target.Group)
+	contract.Target.Model = strings.TrimSpace(contract.Target.Model)
+	contract.Provider.Name = strings.TrimSpace(contract.Provider.Name)
+	contract.Provider.Protocol = strings.TrimSpace(contract.Provider.Protocol)
+	contract.Provenance.ValidationStatus = strings.TrimSpace(contract.Provenance.ValidationStatus)
+	if contract.ContractID == "" || contract.Target.Group == "" || contract.Target.Model == "" {
+		return ModelCapabilityContract{}, errors.New("contract_id, target.group and target.model are required")
+	}
+	if contract.Provider.Protocol == "" {
+		return ModelCapabilityContract{}, errors.New("provider.protocol is required")
+	}
+	if err := validateCapabilityDuration(contract.Generation.Duration); err != nil {
+		return ModelCapabilityContract{}, err
+	}
+	for _, endpoint := range []CapabilityEndpoint{contract.Provider.Create, contract.Provider.Query, contract.Provider.Upload} {
+		if err := validateCapabilityEndpoint(endpoint); err != nil {
+			return ModelCapabilityContract{}, err
+		}
+	}
+	if err := validateCapabilityLimits(contract.References); err != nil {
+		return ModelCapabilityContract{}, err
+	}
+	if err := validateCapabilityGeneration(contract.Generation); err != nil {
+		return ModelCapabilityContract{}, err
+	}
+	if field := contract.Provider.ReferenceURLField; field != "" {
+		if len(field) > 64 || strings.ContainsAny(field, ".[] \t\r\n\\:/") || field == "type" || field == "role" {
+			return ModelCapabilityContract{}, errors.New("provider.reference_url_field must be a bounded field name distinct from type and role")
+		}
+	}
+	for kind, field := range contract.Provider.ReferenceFields {
+		if (kind != "image" && kind != "video" && kind != "audio") || strings.TrimSpace(field) == "" || strings.ContainsAny(field, ".[] \\:/") {
+			return ModelCapabilityContract{}, errors.New("provider.reference_fields must map image/video/audio to a top-level field name")
+		}
+		if field == "model" || field == "prompt" || field == "seconds" || field == "duration" || field == "resolution" || field == "size" || field == "references" {
+			return ModelCapabilityContract{}, errors.New("provider.reference_fields cannot overwrite generation controls")
+		}
+		for otherKind, otherField := range contract.Provider.ReferenceFields {
+			if kind != otherKind && field == otherField {
+				return ModelCapabilityContract{}, errors.New("provider.reference_fields cannot combine different media types into one field")
+			}
+		}
+	}
+	for kind, encoding := range contract.Provider.ReferenceEncoding {
+		if (kind != "image" && kind != "video" && kind != "audio") || encoding != "data_url" || contract.Provider.ReferenceFields[kind] == "" {
+			return ModelCapabilityContract{}, errors.New("reference_encoding requires image/video/audio=data_url and a configured reference field")
+		}
+		limits := map[string]CapabilityReferenceLimit{"image": contract.References.Images, "video": contract.References.Videos, "audio": contract.References.Audios}[kind]
+		if limits.MaxBytes <= 0 || limits.MaxRemoteBytes <= 0 || limits.MaxTotalBytes <= 0 || len(limits.MIMETypes) == 0 {
+			return ModelCapabilityContract{}, errors.New("inline images require positive max_bytes, max_remote_bytes, max_total_bytes and mime_types")
+		}
+		for _, mimeType := range limits.MIMETypes {
+			if !strings.HasPrefix(mimeType, kind+"/") || strings.ContainsAny(mimeType, "\r\n\"; ") {
+				return ModelCapabilityContract{}, errors.New("inline MIME types must match their reference media type")
+			}
+		}
+	}
+	if contract.Provider.MaxRequestBytes < 0 {
+		return ModelCapabilityContract{}, errors.New("provider.max_request_bytes cannot be negative")
+	}
+	for source, destination := range contract.Provider.GenerationFields {
+		if !((source == "seconds" && (destination == "duration" || destination == "seconds")) || (source == "aspect_ratio" && destination == "ratio")) {
+			return ModelCapabilityContract{}, errors.New("generation_fields supports seconds=duration or seconds=seconds and aspect_ratio=ratio")
+		}
+	}
+	for _, channelID := range contract.Source.ChannelIDs {
+		if channelID <= 0 {
+			return ModelCapabilityContract{}, errors.New("source.channel_ids must contain positive channel IDs")
+		}
+	}
+	for _, price := range []CapabilityPrice{contract.Commercial.SourceOffer, contract.Commercial.ConsumerOffer} {
+		if price.BillingUnit != "" {
+			switch price.BillingUnit {
+			case "per_second", "per_request", "fixed_duration", "per_token", "per_image":
+			default:
+				return ModelCapabilityContract{}, fmt.Errorf("unsupported billing unit %q", price.BillingUnit)
+			}
+		}
+	}
+	if contract.Provider.ReferenceDurationField != "" && contract.Provider.ReferenceDurationField != "duration_seconds" {
+		return ModelCapabilityContract{}, errors.New("reference_duration_field must be duration_seconds")
+	}
+	for resolution, durations := range contract.Generation.DurationsByResolution {
+		found := false
+		for _, allowed := range contract.Generation.Resolutions {
+			found = found || allowed == resolution
+		}
+		if !found || len(durations) == 0 {
+			return ModelCapabilityContract{}, errors.New("duration resolution must be declared with nonempty values")
+		}
+		seen := map[int]bool{}
+		for _, seconds := range durations {
+			probe := contract.Generation.Duration
+			probe.Default = seconds
+			if seconds <= 0 || seen[seconds] || validateCapabilityDuration(probe) != nil {
+				return ModelCapabilityContract{}, errors.New("invalid or duplicate resolution duration")
+			}
+			seen[seconds] = true
+		}
+	}
+	computed := modelCapabilityContractRevision(contract)
+	if contract.Revision != "" && contract.Revision != computed {
+		return ModelCapabilityContract{}, fmt.Errorf("contract %q revision mismatch", contract.ContractID)
+	}
+	contract.Revision = computed
+	if contract.FieldEvidence == nil {
+		contract.FieldEvidence = map[string]CapabilityFieldEvidence{}
+	}
+	return contract, nil
+}
+
+func validateCapabilityDuration(duration CapabilityDuration) error {
+	if duration.Step < 0 || duration.Default < 0 {
+		return errors.New("duration step and default cannot be negative")
+	}
+	switch duration.Mode {
+	case "fixed":
+		if duration.Fixed <= 0 || duration.Min != 0 || duration.Max != 0 {
+			return errors.New("fixed duration requires a positive fixed value and no range")
+		}
+	case "range", "free":
+		if duration.Min < 0 || duration.Max < 0 || (duration.Max > 0 && duration.Min > duration.Max) {
+			return errors.New("duration range is invalid")
+		}
+	default:
+		return fmt.Errorf("unsupported duration mode %q", duration.Mode)
+	}
+	if duration.Default > 0 {
+		if duration.Mode == "fixed" && duration.Default != duration.Fixed {
+			return errors.New("duration default must equal the fixed duration")
+		}
+		if duration.Mode == "range" && (duration.Default < duration.Min || (duration.Max > 0 && duration.Default > duration.Max) || (duration.Step > 1 && (duration.Default-duration.Min)%duration.Step != 0)) {
+			return errors.New("duration default must satisfy the configured range and step")
+		}
+	}
+	return nil
+}
+
+func validateCapabilityGeneration(generation CapabilityGeneration) error {
+	allowed := make(map[string]bool, len(generation.Resolutions))
+	for _, resolution := range generation.Resolutions {
+		allowed[strings.ToLower(strings.TrimSpace(resolution))] = true
+	}
+	if generation.DefaultResolution != "" && len(allowed) > 0 && !allowed[strings.ToLower(strings.TrimSpace(generation.DefaultResolution))] {
+		return errors.New("default_resolution must be one of the configured resolutions")
+	}
+	aliases := make(map[string]string, len(generation.ResolutionAliases))
+	for alias, resolution := range generation.ResolutionAliases {
+		key, value := strings.ToLower(strings.TrimSpace(alias)), strings.ToLower(strings.TrimSpace(resolution))
+		if key == "" || value == "" || (len(allowed) > 0 && !allowed[value]) {
+			return errors.New("resolution_aliases must map nonempty aliases to configured resolutions")
+		}
+		if previous, found := aliases[key]; found && previous != value {
+			return errors.New("resolution_aliases contain conflicting normalized aliases")
+		}
+		if allowed[key] && key != value {
+			return errors.New("a canonical resolution cannot alias a different resolution")
+		}
+		aliases[key] = value
+	}
+	for size, ratio := range generation.SizeAspectRatios {
+		key, value := strings.ToLower(strings.TrimSpace(size)), strings.TrimSpace(ratio)
+		if aliases[key] == "" || value == "" {
+			return errors.New("size_aspect_ratios must describe a configured pixel-size alias")
+		}
+		if len(generation.AspectRatios) > 0 {
+			found := false
+			for _, allowedRatio := range generation.AspectRatios {
+				found = found || strings.EqualFold(strings.TrimSpace(allowedRatio), value)
+			}
+			if !found {
+				return errors.New("size_aspect_ratios must use a configured aspect ratio")
+			}
+		}
+	}
+	for _, allowedMode := range generation.AllowedModes {
+		for _, forbiddenMode := range generation.ForbiddenModes {
+			if strings.EqualFold(strings.TrimSpace(allowedMode), strings.TrimSpace(forbiddenMode)) {
+				return errors.New("a generation mode cannot be both allowed and forbidden")
+			}
+		}
+	}
+	return nil
+}
+
+func validateCapabilityEndpoint(endpoint CapabilityEndpoint) error {
+	if strings.TrimSpace(endpoint.Method) == "" && strings.TrimSpace(endpoint.Path) == "" && strings.TrimSpace(endpoint.PathTemplate) == "" {
+		return nil
+	}
+	method := strings.ToUpper(strings.TrimSpace(endpoint.Method))
+	if method != "GET" && method != "POST" && method != "HEAD" && method != "OPTIONS" {
+		return fmt.Errorf("capability endpoint method %q is not allowlisted", endpoint.Method)
+	}
+	value := strings.TrimSpace(endpoint.Path)
+	if value == "" {
+		value = strings.TrimSpace(endpoint.PathTemplate)
+	}
+	if !strings.HasPrefix(value, "/") || strings.Contains(value, "..") || strings.Contains(value, "//") || strings.Contains(value, "\\") {
+		return fmt.Errorf("capability endpoint path must be a safe relative path: %q", value)
+	}
+	return nil
+}
+
+func validateCapabilityLimits(references CapabilityReferences) error {
+	if references.MinVisual < 0 || (references.MaxTotal > 0 && references.MinVisual > references.MaxTotal) || (references.MinVisual > 0 && references.Images.Enabled != nil && !*references.Images.Enabled && references.Videos.Enabled != nil && !*references.Videos.Enabled) {
+		return errors.New("参考图片或视频最小数量与素材上限不一致")
+	}
+	if references.MinImages < 0 || (references.Images.Max > 0 && references.MinImages > references.Images.Max) || (references.MaxTotal > 0 && references.MinImages > references.MaxTotal) || (references.MinImages > 0 && references.Images.Enabled != nil && !*references.Images.Enabled) {
+		return errors.New("参考图片最小数量与素材上限不一致")
+	}
+	for _, limit := range []CapabilityReferenceLimit{references.Images, references.Videos, references.Audios} {
+		if limit.Max < 0 || limit.MaxBytes < 0 || limit.MaxRemoteBytes < 0 || limit.MaxTotalBytes < 0 || limit.MinDurationSeconds < 0 || limit.MaxDurationSeconds < 0 || limit.MaxTotalDurationSeconds < 0 {
+			return errors.New("capability reference limits cannot be negative")
+		}
+		if limit.MaxDurationSeconds > 0 && limit.MinDurationSeconds > limit.MaxDurationSeconds {
+			return errors.New("capability reference duration range is invalid")
+		}
+	}
+	if references.MaxTotal < 0 || references.PromptMaxChars < 0 {
+		return errors.New("capability total limits cannot be negative")
+	}
+	if prompt := references.PromptReference; prompt != nil {
+		if prompt.IndexBase < 0 || (prompt.IndexScope != "" && prompt.IndexScope != "per_type" && prompt.IndexScope != "global") {
+			return errors.New("prompt_reference requires a nonnegative index_base and per_type or global index_scope")
+		}
+		for kind, template := range prompt.Templates {
+			if kind != "image" && kind != "video" && kind != "audio" {
+				return errors.New("prompt_reference templates must be keyed by image, video, or audio")
+			}
+			if strings.Count(template, "{index}") != 1 || strings.TrimSpace(strings.ReplaceAll(template, "{index}", "")) == "" {
+				return errors.New("prompt_reference templates require one {index} and a literal provider token")
+			}
+		}
+	}
+	return nil
+}
+
+func modelCapabilityContractRevision(contract ModelCapabilityContract) string {
+	contract.Revision = ""
+	encoded, _ := json.Marshal(contract)
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func modelCapabilityBundleRevision(bundle ModelCapabilityBundle) string {
+	clone := bundle
+	clone.Revision = ""
+	clone.GeneratedAt = time.Time{}
+	encoded, _ := json.Marshal(clone)
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func ModelCapabilityEmptyRevision() string {
+	return modelCapabilityBundleRevision(ModelCapabilityBundle{SchemaVersion: ModelCapabilityBundleSchema})
+}
+
+func GetActiveModelCapabilityBundle() (ModelCapabilityBundle, error) {
+	return getActiveModelCapabilityBundleAt(time.Now())
+}
+
+// Poll only the small catalog head so other web/worker processes observe an
+// activation too. The immutable bundle is decoded only when its revision changes.
+func getActiveModelCapabilityBundleAt(now time.Time) (ModelCapabilityBundle, error) {
+	if cached := activeCapability.Load(); cached != nil && (DB == nil || now.Sub(cached.checkedAt) < time.Second) {
+		return cached.bundle, nil
+	}
+	if DB == nil {
+		return ModelCapabilityBundle{SchemaVersion: ModelCapabilityBundleSchema, Revision: ModelCapabilityEmptyRevision()}, nil
+	}
+	capabilityCacheMu.Lock()
+	defer capabilityCacheMu.Unlock()
+	if cached := activeCapability.Load(); cached != nil && now.Sub(cached.checkedAt) < time.Second {
+		return cached.bundle, nil
+	}
+	var head ModelCapabilityCatalogHead
+	if err := DB.First(&head, 1).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ModelCapabilityBundle{SchemaVersion: ModelCapabilityBundleSchema, Revision: ModelCapabilityEmptyRevision()}, nil
+		}
+		return ModelCapabilityBundle{}, err
+	}
+	if head.ActiveBundleID == nil {
+		return ModelCapabilityBundle{SchemaVersion: ModelCapabilityBundleSchema, Revision: head.Revision}, nil
+	}
+	if cached := activeCapability.Load(); cached != nil && cached.bundle.Revision == head.Revision {
+		activeCapability.Store(&capabilityCache{bundle: cached.bundle, byGroup: cached.byGroup, checkedAt: now})
+		return cached.bundle, nil
+	}
+	var record ModelCapabilityBundleRecord
+	if err := DB.First(&record, *head.ActiveBundleID).Error; err != nil {
+		return ModelCapabilityBundle{}, err
+	}
+	bundle, err := DecodeModelCapabilityBundle([]byte(record.Payload))
+	if err != nil {
+		return ModelCapabilityBundle{}, err
+	}
+	installActiveModelCapabilityBundle(bundle)
+	return bundle, nil
+}
+
+func installActiveModelCapabilityBundle(bundle ModelCapabilityBundle) {
+	byGroup := make(map[string]map[string]ModelCapabilityContract)
+	for _, contract := range bundle.Contracts {
+		if byGroup[contract.Target.Group] == nil {
+			byGroup[contract.Target.Group] = make(map[string]ModelCapabilityContract)
+		}
+		byGroup[contract.Target.Group][contract.Target.Model] = contract
+	}
+	activeCapability.Store(&capabilityCache{bundle: bundle, byGroup: byGroup, checkedAt: time.Now()})
+}
+
+func GetActiveModelCapabilityContracts(group string) map[string]ModelCapabilityContract {
+	cached, err := GetActiveModelCapabilityBundle()
+	if err != nil {
+		return map[string]ModelCapabilityContract{}
+	}
+	result := make(map[string]ModelCapabilityContract)
+	for _, contract := range cached.Contracts {
+		if strings.TrimSpace(group) == "" || contract.Target.Group == group {
+			result[contract.Target.Model] = contract
+		}
+	}
+	return result
+}
+
+// CapabilityCatalogModel is the small, indexed read shape used by the public
+// key-scoped catalog. It intentionally comes from enabled abilities joined to
+// enabled channels, so a stale contract never hides a currently usable model.
+type CapabilityCatalogModel struct {
+	Group string `json:"group" gorm:"column:group_name"`
+	Model string `json:"model" gorm:"column:model"`
+}
+
+func GetEnabledCapabilityCatalogModels(groups []string) ([]CapabilityCatalogModel, error) {
+	groups = normalizeCapabilityCatalogStrings(groups)
+	if len(groups) == 0 || DB == nil {
+		return []CapabilityCatalogModel{}, nil
+	}
+	groupColumn := commonGroupCol
+	if strings.TrimSpace(groupColumn) == "" {
+		// Tests and lightweight callers may install a GORM database without
+		// running the full model bootstrap. Keep the catalog query bound to the
+		// real reserved column instead of emitting `abilities. as ...`.
+		groupColumn = "`group`"
+	}
+	models := make([]CapabilityCatalogModel, 0)
+	query := DB.Table("abilities").
+		Select("abilities."+groupColumn+" as group_name, abilities.model as model").
+		Joins("JOIN channels ON channels.id = abilities.channel_id").
+		Where("abilities."+groupColumn+" IN ? AND abilities.enabled = ? AND channels.status = ?", groups, true, common.ChannelStatusEnabled).
+		Group("abilities." + groupColumn + ", abilities.model").
+		Order("abilities." + groupColumn + " ASC, abilities.model ASC")
+	if err := query.Scan(&models).Error; err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
+func normalizeCapabilityCatalogStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func PreviewModelCapabilityBundle(raw []byte, expectedRevision string) (ModelCapabilityBundle, string, bool, bool, error) {
+	bundle, err := DecodeModelCapabilityBundle(raw)
+	if err != nil {
+		return ModelCapabilityBundle{}, "", false, false, err
+	}
+	current, err := GetActiveModelCapabilityBundle()
+	if err != nil {
+		return ModelCapabilityBundle{}, "", false, false, err
+	}
+	return bundle, current.Revision, expectedRevision == "" || expectedRevision == current.Revision, bundle.Revision != current.Revision, nil
+}
+
+func StageModelCapabilityBundle(operationKey string, bundle ModelCapabilityBundle) (ModelCapabilityBundleRecord, bool, error) {
+	if DB == nil {
+		return ModelCapabilityBundleRecord{}, false, errors.New("database is not initialized")
+	}
+	operationKey = strings.TrimSpace(operationKey)
+	if operationKey == "" || len(operationKey) > 192 {
+		return ModelCapabilityBundleRecord{}, false, errors.New("a bounded operation_key is required")
+	}
+	normalized, err := NormalizeModelCapabilityBundle(bundle)
+	if err != nil {
+		return ModelCapabilityBundleRecord{}, false, err
+	}
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return ModelCapabilityBundleRecord{}, false, err
+	}
+	var record ModelCapabilityBundleRecord
+	replayed := false
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var existing ModelCapabilityBundleRecord
+		if findErr := tx.Where("operation_key = ?", operationKey).First(&existing).Error; findErr == nil {
+			if existing.Revision != normalized.Revision {
+				return errors.New("operation_key is already bound to another capability revision")
+			}
+			record, replayed = existing, true
+			return nil
+		} else if !errors.Is(findErr, gorm.ErrRecordNotFound) {
+			return findErr
+		}
+		record = ModelCapabilityBundleRecord{Revision: normalized.Revision, SchemaVersion: normalized.SchemaVersion,
+			OperationKey: operationKey, Status: ModelCapabilityStatusStaged, Payload: string(payload), CreatedAt: time.Now().UTC()}
+		return tx.Create(&record).Error
+	})
+	return record, replayed, err
+}
+
+func ActivateModelCapabilityBundle(operationKey, expectedCatalogRevision, expectedPricingRevision string) (ModelCapabilityApplyResult, error) {
+	if DB == nil {
+		return ModelCapabilityApplyResult{}, errors.New("database is not initialized")
+	}
+	if expectedPricingRevision != "" && billing_setting.GetGroupModelPricingContract().Revision != expectedPricingRevision {
+		return ModelCapabilityApplyResult{}, fmt.Errorf("pricing revision changed: expected %s", expectedPricingRevision)
+	}
+	var result ModelCapabilityApplyResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var record ModelCapabilityBundleRecord
+		if err := tx.Where("operation_key = ?", strings.TrimSpace(operationKey)).First(&record).Error; err != nil {
+			return err
+		}
+		var head ModelCapabilityCatalogHead
+		headErr := tx.First(&head, 1).Error
+		if errors.Is(headErr, gorm.ErrRecordNotFound) {
+			head = ModelCapabilityCatalogHead{ID: 1, Revision: ModelCapabilityEmptyRevision(), UpdatedAt: time.Now().UTC()}
+		} else if headErr != nil {
+			return headErr
+		}
+		if expectedCatalogRevision != "" && head.Revision != expectedCatalogRevision {
+			return fmt.Errorf("capability catalog revision changed: expected %s, current %s", expectedCatalogRevision, head.Revision)
+		}
+		if head.Revision == record.Revision && head.ActiveBundleID != nil && *head.ActiveBundleID == record.ID {
+			bundle, decodeErr := DecodeModelCapabilityBundle([]byte(record.Payload))
+			if decodeErr != nil {
+				return decodeErr
+			}
+			result.Bundle, result.Replayed = bundle, true
+			result.ChangeSet = ModelCapabilityChangeSet{OperationKey: record.OperationKey, Status: "applied", BeforeRevision: head.Revision, AfterRevision: record.Revision}
+			return nil
+		}
+		before := head.Revision
+		now := time.Now().UTC()
+		if err := tx.Model(&ModelCapabilityBundleRecord{}).Where("status = ?", ModelCapabilityStatusActive).Updates(map[string]any{"status": ModelCapabilityStatusStale}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&record).Updates(map[string]any{"status": ModelCapabilityStatusActive, "activated_at": now}).Error; err != nil {
+			return err
+		}
+		head.ActiveBundleID = &record.ID
+		head.Revision = record.Revision
+		head.UpdatedAt = now
+		if err := tx.Save(&head).Error; err != nil {
+			return err
+		}
+		change := ModelCapabilityChangeSet{OperationKey: record.OperationKey, Status: "applied", BeforeRevision: before, AfterRevision: record.Revision, CreatedAt: now, UpdatedAt: now}
+		if err := tx.Create(&change).Error; err != nil {
+			return err
+		}
+		bundle, err := DecodeModelCapabilityBundle([]byte(record.Payload))
+		if err != nil {
+			return err
+		}
+		result.Bundle, result.ChangeSet = bundle, change
+		return nil
+	})
+	if err == nil && result.Bundle.Revision != "" {
+		installActiveModelCapabilityBundle(result.Bundle)
+	}
+	return result, err
+}
+
+func RollbackModelCapabilityChangeSet(id int64, expectedCurrentRevision string) (ModelCapabilityApplyResult, error) {
+	if DB == nil {
+		return ModelCapabilityApplyResult{}, errors.New("database is not initialized")
+	}
+	var result ModelCapabilityApplyResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var change ModelCapabilityChangeSet
+		if err := tx.First(&change, id).Error; err != nil {
+			return err
+		}
+		if change.Status != "applied" {
+			return errors.New("capability change set is not active")
+		}
+		var head ModelCapabilityCatalogHead
+		if err := tx.First(&head, 1).Error; err != nil {
+			return err
+		}
+		if expectedCurrentRevision != "" && head.Revision != expectedCurrentRevision {
+			return fmt.Errorf("capability catalog revision changed: expected %s, current %s", expectedCurrentRevision, head.Revision)
+		}
+		var previous ModelCapabilityBundleRecord
+		if change.BeforeRevision != "" && change.BeforeRevision != ModelCapabilityEmptyRevision() {
+			if err := tx.Where("revision = ?", change.BeforeRevision).First(&previous).Error; err != nil {
+				return err
+			}
+		}
+		now := time.Now().UTC()
+		if err := tx.Model(&ModelCapabilityBundleRecord{}).Where("status = ?", ModelCapabilityStatusActive).Updates(map[string]any{"status": ModelCapabilityStatusStale}).Error; err != nil {
+			return err
+		}
+		if previous.ID > 0 {
+			if err := tx.Model(&previous).Updates(map[string]any{"status": ModelCapabilityStatusActive, "activated_at": now}).Error; err != nil {
+				return err
+			}
+			head.ActiveBundleID = &previous.ID
+			head.Revision = previous.Revision
+			payload := previous.Payload
+			bundle, decodeErr := DecodeModelCapabilityBundle([]byte(payload))
+			if decodeErr != nil {
+				return decodeErr
+			}
+			result.Bundle = bundle
+		} else {
+			head.ActiveBundleID = nil
+			head.Revision = ModelCapabilityEmptyRevision()
+			result.Bundle = ModelCapabilityBundle{SchemaVersion: ModelCapabilityBundleSchema, Revision: head.Revision}
+		}
+		head.UpdatedAt = now
+		if err := tx.Save(&head).Error; err != nil {
+			return err
+		}
+		change.Status = "rolled_back"
+		change.RolledBackAt = &now
+		change.UpdatedAt = now
+		if err := tx.Save(&change).Error; err != nil {
+			return err
+		}
+		result.ChangeSet = change
+		return nil
+	})
+	if err == nil {
+		installActiveModelCapabilityBundle(result.Bundle)
+	}
+	return result, err
+}

@@ -15,9 +15,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
-RELEASE_VERSION = "v0.3.0-alpha.1"
-FIXED_ZIP_TIME = (2026, 8, 19, 0, 0, 0)
-EXPECTED_CORE_FILE_COUNT = 20
+from build_release import FIXED_ZIP_TIME, MARKER_NAME, RELEASE_NAME, RELEASE_VERSION
+EXPECTED_CORE_FILE_COUNT = 29
 README_BASELINE_LINES = 2372
 README_BASELINE_SHA256 = "6eaae6be969cc543f08215d7a87774c3c20c113b067bd07dda8827b4b61d118b"
 
@@ -32,6 +31,9 @@ def sha256_file(path: Path) -> str:
 
 def normalized_readme_prefix(path: Path) -> tuple[int, str]:
     normalized = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    marker = b"<!-- historical-manual-start -->\n"
+    if marker in normalized:
+        normalized = normalized.split(marker, 1)[1]
     lines = normalized.splitlines(keepends=True)
     prefix = b"".join(lines[:README_BASELINE_LINES])
     return len(lines), hashlib.sha256(prefix).hexdigest()
@@ -53,6 +55,8 @@ class Validator:
             raise AssertionError(f"{name}: {detail}")
 
     def validate_structure(self) -> None:
+        marker = self.root / MARKER_NAME
+        self.check("release_root_identity", marker.is_file() and marker.read_text(encoding="utf-8").strip() == RELEASE_NAME)
         required = [
             self.repository / "README.md", self.repository / "LICENSE", self.repository / "NOTICE",
             self.repository / "UPSTREAM-NOTICE", self.repository / "THIRD-PARTY-LICENSES.md",
@@ -76,6 +80,8 @@ class Validator:
             path.relative_to(self.root).as_posix() for path in self.root.rglob(".git")
         ]
         self.check("no_vcs_metadata_in_release", not vcs_metadata, vcs_metadata[:20])
+        dependency_trees = [path.relative_to(self.root).as_posix() for root in (self.repository, self.full) for path in root.rglob("node_modules")]
+        self.check("no_dependency_trees_in_release", not dependency_trees, dependency_trees[:20])
         status = (self.repository / "RELEASE-STATUS.md").read_text(encoding="utf-8")
         self.check("four_release_forms_labeled", all(value in status for value in (
             "Full compatibility distribution", "Certified Bridge Add-on", "Custom Fork Integration Kit", "Agent Parts Kit",
@@ -137,8 +143,8 @@ class Validator:
         parts_manifest = yaml.safe_load((self.repository / "parts" / "manifest" / "PARTS-MANIFEST.yaml").read_text(encoding="utf-8"))
         capability_matrix = yaml.safe_load((self.repository / "parts" / "manifest" / "capability-matrix.yaml").read_text(encoding="utf-8"))
         self.check("v0_3_parts_versions", (
-            parts_manifest.get("manifest_version") == "3.0.0-alpha.1"
-            and capability_matrix.get("matrix_version") == "3.0.0-alpha.1"
+            parts_manifest.get("manifest_version") == "4.0.0-alpha.1"
+            and capability_matrix.get("matrix_version") == "4.0.0-alpha.1"
         ), {"parts": parts_manifest.get("manifest_version"), "matrix": capability_matrix.get("matrix_version")})
         route_price_schema = parsed[self.repository / "parts" / "spec" / "route-price.schema.json"]
         route_price_validator = jsonschema.Draft202012Validator(route_price_schema)

@@ -1,0 +1,96 @@
+package media
+
+import (
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestFairMediaGateRotatesPastAUserAtItsActiveLimit(t *testing.T) {
+	firstUserWaiter := &fairMediaWaiter{userID: 11, ready: make(chan struct{})}
+	secondUserWaiter := &fairMediaWaiter{userID: 22, ready: make(chan struct{})}
+	gate := fairMediaGate{
+		active:       1,
+		activeByUser: map[int]int{11: 1},
+		queues: map[int][]*fairMediaWaiter{
+			11: {firstUserWaiter},
+			22: {secondUserWaiter},
+		},
+		userOrder: []int{11, 22},
+		queued:    2,
+	}
+
+	gate.dispatchLocked(2, 1)
+	assert.False(t, firstUserWaiter.granted)
+	assert.True(t, secondUserWaiter.granted, "another user must receive the free global slot")
+	assert.Equal(t, []int{11}, gate.userOrder)
+
+	gate.releaseLocked(11, 2, 1)
+	assert.True(t, firstUserWaiter.granted, "the first user's waiter proceeds after its active request releases")
+	assert.Zero(t, gate.queued)
+}
+
+func TestFairMediaGateCanceledWaiterLeavesNoQueueOrPermit(t *testing.T) {
+	gate := fairMediaGate{}
+	_, err := gate.acquire(context.Background(), 11, 1, 1, 4, 2)
+	require.NoError(t, err)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = gate.acquire(canceled, 22, 1, 1, 4, 2)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, gate.active)
+	assert.Zero(t, gate.queued)
+	assert.Empty(t, gate.queues[22])
+}
+
+func TestFairMediaGateHardCapacityRejectsBeforeWaiting(t *testing.T) {
+	waiter := &fairMediaWaiter{userID: 22, ready: make(chan struct{})}
+	gate := fairMediaGate{
+		active:       1,
+		activeByUser: map[int]int{11: 1},
+		queues:       map[int][]*fairMediaWaiter{22: {waiter}},
+		userOrder:    []int{22},
+		queued:       1,
+	}
+
+	snapshot, err := gate.acquire(context.Background(), 33, 1, 1, 1, 1)
+	assert.ErrorIs(t, err, ErrMediaSafetyCapacity)
+	assert.Equal(t, 1, snapshot.QueueAhead)
+	assert.Equal(t, 1, gate.queued)
+	assert.Equal(t, 1, gate.active)
+}
+
+func TestSerialByteLimiterUsesMbpsAndSharedReservations(t *testing.T) {
+	assert.EqualValues(t, 1_000_000, mediaMbpsBytesPerSecond(8))
+	now := time.Unix(100, 0)
+	limiter := serialByteLimiter{}
+	assert.Zero(t, limiter.reserve(now, 1_000_000, 1_000_000, 0))
+	assert.Equal(t, time.Second, limiter.reserve(now, 1_000_000, 1_000_000, 0))
+}
+
+func TestOutboundLimiterRequiresGenerationAdmission(t *testing.T) {
+	source := strings.NewReader("media")
+	assert.Same(t, source, WrapUpstreamForwardReader(context.Background(), source),
+		"ordinary text traffic must bypass the media limiter")
+
+	managed := WrapUpstreamForwardReader(WithGenerationAdmission(context.Background()), source)
+	assert.NotSame(t, source, managed)
+}
+
+func TestClientUploadLimiterIsInstalledOnce(t *testing.T) {
+	body := io.NopCloser(strings.NewReader("upload"))
+	ctx, first := WrapClientUploadBody(context.Background(), body)
+	secondContext, second := WrapClientUploadBody(ctx, first)
+
+	assert.Same(t, first, second)
+	assert.Equal(t, ctx, secondContext)
+	require.NoError(t, second.Close())
+	assert.False(t, errors.Is(secondContext.Err(), context.Canceled))
+}

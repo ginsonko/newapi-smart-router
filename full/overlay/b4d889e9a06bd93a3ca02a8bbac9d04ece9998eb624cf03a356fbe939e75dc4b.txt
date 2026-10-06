@@ -1,0 +1,151 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useTranslation } from 'react-i18next'
+
+import { DEFAULT_TOKEN_UNIT, QUOTA_TYPE_VALUES } from '../constants'
+import { getDynamicPricingSummary } from '../lib/dynamic-price'
+import {
+  hasModelParameterPricing,
+  modelParameterPrices,
+} from '../lib/parameter-price'
+import { parameterUnitLabel } from '../lib/parameter-price-display'
+import {
+  formatResolvedFixedPrice,
+  formatResolvedTokenPrice,
+  getModelPricingGroups,
+  resolveModelGroupPricing,
+} from '../lib/price'
+import type { PricingModel, TokenUnit } from '../types'
+import { ParameterPriceTable } from './parameter-price-table'
+
+export type ModelGroupPricesProps = {
+  model: PricingModel
+  selectedGroup?: string
+  tokenUnit?: TokenUnit
+  showRechargePrice?: boolean
+  priceRate?: number
+  usdExchangeRate?: number
+}
+
+/** Keep every group's complete pricing mode visible when parameter and legacy rows coexist. */
+export function ModelGroupPrices(props: ModelGroupPricesProps) {
+  const { t } = useTranslation()
+  const tokenUnit = props.tokenUnit ?? DEFAULT_TOKEN_UNIT
+  const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
+  const selectedGroup = props.selectedGroup ?? 'all'
+  const groups =
+    selectedGroup === 'all'
+      ? getModelPricingGroups(props.model)
+      : [selectedGroup]
+
+  if (!groups.length) return <ParameterPriceTable prices={[]} />
+
+  return (
+    <div className='w-full min-w-0 space-y-2' data-model-group-prices>
+      {groups.map((group) => {
+        if (hasModelParameterPricing(props.model, group)) {
+          const prices = modelParameterPrices(props.model, group)
+          return (
+            <div key={group} data-price-group={group}>
+              {!prices.length && (
+                <span className='text-muted-foreground text-xs'>{group}</span>
+              )}
+              <ParameterPriceTable
+                prices={prices.map((price) => ({ ...price, group }))}
+                useDisplayCurrency
+                showRechargePrice={props.showRechargePrice}
+                priceRate={props.priceRate}
+                usdExchangeRate={props.usdExchangeRate}
+              />
+            </div>
+          )
+        }
+
+        const pricing = resolveModelGroupPricing(props.model, group)
+        const dynamic = getDynamicPricingSummary(pricing.model, {
+          tokenUnit,
+          showRechargePrice: props.showRechargePrice,
+          priceRate: props.priceRate,
+          usdExchangeRate: props.usdExchangeRate,
+          groupRatioMultiplier: pricing.groupRatio,
+        })
+        let summary
+        if (dynamic) {
+          // Full tier details remain in the model dialog; never replace an expression by zero.
+          summary = (
+            <span>
+              {t('Dynamic Pricing')} ·{' '}
+              {t('Open details to compare complete price rows')}
+            </span>
+          )
+        } else if (pricing.model.quota_type === QUOTA_TYPE_VALUES.TOKEN) {
+          summary = (
+            <span>
+              {(['input', 'output'] as const).map((type, index) => (
+                <span key={type}>
+                  {index > 0 ? ' · ' : ''}
+                  {t(type === 'input' ? 'Input' : 'Output')}{' '}
+                  {formatResolvedTokenPrice(
+                    pricing,
+                    type,
+                    tokenUnit,
+                    true,
+                    props.showRechargePrice,
+                    props.priceRate,
+                    props.usdExchangeRate
+                  )}
+                  /{tokenUnitLabel}
+                </span>
+              ))}
+            </span>
+          )
+        } else {
+          const unit =
+            pricing.billingUnit === 'fixed_duration'
+              ? t('Fixed {{seconds}} seconds', {
+                  seconds: pricing.fixedDurationSeconds,
+                })
+              : t(parameterUnitLabel(pricing.billingUnit))
+          summary = (
+            <span className='font-mono tabular-nums'>
+              {formatResolvedFixedPrice(
+                pricing,
+                true,
+                props.showRechargePrice,
+                props.priceRate,
+                props.usdExchangeRate
+              )}{' '}
+              / {unit}
+            </span>
+          )
+        }
+        return (
+          <div
+            key={group}
+            className='flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-xs'
+            data-price-group={group}
+          >
+            <span className='text-muted-foreground'>{group}</span>
+            {summary}
+          </div>
+        )
+      })}
+    </div>
+  )
+}

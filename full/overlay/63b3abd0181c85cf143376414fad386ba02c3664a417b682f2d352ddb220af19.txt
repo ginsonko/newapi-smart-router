@@ -1,0 +1,9 @@
+import { createFileRoute } from '@tanstack/react-router'
+
+import { SmartRouterLeaderboard } from '@/features/smart-routing/leaderboard'
+
+export const Route = createFileRoute(
+  '/_authenticated/smart-routing/leaderboard/'
+)({
+  component: SmartRouterLeaderboard,
+})

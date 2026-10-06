@@ -1,0 +1,38 @@
+package common
+
+// TenantCostBindingContext is the redacted, request-local snapshot used by
+// the upstream-cost.v2 projection. It deliberately contains no secret,
+// provider URL, physical channel or prompt/response data. Keeping this type
+// in the common package avoids an import cycle between middleware, relay and
+// model while preserving a single server-owned binding contract.
+type TenantCostBindingContext struct {
+	// BindingID is an internal immutable binding identity. It is used only to
+	// namespace idempotency keys so two partner keys reusing the same client
+	// request header cannot collide. It is never exported in a cost payload.
+	BindingID            int64
+	TenantID             string
+	CredentialPurpose    string
+	KeyID                string
+	KeySuffix            string
+	ProductPoolID        string
+	ServiceTier          string
+	RouteProfileID       string
+	ProfileRevision      string
+	ModelCatalogRevision string
+}
+
+// TenantCostUsageSnapshot is the request-local, non-sensitive usage evidence
+// captured at the same point where the existing billing path settles.  It is
+// deliberately numeric (rather than a provider DTO) so the cost projection
+// cannot retain prompt/response data or provider-specific objects.
+type TenantCostUsageSnapshot struct {
+	InputTokens        int64
+	OutputTokens       int64
+	CacheReadTokens    int64
+	CacheWrite5mTokens int64
+	CacheWrite1hTokens int64
+	AudioInputTokens   int64
+	AudioOutputTokens  int64
+	RequestCount       int64
+	Seconds            int64
+}

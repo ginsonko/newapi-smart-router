@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import { unwrapAnalyticsTooltipDatum } from './analytics-trend-chart-helpers'
+
+describe('analytics trend tooltip datum compatibility', () => {
+  test('unwraps the VChart mark wrapper', () => {
+    const datum = { value: 100_000, series: 'Predicted input cost' }
+    assert.deepEqual(unwrapAnalyticsTooltipDatum({ datum }), datum)
+  })
+
+  test('keeps direct datum callbacks compatible', () => {
+    const datum = { value: 42, series: 'Requests' }
+    assert.deepEqual(unwrapAnalyticsTooltipDatum(datum), datum)
+  })
+})

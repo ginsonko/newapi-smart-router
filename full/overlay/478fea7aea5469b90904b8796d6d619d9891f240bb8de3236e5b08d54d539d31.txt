@@ -1,0 +1,43 @@
+package controller
+
+import (
+	"context"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLogPageQueryRejectsOverflowBeforeOffset(t *testing.T) {
+	for _, query := range []string{"p=-1", "p=0", "p=9999999999999999999999999", "p=1000000000000000000&page_size=100", "p=501&page_size=20", "page_size=101", "ps=-1", "size=999999999999999999999"} {
+		t.Run(query, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("GET", "/api/log/self?"+query, nil)
+			_, err := logPageQuery(c)
+			assert.ErrorIs(t, err, model.ErrLogPagination)
+		})
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/api/log/self?p=500&ps=20", nil)
+	page, err := logPageQuery(c)
+	require.NoError(t, err)
+	assert.Equal(t, 9980, page.GetStartIdx())
+}
+
+func TestLogQueryErrorRetainsFailureAndRequestID(t *testing.T) {
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest("GET", "/api/log/self", nil)
+	c.Set(common.RequestIdKey, "log-query-proof")
+	logQueryError(c, context.DeadlineExceeded)
+	var body map[string]interface{}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+	assert.Equal(t, false, body["success"])
+	assert.Contains(t, body["message"], "log-query-proof")
+	assert.Contains(t, body["message"], "超时")
+	assert.NotContains(t, body, "data")
+}

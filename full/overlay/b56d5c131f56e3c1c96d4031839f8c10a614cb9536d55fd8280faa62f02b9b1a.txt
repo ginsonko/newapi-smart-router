@@ -1,0 +1,395 @@
+package openai
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newSmartResponsesTestContext(t *testing.T, body string, stream bool) (*gin.Context, *httptest.ResponseRecorder, *http.Response, *relaycommon.RelayInfo) {
+	t.Helper()
+	if constant.StreamingTimeout <= 0 {
+		oldTimeout := constant.StreamingTimeout
+		constant.StreamingTimeout = 30
+		t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(common.RequestIdKey, "r32-semantic-test")
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"},
+		IsStream:    stream,
+		RelayFormat: types.RelayFormatOpenAI,
+	}
+	return c, recorder, resp, info
+}
+
+func TestResetSmartResponsesAttemptStateClearsPriorRouteMarkers(t *testing.T) {
+	c, _, _, info := newSmartResponsesTestContext(t, "", true)
+	BeginSmartResponsesSemanticWindow(c, info)()
+	c.Set(smartResponsesBoundaryKey, true)
+	c.Set(smartResponsesCompletedKey, true)
+	c.Set(smartResponsesTerminalKey, true)
+	c.Set(smartResponsesCommittedKey, true)
+	c.Set(smartResponsesSingleRouteKey, true)
+
+	ResetSmartResponsesAttemptState(c)
+
+	assert.False(t, SmartResponsesSemanticBoundaryActive(c))
+	assert.False(t, SmartResponsesCompletedSeen(c))
+	assert.False(t, SmartResponsesTerminalSeen(c))
+	assert.False(t, SmartResponsesSemanticCommitted(c))
+	assert.False(t, c.GetBool(smartResponsesSingleRouteKey))
+}
+
+func TestSmartResponsesSemanticFailureBeforeOutputIsRetryable(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.failed","error":{"message":"Selected model is at capacity. Please try a different model.","type":"invalid_request_error"}}`,
+		`data: [DONE]`,
+	}, "\r\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+
+	restore := BeginSmartResponsesSemanticWindow(c, info)
+	require.True(t, info.DisablePing)
+	defer restore()
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCode("capacity"), apiErr.GetErrorCode())
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
+	assert.False(t, recorder.Flushed)
+	assert.False(t, c.Writer.Written())
+	assert.Empty(t, recorder.Body.String())
+	assert.False(t, info.DisablePing, "the original ping policy must be restored before failover")
+}
+
+func TestSmartResponsesNormalStreamReplaysPreludeWithoutReordering(t *testing.T) {
+	body := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","status":"in_progress"}}`,
+		``,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 2, usage.InputTokens)
+	assert.Equal(t, "openai-responses", usage.UsageSource)
+	assert.Equal(t, 3, usage.TotalTokens)
+	assert.True(t, info.StreamStatus.HasTerminal())
+	assert.Equal(t, "response.completed", info.StreamStatus.TerminalKind())
+	output := recorder.Body.String()
+	requireOrderedSubstrings(t, output, `event: response.created`, `event: response.output_text.delta`, `event: response.completed`)
+	assert.Contains(t, output, `"delta":"hello"`)
+}
+
+func TestSmartResponsesRolePreludeFailureDoesNotCommitChatChunk(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","status":"in_progress"}}`,
+		`data: {"type":"response.failed","error":{"code":"server_is_overloaded","message":"high demand"}}`,
+		`data: [DONE]`,
+	}, "\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	usage, apiErr := OaiResponsesToChatStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCode("capacity"), apiErr.GetErrorCode())
+	assert.False(t, c.Writer.Written())
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestSmartResponsesFailureAfterTextNeverLooksPreCommit(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		`data: {"type":"response.failed","error":{"code":"server_is_overloaded","message":"server overloaded"}}`,
+		`data: [DONE]`,
+	}, "\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.True(t, c.Writer.Written())
+	assert.Contains(t, recorder.Body.String(), `"delta":"partial"`)
+	assert.Contains(t, recorder.Body.String(), `response.failed`)
+}
+
+func TestSmartResponsesLegalEmptyCompletionIsNotFailure(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
+		`data: [DONE]`,
+	}, "\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Zero(t, usage.TotalTokens)
+	assert.Contains(t, recorder.Body.String(), `response.completed`)
+}
+
+func TestSmartResponsesEstimatedInputIsNotMarkedAsProviderUsage(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.output_text.delta","delta":"text"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":0,"output_tokens":1,"total_tokens":1}}}`,
+		`data: [DONE]`,
+	}, "\n")
+	c, _, resp, info := newSmartResponsesTestContext(t, body, true)
+	info.SetEstimatePromptTokens(7)
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 1, usage.OutputTokens)
+	assert.Empty(t, usage.UsageSource, "estimated prompt tokens must not be exposed as provider usage")
+}
+
+func TestSmartResponsesEOFBeforeCompletedIsRetryablePreludeFailure(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+	}, "\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.True(t, c.Writer.Written())
+	assert.Contains(t, recorder.Body.String(), "partial")
+	assert.Equal(t, types.ErrorCodeReadResponseBodyFailed, apiErr.GetErrorCode())
+}
+
+func TestSmartResponsesCompletedThenEOFIsSuccess(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	}, "\n\n")
+	c, _, resp, info := newSmartResponsesTestContext(t, body, true)
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 2, usage.TotalTokens)
+}
+
+func TestSmartResponsesDoneCompletedThenEOFIsSuccess(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.done","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
+	}, "\n\n")
+	c, _, resp, info := newSmartResponsesTestContext(t, body, true)
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 1, usage.InputTokens)
+	assert.Equal(t, "openai-responses", usage.UsageSource)
+	assert.Equal(t, 3, usage.TotalTokens)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasTerminal())
+	assert.Equal(t, "response.done", info.StreamStatus.TerminalKind())
+}
+
+func TestSmartResponsesDoneTopLevelCompletedThenEOFIsSuccess(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.done","status":"completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	}, "\n\n")
+	c, _, resp, info := newSmartResponsesTestContext(t, body, true)
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 2, usage.TotalTokens)
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasTerminal())
+}
+
+func TestSmartResponsesFixedKeyForwardsFailureWithoutSuccessfulSettlement(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.failed","error":{"message":"Selected model is at capacity"}}`,
+		`data: [DONE]`,
+	}, "\n")
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+	c.Set(string(constant.ContextKeyTokenRoutingPolicy), nil)
+	c.Keys = map[string]any{common.RequestIdKey: "fixed-key-test"}
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	require.Nil(t, usage)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	assert.Contains(t, recorder.Body.String(), `response.failed`)
+	assert.True(t, SmartResponsesTerminalSeen(c))
+	assert.False(t, SmartResponsesCompletedSeen(c))
+}
+
+func TestFixedResponsesStreamCompletionPublishesProviderEvidence(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		`data: {"type":"response.done","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`,
+	}, "\n\n")
+	c, _, resp, info := newSmartResponsesTestContext(t, body, true)
+	c.Keys = map[string]any{common.RequestIdKey: "fixed-completed-stream"}
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 3, usage.TotalTokens)
+	assert.True(t, SmartResponsesTerminalSeen(c))
+	assert.True(t, SmartResponsesCompletedSeen(c))
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasTerminal())
+	assert.Equal(t, "response.done", info.StreamStatus.TerminalKind())
+}
+
+func TestFixedResponsesNonStreamCompletionPublishesProviderEvidence(t *testing.T) {
+	body := `{"id":"resp_1","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`
+	c, _, resp, info := newSmartResponsesTestContext(t, body, false)
+	c.Keys = map[string]any{common.RequestIdKey: "fixed-completed-non-stream"}
+	resp.Header.Set("Content-Type", "application/json")
+
+	usage, apiErr := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 2, usage.InputTokens)
+	assert.Equal(t, "openai-responses", usage.UsageSource)
+	assert.Equal(t, 3, usage.TotalTokens)
+	assert.True(t, SmartResponsesTerminalSeen(c))
+	assert.True(t, SmartResponsesCompletedSeen(c))
+}
+
+func TestSmartResponsesNonStreamFailedStatusWithoutErrorType(t *testing.T) {
+	body := `{"id":"resp_1","status":"failed","error":{"message":"Selected model is at capacity. Please try a different model."}}`
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, false)
+	resp.Header.Set("Content-Type", "application/json")
+
+	usage, apiErr := OaiResponsesHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCode("capacity"), apiErr.GetErrorCode())
+	assert.False(t, c.Writer.Written())
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestSmartResponsesLargePreludeSpillIsRemovedOnFailure(t *testing.T) {
+	pattern := filepath.Join(os.TempDir(), "new-api-r32-responses-*.sse")
+	before, err := filepath.Glob(pattern)
+	require.NoError(t, err)
+	metadata := strings.Repeat("x", int(smartResponsesPreludeMemoryLimit)+1024)
+	body := `data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","metadata":{"padding":"` + metadata + `"}}}` + "\n" +
+		`data: {"type":"response.failed","error":{"code":"server_is_overloaded","message":"server overloaded"}}` + "\n"
+	c, recorder, resp, info := newSmartResponsesTestContext(t, body, true)
+
+	_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCode("capacity"), apiErr.GetErrorCode())
+	assert.False(t, c.Writer.Written())
+	assert.Empty(t, recorder.Body.String())
+	after, err := filepath.Glob(pattern)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, before, after)
+}
+
+func TestSmartResponsesPreludeClassificationDoesNotGuessFromUsage(t *testing.T) {
+	tests := []struct {
+		name  string
+		event string
+	}{
+		{name: "tool", event: `{"type":"response.output_item.added","item":{"type":"function_call","name":"lookup"}}`},
+		{name: "refusal", event: `{"type":"response.refusal.delta","delta":"cannot comply"}`},
+		{name: "reasoning", event: `{"type":"response.reasoning_text.delta","delta":"thinking"}`},
+		{name: "max output tokens", event: `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`},
+		{name: "content filter", event: `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := "data: " + test.event + "\ndata: [DONE]\n"
+			c, _, resp, info := newSmartResponsesTestContext(t, body, true)
+			guardErr := guardSmartResponsesStream(c, info, resp)
+			require.Nil(t, guardErr)
+			require.NoError(t, resp.Body.Close())
+		})
+	}
+}
+
+type blockingSmartResponsesBody struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blockingSmartResponsesBody) Read([]byte) (int, error) {
+	<-b.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (b *blockingSmartResponsesBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestSmartResponsesPreludeIdleTimeoutClosesBlockedBody(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	c, recorder, resp, info := newSmartResponsesTestContext(t, "", true)
+	body := &blockingSmartResponsesBody{closed: make(chan struct{})}
+	resp.Body = body
+	started := time.Now()
+
+	usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCodeChannelResponseTimeExceeded, apiErr.GetErrorCode())
+	assert.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
+	assert.Less(t, time.Since(started), 3*time.Second)
+	assert.False(t, c.Writer.Written())
+	assert.Empty(t, recorder.Body.String())
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("blocked upstream body was not closed on semantic prelude timeout")
+	}
+}

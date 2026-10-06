@@ -1,0 +1,24 @@
+export type AnalyticsTooltipDatum<T> =
+  | T
+  | { datum: T }
+  | { datum: T; [key: string]: unknown }
+
+/**
+ * VChart uses a wrapper object for mark tooltip callbacks (`{ datum }`), while
+ * a few versions pass the datum directly. Keep the presentation layer
+ * compatible with both shapes so custom currency/percent formatters are
+ * always applied instead of silently falling back to the default tooltip.
+ */
+export function unwrapAnalyticsTooltipDatum<T>(
+  value: AnalyticsTooltipDatum<T>
+): T {
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    'datum' in value &&
+    (value as { datum?: unknown }).datum !== undefined
+  ) {
+    return (value as { datum: T }).datum
+  }
+  return value as T
+}

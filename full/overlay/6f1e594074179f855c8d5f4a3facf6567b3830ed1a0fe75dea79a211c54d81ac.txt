@@ -1,0 +1,296 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/go-redis/redis/v8"
+)
+
+const (
+	tokenCacheFenceRotated = "rotated"
+	tokenCacheFenceBinding = "binding:"
+)
+
+var (
+	errTenantCostTokenCacheFenced        = errors.New("tenant token cache is fenced")
+	errTenantCostTokenCacheUnavailable   = errors.New("redis is enabled but the client is unavailable")
+	errTenantCostTokenCacheFenceMismatch = errors.New("tenant token cache fence does not match")
+)
+
+const tokenCacheSetIfAllowedScript = `
+local fence = redis.call('GET', KEYS[1])
+if fence and fence ~= '' then
+  if fence == 'rotated' then
+    return 0
+  end
+  if string.sub(fence, 1, 8) == 'binding:' and ARGV[1] ~= string.sub(fence, 9) then
+    return 0
+  end
+end
+local expires = tonumber(ARGV[#ARGV])
+for i = 2, #ARGV - 1, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
+end
+if expires and expires > 0 then
+  redis.call('EXPIRE', KEYS[2], expires)
+end
+return 1
+`
+
+const tokenCacheFenceAndDeleteScript = `
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+return 1
+`
+
+// tokenCacheClearFenceIfMatchesScript makes fence cleanup conditional.  A
+// delayed cleanup from an older operation must never remove a newer safety
+// fence and reopen the stale-token cache path.
+const tokenCacheClearFenceIfMatchesScript = `
+local fence = redis.call('GET', KEYS[1])
+if not fence then
+  return 0
+end
+if fence ~= ARGV[1] then
+  return -1
+end
+redis.call('DEL', KEYS[1])
+return 1
+`
+
+// tokenCacheKeys deliberately keeps fences separate from token hashes. A
+// normal hash DEL therefore cannot remove the safety decision made by a key
+// rotation or binding operation.
+func tokenCacheKeys(rawKey string) (string, string) {
+	hmacKey := common.GenerateHMAC(strings.TrimSpace(rawKey))
+	return fmt.Sprintf("token:%s", hmacKey), fmt.Sprintf("token:fence:%s", hmacKey)
+}
+
+func tokenCacheFenceState(rawKey string) (string, error) {
+	if !common.RedisEnabled {
+		return "", nil
+	}
+	if common.RDB == nil {
+		return "", errTenantCostTokenCacheUnavailable
+	}
+	_, fenceKey := tokenCacheKeys(rawKey)
+	value, err := common.RDB.Get(context.Background(), fenceKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read token cache fence: %w", err)
+	}
+	return value, nil
+}
+
+func tokenCacheFenceModeForBinding(bindingID int64) string {
+	return tokenCacheFenceBinding + strconv.FormatInt(bindingID, 10)
+}
+
+func tokenCacheBindingFenceMatches(state string, tokenBindingID int64) bool {
+	return strings.HasPrefix(state, tokenCacheFenceBinding) && tokenBindingID > 0 &&
+		strings.TrimPrefix(state, tokenCacheFenceBinding) == strconv.FormatInt(tokenBindingID, 10)
+}
+
+func tokenCacheFields(token Token) []interface{} {
+	value := reflect.ValueOf(&token).Elem()
+	typ := value.Type()
+	fields := make([]interface{}, 0, value.NumField()*2)
+	for i := 0; i < value.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Type.String() == "gorm.DeletedAt" {
+			continue
+		}
+		fieldValue := value.Field(i)
+		if fieldValue.Kind() == reflect.Ptr {
+			if fieldValue.IsNil() {
+				fields = append(fields, field.Name, "")
+				continue
+			}
+			fieldValue = fieldValue.Elem()
+		}
+		if fieldValue.Kind() == reflect.Bool {
+			fields = append(fields, field.Name, strconv.FormatBool(fieldValue.Bool()))
+			continue
+		}
+		fields = append(fields, field.Name, fmt.Sprintf("%v", fieldValue.Interface()))
+	}
+	return fields
+}
+
+func cacheSetToken(token Token) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	if common.RDB == nil {
+		return errTenantCostTokenCacheUnavailable
+	}
+	key, fenceKey := tokenCacheKeys(token.Key)
+	marker := strconv.FormatInt(token.TenantCostBindingID, 10)
+	token.Clean()
+	args := make([]interface{}, 0, 2+len(tokenCacheFields(token)))
+	args = append(args, marker)
+	args = append(args, tokenCacheFields(token)...)
+	args = append(args, int64(common.RedisKeyCacheSeconds()))
+	result, err := common.RDB.Eval(context.Background(), tokenCacheSetIfAllowedScript,
+		[]string{fenceKey, key}, args...).Result()
+	if err != nil {
+		return fmt.Errorf("failed to update token cache: %w", err)
+	}
+	allowed, ok := result.(int64)
+	if !ok {
+		return fmt.Errorf("failed to update token cache: unexpected fence result %T", result)
+	}
+	if allowed == 0 {
+		return errTenantCostTokenCacheFenced
+	}
+	if allowed != 1 {
+		return fmt.Errorf("failed to update token cache: unexpected fence result %d", allowed)
+	}
+	return nil
+}
+
+// cacheFenceAndDeleteToken atomically installs a durable fence and removes the
+// old hash. The fence is intentionally not removed by cacheDeleteToken.
+func cacheFenceAndDeleteToken(rawKey, mode string) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	if common.RDB == nil {
+		return errTenantCostTokenCacheUnavailable
+	}
+	if strings.TrimSpace(rawKey) == "" || strings.TrimSpace(mode) == "" {
+		return errors.New("token cache fence requires a key and mode")
+	}
+	cacheKey, fenceKey := tokenCacheKeys(rawKey)
+	if _, err := common.RDB.Eval(context.Background(), tokenCacheFenceAndDeleteScript,
+		[]string{fenceKey, cacheKey}, mode).Result(); err != nil {
+		return fmt.Errorf("failed to fence token cache: %w", err)
+	}
+	return nil
+}
+
+// cacheClearTokenFence removes a fence only when it still has the expected
+// value.  The compare-and-delete is intentionally fail-closed for delayed
+// cleanup: a newer fence remains intact when the expected value no longer
+// matches.
+func cacheClearTokenFence(rawKey, expectedMode string) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	if common.RDB == nil {
+		return errTenantCostTokenCacheUnavailable
+	}
+	if strings.TrimSpace(rawKey) == "" || strings.TrimSpace(expectedMode) == "" {
+		return errors.New("token cache fence cleanup requires a key and expected mode")
+	}
+	_, fenceKey := tokenCacheKeys(rawKey)
+	result, err := common.RDB.Eval(context.Background(), tokenCacheClearFenceIfMatchesScript,
+		[]string{fenceKey}, strings.TrimSpace(expectedMode)).Result()
+	if err != nil {
+		return fmt.Errorf("failed to clear token cache fence: %w", err)
+	}
+	cleared, ok := result.(int64)
+	if !ok {
+		return fmt.Errorf("failed to clear token cache fence: unexpected result %T", result)
+	}
+	if cleared == -1 {
+		return errTenantCostTokenCacheFenceMismatch
+	}
+	if cleared != 0 && cleared != 1 {
+		return fmt.Errorf("failed to clear token cache fence: unexpected result %d", cleared)
+	}
+	return nil
+}
+
+func cacheDeleteToken(key string) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	if common.RDB == nil {
+		return errTenantCostTokenCacheUnavailable
+	}
+	cacheKey, _ := tokenCacheKeys(key)
+	err := common.RedisDelKey(cacheKey)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func cacheIncrTokenQuota(key string, increment int64) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	if common.RDB == nil {
+		return errTenantCostTokenCacheUnavailable
+	}
+	cacheKey, _ := tokenCacheKeys(key)
+	err := common.RedisHIncrBy(cacheKey, constant.TokenFiledRemainQuota, increment)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func cacheDecrTokenQuota(key string, decrement int64) error {
+	return cacheIncrTokenQuota(key, -decrement)
+}
+
+func cacheSetTokenField(key string, field string, value string) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	if common.RDB == nil {
+		return errTenantCostTokenCacheUnavailable
+	}
+	cacheKey, _ := tokenCacheKeys(key)
+	err := common.RedisHSetField(cacheKey, field, value)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// CacheGetTokenByKey 从缓存中获取 token，如果缓存中不存在，则从数据库中获取
+func cacheGetTokenByKey(key string) (*Token, error) {
+	if !common.RedisEnabled {
+		return nil, fmt.Errorf("redis is not enabled")
+	}
+	if common.RDB == nil {
+		return nil, errTenantCostTokenCacheUnavailable
+	}
+	stateBefore, err := tokenCacheFenceState(key)
+	if err != nil {
+		return nil, err
+	}
+	if stateBefore == tokenCacheFenceRotated {
+		return nil, errTenantCostTokenCacheFenced
+	}
+	if stateBefore != "" && !strings.HasPrefix(stateBefore, tokenCacheFenceBinding) {
+		return nil, errTenantCostTokenCacheFenced
+	}
+	var token Token
+	cacheKey, _ := tokenCacheKeys(key)
+	err = common.RedisHGetObj(cacheKey, &token)
+	if err != nil {
+		return nil, err
+	}
+	stateAfter, err := tokenCacheFenceState(key)
+	if err != nil {
+		return nil, err
+	}
+	if stateAfter != stateBefore || (stateAfter != "" && !tokenCacheBindingFenceMatches(stateAfter, token.TenantCostBindingID)) {
+		return nil, errTenantCostTokenCacheFenced
+	}
+	token.Key = key
+	return &token, nil
+}

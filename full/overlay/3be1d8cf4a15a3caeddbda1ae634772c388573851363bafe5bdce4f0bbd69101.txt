@@ -1,0 +1,196 @@
+package common
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestValidateMultipartDirectNormalizesImageField(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := strings.NewReader(`{"model":"wan2.7-i2v","prompt":"animate","image":" https://example.com/first.png "}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/video/generations", body)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = request
+	info := &RelayInfo{
+		TaskRelayInfo: &TaskRelayInfo{},
+	}
+
+	taskErr := ValidateMultipartDirect(context, info)
+
+	require.Nil(t, taskErr)
+	storedReq, err := GetTaskRequest(context)
+	require.NoError(t, err)
+	require.Equal(t, []string{"https://example.com/first.png"}, storedReq.Images)
+	require.Equal(t, constant.TaskActionGenerate, info.Action)
+}
+
+func TestNormalizeTaskVideoDimensionsSupportsBothPublicContracts(t *testing.T) {
+	fromSize := TaskSubmitReq{Size: "1280x720"}
+	NormalizeTaskVideoDimensions(&fromSize)
+	require.Equal(t, "16:9", fromSize.AspectRatio)
+	require.Equal(t, "1280x720", fromSize.Size)
+
+	fromAspect := TaskSubmitReq{AspectRatio: " 9 : 16 "}
+	NormalizeTaskVideoDimensions(&fromAspect)
+	require.Equal(t, "9:16", fromAspect.AspectRatio)
+	require.Equal(t, "720x1280", fromAspect.Size)
+
+	square := TaskSubmitReq{Size: "1024x1024"}
+	NormalizeTaskVideoDimensions(&square)
+	require.Equal(t, "1:1", square.AspectRatio)
+}
+
+// TestTaskDurationBounds guards the billing invariant that user-supplied
+// video duration (a quota multiplier via OtherRatio "seconds") is bounded, so
+// it can never overflow quota calculation into a negative charge.
+func TestTaskDurationBounds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	newContext := func(t *testing.T, body string) (*gin.Context, *RelayInfo) {
+		request := httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		context, _ := gin.CreateTestContext(httptest.NewRecorder())
+		context.Request = request
+		return context, &RelayInfo{TaskRelayInfo: &TaskRelayInfo{}}
+	}
+
+	tests := []struct {
+		name        string
+		body        string
+		wantErr     bool
+		wantSeconds string
+	}{
+		{
+			name:    "huge duration is rejected",
+			body:    `{"model":"sora-2","prompt":"a cat","duration":9999999999}`,
+			wantErr: true,
+		},
+		{
+			name:    "huge seconds string is rejected",
+			body:    `{"model":"sora-2","prompt":"a cat","seconds":"9999999999"}`,
+			wantErr: true,
+		},
+		{
+			name:    "negative duration is rejected",
+			body:    `{"model":"sora-2","prompt":"a cat","duration":-8}`,
+			wantErr: true,
+		},
+		{
+			name:    "non numeric seconds string is rejected",
+			body:    `{"model":"sora-2","prompt":"a cat","seconds":"soon"}`,
+			wantErr: true,
+		},
+		{
+			name:        "normal duration string is accepted",
+			body:        `{"model":"sora-2","prompt":"a cat","seconds":"8"}`,
+			wantSeconds: "8",
+		},
+		{
+			name:        "normal numeric seconds is normalized",
+			body:        `{"model":"sora-2","prompt":"a cat","seconds":8}`,
+			wantSeconds: "8",
+		},
+		{
+			name:    "matching duration and seconds are accepted",
+			body:    `{"model":"sora-2","prompt":"a cat","duration":8,"seconds":"8"}`,
+			wantSeconds: "8",
+		},
+		{
+			name:    "conflicting duration and seconds are rejected",
+			body:    `{"model":"sora-2","prompt":"a cat","duration":8,"seconds":"10"}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+" (multipart direct)", func(t *testing.T) {
+			context, info := newContext(t, tt.body)
+			taskErr := ValidateMultipartDirect(context, info)
+			if tt.wantErr {
+				require.NotNil(t, taskErr)
+				require.Equal(t, "invalid_seconds", taskErr.Code)
+			} else {
+				require.Nil(t, taskErr)
+				stored, err := GetTaskRequest(context)
+				require.NoError(t, err)
+				require.Equal(t, tt.wantSeconds, stored.Seconds)
+			}
+		})
+		t.Run(tt.name+" (basic task request)", func(t *testing.T) {
+			context, info := newContext(t, tt.body)
+			taskErr := ValidateBasicTaskRequest(context, info, constant.TaskActionGenerate)
+			if tt.wantErr {
+				require.NotNil(t, taskErr)
+				require.Equal(t, "invalid_seconds", taskErr.Code)
+			} else {
+				require.Nil(t, taskErr)
+				stored, err := GetTaskRequest(context)
+				require.NoError(t, err)
+				require.Equal(t, tt.wantSeconds, stored.Seconds)
+			}
+		})
+	}
+}
+
+func TestStudioVideoCountIsBoundedOnlyForPlaygroundRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	newContext := func(body string, playground bool) (*gin.Context, *RelayInfo) {
+		context, _ := gin.CreateTestContext(httptest.NewRecorder())
+		context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(body))
+		context.Request.Header.Set("Content-Type", "application/json")
+		context.Set("is_playground", playground)
+		context.Set(TaskMediaModeContextKey, "videos")
+		return context, &RelayInfo{TaskRelayInfo: &TaskRelayInfo{}}
+	}
+
+	for _, count := range []int{0, MaxStudioBatchCount + 1, 128} {
+		context, info := newContext(fmt.Sprintf(`{"model":"video","prompt":"p","count":%d}`, count), true)
+		taskErr := ValidateBasicTaskRequest(context, info, constant.TaskActionGenerate)
+		require.NotNil(t, taskErr)
+		require.Equal(t, "invalid_count", taskErr.Code)
+	}
+
+	context, info := newContext(`{"model":"video","prompt":"p","count":16}`, true)
+	require.Nil(t, ValidateBasicTaskRequest(context, info, constant.TaskActionGenerate))
+	stored, err := GetTaskRequest(context)
+	require.NoError(t, err)
+	require.NotNil(t, stored.Count)
+	require.Equal(t, 16, *stored.Count)
+
+	context, info = newContext(`{"model":"video","prompt":"p","count":128}`, false)
+	require.Nil(t, ValidateBasicTaskRequest(context, info, constant.TaskActionGenerate))
+}
+
+func TestApplyTaskMediaSnapshotKeepsOnlyPublicRecoveryFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	context.Set(TaskMediaModeContextKey, "videos")
+	storeTaskRequest(context, &RelayInfo{TaskRelayInfo: &TaskRelayInfo{}}, constant.TaskActionReferenceGenerate, TaskSubmitReq{
+		Prompt: "restore this scene", Size: "1280x720", Seconds: "8",
+		References: []MediaReference{
+			{Type: "image", Role: "first_frame", FileID: "file-one", ResolvedURL: "https://private.example/signed-one"},
+			{Type: "audio", Role: "driving_audio", FileID: "file-two", ResolvedURL: "https://private.example/signed-two"},
+		},
+	})
+	task := &model.Task{}
+
+	applyTaskMediaSnapshot(context, task)
+
+	require.Equal(t, "videos", task.Properties.MediaMode)
+	require.Equal(t, "restore this scene", task.Properties.Input)
+	require.Equal(t, "1280x720", task.Properties.MediaSize)
+	require.Equal(t, 8, task.Properties.MediaDuration)
+	require.Equal(t, 2, task.Properties.MediaReferenceCount)
+	require.NotContains(t, task.Properties.Input, "private.example")
+}

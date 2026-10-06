@@ -1,0 +1,46 @@
+package controller
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/require"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+func TestParameterAdminRefundAmountBoundaries(t *testing.T) {
+	old := common.QuotaPerUnit
+	common.QuotaPerUnit = 500000
+	t.Cleanup(func() { common.QuotaPerUnit = old })
+	for _, tc := range []struct {
+		name   string
+		quota  int
+		amount string
+		want   int
+		valid  bool
+	}{
+		{"amount only", 0, "0.012", 6000, true}, {"consistent", 6000, "0.012", 6000, true},
+		{"conflict", 6000, "0.016", 0, false}, {"negative", -1, "0.012", 0, false},
+		{"exponent", 0, "1e999999999", 0, false}, {"nan", 0, "NaN", 0, false},
+		{"huge", 0, strings.Repeat("9", 1000), 0, false}, {"below quota", 0, "0.0000001", 0, false},
+		{"fraction overflow", 0, "0.1234567890123456789", 0, false}, {"quota only", 6000, "", 6000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := parseTenantParameterRefundQuota(tc.quota, tc.amount)
+			if tc.valid {
+				require.NoError(t, err)
+				require.Equal(t, tc.want, q)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestParameterAdminParentConflict(t *testing.T) {
+	body := `{"parent_event_id":"different","operation_id":"one","amount":"2","refund_quota":100}`
+	correction := strings.ReplaceAll(body, `,"refund_quota":100`, "")
+	refund := strings.ReplaceAll(body, `,"amount":"2"`, "")
+	require.Equal(t, http.StatusBadRequest, invokeAdminCorrection(t, "original", correction, "").Code)
+	require.Equal(t, http.StatusBadRequest, invokeAdminRefund(t, "original", refund, "").Code)
+}

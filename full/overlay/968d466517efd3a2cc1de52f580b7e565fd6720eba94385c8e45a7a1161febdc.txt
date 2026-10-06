@@ -1,0 +1,50 @@
+package types
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestNewOpenAIErrorPreservesTypedCause(t *testing.T) {
+	cause := errors.New("typed transport cause")
+	wrapped := fmt.Errorf("do request: %w", cause)
+
+	apiErr := NewOpenAIError(wrapped, ErrorCodeDoRequestFailed, http.StatusBadGateway)
+
+	assert.ErrorIs(t, apiErr, cause)
+	assert.Equal(t, wrapped.Error(), apiErr.Error())
+	assert.Equal(t, ErrorTypeOpenAIError, apiErr.GetErrorType())
+}
+
+func TestHiddenErrorMessageDoesNotEraseTypedCause(t *testing.T) {
+	cause := errors.New("private network detail")
+	wrapped := fmt.Errorf("dial failed: %w", cause)
+
+	apiErr := NewError(
+		wrapped,
+		ErrorCodeDoRequestFailed,
+		ErrOptionWithHideErrMsg("upstream error: do request failed"),
+	)
+
+	assert.Equal(t, "upstream error: do request failed", apiErr.Error())
+	assert.ErrorIs(t, apiErr, cause)
+}
+
+func TestUpstreamResponseMarkerSurvivesWrapping(t *testing.T) {
+	original := WithOpenAIError(OpenAIError{
+		Message: "provider response",
+		Type:    "provider_error",
+		Code:    "provider_busy",
+	}, http.StatusBadRequest, ErrOptionWithUpstreamResponseReceived())
+	assert.True(t, original.HasUpstreamResponse())
+
+	wrapped := NewErrorWithStatusCode(original, ErrorCodeBadResponse, http.StatusBadGateway)
+	assert.True(t, wrapped.HasUpstreamResponse())
+
+	wrapped.MarkUpstreamResponseReceived()
+	assert.True(t, wrapped.HasUpstreamResponse())
+}

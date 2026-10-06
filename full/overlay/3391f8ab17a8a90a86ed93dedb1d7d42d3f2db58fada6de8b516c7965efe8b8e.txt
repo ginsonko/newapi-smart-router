@@ -1,0 +1,68 @@
+package service
+
+import (
+	"context"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+)
+
+// routeAnalyticsDetailIDsV1 is a best-effort enrichment. Analytics storage is
+// deliberately not a dependency of the current leaderboard: a missing table,
+// timeout, or unavailable sidecar leaves detail ids empty while all existing
+// route facts and decisions continue to render unchanged.
+func routeAnalyticsDetailIDsV1(
+	ctx context.Context,
+	routes []smartRouteUserStatusMetadata,
+	prices *smartrouter.PriceSnapshot,
+) {
+	if len(routes) == 0 {
+		return
+	}
+	fingerprints := make([]string, 0, len(routes))
+	routeFingerprints := make([]string, len(routes))
+	for index, route := range routes {
+		fingerprint := routeAnalyticsPhysicalDigestV1(smartRouteBackfillCatalogRoute{
+			contract: route.contract,
+			route:    route.route,
+		})
+		routeFingerprints[index] = fingerprint
+		fingerprints = append(fingerprints, fingerprint)
+	}
+	dimensions, err := model.ListRouteAnalyticsDimensionsByFingerprintsV1(ctx, fingerprints)
+	if err != nil {
+		return
+	}
+	detailByFingerprint := make(map[string]string, len(dimensions))
+	for _, dimension := range dimensions {
+		detailByFingerprint[dimension.RouteFingerprintDigest] = dimension.DetailID
+	}
+	nowMS := time.Now().UnixMilli()
+	for index, fingerprint := range routeFingerprints {
+		if detailID := detailByFingerprint[fingerprint]; detailID != "" {
+			routes[index].detailID = detailID
+			continue
+		}
+		route := routes[index]
+		groupRatioPPM := int64(0)
+		if prices != nil {
+			groupRatioPPM = prices.RatiosPPM[route.route.RouteID]
+		}
+		identity := smartRouteBackfillCatalogRoute{contract: route.contract, route: route.route}
+		dimension, ensureErr := model.EnsureRouteAnalyticsDimensionV1(ctx, model.RouteAnalyticsDimensionV1{
+			RouteFingerprintDigest: fingerprint,
+			ChannelID:              route.route.ChannelID, ChannelGeneration: route.route.ChannelGeneration,
+			UpstreamModel: route.route.UpstreamModel, Model: route.contract.CanonicalModel,
+			Endpoint: route.contract.Endpoint, CapabilityContract: routeAnalyticsCapabilityContractV1(identity),
+			PublicGroupName: route.route.Group, GroupRatioPPM: groupRatioPPM,
+			ProjectionVersion: routeAnalyticsProjectionVersionV1,
+			FirstSeenAtMS:     nowMS, LastSeenAtMS: nowMS,
+		})
+		if ensureErr != nil {
+			continue
+		}
+		detailByFingerprint[fingerprint] = dimension.DetailID
+		routes[index].detailID = dimension.DetailID
+	}
+}

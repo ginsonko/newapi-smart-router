@@ -1,0 +1,101 @@
+package service
+
+import (
+	"os"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+// Reuse the end-to-end HTTP/file/billing fixtures against an isolated real PG
+// schema so SQLite cannot mask SQL, CAS or transaction differences.
+func TestVideoDeliveryPostgres(t *testing.T) {
+	dsn := os.Getenv("GENERIC_DELIVERY_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("requires isolated local PostgreSQL")
+	}
+	require.Contains(t, dsn, "host=127.0.0.1")
+	require.Contains(t, dsn, "port=55462")
+	admin, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	adminSQL, err := admin.DB()
+	require.NoError(t, err)
+	defer adminSQL.Close()
+	schema := "delivery_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	require.NoError(t, admin.Exec("CREATE SCHEMA "+schema).Error)
+	defer admin.Exec("DROP SCHEMA " + schema + " CASCADE")
+	db, err := gorm.Open(postgres.Open(dsn+" search_path="+schema), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	defer sqlDB.Close()
+	previousDB, previousLog := model.DB, model.LOG_DB
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
+	defer func() {
+		model.DB, model.LOG_DB = previousDB, previousLog
+		common.SetDatabaseTypes(previousType, previousLogType)
+	}()
+	require.NoError(t, db.AutoMigrate(
+		&model.Task{}, &model.User{}, &model.Token{}, &model.Log{}, &model.Channel{},
+		&model.TopUp{}, &model.UserSubscription{}, &model.SystemTask{}, &model.SystemTaskLock{},
+		&model.TaskDeliverySnapshot{}, &model.TaskMediaInput{}, &model.MediaBlob{},
+		&model.TaskArtifact{}, &model.TaskBillingReceipt{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+	t.Run("archive_and_idempotent_billing", TestVideoDeliveryRecoversRelativeEndpointsAndOriginalAsset)
+	t.Run("redirect_and_failures", TestVideoDeliveryRedirectAndCredentialBoundaries)
+	t.Run("resume_without_scheduled_polling", TestVideoDeliveryResumesWithoutScheduledPolling)
+	t.Run("transaction_rollback_and_concurrent_lease", func(t *testing.T) {
+		truncate(t)
+		task := model.Task{TaskID: "pg-public", UserId: 7, Status: model.TaskStatusFinalizing}
+		require.NoError(t, db.Create(&task).Error)
+		blob := model.MediaBlob{PublicID: "pg-original-blob", UserID: 7, Status: model.MediaBlobStatusReady,
+			StorageBackend: model.MediaStorageBackendRemote, PrivateSource: "task://pg-public", MaterializeStatus: model.MediaMaterializeDisabled}
+		require.NoError(t, db.Create(&blob).Error)
+		artifact := model.TaskArtifact{PublicAssetID: "pg-original-asset", TaskRowID: task.ID, TaskPublicID: task.TaskID,
+			UserID: 7, MediaBlobID: blob.ID, Type: "video", ProviderOutputIdentity: "task.result_url"}
+		require.NoError(t, db.Create(&artifact).Error)
+		require.NoError(t, db.Exec("ALTER TABLE task_artifacts ADD CONSTRAINT reject_fixture_identity CHECK (provider_output_identity <> 'rejected-fixture')").Error)
+		source := "https://provider.test/v1/videos/pg-upstream/download"
+		_, err := model.RecoverTaskProxyArtifact(&task, source, "rejected-fixture")
+		require.Error(t, err)
+		require.NoError(t, db.First(&blob, blob.ID).Error)
+		assert.Equal(t, "task://pg-public", blob.PrivateSource)
+		assert.Equal(t, model.MediaMaterializeDisabled, blob.MaterializeStatus)
+		require.NoError(t, db.Exec("ALTER TABLE task_artifacts DROP CONSTRAINT reject_fixture_identity").Error)
+		_, err = model.RecoverTaskProxyArtifact(&task, source, "task.completed_url")
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		claims := make(chan *model.MediaBlob, 2)
+		for _, owner := range []string{"pg-worker-a", "pg-worker-b"} {
+			wg.Add(1)
+			go func(owner string) {
+				defer wg.Done()
+				<-start
+				b, err := model.ClaimNextMediaMaterialization(owner, time.Minute)
+				if err == nil {
+					claims <- b
+				}
+			}(owner)
+		}
+		close(start)
+		wg.Wait()
+		close(claims)
+		require.Len(t, claims, 1, "only one PG worker can claim the same original blob")
+		require.NoError(t, db.First(&artifact, artifact.ID).Error)
+		assert.Equal(t, "pg-original-asset", artifact.PublicAssetID)
+		assert.Equal(t, blob.ID, artifact.MediaBlobID)
+		assert.Equal(t, "task.completed_url", artifact.ProviderOutputIdentity)
+	})
+}

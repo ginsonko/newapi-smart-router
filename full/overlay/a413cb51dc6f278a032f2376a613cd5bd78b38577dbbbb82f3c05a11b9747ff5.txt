@@ -1,0 +1,41 @@
+package dto
+
+import (
+	"encoding/json"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestImageAdapterNormalization(t *testing.T) {
+	cfg := &ImageAdapterConfig{Models: map[string]ImageAdapterModel{"example": {
+		DefaultQuality: "2k", QualityOrder: []string{"1k", "2k", "4k"}, QualityAliases: map[string]string{"standard": "1k", "hd": "2k", "high": "4k"},
+		Sizes:     map[string]ImageAdapterSize{"1024x1024": {"1k", "1:1"}, "2048x2048": {"2k", "1:1"}, "2880x2880": {"4k", "1:1"}},
+		TierSizes: map[string]map[string]string{"1k": {"1:1": "1024x1024"}, "2k": {"1:1": "2048x2048"}, "4k": {"1:1": "2880x2880"}},
+	}}}
+	for _, test := range []struct{ size, quality, resolution, wantSize, wantQuality string }{
+		{"", "", "", "2048x2048", "2k"},
+		{"1024x1024", "", "", "1024x1024", "1k"},
+		{"2880x2880", "standard", "", "2880x2880", "4k"},
+		{"1024x1024", "", "4K", "2880x2880", "4k"},
+		{"2K", "", "", "2048x2048", "2k"},
+	} {
+		extra := map[string]json.RawMessage{}
+		if test.resolution != "" {
+			extra["resolution"] = json.RawMessage(`"` + test.resolution + `"`)
+		}
+		got, err := cfg.Normalize(ImageRequest{Size: test.size, Quality: test.quality, Extra: extra}, "example")
+		require.NoError(t, err)
+		require.Equal(t, test.wantSize, got.Size)
+		require.Equal(t, test.wantQuality, got.Quality)
+		require.NotContains(t, got.Extra, "resolution")
+		if test.resolution != "" {
+			require.Contains(t, extra, "resolution")
+		}
+	}
+	_, err := cfg.Normalize(ImageRequest{Size: "8192x8192"}, "example")
+	require.Error(t, err)
+	original := ImageRequest{Size: "123x456", Quality: "unknown"}
+	got, err := (*ImageAdapterConfig)(nil).Normalize(original, "old-model")
+	require.NoError(t, err)
+	require.Equal(t, original, got)
+}

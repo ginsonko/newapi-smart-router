@@ -1,0 +1,468 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/bytedance/gopkg/util/gopool"
+)
+
+const smartRouteRecentEvidenceBackfillLimit = 10_000
+
+type smartRouteBackfillCatalogRoute struct {
+	route      smartrouter.CertifiedRoute
+	contractID string
+	contract   smartrouter.RouteContract
+}
+
+type smartRouteBackfillAttempt struct {
+	attempt        int
+	routeID        string
+	channelID      int
+	group          string
+	ratioPPM       int64
+	price          smartrouter.RoutePrice
+	catalogVersion string
+	priceVersion   string
+	outcome        smartrouter.QualityOutcome
+	committed      bool
+	observationID  string
+}
+
+type smartRouteRecentEvidenceBackfillResult struct {
+	recent      []SmartRouteHistoricalEvidence
+	actualInput []SmartRouteActualInputCostObservation
+	logs        int
+	skipped     int
+}
+
+func startSmartRouteRecentEvidenceBackfill(engine *SmartRouterEngine) {
+	if engine == nil || engine.Catalogs == nil || engine.State == nil || engine.ActualInputCosts == nil {
+		return
+	}
+	gopool.Go(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		catalog, err := engine.Catalogs.RefreshIfDue(ctx)
+		if err != nil || catalog == nil {
+			logger.LogWarn(nil, "smart router recent evidence backfill skipped: catalog unavailable")
+			return
+		}
+		logs, err := model.GetRecentLogsForSmartRouteEvidence(
+			ctx, time.Now().Add(-smartRouteLeaderboardWindowHorizon).Unix(), smartRouteRecentEvidenceBackfillLimit,
+		)
+		if err != nil {
+			logger.LogWarn(nil, "smart router recent evidence backfill read failed: "+err.Error())
+			return
+		}
+		result := buildSmartRouteRecentEvidenceBackfill(*catalog, logs)
+		recentImported := 0
+		if importer, ok := engine.State.(SmartRouteRecentEvidenceImporter); ok {
+			recentImported, err = importer.ImportRecentEvidence(ctx, result.recent)
+			if err != nil {
+				logger.LogWarn(nil, "smart router recent evidence import failed: "+err.Error())
+				return
+			}
+		}
+		actualImported := 0
+		if importer, ok := engine.ActualInputCosts.(SmartRouteActualInputCostHistoricalImporter); ok {
+			actualImported = importer.ImportHistorical(result.actualInput)
+		}
+		invalidateSmartRouteHealthReport(engine)
+		logger.LogInfo(nil, fmt.Sprintf(
+			"smart router recent evidence backfill complete: logs=%d recent=%d cache=%d skipped=%d",
+			result.logs, recentImported, actualImported, result.skipped,
+		))
+	})
+}
+
+func buildSmartRouteRecentEvidenceBackfill(
+	catalog smartrouter.CertifiedRouteCatalog,
+	logs []*model.Log,
+) smartRouteRecentEvidenceBackfillResult {
+	result := smartRouteRecentEvidenceBackfillResult{logs: len(logs)}
+	routesByID, aliasesByPhysical := smartRouteBackfillCatalogIndex(catalog)
+	actualCounts := make(map[string]int)
+	// The database returns newest first. Keep that order while selecting each
+	// exact learner's newest 100 cache observations; the importers sort recent
+	// facts by their original event time before publishing.
+	for _, entry := range logs {
+		if entry == nil || strings.TrimSpace(entry.RequestId) == "" || entry.CreatedAt <= 0 {
+			result.skipped++
+			continue
+		}
+		other, ok := smartRouteBackfillOther(entry.Other)
+		if !ok {
+			result.skipped++
+			continue
+		}
+		requestPath := backfillString(other["request_path"])
+		contractID, endpoint, _, err := SmartContractIdentity(entry.ModelName, requestPath)
+		if err != nil || !isActualInputCostTextEndpoint(endpoint) {
+			result.skipped++
+			continue
+		}
+		attempts := smartRouteBackfillAttempts(other)
+		attempts = collapseSmartRouteConfirmationAttempts(attempts)
+		for _, attempt := range attempts {
+			identity, exists := routesByID[attempt.routeID]
+			if !exists || identity.contractID != contractID || identity.contract.CanonicalModel != entry.ModelName ||
+				identity.contract.Endpoint != endpoint || identity.route.ChannelID != attempt.channelID ||
+				identity.route.Group != attempt.group {
+				continue
+			}
+			if success, observed := smartRouteBackfillOutcome(attempt.outcome); observed {
+				observationID := strings.TrimSpace(attempt.observationID)
+				legacyIdentity := observationID == ""
+				if observationID == "" {
+					observationID = smartRouteCanonicalObservationID("request", entry.RequestId)
+				}
+				result.recent = appendSmartRouteBackfillPhysicalEvidence(
+					result.recent, aliasesByPhysical, identity,
+					SmartRouteHistoricalEvidence{
+						ObservationID: observationID, LegacyIdentity: legacyIdentity,
+						EventMS: entry.CreatedAt * 1_000, OutcomeObserved: true, Success: success,
+					},
+					fmt.Sprintf("history:%s:%s:%d", entry.RequestId, identity.route.RouteID, attempt.attempt),
+				)
+			}
+		}
+
+		var finalRoute smartRouteBackfillCatalogRoute
+		finalFound := false
+		for index := len(attempts) - 1; index >= 0; index-- {
+			attempt := attempts[index]
+			identity, exists := routesByID[attempt.routeID]
+			if !exists || identity.contractID != contractID || identity.contract.CanonicalModel != entry.ModelName ||
+				identity.contract.Endpoint != endpoint || identity.route.ChannelID != attempt.channelID || identity.route.Group != attempt.group {
+				continue
+			}
+			if attempt.outcome == smartrouter.OutcomeSuccess || (entry.Type == model.LogTypeConsume && attempt.committed) {
+				finalRoute, finalFound = identity, true
+				break
+			}
+		}
+		if len(attempts) == 0 {
+			// A fixed/direct log has no exact route receipt. Prefer an explicit
+			// generation proof when present, but older producers did not persist
+			// it. For those bounded one-hour logs, accept only a unique exact
+			// contract/model/endpoint/channel/group match. This evidence remains
+			// metric-only and cannot recover or quarantine route health.
+			loggedGeneration := smartRouteBackfillChannelGeneration(other)
+			if identity, unique := smartRouteBackfillUniqueRoute(
+				routesByID, contractID, entry.ModelName, endpoint, entry.ChannelId, entry.Group,
+			); unique && (loggedGeneration == "" || loggedGeneration == identity.route.ChannelGeneration) {
+				finalRoute, finalFound = identity, entry.Type == model.LogTypeConsume
+				if entry.Type == model.LogTypeConsume {
+					result.recent = appendSmartRouteBackfillPhysicalEvidence(
+						result.recent, aliasesByPhysical, identity,
+						SmartRouteHistoricalEvidence{
+							ObservationID:        smartRouteCanonicalObservationID("request", entry.RequestId),
+							LegacyObservationIDs: []string{entry.RequestId}, EventMS: entry.CreatedAt * 1_000,
+							OutcomeObserved: true, Success: true,
+						},
+						"history:"+entry.RequestId+":fixed",
+					)
+				} else if success, observed := smartRouteBackfillHTTPOutcome(other); observed {
+					result.recent = appendSmartRouteBackfillPhysicalEvidence(
+						result.recent, aliasesByPhysical, identity,
+						SmartRouteHistoricalEvidence{
+							ObservationID:        smartRouteCanonicalObservationID("request", entry.RequestId),
+							LegacyObservationIDs: []string{entry.RequestId}, EventMS: entry.CreatedAt * 1_000,
+							OutcomeObserved: true, Success: success,
+						},
+						"history:"+entry.RequestId+":fixed",
+					)
+				}
+			}
+		}
+		if !finalFound || entry.Type != model.LogTypeConsume {
+			continue
+		}
+		if frtMS, exists := backfillInt64(other["frt"]); exists && frtMS >= 0 {
+			observationID := smartRouteCanonicalObservationID("request", entry.RequestId)
+			legacyIdentity := len(attempts) > 0
+			for index := len(attempts) - 1; index >= 0; index-- {
+				if strings.TrimSpace(attempts[index].observationID) != "" {
+					observationID = strings.TrimSpace(attempts[index].observationID)
+					legacyIdentity = false
+					break
+				}
+			}
+			result.recent = appendSmartRouteBackfillPhysicalEvidence(
+				result.recent, aliasesByPhysical, finalRoute,
+				SmartRouteHistoricalEvidence{
+					ObservationID: observationID, LegacyObservationIDs: []string{entry.RequestId},
+					LegacyIdentity: legacyIdentity, EventMS: entry.CreatedAt * 1_000,
+					TTFTObserved: true, TTFTMS: frtMS,
+				},
+				"history:"+entry.RequestId+":ttft",
+			)
+		}
+		if observation, reliable := smartRouteBackfillActualInput(entry, other, finalRoute, endpoint, len(attempts) > 0); reliable &&
+			actualCounts[observation.Key] < smartRouteLeaderboardWindowSize {
+			actualCounts[observation.Key]++
+			result.actualInput = append(result.actualInput, observation)
+		}
+	}
+	return result
+}
+
+func smartRouteBackfillCatalogIndex(catalog smartrouter.CertifiedRouteCatalog) (
+	map[string]smartRouteBackfillCatalogRoute,
+	map[string][]smartRouteBackfillCatalogRoute,
+) {
+	byID := make(map[string]smartRouteBackfillCatalogRoute)
+	aliases := make(map[string][]smartRouteBackfillCatalogRoute)
+	for contractID, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				identity := smartRouteBackfillCatalogRoute{route: route, contractID: contractID, contract: contract.Contract}
+				byID[route.RouteID] = identity
+				key := smartRouteBackfillPhysicalKey(contractID, route)
+				aliases[key] = append(aliases[key], identity)
+			}
+		}
+	}
+	return byID, aliases
+}
+
+func smartRouteBackfillPhysicalKey(contractID string, route smartrouter.CertifiedRoute) string {
+	return strings.Join([]string{
+		contractID, strconv.Itoa(route.ChannelID), route.ChannelGeneration, route.UpstreamModel,
+	}, "\x00")
+}
+
+func appendSmartRouteBackfillPhysicalEvidence(
+	target []SmartRouteHistoricalEvidence,
+	aliases map[string][]smartRouteBackfillCatalogRoute,
+	identity smartRouteBackfillCatalogRoute,
+	evidence SmartRouteHistoricalEvidence,
+	legacyAliasPrefix string,
+) []SmartRouteHistoricalEvidence {
+	routes := aliases[smartRouteBackfillPhysicalKey(identity.contractID, identity.route)]
+	if len(routes) == 0 {
+		routes = []smartRouteBackfillCatalogRoute{identity}
+	}
+	for _, alias := range routes {
+		copyEvidence := evidence
+		copyEvidence.RouteID = alias.route.RouteID
+		copyEvidence.StableFallback = alias.route.StableFallback
+		if strings.TrimSpace(legacyAliasPrefix) != "" {
+			copyEvidence.LegacyObservationIDs = append(
+				append([]string(nil), copyEvidence.LegacyObservationIDs...),
+				legacyAliasPrefix+":"+alias.route.RouteID,
+			)
+		}
+		target = append(target, copyEvidence)
+	}
+	return target
+}
+
+func smartRouteBackfillUniqueRoute(
+	routes map[string]smartRouteBackfillCatalogRoute,
+	contractID string,
+	modelName string,
+	endpoint string,
+	channelID int,
+	group string,
+) (smartRouteBackfillCatalogRoute, bool) {
+	var found smartRouteBackfillCatalogRoute
+	count := 0
+	for _, identity := range routes {
+		if identity.contractID != contractID || identity.contract.CanonicalModel != modelName ||
+			identity.contract.Endpoint != endpoint || identity.route.ChannelID != channelID || identity.route.Group != group {
+			continue
+		}
+		found = identity
+		count++
+		if count > 1 {
+			return smartRouteBackfillCatalogRoute{}, false
+		}
+	}
+	return found, count == 1
+}
+
+func smartRouteBackfillOther(raw string) (map[string]any, bool) {
+	var other map[string]any
+	if err := common.UnmarshalJsonStr(raw, &other); err != nil || other == nil {
+		return nil, false
+	}
+	return other, true
+}
+
+func smartRouteBackfillChannelGeneration(other map[string]any) string {
+	if other == nil {
+		return ""
+	}
+	if generation := backfillString(other["channel_generation"]); generation != "" {
+		return generation
+	}
+	adminInfo, _ := other["admin_info"].(map[string]any)
+	return backfillString(adminInfo["channel_generation"])
+}
+
+func smartRouteBackfillAttempts(other map[string]any) []smartRouteBackfillAttempt {
+	adminInfo, _ := other["admin_info"].(map[string]any)
+	rawAttempts, _ := adminInfo["smart_router_attempts"].([]any)
+	result := make([]smartRouteBackfillAttempt, 0, len(rawAttempts))
+	for _, raw := range rawAttempts {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		attempt, _ := backfillInt64(item["attempt"])
+		channelID, _ := backfillInt64(item["channel_id"])
+		ratioPPM, _ := backfillInt64(item["ratio_ppm"])
+		committed, _ := item["committed"].(bool)
+		price := smartrouter.RoutePrice{}
+		if rawPrice, exists := item["price"]; exists {
+			if encoded, err := common.Marshal(rawPrice); err == nil {
+				_ = common.Unmarshal(encoded, &price)
+			}
+		}
+		result = append(result, smartRouteBackfillAttempt{
+			attempt: int(attempt), routeID: backfillString(item["route_id"]), channelID: int(channelID),
+			group: backfillString(item["group"]), ratioPPM: ratioPPM, price: price,
+			catalogVersion: backfillString(item["catalog_version"]), priceVersion: backfillString(item["price_version"]),
+			outcome:   smartrouter.QualityOutcome(backfillString(item["outcome"])),
+			committed: committed, observationID: backfillString(item["observation_id"]),
+		})
+	}
+	return result
+}
+
+func collapseSmartRouteConfirmationAttempts(attempts []smartRouteBackfillAttempt) []smartRouteBackfillAttempt {
+	result := make([]smartRouteBackfillAttempt, 0, len(attempts))
+	for _, attempt := range attempts {
+		if len(result) > 0 && result[len(result)-1].routeID != "" && result[len(result)-1].routeID == attempt.routeID {
+			result[len(result)-1] = attempt
+			continue
+		}
+		result = append(result, attempt)
+	}
+	return result
+}
+
+func smartRouteBackfillOutcome(outcome smartrouter.QualityOutcome) (bool, bool) {
+	switch outcome {
+	case smartrouter.OutcomeSuccess:
+		return true, true
+	case smartrouter.OutcomeInfrastructure, smartrouter.OutcomeCredential, smartrouter.OutcomeCapacityLimited:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func smartRouteBackfillHTTPOutcome(other map[string]any) (bool, bool) {
+	status, exists := backfillInt64(other["status_code"])
+	if !exists {
+		return false, false
+	}
+	if status >= 200 && status < 400 {
+		return true, true
+	}
+	if status == 401 || status == 403 || status == 408 || status == 409 || status == 429 || status >= 500 {
+		return false, true
+	}
+	return false, false
+}
+
+func smartRouteBackfillActualInput(
+	entry *model.Log,
+	other map[string]any,
+	identity smartRouteBackfillCatalogRoute,
+	endpoint string,
+	smartRoute bool,
+) (SmartRouteActualInputCostObservation, bool) {
+	read, readPresent := backfillInt64(other["cache_tokens"])
+	create5m, create5mPresent := backfillInt64(other["cache_creation_tokens_5m"])
+	create1h, create1hPresent := backfillInt64(other["cache_creation_tokens_1h"])
+	creation, creationPresent := backfillInt64(other["cache_creation_tokens"])
+	if !create5mPresent && !create1hPresent && creationPresent {
+		create5m = creation
+	}
+	if read < 0 || create5m < 0 || create1h < 0 {
+		return SmartRouteActualInputCostObservation{}, false
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: endpoint}).UsageSemantic()
+	regular := int64(entry.PromptTokens)
+	total := int64(0)
+	if usageSemantic == "anthropic" {
+		if regular < 0 || (!readPresent && !creationPresent && !create5mPresent && !create1hPresent) {
+			return SmartRouteActualInputCostObservation{}, false
+		}
+		total = regular + read + create5m + create1h
+	} else {
+		explicitTotal, totalPresent := backfillInt64(other["input_tokens_total"])
+		if totalPresent && explicitTotal > 0 {
+			total = explicitTotal
+		} else if readPresent || creationPresent || create5mPresent || create1hPresent {
+			total = int64(entry.PromptTokens)
+		} else if entry.PromptTokens > 0 {
+			// Older OpenAI-compatible adapters persisted the concrete request
+			// input count only in Log.PromptTokens. Treat it as an uncached mix
+			// instead of dropping a valid request-time prediction.
+			total = int64(entry.PromptTokens)
+		} else {
+			return SmartRouteActualInputCostObservation{}, false
+		}
+		regular = total - read - create5m - create1h
+	}
+	if total <= 0 || regular < 0 || regular+read+create5m+create1h != total {
+		return SmartRouteActualInputCostObservation{}, false
+	}
+	key := smartrouter.ActualInputCostKey(
+		identity.route.CacheNamespaceIdentity(), identity.route.UpstreamModel,
+		entry.ModelName, endpoint, usageSemantic,
+	)
+	poolKey := smartrouter.ActualInputCostPoolKey(identity.route.UpstreamModel, entry.ModelName, endpoint, usageSemantic)
+	observationID := smartRouteCanonicalObservationID("actual-input", entry.RequestId, key)
+	legacyIDs := []string{common.Sha1([]byte("smart-route-history\x00" + entry.RequestId + "\x00" + key))}
+	if smartRoute {
+		legacyIDs = append(legacyIDs, entry.RequestId+":"+identity.route.RouteID)
+	} else {
+		legacyIDs = append(legacyIDs, entry.RequestId+":external:"+common.Sha1([]byte(key)))
+	}
+	return SmartRouteActualInputCostObservation{
+		ObservationID: observationID, LegacyObservationIDs: legacyIDs,
+		EventMS: entry.CreatedAt * 1_000, Key: key, PoolKey: poolKey,
+		RegularInputTokens: regular, CacheReadTokens: read, CacheCreation5mTokens: create5m,
+		CacheCreation1hTokens: create1h, TotalInputTokens: total, Reliable: true,
+	}, true
+}
+
+func backfillString(value any) string {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	return ""
+}
+
+func backfillInt64(value any) (int64, bool) {
+	switch current := value.(type) {
+	case json.Number:
+		if integer, err := current.Int64(); err == nil {
+			return integer, true
+		}
+		if decimal, err := current.Float64(); err == nil {
+			return int64(decimal), true
+		}
+	case float64:
+		return int64(current), true
+	case int:
+		return int64(current), true
+	case int64:
+		return current, true
+	}
+	return 0, false
+}

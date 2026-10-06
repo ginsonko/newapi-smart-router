@@ -1,0 +1,87 @@
+package controller
+
+import (
+	"errors"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	setting "github.com/QuantumNous/new-api/setting"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestModelCapabilityCatalogDegradesAdvisoryWhenBundleUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	response, _, err := buildPublicModelCapabilityCatalogFromSources(
+		context,
+		"",
+		[]string{"video"},
+		[]model.CapabilityCatalogModel{{Group: "video", Model: "seedance-2.5-720p"}},
+		model.ModelCapabilityBundle{},
+		errors.New("private database detail"),
+	)
+	require.NoError(t, err)
+	assert.False(t, response.CapabilityDataAvailable)
+	assert.NotEmpty(t, response.Advisory)
+	require.Len(t, response.Models, 1)
+	assert.Equal(t, "seedance-2.5-720p", response.Models[0].Model)
+	assert.Equal(t, "unavailable", response.Models[0].ContractStatus)
+	assert.Nil(t, response.Models[0].Capabilities)
+	assert.False(t, response.Models[0].AutomaticEligible)
+	assert.NotContains(t, response.Advisory, "private database detail")
+}
+
+func TestSmartCapabilityScopeMatchesModelScopeAndUserPermissions(t *testing.T) {
+	oldGroups := setting.UserUsableGroups2JSONString()
+	oldAuto := setting.AutoGroups2JsonString()
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"legacy":"legacy","video":"video","blocked":"blocked"}`))
+	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["legacy"]`))
+	t.Cleanup(func() {
+		_ = setting.UpdateUserUsableGroupsByJSONString(oldGroups)
+		_ = setting.UpdateAutoGroupsByJsonString(oldAuto)
+	})
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyTokenGroup, "auto")
+	policy := smartrouter.NormalizePolicy(smartrouter.Policy{Version: smartrouter.PolicyVersion, Enabled: true, ManualGroupOrder: []string{"video", "blocked"}, ExcludedGroups: []string{"blocked"}})
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, policy)
+	scope, err := getModelListGroups(c)
+	require.NoError(t, err)
+	require.Equal(t, []string{"video"}, scope.ownerGroups)
+	groups, err := capabilityRequestGroups(c)
+	require.NoError(t, err)
+	require.Equal(t, scope.ownerGroups, groups)
+	common.SetContextKey(c, constant.ContextKeyTokenGroup, "legacy")
+	groups, err = capabilityRequestGroups(c)
+	require.NoError(t, err)
+	require.Equal(t, []string{"legacy"}, groups, "a fixed-group key never expands into other groups")
+}
+func TestCapabilityScopeResolvesUserGroupWhenTokenAuthHasNotPopulatedIt(t *testing.T) {
+	oldDB := model.DB
+	oldRedis, oldMaster, oldPath := common.RedisEnabled, common.IsMasterNode, common.SQLitePath
+	common.RedisEnabled, common.IsMasterNode, common.SQLitePath = false, false, ":memory:"
+	t.Setenv("SQL_DSN", "local")
+	require.NoError(t, model.InitDB())
+	db := model.DB
+	t.Cleanup(func() {
+		sqlDB, _ := db.DB()
+		_ = sqlDB.Close()
+		model.DB = oldDB
+		common.RedisEnabled = oldRedis
+		common.IsMasterNode = oldMaster
+		common.SQLitePath = oldPath
+	})
+	require.NoError(t, db.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, "group" TEXT, deleted_at datetime)`).Error)
+	require.NoError(t, db.Exec(`INSERT INTO users (id,"group") VALUES (101,'tenant-group')`).Error)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("id", 101)
+	groups, err := capabilityRequestGroups(c)
+	require.NoError(t, err)
+	require.Equal(t, []string{"tenant-group"}, groups)
+}

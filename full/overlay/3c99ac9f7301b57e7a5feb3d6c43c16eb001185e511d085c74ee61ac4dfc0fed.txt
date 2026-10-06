@@ -1,0 +1,79 @@
+package media
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestUploadPermitIsReusedAndMaterializationHasAnIndependentGate(t *testing.T) {
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.UploadConnectionHardGlobal = 1
+	nextSetting.UploadConnectionHardPerUser = 1
+	nextSetting.RemoteMaterializeWorkers = 1
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	uploadConnectionGate = fairMediaGate{}
+	materializeGate = adaptiveGate{}
+	t.Cleanup(func() {
+		uploadConnectionGate = fairMediaGate{}
+		materializeGate = adaptiveGate{}
+	})
+
+	ctx, releaseUpload, _, err := AcquireUpload(context.Background(), 17)
+	require.NoError(t, err)
+	releaseNested, err := acquireUploadForSave(ctx, 17)
+	require.NoError(t, err)
+	releaseNested()
+
+	uploadConnectionGate.mu.Lock()
+	assert.Equal(t, 1, uploadConnectionGate.active, "SaveUpload must reuse the controller permit")
+	uploadConnectionGate.mu.Unlock()
+	require.NoError(t, materializeGate.acquire(context.Background(), 1))
+	materializeGate.mu.Lock()
+	assert.Equal(t, 1, materializeGate.active, "background transfers must not consume upload slots")
+	materializeGate.mu.Unlock()
+
+	materializeGate.release()
+	releaseUpload()
+	uploadConnectionGate.mu.Lock()
+	assert.Zero(t, uploadConnectionGate.active)
+	uploadConnectionGate.mu.Unlock()
+}
+
+func TestCleanupTemporaryFilesKeepsFreshSpoolsAndRemovesCrashLeftovers(t *testing.T) {
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	directory, err := RequestSpoolDirectory()
+	require.NoError(t, err)
+	oldPath := filepath.Join(directory, "request-body-old")
+	freshPath := filepath.Join(directory, "request-body-fresh")
+	require.NoError(t, os.WriteFile(oldPath, []byte("old"), 0o600))
+	require.NoError(t, os.WriteFile(freshPath, []byte("fresh"), 0o600))
+	oldTime := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(oldPath, oldTime, oldTime))
+
+	require.NoError(t, CleanupTemporaryFiles(time.Hour))
+	_, err = os.Stat(oldPath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(freshPath)
+	assert.NoError(t, err)
+}
+
+func TestNormalizeMediaFilenameAddsKnownExtensionOnlyWhenMissing(t *testing.T) {
+	assert.Equal(t, "opaque.png", normalizeMediaFilename("opaque", "image/png", "image"))
+	assert.Equal(t, "already.webp", normalizeMediaFilename("already.webp", "image/png", "image"))
+	assert.Equal(t, "result.mp4", normalizeMediaFilename("", "video/mp4", "video"))
+}

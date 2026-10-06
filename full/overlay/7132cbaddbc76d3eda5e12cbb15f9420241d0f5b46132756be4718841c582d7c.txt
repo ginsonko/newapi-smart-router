@@ -1,0 +1,804 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useQueries, useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import {
+  Activity,
+  ArrowLeft,
+  CircleAlert,
+  Info,
+  RefreshCw,
+  Stethoscope,
+} from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { getApiKeys } from '@/features/keys/api'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
+
+import {
+  getAllSmartRouterStatusModels,
+  getGlobalSmartRouterLeaderboardModels,
+  getGlobalSmartRouterLeaderboardStatus,
+  getSmartRouterStatus,
+} from './api'
+import {
+  buildUserModelViews,
+  canonicalHealthState,
+  compareSmartRouterEndpoints,
+  formatSmartRouterTimestamp,
+  matchesHealthFilter,
+  sortUserModelViews,
+  type SmartRouterHealthFilter,
+  type SmartRouterContractView,
+  type SmartRouterModelView,
+  type SmartRouterStatusSort,
+} from './health-view-model'
+import { ModelStatusSection } from './model-status-section'
+import {
+  mergeIndexedContractDetails,
+  shouldUseLegacySmartRouterStatus,
+} from './status-query'
+import { StatusSummary, type SmartRouterUserSummary } from './status-summary'
+import { StatusToolbar } from './status-toolbar'
+import type {
+  SmartRouterPrimaryState,
+  SmartRouterStatusItem,
+  SmartRouterStatusModelIndexItem,
+  SmartRouterStatusModelsResponse,
+} from './types'
+
+const STATUS_QUERY_KEY = ['smart-router-status'] as const
+const STATUS_MODEL_PAGE_SIZE = 25
+
+export type SmartRouterStatusPageProps = {
+  /** A key owned by the signed-in user. The backend checks ownership again. */
+  tokenId?: number
+  model?: string
+  endpoint?: string
+  compact?: boolean
+  onTokenChange?: (tokenId: number) => void
+}
+
+type ModelIndexMeta = {
+  updatedAtMS?: number
+  catalogVersion?: string
+  priceVersion?: string
+}
+
+function normalizeModelIndex(data?: SmartRouterStatusModelsResponse['data']) {
+  if (Array.isArray(data)) {
+    return { items: data, meta: {} as ModelIndexMeta }
+  }
+  return {
+    items: data?.items ?? [],
+    meta: {
+      updatedAtMS: data?.updated_at_ms,
+      catalogVersion: data?.catalog_version,
+      priceVersion: data?.price_version,
+    } satisfies ModelIndexMeta,
+  }
+}
+
+function indexStateRank(state: SmartRouterPrimaryState) {
+  if (state === 'needs_review' || state === 'telemetry_unavailable') return 2
+  if (state === 'unavailable' || state === 'probing') return 0
+  if (state === 'recovering' || state === 'degraded_usable') return 3
+  if (state === 'healthy') return 4
+  return 5
+}
+
+function buildIndexModelViews(index: SmartRouterStatusModelIndexItem[]) {
+  const byModel = new Map<string, Map<string, SmartRouterContractView>>()
+  for (const [entryIndex, entry] of index.entries()) {
+    let contracts = entry.contracts
+    if (!contracts || contracts.length === 0) {
+      const endpoints =
+        entry.endpoints && entry.endpoints.length > 0
+          ? entry.endpoints
+          : [entry.endpoint || '']
+      contracts = endpoints.map((contractEndpoint) => ({
+        endpoint: contractEndpoint,
+        groups: entry.groups,
+        primary_state: entry.primary_state,
+        preferred_group: entry.preferred_group,
+        preferred_ratio_ppm: entry.preferred_ratio_ppm,
+        cheaper_unavailable: entry.cheaper_unavailable,
+        requires_attention: entry.requires_attention,
+        last_observed_at_ms: entry.last_observed_at_ms,
+      }))
+    }
+
+    const views: SmartRouterContractView[] = contracts.map(
+      (contract, contractIndex) => {
+        const contractId = contract.contract_id ?? entry.contract_id
+        const indexedEligibleRatio = entry.lowest_eligible_known
+          ? entry.lowest_eligible_ratio_ppm
+          : undefined
+        const hasPreference = Boolean(contract.preferred_group)
+        const preferredRatio = hasPreference
+          ? (contract.preferred_ratio_ppm ?? indexedEligibleRatio)
+          : undefined
+        let dispatchEligibility: NonNullable<
+          SmartRouterStatusItem['dispatch_eligibility']
+        > = 'ineligible'
+        if (entry.has_available_candidate) {
+          dispatchEligibility =
+            entry.has_conditional_candidate &&
+            (entry.available_groups ?? 0) === 0
+              ? 'safe_last_resort'
+              : 'eligible'
+        }
+        const summaryItem: SmartRouterStatusItem = {
+          model: entry.model,
+          endpoint: contract.endpoint,
+          group: contract.preferred_group || '',
+          primary_state:
+            contract.primary_state || entry.primary_state || 'pending_sample',
+          dispatch_eligibility: dispatchEligibility,
+          effective_ratio_ppm: preferredRatio,
+          price_known:
+            preferredRatio !== undefined &&
+            entry.lowest_eligible_known !== false,
+          selected: hasPreference,
+          last_observed_at_ms: contract.last_observed_at_ms,
+        }
+        const cheaperCount =
+          contract.cheaper_unavailable ?? entry.cheaper_unavailable ?? 0
+        const cheaperUnavailable = Array.from(
+          { length: cheaperCount },
+          (_, index) => ({
+            model: entry.model,
+            endpoint: contract.endpoint,
+            group: `pending-${index}`,
+            primary_state: 'unavailable' as const,
+            cheaper_than_preference: true,
+          })
+        )
+        const state = canonicalHealthState(summaryItem)
+        let decisionRank = state === 'pending_sample' ? 5 : 0
+        if (summaryItem.selected) {
+          decisionRank = cheaperCount > 0 ? 1 : indexStateRank(state)
+        } else if (entry.has_available_candidate) {
+          decisionRank =
+            entry.has_conditional_candidate &&
+            (entry.available_groups ?? 0) === 0
+              ? 3
+              : 4
+        }
+        return {
+          id:
+            contractId ||
+            `${entry.model}\u0000${contract.endpoint}\u0000${entryIndex}:${contractIndex}`,
+          contractId,
+          model: entry.model,
+          endpoint: contract.endpoint,
+          items: [summaryItem],
+          preference: summaryItem.selected ? summaryItem : undefined,
+          cheaperUnavailable,
+          decisionRank,
+          latestActivityAt: contract.last_observed_at_ms ?? 0,
+          minimumRatio:
+            (entry.lowest_ratio_known ? entry.lowest_ratio_ppm : undefined) ??
+            preferredRatio ??
+            Number.MAX_SAFE_INTEGER,
+          visibleGroups: contract.groups ?? entry.groups ?? [],
+        }
+      }
+    )
+    let modelContracts = byModel.get(entry.model)
+    if (!modelContracts) {
+      modelContracts = new Map()
+      byModel.set(entry.model, modelContracts)
+    }
+    for (const view of views) modelContracts.set(view.id, view)
+  }
+
+  return [...byModel.entries()].map(([model, contractMap]) => {
+    const contracts = [...contractMap.values()].sort(
+      (left, right) =>
+        compareSmartRouterEndpoints(left.endpoint, right.endpoint) ||
+        left.id.localeCompare(right.id)
+    )
+    return {
+      model,
+      contracts,
+      decisionRank: Math.min(
+        ...contracts.map((contract) => contract.decisionRank)
+      ),
+      pendingOnly: contracts.every((contract) =>
+        contract.items.every(
+          (item) => canonicalHealthState(item) === 'pending_sample'
+        )
+      ),
+      latestActivityAt: Math.max(
+        ...contracts.map((contract) => contract.latestActivityAt),
+        0
+      ),
+      minimumRatio: Math.min(
+        ...contracts.map((contract) => contract.minimumRatio)
+      ),
+    } satisfies SmartRouterModelView
+  })
+}
+
+function modelMatchesQuery(model: SmartRouterModelView, query: string) {
+  const normalized = query.trim().toLowerCase()
+  if (!normalized) return true
+  if (model.model.toLowerCase().includes(normalized)) return true
+  return model.contracts.some(
+    (contract) =>
+      contract.endpoint.toLowerCase().includes(normalized) ||
+      contract.items.some((item) =>
+        item.group.toLowerCase().includes(normalized)
+      )
+  )
+}
+
+function deriveSummary(models: SmartRouterModelView[]): SmartRouterUserSummary {
+  const contracts = models.flatMap((model) => model.contracts)
+  const items = contracts.flatMap((contract) => contract.items)
+  return {
+    models: models.length,
+    contractsWithPreference: contracts.filter((contract) => contract.preference)
+      .length,
+    contractsAboveLowestPrice: contracts.filter(
+      (contract) => contract.cheaperUnavailable.length > 0
+    ).length,
+    healthy: items.filter((item) => canonicalHealthState(item) === 'healthy')
+      .length,
+    recovering: items.filter((item) => {
+      const state = canonicalHealthState(item)
+      return state === 'unavailable'
+    }).length,
+    needsAttention: items.filter((item) => {
+      const state = canonicalHealthState(item)
+      return state === 'needs_review' || state === 'telemetry_unavailable'
+    }).length,
+    pendingSample: items.filter((item) => {
+      const state = canonicalHealthState(item)
+      return state === 'pending_sample' || state === 'unknown'
+    }).length,
+  }
+}
+
+function IndexedModelStatusSection(props: {
+  scope: 'global' | 'key'
+  tokenId?: number
+  model: SmartRouterModelView
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const userGroup = useAuthStore((state) => state.auth.user?.group ?? '')
+  const detailQueries = useQueries({
+    queries: props.model.contracts.map((contract) => ({
+      queryKey: [
+        ...STATUS_QUERY_KEY,
+        userId,
+        userGroup,
+        props.scope,
+        props.tokenId ?? null,
+        props.model.model,
+        contract.id,
+      ],
+      queryFn: () =>
+        props.scope === 'global'
+          ? getGlobalSmartRouterLeaderboardStatus({
+              model: props.model.model,
+              endpoint: contract.endpoint,
+            })
+          : getSmartRouterStatus({
+              tokenId: props.tokenId,
+              model: props.model.model,
+              endpoint: contract.endpoint,
+            }),
+      enabled:
+        props.open &&
+        (props.scope === 'global' || props.tokenId !== undefined),
+      staleTime: 10_000,
+      refetchInterval: props.open ? 15_000 : false,
+      refetchIntervalInBackground: false,
+      retry: 1,
+    })),
+  })
+  const resolvedModel = mergeIndexedContractDetails(
+    props.model,
+    detailQueries.map((query, index) => ({
+      requestedContractId: props.model.contracts[index]?.contractId,
+      requestedEndpoint: props.model.contracts[index]?.endpoint ?? '',
+      data: query.data?.data,
+      pending: props.open && query.isPending,
+      error: props.open && query.isError,
+    }))
+  )
+  const strategy = detailQueries.find((query) => query.data?.data?.strategy)
+    ?.data?.data?.strategy
+  const maxRatioPPM = detailQueries.find(
+    (query) =>
+      query.data?.data?.effective_policy?.max_effective_ratio_ppm !== undefined
+  )?.data?.data?.effective_policy?.max_effective_ratio_ppm
+
+  return (
+    <ModelStatusSection
+      model={resolvedModel}
+      strategy={strategy}
+      maxRatioPPM={maxRatioPPM}
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+    />
+  )
+}
+
+export function SmartRouterStatusPage(props: SmartRouterStatusPageProps) {
+  const { t } = useTranslation()
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const userGroup = useAuthStore((state) => state.auth.user?.group ?? '')
+  const isRoot = useAuthStore(
+    (state) => state.auth.user?.role === ROLE.SUPER_ADMIN
+  )
+  const [search, setSearch] = useState(props.model ?? '')
+  const [status, setStatus] = useState<SmartRouterHealthFilter>('all')
+  const [group, setGroup] = useState('')
+  const [endpoint, setEndpoint] = useState(props.endpoint ?? '')
+  const [sort, setSort] = useState<SmartRouterStatusSort>('decision')
+  const [scope, setScope] = useState<'global' | 'key'>(
+    props.tokenId === undefined ? 'global' : 'key'
+  )
+  const [openModels, setOpenModels] = useState<Record<string, boolean>>({})
+  const filterKey = `${scope}\u0000${props.tokenId ?? ''}\u0000${search}\u0000${status}\u0000${group}\u0000${endpoint}\u0000${sort}`
+  const [visibleState, setVisibleState] = useState({
+    filterKey,
+    limit: STATUS_MODEL_PAGE_SIZE,
+  })
+  const visibleLimit =
+    visibleState.filterKey === filterKey
+      ? visibleState.limit
+      : STATUS_MODEL_PAGE_SIZE
+
+  const keysQuery = useQuery({
+    queryKey: ['smart-router-user-keys', userId],
+    queryFn: () => getApiKeys({ p: 1, size: 100 }),
+    staleTime: 30_000,
+    select: (response) =>
+      (response.data?.items ?? []).filter(
+        (key) => key.group === 'auto' && Boolean(key.routing_policy?.trim())
+      ),
+  })
+  const indexQuery = useQuery({
+    queryKey: [
+      'smart-router-status-models',
+      userId,
+      userGroup,
+      scope,
+      scope === 'key' ? (props.tokenId ?? null) : null,
+    ],
+    queryFn: () => {
+      if (scope === 'global') {
+        return getGlobalSmartRouterLeaderboardModels()
+      }
+      if (props.tokenId === undefined) {
+        throw new Error('A token is required for smart-routing status')
+      }
+      return getAllSmartRouterStatusModels(props.tokenId)
+    },
+    enabled: scope === 'global' || props.tokenId !== undefined,
+    staleTime: 10_000,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+    retry: 1,
+  })
+  const legacyModel = props.model?.trim()
+  const legacyFallbackEnabled = shouldUseLegacySmartRouterStatus({
+    tokenId: scope === 'key' ? props.tokenId : undefined,
+    model: legacyModel,
+    modelIndexFailed: scope === 'key' && indexQuery.isError,
+  })
+  // V4.2 compatibility: only call the legacy all-items endpoint when the
+  // V4.3 model index does not exist and the URL identifies one model.
+  const legacyQuery = useQuery({
+    queryKey: [
+      ...STATUS_QUERY_KEY,
+      'legacy',
+      userId,
+      userGroup,
+      props.tokenId ?? null,
+      props.model ?? '',
+      props.endpoint ?? '',
+    ],
+    queryFn: () => {
+      if (!legacyModel) {
+        throw new Error('A model is required for legacy smart-routing status')
+      }
+      return getSmartRouterStatus({
+        tokenId: props.tokenId,
+        model: legacyModel,
+        endpoint: props.endpoint,
+      })
+    },
+    enabled: legacyFallbackEnabled,
+    staleTime: 10_000,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+    retry: 1,
+  })
+
+  const indexData = useMemo(
+    () => normalizeModelIndex(indexQuery.data?.data),
+    [indexQuery.data?.data]
+  )
+  const usesModelIndex = indexQuery.isSuccess
+  const allModels = useMemo(
+    () =>
+      usesModelIndex
+        ? buildIndexModelViews(indexData.items)
+        : buildUserModelViews(legacyQuery.data?.data?.items ?? []),
+    [indexData.items, legacyQuery.data?.data?.items, usesModelIndex]
+  )
+  const summary = useMemo(() => deriveSummary(allModels), [allModels])
+  const groups = useMemo(
+    () =>
+      [
+        ...new Set(
+          usesModelIndex
+            ? indexData.items.flatMap((item) => [
+                ...(item.groups ?? []),
+                ...(item.preferred_group ? [item.preferred_group] : []),
+                ...(item.contracts ?? []).flatMap((contract) => [
+                  ...(contract.groups ?? []),
+                  ...(contract.preferred_group
+                    ? [contract.preferred_group]
+                    : []),
+                ]),
+              ])
+            : (legacyQuery.data?.data?.items ?? []).map((item) => item.group)
+        ),
+      ].sort((left, right) => left.localeCompare(right)),
+    [indexData.items, legacyQuery.data?.data?.items, usesModelIndex]
+  )
+  const endpoints = useMemo(
+    () =>
+      [
+        ...new Set(
+          allModels
+            .flatMap((model) =>
+              model.contracts.map((contract) => contract.endpoint)
+            )
+            .filter(Boolean)
+        ),
+      ].sort(compareSmartRouterEndpoints),
+    [allModels]
+  )
+  const filteredModels = useMemo(() => {
+    const models = allModels
+      .filter((model) => modelMatchesQuery(model, search))
+      .filter((model) =>
+        endpoint
+          ? model.contracts.some((contract) => contract.endpoint === endpoint)
+          : true
+      )
+      .filter((model) =>
+        group
+          ? model.contracts.some(
+              (contract) =>
+                (contract.visibleGroups ?? []).includes(group) ||
+                contract.items.some((item) => item.group === group)
+            )
+          : true
+      )
+      .filter((model) =>
+        status === 'all'
+          ? true
+          : model.contracts.some((contract) =>
+              contract.items.some((item) => matchesHealthFilter(item, status))
+            )
+      )
+      .map((model) => ({
+        ...model,
+        contracts: endpoint
+          ? model.contracts.filter((contract) => contract.endpoint === endpoint)
+          : model.contracts,
+      }))
+    return sortUserModelViews(models, sort)
+  }, [allModels, endpoint, group, search, sort, status])
+  const visibleModels = filteredModels.slice(0, visibleLimit)
+  const selectedKey = keysQuery.data?.find((key) => key.id === props.tokenId)
+  const initialLoading =
+    indexQuery.isPending || (legacyFallbackEnabled && legacyQuery.isPending)
+  const unavailable =
+    indexQuery.isError && (!legacyFallbackEnabled || legacyQuery.isError)
+  const updatedAt = usesModelIndex
+    ? indexData.meta.updatedAtMS
+    : legacyQuery.data?.data?.updated_at_ms
+
+  return (
+    <div
+      className={
+        props.compact
+          ? 'flex min-w-0 flex-col gap-3'
+          : 'flex min-w-0 flex-col gap-4'
+      }
+    >
+      <div className='flex min-w-0 flex-wrap items-start justify-between gap-3'>
+        <div className='min-w-0 flex-1'>
+          <div className='flex items-center gap-2'>
+            <Activity className='text-muted-foreground size-4' />
+            <h2 className='text-base font-semibold'>
+              {t('Smart routing status')}
+            </h2>
+          </div>
+          <p className='text-muted-foreground mt-1 max-w-3xl text-xs leading-relaxed'>
+            {t(
+              'This is the current next-request planning snapshot. Every new request is planned again; a request already in progress never changes upstream midway.'
+            )}
+          </p>
+        </div>
+        <div className='flex flex-wrap items-center gap-2'>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            render={<Link to='/keys' />}
+          >
+            <ArrowLeft data-icon='inline-start' />
+            {t('Back to API keys')}
+          </Button>
+          {isRoot ? (
+            <Button
+              type='button'
+              size='sm'
+              variant='ghost'
+              render={
+                <a href='/system-settings/models/smart-routing?tab=health' />
+              }
+            >
+              <Stethoscope data-icon='inline-start' />
+              {t('View global health')}
+            </Button>
+          ) : null}
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            onClick={() => {
+              if (legacyFallbackEnabled) {
+                void Promise.all([indexQuery.refetch(), legacyQuery.refetch()])
+                return
+              }
+              void indexQuery.refetch()
+            }}
+            disabled={
+              indexQuery.isFetching ||
+              (legacyFallbackEnabled && legacyQuery.isFetching)
+            }
+          >
+            <RefreshCw
+              data-icon='inline-start'
+              className={
+                indexQuery.isFetching ||
+                (legacyFallbackEnabled && legacyQuery.isFetching)
+                  ? 'animate-spin'
+                  : undefined
+              }
+            />
+            {t('Refresh')}
+          </Button>
+        </div>
+      </div>
+
+      <div className='flex min-w-0 flex-wrap items-center gap-2'>
+        <span className='text-muted-foreground text-xs'>{t('View')}</span>
+        <NativeSelect
+          value={scope}
+          onChange={(event) =>
+            setScope(event.target.value === 'key' ? 'key' : 'global')
+          }
+          aria-label={t('Route status scope')}
+          className='max-w-full min-w-44'
+        >
+          <NativeSelectOption value='global'>
+            {t('Site-wide route status')}
+          </NativeSelectOption>
+          <NativeSelectOption value='key' disabled={props.tokenId === undefined}>
+            {t('Current key decision')}
+          </NativeSelectOption>
+        </NativeSelect>
+        {scope === 'key' && props.tokenId !== undefined ? (
+          <>
+            <span className='text-muted-foreground text-xs'>{t('API key')}</span>
+            <NativeSelect
+              value={String(props.tokenId)}
+              onChange={(event) =>
+                props.onTokenChange?.(Number(event.target.value))
+              }
+              aria-label={t('Choose a smart routing key')}
+              className='max-w-full min-w-52'
+            >
+              {!selectedKey ? (
+                <NativeSelectOption value={String(props.tokenId)}>
+                  {t('Key #{{id}}', { id: props.tokenId })}
+                </NativeSelectOption>
+              ) : null}
+              {(keysQuery.data ?? []).map((key) => (
+                <NativeSelectOption key={key.id} value={String(key.id)}>
+                  {key.name || t('Key #{{id}}', { id: key.id })}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          </>
+        ) : (
+          <span className='text-muted-foreground text-xs'>
+            {t('Shared health, price and recent evidence for all users')}
+          </span>
+        )}
+        <span className='text-muted-foreground text-xs'>
+          {t('Auto-refresh every 15 seconds')}
+          {updatedAt
+            ? ` · ${t('Updated {{time}}', {
+                time: formatSmartRouterTimestamp(updatedAt),
+              })}`
+            : ''}
+        </span>
+      </div>
+
+      {unavailable ? (
+        <Alert>
+          <CircleAlert />
+          <AlertTitle>{t('Route status is not available yet')}</AlertTitle>
+          <AlertDescription>
+            {t(
+              'The status view is temporarily unavailable. API requests continue independently.'
+            )}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {!unavailable ? <StatusSummary summary={summary} /> : null}
+
+      {summary.contractsAboveLowestPrice > 0 ? (
+        <Alert>
+          <Info />
+          <AlertTitle>
+            {t(
+              '{{count}} model endpoints have a lower price or ordering cost route waiting',
+              {
+                count: summary.contractsAboveLowestPrice,
+              }
+            )}
+          </AlertTitle>
+          <AlertDescription>
+            {t(
+              'Open a model to see the exact ordering cost, health, capacity, price, or key-policy reason. Recovered groups automatically re-enter candidate ordering.'
+            )}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {!unavailable && allModels.length > 0 ? (
+        <StatusToolbar
+          query={search}
+          onQueryChange={setSearch}
+          status={status}
+          onStatusChange={setStatus}
+          group={group}
+          onGroupChange={setGroup}
+          endpoint={endpoint}
+          onEndpointChange={setEndpoint}
+          sort={sort}
+          onSortChange={setSort}
+          groups={groups}
+          endpoints={endpoints}
+          onClear={() => {
+            setSearch('')
+            setStatus('all')
+            setGroup('')
+            setEndpoint('')
+          }}
+        />
+      ) : null}
+
+      {initialLoading ? (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-6 text-center text-sm'>
+          {t('Loading route decisions...')}
+        </div>
+      ) : null}
+
+      {!unavailable && !initialLoading && allModels.length === 0 ? (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-6 text-center text-sm'>
+          {t('No eligible groups are available for this key and model.')}
+        </div>
+      ) : null}
+
+      {allModels.length > 0 && filteredModels.length === 0 ? (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-6 text-center text-sm'>
+          {t('No route decisions match these filters.')}
+        </div>
+      ) : null}
+
+      {visibleModels.length > 0 ? (
+        <div className='space-y-3 pb-[max(1rem,env(safe-area-inset-bottom))]'>
+          {visibleModels.map((model) => {
+            const forcedOpen = Boolean(
+              search.trim() || status !== 'all' || group || endpoint
+            )
+            const open =
+              forcedOpen || (openModels[model.model] ?? model.decisionRank <= 2)
+            const onOpenChange = (nextOpen: boolean) =>
+              setOpenModels((current) => ({
+                ...current,
+                [model.model]: nextOpen,
+              }))
+
+            return usesModelIndex ? (
+              <IndexedModelStatusSection
+                key={model.model}
+                scope={scope}
+                tokenId={props.tokenId}
+                model={model}
+                open={open}
+                onOpenChange={onOpenChange}
+              />
+            ) : (
+              <ModelStatusSection
+                key={model.model}
+                model={model}
+                strategy={legacyQuery.data?.data?.strategy}
+                open={open}
+                onOpenChange={onOpenChange}
+              />
+            )
+          })}
+
+          <div className='flex flex-wrap items-center justify-between gap-2'>
+            <span className='text-muted-foreground text-xs'>
+              {t('Showing {{shown}} of {{total}} models', {
+                shown: visibleModels.length,
+                total: filteredModels.length,
+              })}
+            </span>
+            {visibleModels.length < filteredModels.length ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                onClick={() =>
+                  setVisibleState({
+                    filterKey,
+                    limit: visibleLimit + STATUS_MODEL_PAGE_SIZE,
+                  })
+                }
+              >
+                {t('Show {{count}} more', {
+                  count: Math.min(
+                    STATUS_MODEL_PAGE_SIZE,
+                    filteredModels.length - visibleModels.length
+                  ),
+                })}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}

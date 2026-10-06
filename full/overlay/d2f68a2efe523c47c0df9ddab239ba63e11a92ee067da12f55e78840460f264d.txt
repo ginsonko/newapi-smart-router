@@ -1,0 +1,1094 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import {
+  BarChart3Icon,
+  ChevronDownIcon,
+  LineChartIcon,
+  RefreshCwIcon,
+  SaveIcon,
+  ZapIcon,
+} from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { getApiKeys, updateApiKey } from '@/features/keys/api'
+import type { ApiKey } from '@/features/keys/types'
+import { useAuthStore } from '@/stores/auth-store'
+
+import {
+  getGlobalSmartRouterLeaderboardModels,
+  getGlobalSmartRouterLeaderboardStatus,
+} from './api'
+import {
+  formatSmartRouterInputCostPPM,
+  formatSmartRouterInputCostUSD,
+  formatSmartRouterRoutePrice,
+  ratioText,
+} from './health-view-model'
+import { KeyUsageAnalyticsPanel } from './key-usage-analytics-panel'
+import {
+  buildLeaderboardEvidence,
+  buildLeaderboardDenseRanks,
+  leaderboardConfidence,
+  leaderboardConfidencePercent,
+  leaderboardMetricValue,
+  leaderboardSampleCount,
+  sortLeaderboardModels,
+  type LeaderboardEvidence as RowEvidence,
+  type LeaderboardMetric as BoardMetric,
+  type LeaderboardRankBadge,
+  type LeaderboardWeightKey as WeightKey,
+  type LeaderboardWeights as Weights,
+} from './leaderboard-evidence'
+import {
+  leaderboardModelOptionKey,
+  readLeaderboardPreferencesV3,
+  rememberLeaderboardContractV3,
+  writeLeaderboardPreferencesV3,
+  type LeaderboardModelOption,
+  type LeaderboardPreferencesV3,
+} from './leaderboard-preferences'
+import { ModelContractCombobox } from './model-contract-combobox'
+import { parseSmartRouterPolicy } from './policy'
+import type { SmartRouterStatusItem } from './types'
+
+const DEFAULT_WEIGHTS: Weights = {
+  cache: 25,
+  cost: 25,
+  ttft: 25,
+  stability: 25,
+}
+
+const METRIC_TONE_CLASS: Record<LeaderboardRankBadge['metric'], string> = {
+  cache:
+    'border-sky-300/60 bg-sky-500/10 text-sky-700 dark:border-sky-700/60 dark:text-sky-300',
+  cost: 'border-emerald-300/60 bg-emerald-500/10 text-emerald-700 dark:border-emerald-700/60 dark:text-emerald-300',
+  ttft: 'border-amber-300/60 bg-amber-500/10 text-amber-700 dark:border-amber-700/60 dark:text-amber-300',
+  stability:
+    'border-violet-300/60 bg-violet-500/10 text-violet-700 dark:border-violet-700/60 dark:text-violet-300',
+}
+
+const METRIC_SURFACE_CLASS: Record<LeaderboardRankBadge['metric'], string> = {
+  cache: 'bg-sky-500/[0.035] dark:bg-sky-400/[0.055]',
+  cost: 'bg-emerald-500/[0.035] dark:bg-emerald-400/[0.055]',
+  ttft: 'bg-amber-500/[0.035] dark:bg-amber-400/[0.055]',
+  stability: 'bg-violet-500/[0.035] dark:bg-violet-400/[0.055]',
+}
+
+function finite(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function normalizedScore(
+  value: number | undefined,
+  values: number[],
+  higherIsBetter: boolean
+) {
+  if (value === undefined || values.length < 2) {
+    return value === undefined ? 0.5 : 1
+  }
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  if (max <= min) return 0.5
+  const normalized = (value - min) / (max - min)
+  return higherIsBetter ? normalized : 1 - normalized
+}
+
+function weightedScore(
+  item: SmartRouterStatusItem,
+  rows: SmartRouterStatusItem[],
+  weights: Weights,
+  evidence: Map<SmartRouterStatusItem, RowEvidence>
+) {
+  const metrics: Array<{
+    key: WeightKey
+    metric: Exclude<BoardMetric, 'usage' | 'weighted'>
+    higherIsBetter: boolean
+  }> = [
+    { key: 'cache', metric: 'cache', higherIsBetter: true },
+    { key: 'cost', metric: 'cost', higherIsBetter: false },
+    { key: 'ttft', metric: 'ttft', higherIsBetter: false },
+    { key: 'stability', metric: 'stability', higherIsBetter: true },
+  ]
+  return metrics.reduce((total, definition) => {
+    const values = rows
+      .map((row) => leaderboardMetricValue(row, definition.metric, evidence))
+      .filter((value): value is number => value !== undefined)
+    return (
+      total +
+      normalizedScore(
+        leaderboardMetricValue(item, definition.metric, evidence),
+        values,
+        definition.higherIsBetter
+      ) *
+        weights[definition.key]
+    )
+  }, 0)
+}
+
+function normalizeWeights(weights: Weights): Weights {
+  const keys = Object.keys(DEFAULT_WEIGHTS) as WeightKey[]
+  const positive = keys.map((key) => ({
+    key,
+    value: Math.max(0, Math.min(100, Number(weights[key]) || 0)),
+  }))
+  const total = positive.reduce((sum, item) => sum + item.value, 0)
+  if (total === 0) return { ...DEFAULT_WEIGHTS }
+  const parts = positive.map((item) => {
+    const exact = (item.value / total) * 100
+    return { ...item, normalized: Math.floor(exact), remainder: exact % 1 }
+  })
+  let remaining = 100 - parts.reduce((sum, item) => sum + item.normalized, 0)
+  for (const item of [...parts].sort(
+    (left, right) => right.remainder - left.remainder
+  )) {
+    if (remaining <= 0) break
+    item.normalized += 1
+    remaining -= 1
+  }
+  return Object.fromEntries(
+    parts.map((item) => [item.key, item.normalized])
+  ) as Weights
+}
+
+function readStoredWeights(userId: number): Weights {
+  if (typeof window === 'undefined') return { ...DEFAULT_WEIGHTS }
+  try {
+    const raw = window.localStorage.getItem(
+      `smart-router-leaderboard-weights-v3:${userId}`
+    )
+    return raw
+      ? normalizeWeights({
+          ...DEFAULT_WEIGHTS,
+          ...(JSON.parse(raw) as Partial<Weights>),
+        })
+      : { ...DEFAULT_WEIGHTS }
+  } catch {
+    return { ...DEFAULT_WEIGHTS }
+  }
+}
+
+function formatPercentagePPM(value?: number) {
+  return value === undefined ? 'No data' : `${(value / 10_000).toFixed(1)}%`
+}
+
+function formatStability(value?: number) {
+  if (value === undefined) return 'No data'
+  const normalized = value > 1 ? value / 1_000_000 : value
+  return `${(normalized * 100).toFixed(1)}%`
+}
+
+function formatTTFT(value?: number) {
+  return value === undefined ? 'No data' : `${Math.round(value)} ms`
+}
+
+function formatPredictedCost(
+  item: SmartRouterStatusItem
+) {
+  const dollars = finite(item.predicted_input_usd_per_million)
+  if (dollars !== undefined) return formatSmartRouterInputCostUSD(dollars)
+  const ppm = finite(item.predicted_input_cost_ppm)
+  return formatSmartRouterInputCostPPM(ppm)
+}
+
+function formatUpdatedAt(item: SmartRouterStatusItem) {
+  const value =
+    finite(item.actual_input_cost_last_observed_at_ms) ??
+    finite(item.recent_metrics_observed_at_ms) ??
+    finite(item.evidence?.last_observed_at_ms) ??
+    finite(item.last_observed_at_ms)
+  return value === undefined
+    ? 'Reference value'
+    : new Date(value).toLocaleString()
+}
+
+function routeState(item: SmartRouterStatusItem) {
+  if (item.dispatch_eligibility === 'eligible') return 'Currently eligible'
+  if (item.dispatch_eligibility === 'safe_last_resort') {
+    return 'Recent fluctuation, still safe to try'
+  }
+  if (item.dispatch_eligibility === 'conditional') {
+    return 'Eligible when conditions allow'
+  }
+  if (item.dispatch_eligibility === 'ineligible') {
+    return 'Not currently dispatched'
+  }
+  return (
+    item.availability ||
+    item.health_status ||
+    item.primary_state ||
+    'Unknown status'
+  )
+}
+
+function LeaderboardRankBadges(props: { badges: LeaderboardRankBadge[] }) {
+  const { t } = useTranslation()
+  if (props.badges.length === 0) return null
+  return (
+    <div className='flex flex-wrap gap-1' data-leaderboard-rank-badges='true'>
+      {props.badges.map((badge) => (
+        <Badge
+          key={`${badge.metric}-${badge.rank}`}
+          variant='outline'
+          className={`px-1.5 text-[10px] ${METRIC_TONE_CLASS[badge.metric]}`}
+        >
+          {t('{{metric}} Top{{rank}}', {
+            metric: t(
+              {
+                cache: 'Cache',
+                cost: 'Cost',
+                ttft: 'First token',
+                stability: 'Stability',
+              }[badge.metric]
+            ),
+            rank: badge.rank,
+          })}
+        </Badge>
+      ))}
+    </div>
+  )
+}
+
+function LeaderboardMobileMetric(props: {
+  label: string
+  value: ReactNode
+  details?: Array<{ key: string; value: ReactNode }>
+  tone?: LeaderboardRankBadge['metric']
+  wide?: boolean
+}) {
+  const surface = props.tone
+    ? METRIC_SURFACE_CLASS[props.tone]
+    : 'bg-background'
+  return (
+    <div
+      className={`${surface} min-w-0 rounded-lg border p-3 ${props.wide ? 'col-span-2' : ''}`}
+    >
+      <div className='text-muted-foreground text-xs'>{props.label}</div>
+      <div className='mt-1 font-medium break-words tabular-nums'>
+        {props.value}
+      </div>
+      {props.details?.map((detail) => (
+        <div
+          className='text-muted-foreground mt-1 text-xs break-words'
+          key={detail.key}
+        >
+          {detail.value}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function LeaderboardTrendButton(props: { detailId?: string }) {
+  const { t } = useTranslation()
+  if (!props.detailId) return null
+  return (
+    <Button
+      render={
+        <Link
+          to='/smart-routing/leaderboard/$detailId'
+          params={{ detailId: props.detailId }}
+        />
+      }
+      variant='outline'
+      size='sm'
+      className='mt-2 h-8 border-indigo-300/70 bg-indigo-500/10 px-2.5 text-xs font-medium text-indigo-700 shadow-sm hover:bg-indigo-500/15 dark:border-indigo-700/70 dark:text-indigo-300'
+      data-leaderboard-trend-link='true'
+    >
+      <LineChartIcon aria-hidden='true' />
+      {t('View trend')}
+    </Button>
+  )
+}
+
+function buildKeyUpdate(key: ApiKey, routingPolicy: string) {
+  return {
+    id: key.id,
+    name: key.name,
+    remain_quota: key.remain_quota,
+    expired_time: key.expired_time,
+    unlimited_quota: key.unlimited_quota,
+    model_limits_enabled: key.model_limits_enabled,
+    model_limits: key.model_limits ?? '',
+    allow_ips: key.allow_ips ?? '',
+    group: key.group ?? 'auto',
+    cross_group_retry: key.cross_group_retry,
+    routing_policy: routingPolicy,
+  }
+}
+
+export function SmartRouterLeaderboard(props: { initialTokenId?: number }) {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const userGroup = useAuthStore((state) => state.auth.user?.group ?? '')
+  const [preferences, setPreferences] = useState<LeaderboardPreferencesV3>(() =>
+    readLeaderboardPreferencesV3(userId)
+  )
+  const [tokenId, setTokenId] = useState<number | undefined>(
+    props.initialTokenId ?? preferences.lastWeightTokenId
+  )
+  const [modelKey, setModelKey] = useState(() =>
+    leaderboardModelOptionKey({
+      model: preferences.model,
+      endpoint: preferences.endpoint,
+    })
+  )
+  const [metric, setMetric] = useState<BoardMetric>(preferences.metric)
+  const [editedWeights, setEditedWeights] = useState<Weights>(() =>
+    readStoredWeights(userId)
+  )
+  const [editedTokenId, setEditedTokenId] = useState<number>()
+
+  useEffect(() => {
+    writeLeaderboardPreferencesV3(userId, preferences)
+  }, [preferences, userId])
+
+  const keysQuery = useQuery({
+    queryKey: ['smart-router-leaderboard-keys', userId],
+    queryFn: () => getApiKeys({ p: 1, size: 100 }),
+    staleTime: 30_000,
+  })
+  const allKeys = useMemo(
+    () => keysQuery.data?.data?.items ?? [],
+    [keysQuery.data?.data?.items]
+  )
+  const keys = useMemo(
+    () =>
+      allKeys.filter(
+        (key) => key.group === 'auto' && Boolean(key.routing_policy?.trim())
+      ),
+    [allKeys]
+  )
+  const selectedTokenId = tokenId
+  const selectedKey = keys.find((key) => key.id === selectedTokenId)
+  const selectedPolicy = parseSmartRouterPolicy(selectedKey?.routing_policy)
+  let weights = editedWeights
+  if (editedTokenId !== selectedTokenId && selectedPolicy?.custom_weights) {
+    weights = normalizeWeights(selectedPolicy.custom_weights)
+  }
+
+  const modelIndexQuery = useQuery({
+    queryKey: ['smart-router-global-leaderboard-models', userId, userGroup],
+    queryFn: getGlobalSmartRouterLeaderboardModels,
+    staleTime: 15_000,
+  })
+  const models = useMemo<LeaderboardModelOption[]>(() => {
+    const data = modelIndexQuery.data?.data
+    const items = Array.isArray(data) ? data : (data?.items ?? [])
+    const seen = new Set<string>()
+    return sortLeaderboardModels(
+      items
+        .flatMap((item) => {
+          const contracts = item.contracts ?? []
+          if (contracts.length > 0) {
+            return contracts.map((contract) => ({
+              model: item.model?.trim() ?? '',
+              endpoint: contract.endpoint?.trim() ?? '',
+              displayName:
+                item.display_name?.trim() || item.model?.trim() || '',
+              family: item.family?.trim() || 'other',
+              modality: item.modality?.trim() || 'other',
+              aliases: item.search_aliases ?? [],
+              recentUsageCount: item.recent_usage_count ?? 0,
+            }))
+          }
+          let endpoints = ['']
+          if (item.endpoint) {
+            endpoints = [item.endpoint]
+          } else if (item.endpoints?.length) {
+            endpoints = item.endpoints
+          }
+          return endpoints.map((endpoint) => ({
+            model: item.model?.trim() ?? '',
+            endpoint: endpoint?.trim() ?? '',
+            displayName: item.display_name?.trim() || item.model?.trim() || '',
+            family: item.family?.trim() || 'other',
+            modality: item.modality?.trim() || 'other',
+            aliases: item.search_aliases ?? [],
+            recentUsageCount: item.recent_usage_count ?? 0,
+          }))
+        })
+        .filter((item) => {
+          if (!item.model) return false
+          const key = `${item.model}\u0000${item.endpoint}`
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+    )
+  }, [modelIndexQuery.data?.data])
+
+  const selectedModelOption =
+    models.find((option) => leaderboardModelOptionKey(option) === modelKey) ??
+    models[0]
+  const selectedModel = selectedModelOption?.model ?? ''
+  const selectedEndpoint = selectedModelOption?.endpoint ?? ''
+  const statusQuery = useQuery({
+    queryKey: [
+      'smart-router-global-leaderboard-status',
+      userId,
+      userGroup,
+      selectedModel,
+      selectedEndpoint,
+    ],
+    queryFn: () =>
+      getGlobalSmartRouterLeaderboardStatus({
+        model: selectedModel,
+        endpoint: selectedEndpoint || undefined,
+      }),
+    enabled: Boolean(selectedModel),
+    staleTime: 10_000,
+    refetchInterval: 15_000,
+  })
+
+  const items = useMemo(
+    () => statusQuery.data?.data?.items ?? [],
+    [statusQuery.data?.data?.items]
+  )
+  const evidence = useMemo(() => buildLeaderboardEvidence(items), [items])
+  const denseRanks = useMemo(
+    () => buildLeaderboardDenseRanks(items, evidence),
+    [evidence, items]
+  )
+  useEffect(() => {
+    if (!selectedModelOption) return
+    const selectedKey = leaderboardModelOptionKey(selectedModelOption)
+    if (selectedKey !== modelKey) {
+      // The asynchronously loaded model index may invalidate a stored choice.
+      // oxlint-disable-next-line react/set-state-in-effect
+      setModelKey(selectedKey)
+    }
+    // Keep the durable preference aligned with the validated catalog entry.
+    // oxlint-disable-next-line react/set-state-in-effect
+    setPreferences((current) => {
+      if (
+        current.model === selectedModelOption.model &&
+        current.endpoint === selectedModelOption.endpoint
+      ) {
+        return current
+      }
+      return {
+        ...rememberLeaderboardContractV3(current, selectedKey),
+        model: selectedModelOption.model,
+        endpoint: selectedModelOption.endpoint,
+      }
+    })
+  }, [modelKey, selectedModelOption])
+  useEffect(() => {
+    // Persist the visible sorting choice through the existing preference state.
+    // oxlint-disable-next-line react/set-state-in-effect
+    setPreferences((current) =>
+      current.metric === metric ? current : { ...current, metric }
+    )
+  }, [metric])
+  const rows = useMemo(() => {
+    const sorted = [...items].sort((left, right) => {
+      if (metric === 'weighted') {
+        return (
+          weightedScore(right, items, weights, evidence) -
+            weightedScore(left, items, weights, evidence) ||
+          left.group.localeCompare(right.group)
+        )
+      }
+      const leftValue = leaderboardMetricValue(left, metric, evidence)
+      const rightValue = leaderboardMetricValue(right, metric, evidence)
+      if (leftValue === undefined && rightValue === undefined) {
+        return left.group.localeCompare(right.group)
+      }
+      if (leftValue === undefined) return 1
+      if (rightValue === undefined) return -1
+      const descending =
+        metric === 'usage' || metric === 'cache' || metric === 'stability'
+      return (
+        (descending ? rightValue - leftValue : leftValue - rightValue) ||
+        left.group.localeCompare(right.group)
+      )
+    })
+    return sorted
+  }, [evidence, items, metric, weights])
+
+  const policyMutation = useMutation({
+    mutationFn: async ({ activate }: { activate: boolean }) => {
+      if (!selectedKey) throw new Error(t('Select a smart key first'))
+      const policy = parseSmartRouterPolicy(selectedKey.routing_policy)
+      if (!policy) throw new Error(t('This smart key policy cannot be read'))
+      const normalized = normalizeWeights(weights)
+      const nextPolicy = {
+        ...policy,
+        ...(activate
+          ? {
+              strategy: 'custom_weighted' as const,
+              order_mode: 'auto_price' as const,
+            }
+          : {}),
+        custom_weights: normalized,
+      }
+      const response = await updateApiKey(
+        buildKeyUpdate(selectedKey, JSON.stringify(nextPolicy))
+      )
+      if (!response.success) {
+        throw new Error(
+          response.message || t('Unable to update this smart key')
+        )
+      }
+      return { activate, normalized }
+    },
+    onSuccess: ({ activate, normalized }) => {
+      setEditedWeights(normalized)
+      setEditedTokenId(selectedTokenId)
+      window.localStorage.setItem(
+        `smart-router-leaderboard-weights-v3:${userId}`,
+        JSON.stringify(normalized)
+      )
+      setPreferences((current) => ({
+        ...current,
+        lastWeightTokenId: selectedTokenId,
+      }))
+      void queryClient.invalidateQueries({
+        queryKey: ['smart-router-leaderboard-keys'],
+      })
+      toast.success(
+        activate
+          ? t('Custom ranking is now active for this smart key')
+          : t('Ranking weights saved without changing this key strategy')
+      )
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : t('Save failed'))
+    },
+  })
+
+  const renderedRows = rows.map((item) => {
+    const rowEvidence = evidence.get(item)
+    const sampleCount = leaderboardSampleCount(item)
+    const confidence = leaderboardConfidence(item)
+    const confidencePercent = leaderboardConfidencePercent(item)
+    let confidenceLabel = t('Reference value, no direct samples')
+    if (confidence === 'low') confidenceLabel = t('Low confidence')
+    if (confidence === 'medium') confidenceLabel = t('Medium confidence')
+    if (confidence === 'high') confidenceLabel = t('High confidence')
+    if (confidencePercent !== undefined) {
+      confidenceLabel = t('Confidence {{value}}% · {{level}}', {
+        value: confidencePercent,
+        level: confidenceLabel,
+      })
+    }
+    return {
+      item,
+      rowEvidence,
+      sampleCount,
+      confidenceLabel,
+      effectiveGroupRatio: ratioText(item.effective_ratio_ppm),
+      rankBadges: denseRanks.get(item) ?? [],
+      customScore: weightedScore(item, items, weights, evidence).toFixed(1),
+    }
+  })
+
+  return (
+    <div className='space-y-4'>
+      <div className='flex flex-wrap items-center justify-between gap-3'>
+        <div>
+          <div className='flex items-center gap-2'>
+            <BarChart3Icon aria-hidden='true' className='size-5' />
+            <h1 className='text-lg font-semibold'>
+              {t('Live channel leaderboard')}
+            </h1>
+          </div>
+          <p className='text-muted-foreground mt-1 text-sm'>
+            {t(
+              'Site-wide route facts are shared. Selecting a smart key only saves or applies weights and never changes leaderboard data.'
+            )}
+          </p>
+        </div>
+        <Button
+          type='button'
+          variant='outline'
+          size='sm'
+          onClick={() =>
+            void Promise.all([modelIndexQuery.refetch(), statusQuery.refetch()])
+          }
+          disabled={modelIndexQuery.isFetching || statusQuery.isFetching}
+        >
+          <RefreshCwIcon
+            className={
+              modelIndexQuery.isFetching || statusQuery.isFetching
+                ? 'animate-spin'
+                : undefined
+            }
+          />
+          {t('Refresh')}
+        </Button>
+      </div>
+      <Alert>
+        <AlertDescription>
+          {t(
+            'The default view is gpt-5.6-sol / openai-responses-v1 ranked by real predicted input cost. Sparse routes show their historical source and confidence; one real sample is included immediately.'
+          )}
+        </AlertDescription>
+      </Alert>
+      <div className='grid gap-3 sm:grid-cols-3'>
+        <NativeSelect
+          aria-label={t('Smart key for saving weights')}
+          onChange={(event) => {
+            const nextTokenId = Number(event.target.value) || undefined
+            setTokenId(nextTokenId)
+            setPreferences((current) => ({
+              ...current,
+              lastWeightTokenId: nextTokenId,
+            }))
+          }}
+          value={selectedTokenId ?? ''}
+        >
+          <NativeSelectOption value=''>
+            {t('Select a smart key to apply weights')}
+          </NativeSelectOption>
+          {keys.map((key) => (
+            <NativeSelectOption key={key.id} value={key.id}>
+              {key.name || key.key}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <ModelContractCombobox
+          options={models}
+          value={
+            selectedModelOption
+              ? leaderboardModelOptionKey(selectedModelOption)
+              : undefined
+          }
+          recent={preferences.recentContracts}
+          favorites={preferences.favoriteContracts}
+          onValueChange={(value) => {
+            setModelKey(value)
+            const option = models.find(
+              (item) => leaderboardModelOptionKey(item) === value
+            )
+            if (!option) return
+            setPreferences((current) => ({
+              ...rememberLeaderboardContractV3(current, value),
+              model: option.model,
+              endpoint: option.endpoint,
+            }))
+          }}
+          onToggleFavorite={(value) =>
+            setPreferences((current) => ({
+              ...current,
+              favoriteContracts: current.favoriteContracts.includes(value)
+                ? current.favoriteContracts.filter((item) => item !== value)
+                : [...current.favoriteContracts, value].slice(0, 100),
+            }))
+          }
+          disabled={modelIndexQuery.isPending}
+        />
+        <NativeSelect
+          aria-label={t('Ranking metric')}
+          onChange={(event) => setMetric(event.target.value as BoardMetric)}
+          value={metric}
+        >
+          <NativeSelectOption value='usage'>{t('Usage')}</NativeSelectOption>
+          <NativeSelectOption value='cache'>
+            {t('Real cache rate')}
+          </NativeSelectOption>
+          <NativeSelectOption value='cost'>
+            {t('Predicted input cost')}
+          </NativeSelectOption>
+          <NativeSelectOption value='ttft'>
+            {t('Recent weighted first-token latency')}
+          </NativeSelectOption>
+          <NativeSelectOption value='stability'>
+            {t('Stability')}
+          </NativeSelectOption>
+          <NativeSelectOption value='weighted'>
+            {t('Custom weighted score')}
+          </NativeSelectOption>
+        </NativeSelect>
+      </div>
+      <div className='rounded-lg border p-3'>
+        <button
+          type='button'
+          className='flex w-full items-center justify-between text-left text-sm font-medium'
+          aria-expanded={preferences.weightPanelOpen}
+          onClick={() =>
+            setPreferences((current) => ({
+              ...current,
+              weightPanelOpen: !current.weightPanelOpen,
+            }))
+          }
+        >
+          {t('Custom ranking weights')}
+          <ChevronDownIcon
+            className={`size-4 transition-transform ${preferences.weightPanelOpen ? 'rotate-180' : ''}`}
+          />
+        </button>
+        {preferences.weightPanelOpen && (
+          <div className='mt-3'>
+            <div className='grid grid-cols-2 gap-2 sm:grid-cols-4'>
+              {(
+                [
+                  ['cache', 'Cache weight'],
+                  ['cost', 'Cost weight'],
+                  ['ttft', 'First-token weight'],
+                  ['stability', 'Stability weight'],
+                ] as const
+              ).map(([key, label]) => (
+                <label className='text-muted-foreground text-xs' key={key}>
+                  {t(label)} (%)
+                  <Input
+                    min={0}
+                    max={100}
+                    onChange={(event) => {
+                      setEditedTokenId(selectedTokenId)
+                      setEditedWeights({
+                        ...weights,
+                        [key]: Number(event.target.value),
+                      })
+                    }}
+                    type='number'
+                    value={weights[key]}
+                  />
+                </label>
+              ))}
+            </div>
+            <p className='text-muted-foreground mt-2 text-xs'>
+              {t(
+                'Saving stores the weights on the selected key without changing its current strategy. Applying explicitly switches only this key to custom weighted routing; route eligibility and billing stay unchanged.'
+              )}
+            </p>
+            <div className='mt-2 flex flex-wrap gap-2'>
+              <Button
+                onClick={() => policyMutation.mutate({ activate: false })}
+                size='sm'
+                variant='outline'
+                disabled={!selectedKey || policyMutation.isPending}
+              >
+                <SaveIcon aria-hidden='true' />
+                {t('Save ranking weights')}
+              </Button>
+              <Button
+                onClick={() => policyMutation.mutate({ activate: true })}
+                size='sm'
+                disabled={!selectedKey || policyMutation.isPending}
+              >
+                <ZapIcon aria-hidden='true' />
+                {t('Apply to current smart key')}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+      {(modelIndexQuery.isError || statusQuery.isError) && (
+        <Alert variant='destructive'>
+          <AlertDescription>
+            {t('Unable to load site-wide leaderboard data.')}
+          </AlertDescription>
+        </Alert>
+      )}
+      {(modelIndexQuery.isPending || statusQuery.isPending) && (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-6 text-center text-sm'>
+          {t('Loading live channel evidence...')}
+        </div>
+      )}
+      {!statusQuery.isPending && rows.length === 0 && (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-6 text-center text-sm'>
+          {t('No site-wide routes are published for this model contract.')}
+        </div>
+      )}
+      {renderedRows.length > 0 && (
+        <>
+          <div className='hidden overflow-hidden rounded-lg border md:block'>
+            <table className='w-full table-fixed text-sm'>
+              <colgroup>
+                <col className='w-[18%]' />
+                <col className='w-[17%]' />
+                <col className='w-[14%]' />
+                <col className='w-[14%]' />
+                <col className='w-[12%]' />
+                <col className='w-[12%]' />
+                <col className='w-[13%]' />
+              </colgroup>
+              <thead className='bg-muted/30 text-muted-foreground text-left text-xs'>
+                <tr>
+                  <th className='p-3'>{t('Group')}</th>
+                  <th className='p-3'>{t('Status and price')}</th>
+                  <th className={`p-3 ${METRIC_SURFACE_CLASS.cache}`}>
+                    {t('Routing cache weight')}
+                  </th>
+                  <th className={`p-3 ${METRIC_SURFACE_CLASS.cost}`}>
+                    {t('Predicted input cost')}
+                  </th>
+                  <th className={`p-3 ${METRIC_SURFACE_CLASS.ttft}`}>
+                    {t('Recent weighted first-token latency')}
+                  </th>
+                  <th className={`p-3 ${METRIC_SURFACE_CLASS.stability}`}>
+                    {t('Stability')}
+                  </th>
+                  <th className='p-3'>{t('Evidence')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {renderedRows.map((row) => (
+                  <tr
+                    className='border-t align-top'
+                    key={`${row.item.group}-${row.item.endpoint}`}
+                  >
+                    <td className='p-3'>
+                      <div className='font-medium break-words'>
+                        {row.item.group}
+                      </div>
+                      <div className='mt-2'>
+                        <LeaderboardRankBadges badges={row.rankBadges} />
+                      </div>
+                      <div className='text-muted-foreground mt-1 truncate text-xs'>
+                        {row.item.endpoint}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs tabular-nums'>
+                        {t('group ratio')}:{' '}
+                        {row.effectiveGroupRatio ?? t('Unknown')}
+                      </div>
+                      <LeaderboardTrendButton detailId={row.item.detail_id} />
+                      <div className='text-muted-foreground mt-1 text-xs tabular-nums'>
+                        {t('Custom score')}: {row.customScore}
+                      </div>
+                    </td>
+                    <td className='p-3'>
+                      <Badge
+                        className='max-w-full whitespace-normal'
+                        variant='outline'
+                      >
+                        {t(routeState(row.item))}
+                      </Badge>
+                      <div className='mt-2 text-xs break-words'>
+                        {row.item.price
+                          ? formatSmartRouterRoutePrice(row.item.price, t)
+                          : t('Price reference unavailable')}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs tabular-nums'>
+                        {t('group ratio')}:{' '}
+                        {row.effectiveGroupRatio ?? t('Unknown')}
+                      </div>
+                    </td>
+                    <td className={`p-3 ${METRIC_SURFACE_CLASS.cache}`}>
+                      <div className='font-medium tabular-nums'>
+                        {t(formatPercentagePPM(row.rowEvidence?.cache.value))}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {t(row.rowEvidence?.cache.source ?? 'No data')}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {finite(row.item.recent_cache_rate_ppm) === undefined
+                          ? t('Real cache rate: awaiting samples')
+                          : t('Real cache rate: {{value}}', {
+                              value: formatPercentagePPM(
+                                finite(row.item.recent_cache_rate_ppm)
+                              ),
+                            })}
+                      </div>
+                    </td>
+                    <td className={`p-3 ${METRIC_SURFACE_CLASS.cost}`}>
+                      <div className='font-medium break-words tabular-nums'>
+                        {t(
+                          formatPredictedCost(row.item)
+                        )}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {t(row.rowEvidence?.cost.source ?? 'No data')}
+                      </div>
+                    </td>
+                    <td className={`p-3 ${METRIC_SURFACE_CLASS.ttft}`}>
+                      <div className='font-medium tabular-nums'>
+                        {t(formatTTFT(row.rowEvidence?.ttft.value))}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {t(row.rowEvidence?.ttft.source ?? 'No data')}
+                      </div>
+                    </td>
+                    <td className={`p-3 ${METRIC_SURFACE_CLASS.stability}`}>
+                      <div className='font-medium tabular-nums'>
+                        {t(formatStability(row.rowEvidence?.stability.value))}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {t(row.rowEvidence?.stability.source ?? 'No data')}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {(row.item.recent_stability_samples ?? 0) > 0
+                          ? t('{{count}} stability samples', {
+                              count: row.item.recent_stability_samples,
+                            })
+                          : t('Reference value, no direct stability samples')}
+                      </div>
+                    </td>
+                    <td className='p-3'>
+                      <div className='font-medium'>
+                        {row.sampleCount === undefined
+                          ? t('Reference value')
+                          : t('{{count}} samples', {
+                              count: row.sampleCount,
+                            })}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {row.confidenceLabel}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs break-words'>
+                        {t(formatUpdatedAt(row.item))}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div
+            className='grid gap-3 md:hidden'
+            data-leaderboard-mobile-cards='true'
+          >
+            {renderedRows.map((row) => (
+              <article
+                className='min-w-0 rounded-xl border p-4'
+                data-leaderboard-route-card='true'
+                key={`${row.item.group}-${row.item.endpoint}`}
+              >
+                <div className='flex min-w-0 items-start justify-between gap-3'>
+                  <div className='min-w-0'>
+                    <h2 className='font-semibold break-words'>
+                      {row.item.group}
+                    </h2>
+                    <div className='text-muted-foreground mt-1 text-xs break-words'>
+                      {row.item.endpoint}
+                    </div>
+                    <div className='text-muted-foreground mt-1 text-xs tabular-nums'>
+                      {t('group ratio')}:{' '}
+                      {row.effectiveGroupRatio ?? t('Unknown')}
+                    </div>
+                  </div>
+                  <Badge
+                    className='max-w-[46%] whitespace-normal'
+                    variant='outline'
+                  >
+                    {t(routeState(row.item))}
+                  </Badge>
+                </div>
+
+                <div className='mt-3'>
+                  <LeaderboardRankBadges badges={row.rankBadges} />
+                </div>
+
+                <div className='bg-muted/30 mt-3 rounded-lg p-3'>
+                  <div className='text-muted-foreground text-xs'>
+                    {t('Status and price')}
+                  </div>
+                  <div className='mt-1 text-sm font-medium break-words'>
+                    {row.item.price
+                      ? formatSmartRouterRoutePrice(row.item.price, t)
+                      : t('Price reference unavailable')}
+                  </div>
+                </div>
+
+                <div className='mt-3 grid grid-cols-2 gap-3'>
+                  <LeaderboardMobileMetric
+                    tone='cache'
+                    label={t('Routing cache weight')}
+                    value={t(formatPercentagePPM(row.rowEvidence?.cache.value))}
+                    details={[
+                      {
+                        key: 'source',
+                        value: t(row.rowEvidence?.cache.source ?? 'No data'),
+                      },
+                      {
+                        key: 'real-cache-rate',
+                        value:
+                          finite(row.item.recent_cache_rate_ppm) === undefined
+                            ? t('Real cache rate: awaiting samples')
+                            : t('Real cache rate: {{value}}', {
+                                value: formatPercentagePPM(
+                                  finite(row.item.recent_cache_rate_ppm)
+                                ),
+                              }),
+                      },
+                    ]}
+                  />
+                  <LeaderboardMobileMetric
+                    tone='cost'
+                    label={t('Predicted input cost')}
+                    value={t(
+                      formatPredictedCost(row.item)
+                    )}
+                    details={[
+                      {
+                        key: 'source',
+                        value: t(row.rowEvidence?.cost.source ?? 'No data'),
+                      },
+                    ]}
+                  />
+                  <LeaderboardMobileMetric
+                    tone='ttft'
+                    label={t('Recent weighted first-token latency')}
+                    value={t(formatTTFT(row.rowEvidence?.ttft.value))}
+                    details={[
+                      {
+                        key: 'source',
+                        value: t(row.rowEvidence?.ttft.source ?? 'No data'),
+                      },
+                    ]}
+                  />
+                  <LeaderboardMobileMetric
+                    tone='stability'
+                    label={t('Stability')}
+                    value={t(formatStability(row.rowEvidence?.stability.value))}
+                    details={[
+                      {
+                        key: 'source',
+                        value: t(
+                          row.rowEvidence?.stability.source ?? 'No data'
+                        ),
+                      },
+                      {
+                        key: 'sample-count',
+                        value:
+                          (row.item.recent_stability_samples ?? 0) > 0
+                            ? t('{{count}} stability samples', {
+                                count: row.item.recent_stability_samples,
+                              })
+                            : t('Reference value, no direct stability samples'),
+                      },
+                    ]}
+                  />
+                  <LeaderboardMobileMetric
+                    wide
+                    label={t('Evidence')}
+                    value={
+                      row.sampleCount === undefined
+                        ? t('Reference value')
+                        : t('{{count}} samples', { count: row.sampleCount })
+                    }
+                    details={[
+                      { key: 'confidence', value: row.confidenceLabel },
+                      {
+                        key: 'updated-at',
+                        value: t(formatUpdatedAt(row.item)),
+                      },
+                    ]}
+                  />
+                </div>
+
+                <div className='mt-3 flex flex-wrap items-center justify-between gap-2'>
+                  <LeaderboardTrendButton detailId={row.item.detail_id} />
+                  <span className='text-muted-foreground text-xs tabular-nums'>
+                    {t('Custom score')}: {row.customScore}
+                  </span>
+                </div>
+              </article>
+            ))}
+          </div>
+        </>
+      )}
+      <KeyUsageAnalyticsPanel keys={allKeys} />
+    </div>
+  )
+}

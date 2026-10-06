@@ -1,0 +1,120 @@
+package service
+
+import (
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestParameterFinanceSendHookPersistsDirectQuoteAndOwnsUsage(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	seedUser(t, 8801, 1000)
+	seedToken(t, 8802, 8801, "parameter-direct-hook", 1000)
+	info := directBillingInfo("parameter-hook", 8801, 8802)
+	info.StartTime = time.Now().UTC()
+	info.PriceData.ParameterPricing = &types.ParameterPriceSnapshot{SchemaVersion: 1, Revision: "price-v1", RuleID: "test-rule", Group: "retail", Model: "image-model", ChannelID: 99,
+		Unit: "per_request", Currency: "USD", UnitPrice: "0.0002", Quantity: "1", Amount: "0.0002", Quota: 100, Parameters: map[string]string{"count": "1"}}
+	session, apiErr := NewBillingSession(smartRouteBillingContext(), info, 100)
+	require.Nil(t, apiErr)
+	info.Billing = session
+	assert.False(t, BillingOwnsUsageProjection(info))
+	require.NoError(t, PersistParameterCostBeforeSend(info))
+	assert.True(t, BillingOwnsUsageProjection(info))
+	assert.Equal(t, "direct:parameter-hook", session.ReservationID())
+	row := directReservationRow(t, "parameter-hook")
+	require.NotNil(t, row.ParameterCostContext)
+	require.NoError(t, session.Settle(100))
+	assert.Equal(t, 900, smartRouteWalletQuota(t, 8801))
+	var user model.User
+	require.NoError(t, model.DB.First(&user, 8801).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+}
+
+func TestParameterFinanceAsyncHookPersistsBeforeSendWithoutTakingTaskUsage(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	seedUser(t, 8805, 1000)
+	seedToken(t, 8806, 8805, "parameter-async-hook", 1000)
+	info := directBillingInfo("parameter-async", 8805, 8806)
+	info.StartTime = time.Now().UTC()
+	info.TaskRelayInfo = &relaycommon.TaskRelayInfo{PublicTaskID: "task-before-send"}
+	info.PriceData.ParameterPricing = &types.ParameterPriceSnapshot{SchemaVersion: 1, Revision: "sale-v1", RuleID: "task-rule", Group: "retail", Model: "video-model", ChannelID: 99,
+		SupplyRevision: "supply-v2", Unit: "per_second", Currency: "USD", UnitPrice: "0.00005", Quantity: "4", Amount: "0.0002", Quota: 100, Parameters: map[string]string{"resolution": "720p"}}
+	session, apiErr := NewBillingSession(smartRouteBillingContext(), info, 100)
+	require.Nil(t, apiErr)
+	info.Billing = session
+	require.NoError(t, PersistParameterCostBeforeSend(info))
+	assert.False(t, BillingOwnsUsageProjection(info), "task receipt retains usage ownership")
+	row := directReservationRow(t, "parameter-async")
+	require.NotNil(t, row.ParameterCostContext)
+	var frozen model.ParameterReservationCostContext
+	require.NoError(t, common.UnmarshalJsonStr(*row.ParameterCostContext, &frozen))
+	assert.Equal(t, info.PublicTaskID, frozen.TaskPublicID)
+	assert.Equal(t, info.RequestId, frozen.RequestID)
+	assert.Equal(t, "supply-v2", frozen.TaskBilling.ParameterPricing.SupplyRevision)
+	require.ErrorIs(t, PersistParameterCostBeforeSend(info), model.ErrParameterTaskSubmissionPending)
+	require.NoError(t, MarkParameterTaskSubmissionRejected(info))
+	require.NoError(t, PersistParameterCostBeforeSend(info))
+	assert.Equal(t, 900, smartRouteWalletQuota(t, 8805))
+}
+
+func TestParameterFinanceSynchronousSubscriptionUsesDurableQuoteAndFunding(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	seedUser(t, 8807, 1000)
+	seedToken(t, 8808, 8807, "parameter-subscription-hook", 1000)
+	now := time.Now().Unix()
+	require.NoError(t, model.DB.Create(&model.SubscriptionPlan{Id: 8809, Title: "Parameter plan", TotalAmount: 500, QuotaResetPeriod: model.SubscriptionResetDaily}).Error)
+	require.NoError(t, model.DB.Create(&model.UserSubscription{Id: 8810, UserId: 8807, PlanId: 8809, AmountTotal: 500,
+		StartTime: now - 3600, EndTime: now + 86400, Status: "active", LastResetTime: now, NextResetTime: now + 86400}).Error)
+	info := directBillingInfo("parameter-subscription", 8807, 8808)
+	info.ForcePreConsume = false
+	info.StartTime = time.Now().UTC()
+	info.UserSetting.BillingPreference = "subscription_only"
+	info.PriceData.ParameterPricing = &types.ParameterPriceSnapshot{SchemaVersion: 1, Revision: "sale-v1", RuleID: "image-rule", Group: "retail", Model: "image-model", ChannelID: 99,
+		Unit: "per_request", Currency: "USD", UnitPrice: "0.0002", Quantity: "1", Amount: "0.0002", Quota: 100, Parameters: map[string]string{"count": "1"}}
+	session, apiErr := NewBillingSession(smartRouteBillingContext(), info, 100)
+	require.Nil(t, apiErr)
+	info.Billing = session
+	require.NoError(t, PersistParameterCostBeforeSend(info))
+	assert.Equal(t, "direct:parameter-subscription", BillingReservationID(session))
+	assert.EqualValues(t, 100, smartRouteSubscriptionUsed(t, 8810))
+	assert.Equal(t, 1000, smartRouteWalletQuota(t, 8807))
+	require.NoError(t, session.Settle(100))
+	require.NotNil(t, directReservationRow(t, "parameter-subscription").ParameterCostContext)
+}
+
+func TestParameterFinanceSendHookSkipsLegacyButRequiresTaskReservation(t *testing.T) {
+	require.NoError(t, PersistParameterCostBeforeSend(nil))
+	require.NoError(t, PersistParameterCostBeforeSend(&relaycommon.RelayInfo{}))
+	info := &relaycommon.RelayInfo{PriceData: types.PriceData{ParameterPricing: &types.ParameterPriceSnapshot{Quota: 1}}}
+	require.ErrorContains(t, PersistParameterCostBeforeSend(info), "durable reservation")
+	info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+	require.ErrorContains(t, PersistParameterCostBeforeSend(info), "durable reservation")
+}
+
+func TestParameterFinanceExplicitFreePriceStillHasDurableIdentity(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	seedUser(t, 8803, 1000)
+	seedToken(t, 8804, 8803, "parameter-free-hook", 1000)
+	info := directBillingInfo("parameter-free", 8803, 8804)
+	info.StartTime = time.Now().UTC()
+	info.PriceData.ParameterPricing = &types.ParameterPriceSnapshot{SchemaVersion: 1, Revision: "free-v1", RuleID: "free-rule", Group: "retail", Model: "image-model", ChannelID: 99,
+		Unit: "per_request", Currency: "USD", UnitPrice: "0", Quantity: "1", Amount: "0", Quota: 0, Parameters: map[string]string{"count": "1"}}
+	require.NoError(t, PersistParameterCostBeforeSend(info))
+	require.NotNil(t, info.Billing)
+	assert.True(t, BillingOwnsUsageProjection(info))
+	require.NoError(t, info.Billing.Settle(0))
+	assert.Equal(t, 1000, smartRouteWalletQuota(t, 8803))
+	row := directReservationRow(t, "parameter-free")
+	assert.Equal(t, model.QuotaReservationStatusSettled, row.Status)
+	require.NotNil(t, row.ParameterCostContext)
+}

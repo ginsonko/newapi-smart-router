@@ -1,0 +1,61 @@
+package media
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestVideoFailureDetailsPreservesActionableProviderReasons(t *testing.T) {
+	tests := []struct{ name, reason, raw, want, code string }{
+		{"nested", "task failed", `{"message":"success","data":{"error":{"message":"参考图片超过上限，请减少到六张","code":"too_many_images"}}}`, "参考图片超过上限，请减少到六张", "too_many_images"},
+		{"reason", "", `{"status":"failed","fail_reason":"参考图比例不支持"}`, "参考图比例不支持", ""},
+		{"string error", "", `{"status":"failed","error":"参考图无法读取"}`, "参考图无法读取", ""},
+		{"numeric code", "", `{"error":{"code":413,"message":"参考素材太大"}}`, "参考素材太大", "413"},
+		{"code only", "", `{"error":{"code":"content_policy_violation"}}`, "上游内容审核未通过，请检查提示词和参考素材后调整。", "content_policy_violation"},
+		{"no detail", "task failed", `{"status":"failed"}`, unknownVideoFailure, ""},
+		{"ignore echoes", "", `{"prompt":"私人提示词","references":[{"error":"不是诊断"}],"status":"failed"}`, unknownVideoFailure, ""},
+		{"provider-specific", "素材音轨无法解码", `{"message":"Task failed"}`, "素材音轨无法解码", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := VideoFailureDetails(test.reason, []byte(test.raw))
+			assert.Equal(t, test.want, result.Message)
+			assert.Equal(t, test.code, result.Code)
+		})
+	}
+}
+
+func TestVideoFailureDetailsRemovesSecretsAndEchoes(t *testing.T) {
+	raw := []byte(`{"error":{"message":"下载参考图失败 https://private.test/image?signature=private-signed-value sk-privatecredential bearer privatebearer token=privatetoken plain-secret prompt: private-prompt","code":"bad_reference"}}`)
+	result := VideoFailureDetails("", raw, "plain-secret", "private-prompt")
+	assert.Contains(t, result.Message, "下载参考图失败")
+	for _, secret := range []string{"private.test", "private-signed-value", "sk-privatecredential", "privatebearer", "privatetoken", "plain-secret", "private-prompt"} {
+		assert.NotContains(t, result.Message, secret)
+	}
+	assert.Equal(t, unknownVideoFailure, VideoFailureDetails("", []byte(`{"error":"<html>secret body</html>"}`)).Message)
+	assert.LessOrEqual(t, len([]rune(VideoFailureDetails(strings.Repeat("原因", 1000), nil).Message)), 513)
+	assert.Equal(t, unknownVideoFailure, VideoFailureDetails(strings.Repeat("x", 20000), nil).Message)
+}
+
+func TestFailedVideoResponseRecoversHistoricalReasonWithoutMutation(t *testing.T) {
+	task := &model.Task{TaskID: "public-task", Status: model.TaskStatusFailure, FailReason: "task failed", Quota: 123,
+		Data: []byte(`{"id":"provider-private-id","error":{"message":"仅支持五秒、十秒或十五秒"},"prompt":"private-prompt"}`)}
+	before := *task
+	raw, err := DecorateOpenAIVideoResponse(task.Data, task)
+	require.NoError(t, err) // Failed projection does not even require a database.
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(raw, &response))
+	assert.Equal(t, "public-task", response["id"])
+	assert.Equal(t, "failed", response["status"])
+	assert.Equal(t, "仅支持五秒、十秒或十五秒", response["fail_reason"])
+	assert.Equal(t, "仅支持五秒、十秒或十五秒", response["error"].(map[string]any)["message"])
+	assert.NotContains(t, string(raw), "private")
+	assert.Equal(t, before, *task)
+	task.Status = model.TaskStatusInProgress
+	assert.Empty(t, PublicVideoFailure(task).Message)
+}

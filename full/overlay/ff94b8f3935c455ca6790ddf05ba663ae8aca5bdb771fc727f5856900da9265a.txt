@@ -1,0 +1,10 @@
+package common
+
+import "github.com/QuantumNous/new-api/dto"
+
+func (info *RelayInfo) ImageAdapter() *dto.ImageAdapterConfig {
+	if info == nil || info.ChannelMeta == nil {
+		return nil
+	}
+	return info.ChannelOtherSettings.ImageAdapter
+}

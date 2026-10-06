@@ -1,0 +1,124 @@
+package controller
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSmartRouteExhaustedAPIErrorIsBoundedAndPreservesStatus(t *testing.T) {
+	original := types.WithOpenAIError(types.OpenAIError{
+		Message: "upstream unavailable",
+		Type:    "server_error",
+		Code:    "server_error",
+	}, http.StatusBadGateway)
+	original.SetOriginalStatusCode(http.StatusBadGateway)
+
+	result := smartRouteExhaustedAPIError(original, 7, strings.Repeat("reason ", 800))
+	require.NotNil(t, result)
+	require.Equal(t, http.StatusBadGateway, result.StatusCode)
+	require.Equal(t, http.StatusBadGateway, result.GetOriginalStatusCode())
+	require.Contains(t, result.ToOpenAIError().Message, "发起 7 次上游尝试")
+	require.LessOrEqual(t, len([]rune(result.ToOpenAIError().Message)), 700)
+	require.True(t, types.IsSkipRetryError(result))
+}
+
+func TestSmartRouteExhaustedAPIErrorUsesCapacityGuidance(t *testing.T) {
+	original := types.WithOpenAIError(types.OpenAIError{
+		Message: "our servers are currently overloaded", Type: "capacity_error", Code: "capacity",
+	}, http.StatusTooManyRequests)
+	result := smartRouteExhaustedAPIError(original, 3, "our servers are currently overloaded capacity_error")
+	require.NotNil(t, result)
+	assert.Contains(t, result.ToOpenAIError().Message, "繁忙")
+	assert.Contains(t, result.ToOpenAIError().Message, "发起 3 次上游尝试")
+	assert.NotContains(t, result.ToOpenAIError().Message, "capacity_error")
+}
+
+func TestSmartRouteExhaustedAPIErrorIncludesCandidateCount(t *testing.T) {
+	original := types.WithOpenAIError(types.OpenAIError{
+		Message: "provider-specific transient condition", Type: "provider_error", Code: "vendor_busy",
+	}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+	result := smartRouteExhaustedAPIErrorWithCandidates(original, 4, 9, "provider-specific transient condition", "req-400")
+	require.NotNil(t, result)
+	assert.Contains(t, result.ToOpenAIError().Message, "发起 4 次上游尝试")
+	assert.Contains(t, result.ToOpenAIError().Message, "覆盖 9 个")
+	assert.Contains(t, result.ToOpenAIError().Message, "req-400")
+	assert.Equal(t, http.StatusBadRequest, result.GetOriginalStatusCode())
+}
+
+func TestSmartRouteConversationStateAPIErrorDoesNotInviteFailover(t *testing.T) {
+	original := types.WithOpenAIError(types.OpenAIError{
+		Message: "Invalid input item id",
+		Type:    "invalid_request_error",
+		Code:    "invalid_request",
+	}, http.StatusBadRequest)
+
+	result := smartRouteConversationStateAPIError(original)
+	require.NotNil(t, result)
+	require.Equal(t, http.StatusBadRequest, result.StatusCode)
+	require.Contains(t, result.ToOpenAIError().Message, "新建会话")
+	require.Contains(t, result.ToOpenAIError().Message, "切换")
+	require.True(t, types.IsSkipRetryError(result))
+}
+
+func TestSmartRouteUserFacingErrorDoesNotMislabelUnknownProvider400(t *testing.T) {
+	providerErr := types.WithOpenAIError(types.OpenAIError{
+		Message: "provider is temporarily busy",
+		Type:    "provider_error",
+		Code:    "vendor_busy",
+	}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+
+	result := smartRouteUserFacingTerminalError(providerErr)
+	require.NotNil(t, result)
+	assert.Equal(t, "provider is temporarily busy", result.ToOpenAIError().Message)
+	assert.NotContains(t, result.ToOpenAIError().Message, "请求中的具体字段或参数不符合当前模型接口要求")
+}
+
+func TestSmartRouteUserFacingErrorExplainsConcreteProviderField400(t *testing.T) {
+	providerErr := types.WithOpenAIError(types.OpenAIError{
+		Message: "Invalid 'input[0].type': expected message",
+		Type:    "invalid_request_error",
+		Code:    "invalid_request",
+	}, http.StatusBadRequest, types.ErrOptionWithUpstreamResponseReceived())
+
+	result := smartRouteUserFacingTerminalErrorWithRequestID(providerErr, "req-field-400")
+	require.NotNil(t, result)
+	assert.Contains(t, result.ToOpenAIError().Message, "上游明确拒绝")
+	assert.Contains(t, result.ToOpenAIError().Message, "状态码 400")
+	assert.Contains(t, result.ToOpenAIError().Message, "Invalid 'input[0].type': expected message")
+	assert.Contains(t, result.ToOpenAIError().Message, "req-field-400")
+	assert.NotContains(t, result.ToOpenAIError().Message, "请求中的具体字段或参数不符合当前模型接口要求")
+	assert.True(t, result.HasUpstreamResponse())
+}
+
+func TestSmartRouteFailureSummaryAggregatesBoundedChineseCategories(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	appendSmartRouteFailureSummary(c, service.SmartRouteOutcome{
+		FailureScope: service.SmartFailureCapacity, HTTPStatus: http.StatusTooManyRequests,
+		Outcome: smartrouter.OutcomeCapacityLimited, ErrorSummary: "rate limit at https://internal.example/sk-secret",
+	})
+	appendSmartRouteFailureSummary(c, service.SmartRouteOutcome{
+		FailureScope: service.SmartFailureRouteContract, HTTPStatus: http.StatusBadRequest,
+		Outcome: smartrouter.OutcomeInfrastructure, ErrorSummary: "unsupported parameter",
+	})
+	reason := smartRouteFailureReason(c, "最后一次失败")
+	assert.Contains(t, reason, "容量/限流 1 次（状态 429）")
+	assert.Contains(t, reason, "能力合同不匹配 1 次（状态 400）")
+	assert.NotContains(t, reason, "https://")
+	assert.NotContains(t, reason, "sk-secret")
+}
+
+func TestSmartRouteRequestIDSuffixPreservesLocalAndUpstreamIDs(t *testing.T) {
+	assert.Equal(t, " 请求 ID：local-1；上游请求 ID：up-1", smartRouteRequestIDSuffix("local-1", "up-1"))
+	assert.Equal(t, " 请求 ID：same", smartRouteRequestIDSuffix("same", "same"))
+}

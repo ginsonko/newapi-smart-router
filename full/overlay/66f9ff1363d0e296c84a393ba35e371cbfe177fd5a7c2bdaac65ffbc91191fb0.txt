@@ -1,0 +1,355 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { api } from '@/lib/api'
+
+import { buildSmartRouterSettlementPayload } from './reconciliation'
+import type {
+  KeyUsageAnalyticsResponse,
+  RouteAnalyticsDetailResponse,
+  SmartRouterConfigResponse,
+  SmartRouterBlockInput,
+  SmartRouterBlocksResponse,
+  SmartRouterBulkRecoveryResponse,
+  SmartRouterCacheEconomyStatusResponse,
+  SmartRouterHealthResponse,
+  SmartRouterHealthActionResponse,
+  SmartRouterResetAllAutomaticHealthResponse,
+  SmartRouterOptionsResponse,
+  SmartRouterReconciliationListResponse,
+  SmartRouterReconciliationRetryResponse,
+  SmartRouterReconciliationSettleResponse,
+  SmartRouterReconciliationUsage,
+  SmartRouterStatusResponse,
+  SmartRouterStatusModelsResponse,
+  SmartRouterSetting,
+  UpdateSmartRouterConfigResponse,
+} from './types'
+
+export async function getSmartRouterOptions() {
+  const res = await api.get<SmartRouterOptionsResponse>(
+    '/api/smart-router/options'
+  )
+  return res.data
+}
+
+export async function getSmartRouterConfig() {
+  const res = await api.get<SmartRouterConfigResponse>(
+    '/api/smart-router/config'
+  )
+  return res.data
+}
+
+export async function updateSmartRouterConfig(setting: SmartRouterSetting) {
+  const res = await api.put<UpdateSmartRouterConfigResponse>(
+    '/api/smart-router/config',
+    setting
+  )
+  return res.data
+}
+
+export async function refreshSmartRouterCatalog() {
+  const res = await api.post<SmartRouterConfigResponse>(
+    '/api/smart-router/refresh'
+  )
+  return res.data
+}
+
+export async function getSmartRouterBlocks() {
+  const res = await api.get<SmartRouterBlocksResponse>(
+    '/api/smart-router/blocks',
+    { params: { p: 1, page_size: 100 } }
+  )
+  return res.data
+}
+
+export async function createSmartRouterBlock(input: SmartRouterBlockInput) {
+  const res = await api.post<SmartRouterBlocksResponse>(
+    '/api/smart-router/blocks',
+    input
+  )
+  return res.data
+}
+
+export async function deleteSmartRouterBlock(id: number) {
+  const res = await api.delete<SmartRouterBlocksResponse>(
+    `/api/smart-router/blocks/${id}`
+  )
+  return res.data
+}
+
+async function getSmartRouterHealthPage(params: {
+  page?: number
+  pageSize?: number
+}) {
+  const res = await api.get<SmartRouterHealthResponse>(
+    '/api/smart-router/health',
+    {
+      params: {
+        page: params.page ?? 1,
+        page_size: params.pageSize ?? 100,
+      },
+    }
+  )
+  return res.data
+}
+
+export async function getSmartRouterHealth() {
+  return getSmartRouterHealthPage({ page: 1, pageSize: 100 })
+}
+
+export async function getSmartRouterCacheEconomyStatus() {
+  const res = await api.get<SmartRouterCacheEconomyStatusResponse>(
+    '/api/smart-router/cache-economy/status'
+  )
+  return res.data
+}
+
+export async function getAllSmartRouterHealth() {
+  const first = await getSmartRouterHealthPage({ page: 1, pageSize: 100 })
+  if (!first.success) {
+    throw new Error(first.message || 'Unable to load smart-routing health')
+  }
+  if (!first.data || Array.isArray(first.data)) return first
+
+  const total = first.data.total ?? first.data.items.length
+  const pageCount = Math.min(50, Math.ceil(total / 100))
+  if (pageCount <= 1) return first
+
+  const remaining = []
+  for (let page = 2; page <= pageCount; page += 4) {
+    const batch = await Promise.all(
+      Array.from({ length: Math.min(4, pageCount - page + 1) }, (_, index) =>
+        getSmartRouterHealthPage({ page: page + index, pageSize: 100 })
+      )
+    )
+    remaining.push(...batch)
+  }
+  const failedPage = remaining.find((response) => !response.success)
+  if (failedPage) {
+    throw new Error(
+      failedPage.message || 'Unable to load a smart-routing health page'
+    )
+  }
+
+  const items = [
+    ...first.data.items,
+    ...remaining.flatMap((response) => {
+      if (!response.success || !response.data) return []
+      return Array.isArray(response.data) ? response.data : response.data.items
+    }),
+  ]
+  return {
+    ...first,
+    data: {
+      ...first.data,
+      items,
+      page: 1,
+      page_size: items.length,
+    },
+  }
+}
+
+/**
+ * Fetch the privacy-filtered route view for one of the current user's keys.
+ * The endpoint is intentionally separate from the Root-only health console;
+ * callers must never infer channel topology from this response.
+ */
+export async function getSmartRouterStatus(params: {
+  tokenId?: number
+  model?: string
+  endpoint?: string
+}) {
+  const search = new URLSearchParams()
+  if (params.tokenId !== undefined) {
+    search.set('token_id', String(params.tokenId))
+  }
+  if (params.model) {
+    search.set('model', params.model)
+  }
+  if (params.endpoint) {
+    search.set('endpoint', params.endpoint)
+  }
+  const query = search.toString()
+  const res = await api.get<SmartRouterStatusResponse>(
+    `/api/smart-router/status${query ? `?${query}` : ''}`
+  )
+  return res.data
+}
+
+export async function getSmartRouterStatusModels(params: {
+  tokenId: number
+  query?: string
+  page?: number
+  pageSize?: number
+}) {
+  const res = await api.get<SmartRouterStatusModelsResponse>(
+    '/api/smart-router/status/models',
+    {
+      params: {
+        token_id: params.tokenId,
+        q: params.query || undefined,
+        p: params.page ?? 1,
+        page_size: params.pageSize ?? 100,
+      },
+    }
+  )
+  return res.data
+}
+
+// The backend can return the complete privacy-safe index in one bounded
+// snapshot. Keep this path single-request so a slow page can never leave the
+// status screen waiting on a fan-out of 20 overlapping Redis/catalog reads.
+export async function getAllSmartRouterStatusModels(tokenId: number) {
+  const res = await getSmartRouterStatusModels({
+    tokenId,
+    page: 1,
+    pageSize: 1000,
+  })
+  if (!res.success) {
+    throw new Error(res.message || 'Unable to load smart-routing model index')
+  }
+  return res
+}
+
+export async function getGlobalSmartRouterLeaderboardModels() {
+  const res = await api.get<SmartRouterStatusModelsResponse>(
+    '/api/smart-router/leaderboard/models',
+    { params: { p: 1, page_size: 1000 } }
+  )
+  if (!res.data.success) {
+    throw new Error(
+      res.data.message || 'Unable to load the site leaderboard model index'
+    )
+  }
+  return res.data
+}
+
+export async function getGlobalSmartRouterLeaderboardStatus(params: {
+  model: string
+  endpoint?: string
+}) {
+  const res = await api.get<SmartRouterStatusResponse>(
+    '/api/smart-router/leaderboard/status',
+    {
+      params: {
+        model: params.model,
+        endpoint: params.endpoint || undefined,
+        p: 1,
+        page_size: 1000,
+      },
+    }
+  )
+  return res.data
+}
+
+export async function getSmartRouterRouteAnalytics(params: {
+  detailId: string
+  range: '1h' | '24h' | '3d'
+}) {
+  const res = await api.get<RouteAnalyticsDetailResponse>(
+    `/api/smart-router/leaderboard/routes/${encodeURIComponent(params.detailId)}/analytics`,
+    { params: { range: params.range } }
+  )
+  if (!res.data.success) {
+    throw new Error(res.data.message || 'Unable to load route analytics')
+  }
+  return res.data
+}
+
+export async function getSmartRouterKeyUsageAnalytics(params: {
+  tokenId: number
+  range: '1h' | '1d' | '7d'
+  model?: string
+}) {
+  const res = await api.get<KeyUsageAnalyticsResponse>(
+    '/api/smart-router/usage-analytics',
+    {
+      params: {
+        token_id: params.tokenId,
+        range: params.range,
+        model: params.model || undefined,
+      },
+    }
+  )
+  if (!res.data.success) {
+    throw new Error(res.data.message || 'Unable to load key usage analytics')
+  }
+  return res.data
+}
+
+export async function probeSmartRouterRoute(routeID: string) {
+  const res = await api.post<SmartRouterHealthActionResponse>(
+    `/api/smart-router/health/${encodeURIComponent(routeID)}/probe`
+  )
+  return res.data
+}
+
+export async function scheduleAllSmartRouterRecoveries() {
+  const res = await api.post<SmartRouterBulkRecoveryResponse>(
+    '/api/smart-router/health/recoveries/schedule-all'
+  )
+  return res.data
+}
+
+export async function resetAllSmartRouterAutomaticHealth() {
+  const res = await api.post<SmartRouterResetAllAutomaticHealthResponse>(
+    '/api/smart-router/health/reset-all',
+    { confirmation: 'RESET AUTOMATIC HEALTH' }
+  )
+  return res.data
+}
+
+export async function resetSmartRouterRoute(routeID: string) {
+  const res = await api.post<SmartRouterHealthActionResponse>(
+    `/api/smart-router/health/${encodeURIComponent(routeID)}/reset`
+  )
+  return res.data
+}
+
+export async function getSmartRouterReconciliations(
+  usage: SmartRouterReconciliationUsage,
+  page: number,
+  pageSize: number
+) {
+  const res = await api.get<SmartRouterReconciliationListResponse>(
+    '/api/smart-router/reconciliations',
+    {
+      params: { usage, p: page, page_size: pageSize },
+    }
+  )
+  return res.data
+}
+
+export async function retryKnownSmartRouterReconciliations() {
+  const res = await api.post<SmartRouterReconciliationRetryResponse>(
+    '/api/smart-router/reconciliations/retry-known'
+  )
+  return res.data
+}
+
+export async function settleSmartRouterReconciliation(
+  reservationID: string,
+  actualQuota: number
+) {
+  const res = await api.post<SmartRouterReconciliationSettleResponse>(
+    `/api/smart-router/reconciliations/${encodeURIComponent(reservationID)}/settle`,
+    buildSmartRouterSettlementPayload(actualQuota)
+  )
+  return res.data
+}

@@ -1,0 +1,350 @@
+package service
+
+import (
+	"fmt"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSmartRouteActualInputCostStorePublishesBoundedSnapshot(t *testing.T) {
+	store := &smartRouteActualInputCostStore{
+		events: make(chan SmartRouteActualInputCostObservation, 16),
+		stop:   make(chan struct{}), done: make(chan struct{}),
+		profiles: make(smartrouter.ActualInputCostSnapshot), seen: make(map[string]int64),
+	}
+	store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+	store.learningEnabled.Store(true)
+	store.evidenceReady.Store(true)
+	store.applyObservations([]SmartRouteActualInputCostObservation{{
+		ObservationID: "one", Key: "route", PoolKey: "pool", TotalInputTokens: 100,
+		RegularInputTokens: 50, CacheReadTokens: 50, Reliable: true, EventMS: time.Now().UnixMilli(),
+	}})
+	require.Empty(t, store.Snapshot(), "request readers keep the old immutable snapshot until the coalesced publish")
+	store.publishSnapshotIfDirty()
+	profile := store.Snapshot()["route"]
+	require.Equal(t, int64(1), profile.TotalSamples)
+	require.Equal(t, int64(1), store.Snapshot()["pool"].TotalSamples)
+	store.applyObservations([]SmartRouteActualInputCostObservation{{
+		ObservationID: "one", Key: "route", PoolKey: "pool", TotalInputTokens: 100,
+		RegularInputTokens: 50, CacheReadTokens: 50, Reliable: true, EventMS: time.Now().UnixMilli(),
+	}})
+	store.publishSnapshotIfDirty()
+	require.Equal(t, int64(1), store.Snapshot()["route"].TotalSamples)
+	require.Equal(t, int64(1), store.Status().Duplicates)
+}
+
+func TestActualInputCostQueueFullDropsLearningWithoutBlocking(t *testing.T) {
+	store := &smartRouteActualInputCostStore{events: make(chan SmartRouteActualInputCostObservation, 1)}
+	store.learningEnabled.Store(true)
+	observation := SmartRouteActualInputCostObservation{
+		ObservationID: "one", Key: "route", PoolKey: "pool", TotalInputTokens: 1,
+		RegularInputTokens: 1, Reliable: true,
+	}
+	require.True(t, store.Observe(observation))
+	observation.ObservationID = "two"
+	require.False(t, store.Observe(observation))
+	require.Equal(t, int64(1), store.dropped.Load())
+}
+
+func TestActualInputCostSkipsUnknownCacheFieldsButAcceptsExplicitZero(t *testing.T) {
+	store := &smartRouteActualInputCostStore{
+		events: make(chan SmartRouteActualInputCostObservation, 4),
+		stop:   make(chan struct{}), done: make(chan struct{}),
+		profiles: make(smartrouter.ActualInputCostSnapshot), seen: make(map[string]int64),
+	}
+	store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+	store.learningEnabled.Store(true)
+	store.evidenceReady.Store(true)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set(actualInputCostObservationContextKey, smartRouteActualInputCostObservationBase{
+		sink: store, ObservationID: "known-zero", Key: "route", PoolKey: "pool",
+	})
+	relayInfo := &relaycommon.RelayInfo{}
+	unknown := &dto.Usage{InputTokens: 100, PromptTokens: 100}
+	observeSmartRouteActualInputCostUsage(ctx, relayInfo, unknown, textQuotaSummary{PromptTokens: 100})
+	require.Len(t, store.events, 1, "a successful response without cache fields must advance the bounded fallback state")
+	missing := <-store.events
+	require.True(t, missing.MissingEvidence)
+	require.False(t, missing.Reliable)
+	require.Zero(t, missing.TotalInputTokens, "missing evidence must not become a guessed zero-hit sample")
+
+	ctx.Set(actualInputCostObservationContextKey, smartRouteActualInputCostObservationBase{
+		sink: store, ObservationID: "explicit-zero", Key: "route", PoolKey: "pool",
+	})
+	explicitZero := &dto.Usage{InputTokens: 100, PromptTokens: 100, CacheUsageReliable: true}
+	observeSmartRouteActualInputCostUsage(ctx, relayInfo, explicitZero, textQuotaSummary{PromptTokens: 100})
+	require.Len(t, store.events, 1)
+	zero := <-store.events
+	require.True(t, zero.Reliable)
+	require.False(t, zero.MissingEvidence)
+	require.Equal(t, int64(100), zero.RegularInputTokens)
+}
+
+func TestActualInputCostBindsTieredExpressionRoutesBeforeUsageArrives(t *testing.T) {
+	store := &smartRouteActualInputCostStore{events: make(chan SmartRouteActualInputCostObservation, 1)}
+	store.learningEnabled.Store(true)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	session := &SmartRoutingSession{
+		engine: &SmartRouterEngine{ActualInputCosts: store},
+		request: smartrouter.RouteRequest{
+			CanonicalModel: "gpt-5.6-sol", Endpoint: SmartEndpointResponses,
+		},
+	}
+	handle := &SmartRouteAttemptHandle{
+		Plan: smartrouter.PlanResult{
+			RouteID: "tiered-route",
+			Price: smartrouter.RoutePrice{
+				BillingMode: "tiered_expr", BillingUnit: "per_token",
+				StaticComparable: true, ComparisonClass: "tiered-price",
+			},
+		},
+		Route: smartrouter.CertifiedRoute{
+			RouteID: "tiered-route", UpstreamModel: "provider-sol",
+			CacheDomain: "channel:46", CacheNamespaceRevision: "generation-7",
+		},
+	}
+
+	session.BindActualInputCostObservation(ctx, handle, &relaycommon.RelayInfo{RequestId: "request-tiered"})
+	value, exists := ctx.Get(actualInputCostObservationContextKey)
+	require.True(t, exists, "tiered pricing must not discard otherwise reliable cache evidence")
+	base, ok := value.(smartRouteActualInputCostObservationBase)
+	require.True(t, ok)
+	require.Equal(t, smartRouteCanonicalObservationID("actual-input", "request-tiered", base.Key), base.ObservationID)
+	require.Equal(t, []string{"request-tiered:tiered-route"}, base.LegacyObservationIDs)
+}
+
+func TestActualInputCostStoreRejectsLegacyReplayAfterRestart(t *testing.T) {
+	const legacyID = "request-before-upgrade:route"
+	old := smartrouter.ActualInputCostObservation{
+		ObservationID: legacyID, Key: "route", PoolKey: "pool", EventMS: 1_000,
+		RegularInputTokens: 10, CacheReadTokens: 90, TotalInputTokens: 100, Reliable: true,
+	}
+	profile := smartrouter.ApplyActualInputCostObservation(smartrouter.ActualInputCostProfile{}, old, 1_000)
+	profile = smartrouter.ApplyActualInputCostWindowObservation(profile, old, 1_000)
+
+	store := &smartRouteActualInputCostStore{
+		events: make(chan SmartRouteActualInputCostObservation, 1), stop: make(chan struct{}), done: make(chan struct{}),
+		profiles: smartrouter.ActualInputCostSnapshot{"route": profile}, seen: make(map[string]int64),
+	}
+	store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+	store.learningEnabled.Store(true)
+	store.evidenceReady.Store(true)
+	store.applyObservations([]SmartRouteActualInputCostObservation{{
+		ObservationID:        smartRouteCanonicalObservationID("actual-input", "request-before-upgrade", "route"),
+		LegacyObservationIDs: []string{legacyID}, Key: "route", PoolKey: "pool", EventMS: 1_000,
+		RegularInputTokens: 10, CacheReadTokens: 90, TotalInputTokens: 100, Reliable: true,
+	}})
+
+	require.Equal(t, int64(1), store.profiles["route"].TotalSamples)
+	require.Len(t, store.profiles["route"].Window, 1)
+	require.Equal(t, int64(1), store.duplicates.Load())
+}
+
+func TestExternalActualInputCostBindingUsesExactEndpointContractAndSharedPhysicalKey(t *testing.T) {
+	store := &smartRouteActualInputCostStore{events: make(chan SmartRouteActualInputCostObservation, 1)}
+	store.learningEnabled.Store(true)
+	chatContractID, chatFingerprint, err := BuildSmartContractIdentity("gpt-5.6-sol", SmartEndpointChat)
+	require.NoError(t, err)
+	responsesContractID, responsesFingerprint, err := BuildSmartContractIdentity("gpt-5.6-sol", SmartEndpointResponses)
+	require.NoError(t, err)
+	chat := smartrouter.CertifiedRoute{
+		RouteID: "chat-route", ChannelID: 46, ChannelGeneration: "generation-7",
+		Group: "economy", UpstreamModel: "provider-chat", CacheDomain: "channel:46",
+	}
+	responses := chat
+	responses.RouteID = "responses-route"
+	responses.UpstreamModel = "provider-responses"
+	responsesAlias := responses
+	responsesAlias.RouteID = "responses-pro"
+	responsesAlias.Group = "pro"
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			chatContractID: {
+				Contract: smartrouter.RouteContract{
+					ContractID: chatContractID, CanonicalModel: "gpt-5.6-sol",
+					Endpoint: SmartEndpointChat, CapabilityFingerprint: chatFingerprint,
+				},
+				Pools: map[string]smartrouter.CertifiedPool{
+					SmartRouteAutoDiscoveredPool: {Candidates: []smartrouter.CertifiedRoute{chat}},
+				},
+			},
+			responsesContractID: {
+				Contract: smartrouter.RouteContract{
+					ContractID: responsesContractID, CanonicalModel: "gpt-5.6-sol",
+					Endpoint: SmartEndpointResponses, CapabilityFingerprint: responsesFingerprint,
+				},
+				Pools: map[string]smartrouter.CertifiedPool{
+					SmartRouteAutoDiscoveredPool: {Candidates: []smartrouter.CertifiedRoute{responses, responsesAlias}},
+				},
+			},
+		},
+	}
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{RequestId: "external-request", OriginModelName: "gpt-5.6-sol"}
+
+	bound := bindSmartRouteExternalActualInputCostObservation(
+		ctx, &SmartRouterEngine{ActualInputCosts: store}, catalog, info,
+		46, "generation-7", "/v1/responses",
+	)
+	require.True(t, bound)
+	value, exists := ctx.Get(actualInputCostObservationContextKey)
+	require.True(t, exists)
+	base, ok := value.(smartRouteActualInputCostObservationBase)
+	require.True(t, ok)
+	expected := smartrouter.ActualInputCostKey(
+		responses.CacheNamespaceIdentity(), responses.UpstreamModel,
+		"gpt-5.6-sol", SmartEndpointResponses,
+		(smartrouter.RouteRequest{Endpoint: SmartEndpointResponses}).UsageSemantic(),
+	)
+	require.Equal(t, expected, base.Key)
+	require.NotContains(t, base.Key, chat.RouteID)
+}
+
+func TestActualInputCostReadinessSeparatesUnavailableLearnerFromReadyEmptyEvidence(t *testing.T) {
+	store := &smartRouteActualInputCostStore{}
+	store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+	require.Nil(t, store.Snapshot(), "an unread Redis snapshot must preserve R41 static ordering")
+
+	store.evidenceReady.Store(true)
+	require.NotNil(t, store.Snapshot(), "a confirmed empty snapshot enables the hidden cold-start prior")
+	require.Empty(t, store.Snapshot())
+	require.True(t, store.Status().EvidenceReady)
+}
+
+func TestActualInputCostRecordsSuccessfulResponsesWithNilOrMalformedUsageAsMissing(t *testing.T) {
+	store := &smartRouteActualInputCostStore{events: make(chan SmartRouteActualInputCostObservation, 4)}
+	store.learningEnabled.Store(true)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	relayInfo := &relaycommon.RelayInfo{}
+
+	ctx.Set(actualInputCostObservationContextKey, smartRouteActualInputCostObservationBase{
+		sink: store, ObservationID: "nil-usage", Key: "route", PoolKey: "pool",
+	})
+	observeSmartRouteActualInputCostUsage(ctx, relayInfo, nil, textQuotaSummary{})
+	require.Len(t, store.events, 1)
+	require.True(t, (<-store.events).MissingEvidence)
+
+	ctx.Set(actualInputCostObservationContextKey, smartRouteActualInputCostObservationBase{
+		sink: store, ObservationID: "malformed-usage", Key: "route", PoolKey: "pool",
+	})
+	observeSmartRouteActualInputCostUsage(
+		ctx, relayInfo,
+		&dto.Usage{InputTokens: 10, PromptTokens: 10, CacheUsageReliable: true},
+		textQuotaSummary{PromptTokens: 10, CacheTokens: 11},
+	)
+	require.Len(t, store.events, 1)
+	require.True(t, (<-store.events).MissingEvidence)
+}
+
+func TestActualInputCostMissingEvidenceStaysExactAndReliableSampleResetsIt(t *testing.T) {
+	store := &smartRouteActualInputCostStore{
+		profiles: make(smartrouter.ActualInputCostSnapshot), seen: make(map[string]int64),
+	}
+	store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+	store.learningEnabled.Store(true)
+	store.evidenceReady.Store(true)
+
+	store.applyObservations([]SmartRouteActualInputCostObservation{{
+		ObservationID: "missing", Key: "route", PoolKey: "pool", MissingEvidence: true, EventMS: 1_000,
+	}})
+	require.Equal(t, int64(1), store.profiles["route"].MissingEvidenceStreak)
+	require.NotContains(t, store.profiles, "pool", "missing evidence must not poison the compatibility aggregate")
+
+	store.applyObservations([]SmartRouteActualInputCostObservation{{
+		ObservationID: "reliable", Key: "route", PoolKey: "pool", Reliable: true, EventMS: 2_000,
+		TotalInputTokens: 100, CacheReadTokens: 100,
+	}})
+	require.Zero(t, store.profiles["route"].MissingEvidenceStreak)
+	require.Zero(t, store.profiles["route"].LastMissingEvidenceMS)
+	require.Equal(t, int64(1), store.profiles["route"].TotalSamples)
+	require.Equal(t, int64(1), store.profiles["pool"].TotalSamples)
+}
+
+func TestActualInputCostIgnoresMediaAndAudioEndpoints(t *testing.T) {
+	for _, endpoint := range []string{
+		SmartEndpointImages, SmartEndpointImageEdits, SmartEndpointVideos,
+		SmartEndpointVideoTasks, SmartEndpointAudioSpeech,
+		SmartEndpointAudioTranscription, SmartEndpointAudioTranslation,
+	} {
+		require.False(t, isActualInputCostTextEndpoint(endpoint), endpoint)
+	}
+	for _, endpoint := range []string{
+		SmartEndpointChat, SmartEndpointCompletions, SmartEndpointMessages,
+		SmartEndpointResponses,
+	} {
+		require.True(t, isActualInputCostTextEndpoint(endpoint), endpoint)
+	}
+}
+
+func TestActualInputCostSeenPruneStopsAfterExpiredEntriesDropBelowLimit(t *testing.T) {
+	store := &smartRouteActualInputCostStore{seen: make(map[string]int64, actualInputCostMaxSeen+1)}
+	nowMS := time.Now().UnixMilli()
+	expiredMS := nowMS - int64(25*time.Hour/time.Millisecond)
+	for index := 0; index <= actualInputCostMaxSeen; index++ {
+		store.seen[strconv.Itoa(index)] = expiredMS
+	}
+
+	require.NotPanics(t, func() { store.pruneSeenLocked(nowMS) })
+	require.Empty(t, store.seen)
+}
+
+func TestActualInputCostReplicaMergeUnionsAndDeduplicatesObservationWindows(t *testing.T) {
+	build := func(id string, eventMS int64) smartrouter.ActualInputCostProfile {
+		return smartrouter.ApplyActualInputCostWindowObservation(
+			smartrouter.ActualInputCostProfile{},
+			smartrouter.ActualInputCostObservation{
+				ObservationID: id, Key: "route", TotalInputTokens: 100,
+				RegularInputTokens: 10, CacheReadTokens: 90, Reliable: true, EventMS: eventMS,
+				TieredExpressionHash: "revision-a", TieredInputPriceMicros: 380_000,
+			}, eventMS,
+		)
+	}
+	left := build("shared", 1_000)
+	right := build("shared", 1_000)
+	right = smartrouter.ApplyActualInputCostWindowObservation(right, smartrouter.ActualInputCostObservation{
+		ObservationID: "worker-only", Key: "route", TotalInputTokens: 100,
+		RegularInputTokens: 20, CacheReadTokens: 80, Reliable: true, EventMS: 2_000,
+		TieredExpressionHash: "revision-a", TieredInputPriceMicros: 400_000,
+	}, 2_000)
+
+	merged := mergeActualInputCostReplicaProfiles(left, right)
+	require.Len(t, merged.Window, 2)
+	require.Equal(t, int64(2_000), merged.Window[0].EventMS)
+	require.NotEmpty(t, merged.Window[0].ObservationHash)
+	assert.Len(t, merged.History.Pending, 2,
+		"replica merge must retain history for the cache-rate prior; it is not a cost history")
+}
+
+func TestActualInputCostReplicaMergeCommitsOneDeduplicatedHistoryBatch(t *testing.T) {
+	build := func(prefix string, cacheRead int64) smartrouter.ActualInputCostProfile {
+		profile := smartrouter.ActualInputCostProfile{}
+		for index := 0; index < 10; index++ {
+			eventMS := int64(1_000 + index)
+			profile = smartrouter.ApplyActualInputCostWindowObservation(profile, smartrouter.ActualInputCostObservation{
+				ObservationID: fmt.Sprintf("%s-%d", prefix, index), Key: "route", EventMS: eventMS,
+				TotalInputTokens: 100, RegularInputTokens: 100 - cacheRead,
+				CacheReadTokens: cacheRead, Reliable: true,
+			}, eventMS)
+		}
+		return profile
+	}
+
+	merged := mergeActualInputCostReplicaProfiles(build("web", 90), build("worker", 80))
+	assert.Len(t, merged.Window, 20)
+	// A full 20-observation merge flushes the pending batch into the compact
+	// history summary. The retained history still feeds the cache-rate prior.
+	assert.Greater(t, merged.History.TotalSamples, int64(0))
+	assert.Greater(t, merged.History.CacheReadShare, float64(0))
+	assert.Greater(t, merged.History.RegularShare, float64(0))
+}

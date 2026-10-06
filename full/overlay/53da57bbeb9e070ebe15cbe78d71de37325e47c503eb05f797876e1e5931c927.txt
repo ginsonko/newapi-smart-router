@@ -1,0 +1,662 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+)
+
+const (
+	routeAnalyticsSafeDelayV1       = time.Minute
+	routeAnalyticsOverlapV1         = 15 * time.Minute
+	routeAnalyticsInitialWindowV1   = time.Hour
+	routeAnalyticsMaximumHistoryV1  = 7 * 24 * time.Hour
+	routeAnalyticsBackfillChunkV1   = time.Hour
+	routeAnalyticsDefaultIntervalV1 = 15 * time.Second
+	routeAnalyticsDefaultLeaseV1    = 45 * time.Second
+	routeAnalyticsWatchdogPollV1    = 15 * time.Second
+)
+
+type routeAnalyticsWorkerConfigV1 struct {
+	Interval        time.Duration
+	LeaseDuration   time.Duration
+	RunTimeout      time.Duration
+	BatchLimit      int
+	BoundaryLimit   int
+	CPUThreshold    float64
+	MemoryThreshold float64
+}
+
+type routeAnalyticsWorkerBatchResultV1 struct {
+	Logs        int
+	Projections int
+	Applied     int
+	Skipped     int
+	CatalogErr  error
+}
+
+type RouteAnalyticsWorkerStatusV1 struct {
+	Owner              string `json:"-"`
+	Running            bool   `json:"running"`
+	HeartbeatAtMS      int64  `json:"heartbeat_at_ms"`
+	LastRunAtMS        int64  `json:"last_run_at_ms"`
+	LastSuccessAtMS    int64  `json:"last_success_at_ms"`
+	ProcessedLogs      int64  `json:"processed_logs"`
+	AppliedProjections int64  `json:"applied_projections"`
+	DeferredRuns       int64  `json:"deferred_runs"`
+	FailedRuns         int64  `json:"failed_runs"`
+	LastError          string `json:"last_error,omitempty"`
+}
+
+type RouteAnalyticsWorkerV1 struct {
+	engine *SmartRouterEngine
+	owner  string
+	config routeAnalyticsWorkerConfigV1
+	clock  func() time.Time
+	load   func() common.SystemStatus
+	scan   func(context.Context, int64, int64, int, int) (model.RouteAnalyticsLogBatchV1, error)
+
+	stop             chan struct{}
+	done             chan struct{}
+	watchdogDone     chan struct{}
+	startOnce        sync.Once
+	closeOnce        sync.Once
+	doneOnce         sync.Once
+	watchdogDoneOnce sync.Once
+	started          atomic.Bool
+	startedAtMS      atomic.Int64
+	exitProcess      func(int)
+
+	running            atomic.Bool
+	heartbeatMS        atomic.Int64
+	lastRunMS          atomic.Int64
+	lastSuccessMS      atomic.Int64
+	processedLogs      atomic.Int64
+	appliedProjections atomic.Int64
+	deferredRuns       atomic.Int64
+	failedRuns         atomic.Int64
+	lastCleanupMS      atomic.Int64
+	lastError          atomic.Value
+}
+
+func NewRouteAnalyticsWorkerV1(engine *SmartRouterEngine) (*RouteAnalyticsWorkerV1, error) {
+	if engine == nil || engine.Catalogs == nil {
+		return nil, errors.New("route analytics worker requires a smart router catalog")
+	}
+	random, err := common.GenerateRandomCharsKey(12)
+	if err != nil {
+		return nil, fmt.Errorf("generate route analytics worker identity: %w", err)
+	}
+	node := strings.TrimSpace(common.NodeName)
+	if node == "" {
+		node, _ = os.Hostname()
+	}
+	if node == "" {
+		node = "worker"
+	}
+	worker := &RouteAnalyticsWorkerV1{
+		engine: engine,
+		owner:  node + ":route-analytics:" + random,
+		config: routeAnalyticsWorkerConfigV1{
+			Interval: routeAnalyticsDefaultIntervalV1, LeaseDuration: routeAnalyticsDefaultLeaseV1,
+			RunTimeout: 10 * time.Second, BatchLimit: 500, BoundaryLimit: 5_000,
+			CPUThreshold: 70, MemoryThreshold: 90,
+		},
+		clock:        time.Now,
+		load:         common.GetSystemStatus,
+		scan:         model.GetRouteAnalyticsLogBatchV1,
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		watchdogDone: make(chan struct{}),
+		exitProcess:  os.Exit,
+	}
+	worker.lastError.Store("")
+	worker.applyEnvironmentOverridesV1()
+	return worker, nil
+}
+
+func (worker *RouteAnalyticsWorkerV1) applyEnvironmentOverridesV1() {
+	if worker == nil {
+		return
+	}
+	if seconds := common.GetEnvOrDefault("ROUTE_ANALYTICS_INTERVAL_SECONDS", int(worker.config.Interval/time.Second)); seconds >= 5 && seconds <= 300 {
+		worker.config.Interval = time.Duration(seconds) * time.Second
+	}
+	if limit := common.GetEnvOrDefault("ROUTE_ANALYTICS_BATCH_LIMIT", worker.config.BatchLimit); limit >= 50 && limit <= 2_000 {
+		worker.config.BatchLimit = limit
+	}
+	if threshold := common.GetEnvOrDefault("ROUTE_ANALYTICS_MAX_CPU_PERCENT", int(worker.config.CPUThreshold)); threshold >= 20 && threshold <= 95 {
+		worker.config.CPUThreshold = float64(threshold)
+	}
+	if threshold := common.GetEnvOrDefault("ROUTE_ANALYTICS_MAX_MEMORY_PERCENT", int(worker.config.MemoryThreshold)); threshold >= 40 && threshold <= 98 {
+		worker.config.MemoryThreshold = float64(threshold)
+	}
+}
+
+func (worker *RouteAnalyticsWorkerV1) Start() {
+	if worker == nil {
+		return
+	}
+	worker.startOnce.Do(func() {
+		worker.startedAtMS.Store(worker.clock().UnixMilli())
+		worker.started.Store(true)
+		worker.running.Store(true)
+		go worker.superviseV1()
+		if worker.watchdogEnabledV1() {
+			go worker.watchdogV1()
+		} else {
+			worker.watchdogDoneOnce.Do(func() { close(worker.watchdogDone) })
+		}
+	})
+}
+
+func (worker *RouteAnalyticsWorkerV1) Close() {
+	if worker == nil {
+		return
+	}
+	worker.closeOnce.Do(func() {
+		close(worker.stop)
+		if !worker.started.Load() {
+			worker.doneOnce.Do(func() { close(worker.done) })
+			worker.watchdogDoneOnce.Do(func() { close(worker.watchdogDone) })
+		}
+		// A non-cooperative database driver may keep the loop blocked during
+		// shutdown. Do not let SIGTERM hang forever; the process-level watchdog
+		// and container stop policy will reclaim it if it cannot exit promptly.
+		shutdown := time.NewTimer(2 * time.Second)
+		select {
+		case <-worker.done:
+		case <-shutdown.C:
+		}
+		if !shutdown.Stop() {
+			select {
+			case <-shutdown.C:
+			default:
+			}
+		}
+		watchdogShutdown := time.NewTimer(2 * time.Second)
+		select {
+		case <-worker.watchdogDone:
+		case <-watchdogShutdown.C:
+		}
+		if !watchdogShutdown.Stop() {
+			select {
+			case <-watchdogShutdown.C:
+			default:
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = model.ReleaseRouteAnalyticsWorkerLeaseV1(ctx, worker.owner, worker.clock().UnixMilli())
+	})
+}
+
+func (worker *RouteAnalyticsWorkerV1) watchdogEnabledV1() bool {
+	return worker != nil && strings.EqualFold(strings.TrimSpace(os.Getenv("PROCESS_ROLE")), "route-analytics-worker")
+}
+
+func (worker *RouteAnalyticsWorkerV1) watchdogThresholdV1() time.Duration {
+	if worker == nil {
+		return 3 * routeAnalyticsDefaultLeaseV1
+	}
+	threshold := 3 * worker.config.LeaseDuration
+	minimum := 2*worker.config.RunTimeout + worker.config.Interval
+	if threshold < minimum {
+		threshold = minimum
+	}
+	return threshold
+}
+
+func (worker *RouteAnalyticsWorkerV1) watchdogStaleV1(now time.Time) bool {
+	if worker == nil {
+		return false
+	}
+	heartbeat := worker.heartbeatMS.Load()
+	if heartbeat <= 0 {
+		startedAt := worker.startedAtMS.Load()
+		return startedAt > 0 && now.UnixMilli()-startedAt > worker.watchdogThresholdV1().Milliseconds()
+	}
+	return now.UnixMilli()-heartbeat > worker.watchdogThresholdV1().Milliseconds()
+}
+
+func (worker *RouteAnalyticsWorkerV1) watchdogCheckV1(now time.Time) bool {
+	if !worker.watchdogStaleV1(now) {
+		return false
+	}
+	err := fmt.Sprintf("route analytics freshness watchdog: heartbeat stale beyond %s", worker.watchdogThresholdV1())
+	worker.lastError.Store(err)
+	logger.LogError(nil, err)
+	return true
+}
+
+// watchdogV1 is intentionally process-level and read-only. A blocked database
+// driver can prevent the supervisor from reaching its next tick; in the
+// dedicated analytics process the container restart policy is the only
+// reliable way to reclaim that stuck goroutine without creating an orphaned
+// concurrent RunOnce. Web/all roles do not enable this watchdog.
+func (worker *RouteAnalyticsWorkerV1) watchdogV1() {
+	defer worker.watchdogDoneOnce.Do(func() { close(worker.watchdogDone) })
+	ticker := time.NewTicker(routeAnalyticsWatchdogPollV1)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-worker.stop:
+			return
+		case now := <-ticker.C:
+			if !worker.watchdogCheckV1(now) {
+				continue
+			}
+			if worker.exitProcess != nil {
+				worker.exitProcess(1)
+			}
+			return
+		}
+	}
+}
+
+func (worker *RouteAnalyticsWorkerV1) Status() RouteAnalyticsWorkerStatusV1 {
+	if worker == nil {
+		return RouteAnalyticsWorkerStatusV1{}
+	}
+	lastError, _ := worker.lastError.Load().(string)
+	return RouteAnalyticsWorkerStatusV1{
+		Owner: worker.owner, Running: worker.running.Load(), HeartbeatAtMS: worker.heartbeatMS.Load(),
+		LastRunAtMS: worker.lastRunMS.Load(), LastSuccessAtMS: worker.lastSuccessMS.Load(),
+		ProcessedLogs: worker.processedLogs.Load(), AppliedProjections: worker.appliedProjections.Load(),
+		DeferredRuns: worker.deferredRuns.Load(), FailedRuns: worker.failedRuns.Load(), LastError: lastError,
+	}
+}
+
+// superviseV1 keeps the long-lived ticker alive even if a future change adds
+// a panic outside runWithTimeoutV1. The normal tick path already recovers
+// panics per run; this outer boundary is the process-local final guard and
+// restarts the loop with bounded backoff instead of silently losing freshness.
+func (worker *RouteAnalyticsWorkerV1) superviseV1() {
+	defer worker.doneOnce.Do(func() { close(worker.done) })
+	for {
+		worker.running.Store(true)
+		panicked := false
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					panicked = true
+					err := fmt.Errorf("route analytics worker loop panic recovered: %v", recovered)
+					worker.failedRuns.Add(1)
+					worker.lastError.Store(err.Error())
+					logger.LogError(nil, err.Error())
+				}
+			}()
+			worker.loopV1()
+		}()
+		worker.running.Store(false)
+		select {
+		case <-worker.stop:
+			return
+		default:
+		}
+		if !panicked {
+			// loopV1 only returns when stop is closed. Treat any other return as
+			// an unexpected exit and restart it through the same bounded path.
+			err := errors.New("route analytics worker loop exited unexpectedly")
+			worker.failedRuns.Add(1)
+			worker.lastError.Store(err.Error())
+			logger.LogError(nil, err.Error())
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-worker.stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (worker *RouteAnalyticsWorkerV1) loopV1() {
+	ticker := time.NewTicker(worker.config.Interval)
+	defer ticker.Stop()
+	worker.runWithTimeoutV1()
+	for {
+		select {
+		case <-worker.stop:
+			return
+		case <-ticker.C:
+			worker.runWithTimeoutV1()
+		}
+	}
+}
+
+func (worker *RouteAnalyticsWorkerV1) runWithTimeoutV1() {
+	// A malformed historical row or an unexpected adapter value must not be
+	// able to kill the long-lived analytics goroutine. Record the panic and let
+	// the next bounded tick reacquire the lease and continue processing.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("route analytics worker panic recovered: %v", recovered)
+			worker.failedRuns.Add(1)
+			worker.lastError.Store(err.Error())
+			logger.LogError(nil, err.Error())
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), worker.config.RunTimeout)
+	defer cancel()
+	if err := worker.RunOnceV1(ctx); err != nil && !errors.Is(err, model.ErrRouteAnalyticsWorkerLeaseLost) {
+		logger.LogWarn(nil, "route analytics worker run deferred: "+err.Error())
+	}
+}
+
+func (worker *RouteAnalyticsWorkerV1) RunOnceV1(ctx context.Context) error {
+	if worker == nil || worker.engine == nil {
+		return errors.New("route analytics worker is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := worker.clock()
+	nowMS := now.UnixMilli()
+	worker.heartbeatMS.Store(nowMS)
+	worker.lastRunMS.Store(nowMS)
+	leaseUntilMS := now.Add(worker.config.LeaseDuration).UnixMilli()
+	state, acquired, err := model.AcquireRouteAnalyticsWorkerLeaseV1(ctx, worker.owner, nowMS, leaseUntilMS)
+	if err != nil {
+		worker.failedRuns.Add(1)
+		worker.lastError.Store(err.Error())
+		return err
+	}
+	if !acquired {
+		worker.deferredRuns.Add(1)
+		return nil
+	}
+	if state.PausedUntilMS > nowMS {
+		worker.deferredRuns.Add(1)
+		return model.UpdateRouteAnalyticsWorkerStateV1(ctx, worker.owner, nowMS, leaseUntilMS, map[string]any{})
+	}
+	if overloaded, reason := worker.overloadedV1(); overloaded {
+		worker.deferredRuns.Add(1)
+		worker.lastError.Store(reason)
+		return model.UpdateRouteAnalyticsWorkerStateV1(ctx, worker.owner, nowMS, leaseUntilMS, map[string]any{
+			"paused_until_ms": now.Add(30 * time.Second).UnixMilli(),
+			"last_error":      reason,
+		})
+	}
+
+	updated, liveComplete, batchResult, err := worker.runLiveBatchV1(ctx, now, state)
+	if err == nil && liveComplete {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var backfillResult routeAnalyticsWorkerBatchResultV1
+		updated, backfillResult, err = worker.runBackfillBatchV1(ctx, now, updated)
+		batchResult.Logs += backfillResult.Logs
+		batchResult.Projections += backfillResult.Projections
+		batchResult.Applied += backfillResult.Applied
+		batchResult.Skipped += backfillResult.Skipped
+		if batchResult.CatalogErr == nil {
+			batchResult.CatalogErr = backfillResult.CatalogErr
+		}
+	}
+	if err != nil {
+		return worker.recordFailureV1(ctx, now, leaseUntilMS, state, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	updates := routeAnalyticsWorkerStateUpdatesV1(updated)
+	updates["paused_until_ms"] = int64(0)
+	updates["consecutive_failures"] = 0
+	updates["last_error"] = ""
+	if err := model.UpdateRouteAnalyticsWorkerStateV1(ctx, worker.owner, nowMS, leaseUntilMS, updates); err != nil {
+		worker.failedRuns.Add(1)
+		worker.lastError.Store(err.Error())
+		return err
+	}
+	worker.processedLogs.Add(int64(batchResult.Logs))
+	worker.appliedProjections.Add(int64(batchResult.Applied))
+	worker.lastSuccessMS.Store(nowMS)
+	worker.lastError.Store("")
+	if batchResult.CatalogErr != nil {
+		logger.LogWarn(nil, "route analytics route facts skipped while key analytics continued: "+batchResult.CatalogErr.Error())
+	}
+	worker.cleanupIfDueV1(ctx, now)
+	return nil
+}
+
+func (worker *RouteAnalyticsWorkerV1) runLiveBatchV1(
+	ctx context.Context,
+	now time.Time,
+	state model.RouteAnalyticsWorkerStateV1,
+) (model.RouteAnalyticsWorkerStateV1, bool, routeAnalyticsWorkerBatchResultV1, error) {
+	safeEndSec := now.Add(-routeAnalyticsSafeDelayV1).Unix()
+	if safeEndSec <= 0 {
+		return state, false, routeAnalyticsWorkerBatchResultV1{}, errors.New("route analytics safe end is invalid")
+	}
+	if state.ScanMode != "live" || state.CursorCreatedAt <= 0 || state.ScanTargetEndMS <= 0 {
+		startSec := safeEndSec - int64(routeAnalyticsInitialWindowV1/time.Second) + 1
+		if state.WatermarkEventTimeMS > 0 {
+			candidate := state.WatermarkEventTimeMS/1_000 - int64(routeAnalyticsOverlapV1/time.Second)
+			if candidate > startSec {
+				startSec = candidate
+			}
+		}
+		state.ScanMode = "live"
+		state.CursorCreatedAt = startSec
+		state.CursorRequestDigest = ""
+		state.ScanTargetEndMS = safeEndSec * 1_000
+	}
+	targetEndSec := state.ScanTargetEndMS / 1_000
+	if state.CursorCreatedAt > targetEndSec {
+		return finishRouteAnalyticsLiveScanV1(state), true, routeAnalyticsWorkerBatchResultV1{}, nil
+	}
+	batch, err := worker.scan(ctx, state.CursorCreatedAt, targetEndSec, worker.config.BatchLimit, worker.config.BoundaryLimit)
+	if err != nil {
+		return state, false, routeAnalyticsWorkerBatchResultV1{}, err
+	}
+	processed, err := worker.processLogsV1(ctx, batch.Logs)
+	if err != nil {
+		return state, false, processed, err
+	}
+	state.CursorCreatedAt = batch.CompleteThroughSec + 1
+	if len(batch.Logs) > 0 {
+		state.CursorRequestDigest = routeAnalyticsDigestV1(
+			"cursor",
+			strconv.FormatInt(batch.CompleteThroughSec, 10),
+			strconv.Itoa(len(batch.Logs)),
+		)
+	}
+	if batch.HasMore {
+		return state, false, processed, nil
+	}
+	return finishRouteAnalyticsLiveScanV1(state), true, processed, nil
+}
+
+func finishRouteAnalyticsLiveScanV1(state model.RouteAnalyticsWorkerStateV1) model.RouteAnalyticsWorkerStateV1 {
+	liveStartMS := state.ScanTargetEndMS - int64(routeAnalyticsInitialWindowV1/time.Millisecond) + 1_000
+	if state.CoverageEndMS > 0 && state.CoverageEndMS < liveStartMS-1_000 {
+		state.CoverageStartMS = liveStartMS
+	}
+	if state.CoverageStartMS == 0 || liveStartMS < state.CoverageStartMS {
+		state.CoverageStartMS = liveStartMS
+	}
+	if state.ScanTargetEndMS > state.CoverageEndMS {
+		state.CoverageEndMS = state.ScanTargetEndMS
+	}
+	state.WatermarkEventTimeMS = state.ScanTargetEndMS
+	state.FreshnessAtMS = state.ScanTargetEndMS
+	state.ScanMode = ""
+	state.ScanTargetEndMS = 0
+	state.CursorCreatedAt = 0
+	state.CursorRequestDigest = ""
+	return state
+}
+
+func (worker *RouteAnalyticsWorkerV1) runBackfillBatchV1(
+	ctx context.Context,
+	now time.Time,
+	state model.RouteAnalyticsWorkerStateV1,
+) (model.RouteAnalyticsWorkerStateV1, routeAnalyticsWorkerBatchResultV1, error) {
+	minimumSec := now.Add(-routeAnalyticsMaximumHistoryV1).Unix()
+	if !state.BackfillInProgress {
+		if state.CoverageStartMS <= 0 {
+			return state, routeAnalyticsWorkerBatchResultV1{}, nil
+		}
+		targetEndSec := state.CoverageStartMS/1_000 - 1
+		if targetEndSec < minimumSec {
+			state.BackfillInProgress = false
+			return state, routeAnalyticsWorkerBatchResultV1{}, nil
+		}
+		targetStartSec := targetEndSec - int64(routeAnalyticsBackfillChunkV1/time.Second) + 1
+		if targetStartSec < minimumSec {
+			targetStartSec = minimumSec
+		}
+		state.BackfillInProgress = true
+		state.BackfillCursorCreatedAt = targetStartSec
+		state.BackfillTargetStartMS = targetStartSec * 1_000
+		state.BackfillTargetEndMS = targetEndSec * 1_000
+	}
+	startSec := state.BackfillCursorCreatedAt
+	endSec := state.BackfillTargetEndMS / 1_000
+	batch, err := worker.scan(ctx, startSec, endSec, worker.config.BatchLimit, worker.config.BoundaryLimit)
+	if err != nil {
+		return state, routeAnalyticsWorkerBatchResultV1{}, err
+	}
+	processed, err := worker.processLogsV1(ctx, batch.Logs)
+	if err != nil {
+		return state, processed, err
+	}
+	state.BackfillCursorCreatedAt = batch.CompleteThroughSec + 1
+	if batch.HasMore {
+		return state, processed, nil
+	}
+	state.CoverageStartMS = state.BackfillTargetStartMS
+	state.BackfillInProgress = false
+	state.BackfillCursorCreatedAt = 0
+	state.BackfillTargetStartMS = 0
+	state.BackfillTargetEndMS = 0
+	return state, processed, nil
+}
+
+func (worker *RouteAnalyticsWorkerV1) processLogsV1(
+	ctx context.Context,
+	logs []*model.Log,
+) (routeAnalyticsWorkerBatchResultV1, error) {
+	result := routeAnalyticsWorkerBatchResultV1{Logs: len(logs)}
+	if len(logs) == 0 {
+		return result, nil
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Contracts: map[string]smartrouter.ContractCatalog{}}
+	if current, err := worker.engine.Catalogs.RefreshIfDue(ctx); err == nil && current != nil {
+		catalog = *current
+	} else {
+		result.CatalogErr = err
+	}
+	built := buildRouteAnalyticsProjectionsV1(catalog, logs)
+	result.Projections = len(built.Projections)
+	result.Skipped = built.Skipped
+	detailIDs := make(map[string]string, len(built.Dimensions))
+	for _, dimension := range built.Dimensions {
+		stored, err := model.EnsureRouteAnalyticsDimensionV1(ctx, dimension)
+		if err != nil {
+			return result, err
+		}
+		detailIDs[stored.RouteFingerprintDigest] = stored.DetailID
+	}
+	if err := attachRouteAnalyticsDetailIDsV1(built.Projections, detailIDs); err != nil {
+		return result, err
+	}
+	applied, err := model.ApplyRouteAnalyticsProjectionsV1(ctx, built.Projections)
+	result.Applied = applied
+	return result, err
+}
+
+func (worker *RouteAnalyticsWorkerV1) overloadedV1() (bool, string) {
+	if worker.load == nil {
+		return false, ""
+	}
+	status := worker.load()
+	if status.CPUUsage > 0 && status.CPUUsage >= worker.config.CPUThreshold {
+		return true, fmt.Sprintf("CPU %.1f%% exceeds route analytics %.1f%% budget", status.CPUUsage, worker.config.CPUThreshold)
+	}
+	if status.MemoryUsage > 0 && status.MemoryUsage >= worker.config.MemoryThreshold {
+		return true, fmt.Sprintf("memory %.1f%% exceeds route analytics %.1f%% budget", status.MemoryUsage, worker.config.MemoryThreshold)
+	}
+	return false, ""
+}
+
+func (worker *RouteAnalyticsWorkerV1) recordFailureV1(
+	ctx context.Context,
+	now time.Time,
+	leaseUntilMS int64,
+	state model.RouteAnalyticsWorkerStateV1,
+	runErr error,
+) error {
+	worker.failedRuns.Add(1)
+	worker.lastError.Store(runErr.Error())
+	failures := state.ConsecutiveFailures + 1
+	backoff := time.Duration(5*(1<<min(failures-1, 6))) * time.Second
+	if backoff > 5*time.Minute {
+		backoff = 5 * time.Minute
+	}
+	updateErr := model.UpdateRouteAnalyticsWorkerStateV1(ctx, worker.owner, now.UnixMilli(), leaseUntilMS, map[string]any{
+		"consecutive_failures": failures,
+		"paused_until_ms":      now.Add(backoff).UnixMilli(),
+		"last_error":           runErr.Error(),
+	})
+	if updateErr != nil {
+		return errors.Join(runErr, updateErr)
+	}
+	return runErr
+}
+
+func routeAnalyticsWorkerStateUpdatesV1(state model.RouteAnalyticsWorkerStateV1) map[string]any {
+	return map[string]any{
+		"watermark_event_time_ms":    state.WatermarkEventTimeMS,
+		"cursor_created_at":          state.CursorCreatedAt,
+		"cursor_request_digest":      state.CursorRequestDigest,
+		"scan_mode":                  state.ScanMode,
+		"scan_target_end_ms":         state.ScanTargetEndMS,
+		"backfill_cursor_created_at": state.BackfillCursorCreatedAt,
+		"backfill_target_start_ms":   state.BackfillTargetStartMS,
+		"backfill_target_end_ms":     state.BackfillTargetEndMS,
+		"coverage_start_ms":          state.CoverageStartMS,
+		"coverage_end_ms":            state.CoverageEndMS,
+		"freshness_at_ms":            state.FreshnessAtMS,
+		"backfill_in_progress":       state.BackfillInProgress,
+	}
+}
+
+func (worker *RouteAnalyticsWorkerV1) cleanupIfDueV1(ctx context.Context, now time.Time) {
+	last := worker.lastCleanupMS.Load()
+	if last > 0 && now.UnixMilli()-last < int64(time.Hour/time.Millisecond) {
+		return
+	}
+	if !worker.lastCleanupMS.CompareAndSwap(last, now.UnixMilli()) {
+		return
+	}
+	if _, err := model.CleanupRouteAnalyticsRetentionV1(ctx, now, 250); err != nil {
+		logger.LogWarn(nil, "route analytics retention cleanup deferred: "+err.Error())
+	}
+}
+
+func RouteAnalyticsEnabledV1() bool {
+	value := strings.TrimSpace(os.Getenv("ROUTE_ANALYTICS_ENABLED"))
+	if value == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
+}

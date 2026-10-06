@@ -1,0 +1,81 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+)
+
+// PersistParameterCostBeforeSend freezes billing after preconsume and before
+// upstream dispatch, including asynchronous task identity and recovery state.
+func PersistParameterCostBeforeSend(info *relaycommon.RelayInfo) error {
+	if info == nil || info.PriceData.ParameterPricing == nil {
+		return nil
+	}
+	// The legacy controller skips preconsume for a free model. A zero-value
+	// reservation still supplies durable identity without debiting any funds.
+	if info.Billing == nil && info.PriceData.ParameterPricing.Quota == 0 {
+		funding, err := NewDirectReservationFunding(info)
+		if err != nil {
+			return err
+		}
+		if err := funding.PreConsume(0); err != nil {
+			return err
+		}
+		session := &BillingSession{relayInfo: info, funding: funding}
+		session.syncRelayInfo()
+		info.Billing = session
+	}
+	reservationID := smartReservationID(info)
+	if reservationID == "" {
+		return fmt.Errorf("parameter pricing requires a durable reservation before sending")
+	}
+	if info.TenantCostBinding != nil && !tenantCostEnabled(info) {
+		return model.ErrTenantCostScope
+	}
+	start := info.StartTime
+	if start.IsZero() {
+		return fmt.Errorf("parameter cost request start time is missing")
+	}
+	cost := model.ParameterReservationCostContext{SchemaVersion: 1, Quote: *info.PriceData.ParameterPricing, RequestID: info.RequestId, OccurredAt: start.UnixNano()}
+	if b := info.TenantCostBinding; b != nil {
+		cost.Binding = model.TenantCostTaskContext{BindingID: b.BindingID, TenantID: b.TenantID, DownstreamRequestId: info.TenantCostRequestID,
+			ProductPoolID: b.ProductPoolID, ServiceTier: b.ServiceTier, RouteProfileID: b.RouteProfileID, ProfileRevision: b.ProfileRevision,
+			ModelCatalogRevision: b.ModelCatalogRevision, KeyID: b.KeyID}
+	}
+	if info.TaskRelayInfo != nil {
+		if info.PublicTaskID == "" {
+			return fmt.Errorf("parameter task public identity is required before sending")
+		}
+		cost.TaskPublicID = info.PublicTaskID
+		cost.TaskBilling = SnapshotTaskBillingContext(info)
+		cost.SubmissionState = "dispatching"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	tokenID := info.TokenId
+	if info.IsPlayground {
+		tokenID = 0
+	}
+	if err := model.PersistParameterReservationCost(ctx, reservationID, info.UserId, tokenID, cost); err != nil {
+		return err
+	}
+	if owner, ok := info.Billing.(interface{ markParameterCostPersisted() }); ok && info.TaskRelayInfo == nil {
+		owner.markParameterCostPersisted()
+	}
+	return nil
+}
+
+// MarkParameterTaskSubmissionRejected is only for a confirmed upstream
+// rejection. Transport ambiguity must leave the dispatch fence intact.
+func MarkParameterTaskSubmissionRejected(info *relaycommon.RelayInfo) error {
+	if info == nil || info.PriceData.ParameterPricing == nil || info.TaskRelayInfo == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return model.MarkParameterTaskSubmissionRejected(ctx, smartReservationID(info), info.UserId, info.PublicTaskID, info.RequestId)
+}

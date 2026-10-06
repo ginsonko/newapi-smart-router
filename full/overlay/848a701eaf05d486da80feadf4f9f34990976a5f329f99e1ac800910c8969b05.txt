@@ -1,0 +1,354 @@
+package controller
+
+import (
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+const smartRouteUserSummaryMaxRunes = 512
+
+const smartRouteFailureSummaryContextKey = "smart_router_failure_summary"
+
+type smartRouteFailureClass struct {
+	Count    int
+	Status   int
+	Statuses []int
+	Reasons  []string
+}
+
+const (
+	smartRouteFailureClassMaxReasons = 4
+	smartRouteFailureDetailMaxRunes  = 120
+)
+
+// smartRouteFailureSummary is request-local and deliberately bounded. It is
+// used only to explain an exhausted safe-text request; it never controls
+// retry/admission decisions and never stores keys, bodies, or route topology.
+type smartRouteFailureSummary struct {
+	classes map[service.SmartRouteFailureScope]smartRouteFailureClass
+}
+
+func (s *smartRouteFailureSummary) add(outcome service.SmartRouteOutcome) {
+	if s == nil || outcome.FailureScope == service.SmartFailureNone || outcome.Outcome == "" {
+		return
+	}
+	if s.classes == nil {
+		s.classes = make(map[service.SmartRouteFailureScope]smartRouteFailureClass)
+	}
+	item := s.classes[outcome.FailureScope]
+	item.Count++
+	if item.Status == 0 && outcome.HTTPStatus != 0 {
+		item.Status = outcome.HTTPStatus
+	}
+	if outcome.HTTPStatus != 0 && len(item.Statuses) < smartRouteFailureClassMaxReasons {
+		seen := false
+		for _, status := range item.Statuses {
+			if status == outcome.HTTPStatus {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			item.Statuses = append(item.Statuses, outcome.HTTPStatus)
+		}
+	}
+	if reason := safeSmartRouteFailureDetail(outcome.ErrorSummary); reason != "" && len(item.Reasons) < smartRouteFailureClassMaxReasons {
+		seen := false
+		for _, previous := range item.Reasons {
+			if previous == reason {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			item.Reasons = append(item.Reasons, reason)
+		}
+	}
+	s.classes[outcome.FailureScope] = item
+}
+
+func safeSmartRouteFailureDetail(value string) string {
+	value = common.MaskSensitiveInfo(strings.TrimSpace(value))
+	fields := strings.Fields(value)
+	kept := fields[:0]
+	for _, field := range fields {
+		// Do not expose provider URLs, credentials, or internal paths in a
+		// user-facing aggregate. The category and status remain actionable.
+		if strings.Contains(field, "://") || strings.Contains(field, "@") || strings.HasPrefix(field, "/") {
+			continue
+		}
+		kept = append(kept, field)
+	}
+	value = strings.Join(kept, " ")
+	if runes := []rune(value); len(runes) > smartRouteFailureDetailMaxRunes {
+		value = string(runes[:smartRouteFailureDetailMaxRunes])
+	}
+	return value
+}
+
+func smartRouteFailureScopeLabel(scope service.SmartRouteFailureScope) string {
+	switch scope {
+	case service.SmartFailureRouteModel:
+		return "模型/渠道不匹配"
+	case service.SmartFailureRouteContract:
+		return "能力合同不匹配"
+	case service.SmartFailureCapacity:
+		return "容量/限流"
+	case service.SmartFailureCredential:
+		return "凭证/授权"
+	case service.SmartFailureInfrastructure:
+		return "上游/网络基础设施"
+	case service.SmartFailureUser:
+		return "用户请求或价格策略"
+	case service.SmartFailureContent:
+		return "内容策略"
+	case service.SmartFailureCancellation:
+		return "客户端取消"
+	default:
+		return "其它失败"
+	}
+}
+
+func (s *smartRouteFailureSummary) render() string {
+	if s == nil || len(s.classes) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(s.classes))
+	for scope := range s.classes {
+		keys = append(keys, string(scope))
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		scope := service.SmartRouteFailureScope(key)
+		item := s.classes[scope]
+		part := fmt.Sprintf("%s %d 次", smartRouteFailureScopeLabel(scope), item.Count)
+		if len(item.Statuses) == 0 && item.Status != 0 {
+			item.Statuses = []int{item.Status}
+		}
+		if len(item.Statuses) > 0 {
+			statusParts := make([]string, 0, len(item.Statuses))
+			for _, status := range item.Statuses {
+				statusParts = append(statusParts, fmt.Sprint(status))
+			}
+			part += "（状态 " + strings.Join(statusParts, "/") + "）"
+		}
+		if len(item.Reasons) > 0 {
+			part += "：" + strings.Join(item.Reasons, "；")
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "；")
+}
+
+func appendSmartRouteFailureSummary(c *gin.Context, outcome service.SmartRouteOutcome) {
+	if c == nil {
+		return
+	}
+	current, _ := c.Get(smartRouteFailureSummaryContextKey)
+	summary, _ := current.(*smartRouteFailureSummary)
+	if summary == nil {
+		summary = &smartRouteFailureSummary{}
+		c.Set(smartRouteFailureSummaryContextKey, summary)
+	}
+	summary.add(outcome)
+}
+
+func smartRouteFailureReason(c *gin.Context, fallback string) string {
+	if c != nil {
+		if current, ok := c.Get(smartRouteFailureSummaryContextKey); ok {
+			if summary, ok := current.(*smartRouteFailureSummary); ok {
+				if rendered := summary.render(); rendered != "" {
+					if strings.TrimSpace(fallback) == "" {
+						return "失败分类摘要：" + rendered
+					}
+					return "失败分类摘要：" + rendered + "；最后原因：" + safeSmartRouteFailureDetail(fallback)
+				}
+			}
+		}
+	}
+	return fallback
+}
+
+// smartRouteExhaustedAPIError keeps the original status and retry metadata,
+// but gives the caller a bounded explanation of what the router actually did.
+// It is only used after the planner reports that no further eligible route is
+// available; a single failed attempt never gets this wording.
+func smartRouteExhaustedAPIError(
+	apiErr *types.NewAPIError,
+	attempts int,
+	reason string,
+	requestIDs ...string,
+) *types.NewAPIError {
+	return smartRouteExhaustedAPIErrorWithCandidates(apiErr, attempts, 0, reason, requestIDs...)
+}
+
+// smartRouteExhaustedAPIErrorWithCandidates adds the request-local candidate
+// count to the bounded user summary. The legacy wrapper above is retained for
+// callers/tests that only have an error and attempt count.
+func smartRouteExhaustedAPIErrorWithCandidates(
+	apiErr *types.NewAPIError,
+	attempts int,
+	candidates int,
+	reason string,
+	requestIDs ...string,
+) *types.NewAPIError {
+	if apiErr == nil {
+		return nil
+	}
+	if attempts < 0 {
+		attempts = 0
+	}
+	if candidates < 0 {
+		candidates = 0
+	}
+	reason = strings.Join(strings.Fields(strings.TrimSpace(reason)), " ")
+	if reason == "" {
+		reason = apiErr.ToOpenAIError().Message
+	}
+	if runes := []rune(reason); len(runes) > smartRouteUserSummaryMaxRunes {
+		reason = string(runes[:smartRouteUserSummaryMaxRunes])
+	}
+	message := fmt.Sprintf(
+		"%s",
+		smartRouteExhaustedMessageWithCandidates(apiErr, attempts, candidates, reason, requestIDs...),
+	)
+	return smartRouteRewritePublicMessage(apiErr, message)
+}
+
+func smartRouteExhaustedMessage(apiErr *types.NewAPIError, attempts int, reason string, requestIDs ...string) string {
+	return smartRouteExhaustedMessageWithCandidates(apiErr, attempts, 0, reason, requestIDs...)
+}
+
+func smartRouteExhaustedMessageWithCandidates(apiErr *types.NewAPIError, attempts, candidates int, reason string, requestIDs ...string) string {
+	details := ""
+	status := 0
+	if apiErr != nil {
+		details = strings.ToLower(strings.Join([]string{
+			apiErr.Error(), apiErr.ToOpenAIError().Message,
+			apiErr.ToOpenAIError().Type, fmt.Sprint(apiErr.ToOpenAIError().Code),
+		}, " "))
+		status = apiErr.GetOriginalStatusCode()
+	}
+	if status == http.StatusTooManyRequests || strings.Contains(details, "capacity") ||
+		strings.Contains(details, "overload") || strings.Contains(details, "too many pending") ||
+		strings.Contains(details, "rate limit") {
+		summary := ""
+		if strings.HasPrefix(strings.TrimSpace(reason), "失败分类摘要：") {
+			summary = " " + strings.TrimSpace(reason)
+		}
+		return fmt.Sprintf("当前符合条件的上游渠道均处于繁忙、容量不足或限流状态，智能路由已发起 %d 次上游尝试，覆盖 %d 个可用候选。请稍后重试。%s%s", attempts, candidates, summary, smartRouteRequestIDSuffix(requestIDs...))
+	}
+	reason = strings.Join(strings.Fields(strings.TrimSpace(reason)), " ")
+	if reason == "" {
+		reason = "上游未返回可识别的原因"
+	}
+	return fmt.Sprintf("智能路由已发起 %d 次上游尝试，覆盖 %d 个符合当前模型、分组、价格和能力条件的可用候选，但上游均未成功。请稍后重试；若持续出现，请提供请求 ID。上游提示：%s%s", attempts, candidates, reason, smartRouteRequestIDSuffix(requestIDs...))
+}
+
+func smartRouteRequestIDSuffix(requestIDs ...string) string {
+	if len(requestIDs) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(requestIDs))
+	seen := make(map[string]struct{}, len(requestIDs))
+	for _, raw := range requestIDs {
+		id := strings.Join(strings.Fields(strings.TrimSpace(raw)), "")
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		if runes := []rune(id); len(runes) > 128 {
+			id = string(runes[:128])
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	if len(ids) == 1 {
+		return " 请求 ID：" + ids[0]
+	}
+	return " 请求 ID：" + ids[0] + "；上游请求 ID：" + ids[1]
+}
+
+func smartRouteUserFacingTerminalError(apiErr *types.NewAPIError) *types.NewAPIError {
+	return smartRouteUserFacingTerminalErrorWithRequestID(apiErr, "")
+}
+
+func smartRouteUserFacingTerminalErrorWithRequestID(apiErr *types.NewAPIError, requestID string) *types.NewAPIError {
+	if apiErr == nil {
+		return nil
+	}
+	if (apiErr.GetOriginalStatusCode() == http.StatusBadRequest || apiErr.GetOriginalStatusCode() == http.StatusUnprocessableEntity) &&
+		service.IsSmartExplicitUserRequestError(apiErr) {
+		message := fmt.Sprintf(
+			"上游明确拒绝了当前请求中的字段或参数（状态码 %d），智能路由未跨渠道重复发送，以避免无效重试。",
+			apiErr.GetOriginalStatusCode(),
+		)
+		if reason := safeSmartRouteFailureDetail(apiErr.ToOpenAIError().Message); reason != "" {
+			message += " 具体原因：" + reason + "。"
+		}
+		message += " 请根据上述原因调整请求后重试。"
+		if requestID = strings.TrimSpace(requestID); requestID != "" {
+			message += " 请求 ID：" + requestID
+		}
+		return smartRouteRewritePublicMessage(apiErr, message)
+	}
+	return apiErr
+}
+
+// smartRouteConversationStateAPIError explains the one class of Responses
+// 400 that is local conversation state, not a provider-route failure. The
+// request must not be replayed against another channel because the stale item
+// ID would fail in the same way everywhere.
+func smartRouteConversationStateAPIError(apiErr *types.NewAPIError) *types.NewAPIError {
+	return smartRouteConversationStateAPIErrorWithRequestID(apiErr, "")
+}
+
+func smartRouteConversationStateAPIErrorWithRequestID(apiErr *types.NewAPIError, requestID string) *types.NewAPIError {
+	if apiErr == nil {
+		return nil
+	}
+	message := "上游拒绝了当前会话中的历史响应条目，可能是会话状态已失效。请新建会话或切换一个对话后重试；这不是切换渠道可以修复的问题。"
+	if requestID = strings.TrimSpace(requestID); requestID != "" {
+		message += " 请求 ID：" + requestID
+	}
+	return smartRouteRewritePublicMessage(
+		apiErr,
+		message,
+	)
+}
+
+func smartRouteRewritePublicMessage(apiErr *types.NewAPIError, message string) *types.NewAPIError {
+	if apiErr == nil {
+		return nil
+	}
+	openAIError := apiErr.ToOpenAIError()
+	openAIError.Message = message
+	if strings.TrimSpace(fmt.Sprint(openAIError.Code)) == "" {
+		openAIError.Code = apiErr.GetErrorCode()
+	}
+	result := types.WithOpenAIError(
+		openAIError,
+		apiErr.StatusCode,
+		types.ErrOptionWithSkipRetry(),
+	)
+	result.SetOriginalStatusCode(apiErr.GetOriginalStatusCode())
+	if apiErr.HasUpstreamResponse() {
+		result.MarkUpstreamResponseReceived()
+	}
+	result.Metadata = apiErr.Metadata
+	result.RetryAfter = apiErr.RetryAfter
+	return result
+}

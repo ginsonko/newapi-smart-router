@@ -1,0 +1,52 @@
+package controller
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestImageRouteCommitmentDurableFirstWriter(test *testing.T) {
+	fixture := newImageRouteJobFixture(test)
+	claimed, won, err := model.ClaimImageRouteJob(fixture.job.ID, fixture.job.Version)
+	require.NoError(test, err)
+	require.True(test, won)
+	request, _ := gin.CreateTestContext(httptest.NewRecorder())
+	request.Set(service.ImageRouteJobContextKey, claimed.ID)
+	offer := &types.ParameterPriceSnapshot{Model: "image", Amount: "0.2", Currency: "CNY", Parameters: map[string]string{"size": "4k"}}
+	helper.FreezeParameterCommitment(request, offer)
+	require.NoError(test, persistImageRouteCommitment(request))
+	require.NoError(test, persistImageRouteCommitment(request))
+	job := fixture.loadJob(test)
+	fresh, _ := gin.CreateTestContext(httptest.NewRecorder())
+	require.NoError(test, restoreImageRouteCommitments(fresh, job))
+	value, found := fresh.Get(types.ParameterCommitmentContextKey)
+	require.True(test, found)
+	require.Equal(test, offer, value)
+	fresh.Set(service.ImageRouteJobContextKey, job.ID)
+	require.NoError(test, persistImageRouteCommitment(fresh))
+	offer.Amount = "0.4"
+	fresh.Set(types.ParameterCommitmentContextKey, offer)
+	require.ErrorIs(test, persistImageRouteCommitment(fresh), model.ErrImageRouteJobConflict)
+	require.Equal(test, job.CommitmentJSON, fixture.loadJob(test).CommitmentJSON)
+}
+
+func TestImageRouteQuoteRequiresVerifiedSnapshot(test *testing.T) {
+	request, _ := gin.CreateTestContext(httptest.NewRecorder())
+	job := &model.ImageRouteJob{QuoteToken: "untrusted-header"}
+	require.Error(test, restoreImageRouteCommitments(request, job))
+	encoded, err := common.Marshal(&types.ParameterPriceSnapshot{Model: "image", Amount: "0.2"})
+	require.NoError(test, err)
+	job.QuoteSnapshotJSON = string(encoded)
+	require.NoError(test, restoreImageRouteCommitments(request, job))
+	value, found := request.Get(types.ParameterQuoteContextKey)
+	require.True(test, found)
+	require.Equal(test, "0.2", value.(*types.ParameterPriceSnapshot).Amount)
+}

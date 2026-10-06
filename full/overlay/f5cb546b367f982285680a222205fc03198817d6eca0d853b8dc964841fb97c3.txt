@@ -1,0 +1,225 @@
+package relay
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+func configuredAsyncImage(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ImageRequest, adaptor channel.Adaptor, body io.Reader) *types.NewAPIError {
+	count := 1
+	if request.N != nil {
+		count = int(*request.N)
+	}
+	if info.TaskRelayInfo == nil {
+		info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+	}
+	info.Action = "图片生成"
+	publicID := info.PublicTaskID
+	task := model.InitTask(constant.TaskPlatformOpenAIImage, model.TaskInitParams{
+		UserID: info.UserId, Group: info.UsingGroup, ChannelID: info.ChannelId,
+		OriginModelName: info.OriginModelName, UpstreamModelName: info.UpstreamModelName,
+		ChannelType: info.ChannelType, ChannelAPIKey: info.ApiKey, PublicTaskID: publicID,
+	})
+	info.PublicTaskID = task.TaskID
+	task.Action = info.Action
+	task.Quota = info.PriceData.Quota
+	if info.PriceData.ParameterPricing == nil && info.PriceData.UsePrice {
+		task.Quota = common.QuotaFromFloat(info.PriceData.ModelPrice * common.QuotaPerUnit * info.PriceData.GroupRatioInfo.GroupRatio * float64(count))
+		info.PriceData.Quota = task.Quota
+	}
+	task.BillingReservationID = service.BillingReservationID(info.Billing)
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.BillingRequestID = info.RequestId
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.BillingContext = service.SnapshotTaskBillingContext(info)
+	task.PrivateData.ImageTask = &model.ImageTaskContext{ResponseFormat: request.ResponseFormat, Count: count, NoRetention: c.GetBool("image_task_no_retention")}
+	task.PrivateData.ImageTask.RouteJobID = c.GetInt64(service.ImageRouteJobContextKey)
+	task.PrivateData.ImageTask.RequestPath = c.Request.URL.Path
+	if channel, err := model.GetChannelById(info.ChannelId, true); err == nil {
+		task.PrivateData.ImageTask.ChannelGeneration = service.SmartRouteChannelGeneration(*channel)
+	}
+	mode := c.GetString(relaycommon.TaskMediaModeContextKey)
+	if mode == "" {
+		mode = "images"
+		if strings.HasSuffix(c.Request.URL.Path, "/edits") {
+			mode = "image-edits"
+		}
+		c.Set(relaycommon.TaskMediaModeContextKey, mode)
+	}
+	task.Properties.MediaMode, task.Properties.MediaSize = mode, request.Size
+	if !task.PrivateData.ImageTask.NoRetention {
+		task.Properties.Input = request.Prompt
+	}
+	task.Data = []byte(`{}`)
+	if err := relaycommon.PersistTaskWithMediaReferences(c, task); err != nil {
+		if rejectErr := service.MarkParameterTaskSubmissionRejected(info); rejectErr != nil {
+			return types.NewError(rejectErr, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry())
+		}
+		if errors.Is(err, model.ErrImageTaskExists) {
+			if existing, found, lookupErr := model.GetByTaskId(info.UserId, task.TaskID); lookupErr == nil && found {
+				if info.Billing != nil {
+					info.Billing.Refund(c)
+				}
+				c.Set(service.ImageTaskOwnedContextKey, true)
+				return respondAsyncImage(c, info, existing)
+			}
+		}
+		return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+	}
+	// Persist before the paid POST. From this point the durable task owns the
+	// reservation, including a disconnect between provider acceptance and its reply.
+	service.HandoffTaskBilling(info)
+	c.Set(service.ImageTaskOwnedContextKey, true)
+	if task.PrivateData.ImageTask.RouteJobID > 0 {
+		if err := model.BindImageRouteJobTask(task.PrivateData.ImageTask.RouteJobID, task.TaskID); err != nil {
+			_ = service.RejectImageTask(context.Background(), task, "发送前绑定路由作业失败")
+			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+		}
+	}
+	c.Header("X-New-Api-Task-ID", task.TaskID)
+	c.Header("Location", "/v1/images/generations/"+task.TaskID)
+	if err := c.Request.Context().Err(); err != nil {
+		_ = service.RejectImageTask(context.Background(), task, "请求在发送上游前已取消")
+		return types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	service.ObserveImageAttemptPending(info, c.Request.URL.Path)
+	response, requestErr := adaptor.DoRequest(c, info, body)
+	if requestErr != nil {
+		classified := types.NewOpenAIError(requestErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+		if service.ClassifySmartMediaAttempt(classified) == service.SmartMediaAttemptNotAccepted {
+			task.PrivateData.ImageTask.RetryableFailure = true
+			task.PrivateData.ImageTask.HealthOutcome = string(smartrouter.OutcomeInfrastructure)
+			if err := service.RejectImageTask(context.Background(), task, "连接上游失败，请求未发送："+classified.Error()); err != nil {
+				return imageTaskSubmissionUnknown(c, task, err)
+			}
+			service.ObserveImageTaskTerminal(task, false)
+			return classified
+		}
+		return imageTaskSubmissionUnknown(c, task, requestErr)
+	}
+	resp, ok := response.(*http.Response)
+	if !ok || resp == nil || resp.Body == nil {
+		return imageTaskSubmissionUnknown(c, task, errors.New("上游未返回受理信息"))
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return imageTaskSubmissionUnknown(c, task, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		taskErr := classifyTaskSubmissionError(resp.StatusCode, raw, true)
+		if errors.Is(taskErr.Error, service.ErrSmartMediaSubmissionAmbiguous) {
+			return imageTaskSubmissionUnknown(c, task, taskErr.Error)
+		}
+		task.PrivateData.ImageTask.RetryableFailure = true
+		task.PrivateData.ImageTask.HealthOutcome = string(service.ClassifyImageTaskFailure(resp.StatusCode, raw, ""))
+		if err := service.RejectImageTask(context.Background(), task, taskErr.Message); err != nil {
+			return imageTaskSubmissionUnknown(c, task, err)
+		}
+		service.ObserveImageTaskTerminal(task, false)
+		return types.NewErrorWithStatusCode(errors.New(taskErr.Message), types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode, types.ErrOptionWithSkipRetry())
+	}
+	var accepted service.ImageTaskResult
+	if err := common.Unmarshal(raw, &accepted); err != nil {
+		return imageTaskSubmissionUnknown(c, task, err)
+	}
+	if strings.TrimSpace(accepted.TaskID) == "" && len(accepted.Data) == 0 {
+		return imageTaskSubmissionUnknown(c, task, errors.New("上游未返回任务编号或图片"))
+	}
+	oldStatus := task.Status
+	task.PrivateData.UpstreamTaskID = strings.TrimSpace(accepted.TaskID)
+	task.Status, task.Progress = model.TaskStatusSubmitted, "5%"
+	if won, err := task.UpdateWithStatus(oldStatus); err != nil || !won {
+		return imageTaskSubmissionUnknown(c, task, fmt.Errorf("保存图片受理信息失败：%v", err))
+	}
+	if receipt, err := model.ApplyTaskBillingSubmission(task.ID); err != nil {
+		common.SysError(fmt.Sprintf("image task %s billing submission pending: %v", task.TaskID, err))
+	} else {
+		service.ConfirmTaskBillingApplied(info, receipt.AppliedQuota)
+		service.RecordTaskConsumptionLog(c, info)
+	}
+	// Some providers finish immediately even when asked for asynchronous intake.
+	if len(accepted.Data) > 0 {
+		_ = service.ApplyImageTaskResult(context.Background(), task, raw)
+	}
+	return respondAsyncImage(c, info, task)
+}
+
+func imageTaskSubmissionUnknown(c *gin.Context, task *model.Task, cause error) *types.NewAPIError {
+	message := "图片提交结果暂未确认，已保留原任务，请勿重复生成；请使用任务编号查询或联系管理员"
+	common.SysError(fmt.Sprintf("image task %s submission uncertain: %v", task.TaskID, cause))
+	previous := task.Status
+	task.Status, task.FailReason = model.TaskStatusUnknown, message
+	_, _ = task.UpdateWithStatus(previous)
+	return types.NewErrorWithStatusCode(fmt.Errorf("%s（任务编号：%s）", message, task.TaskID), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+}
+
+func respondAsyncImage(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) *types.NewAPIError {
+	if c.GetInt64(service.ImageRouteJobContextKey) > 0 {
+		c.JSON(http.StatusAccepted, gin.H{"task_id": task.TaskID, "status": task.Status.ToVideoStatus()})
+		return nil
+	}
+	if c.GetBool("is_playground") || strings.Contains(strings.ToLower(c.GetHeader("Prefer")), "respond-async") || c.Query("async") == "1" {
+		c.JSON(http.StatusAccepted, gin.H{"id": task.TaskID, "task_id": task.TaskID, "object": "image", "status": task.Status.ToVideoStatus(), "data": []any{}, "status_url": "/v1/images/generations/" + task.TaskID})
+		return nil
+	}
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	if info.IsStream {
+		helper.SetEventStreamHeaders(c)
+	}
+	for {
+		if task.Status == model.TaskStatusFailure {
+			return types.NewErrorWithStatusCode(errors.New(task.FailReason), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
+		if task.Status == model.TaskStatusSuccess {
+			raw, err := service.ImageTaskResponse(task)
+			if err != nil {
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+			}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(raw))}
+			resp.Header.Set("Content-Type", "application/json")
+			if info.IsStream {
+				_, apiErr := openai.OpenaiImageJSONAsStreamHandler(c, info, resp)
+				return apiErr
+			}
+			c.Data(http.StatusOK, "application/json", raw)
+			return nil
+		}
+		select {
+		case <-c.Request.Context().Done():
+			// The scheduled consumer keeps the accepted task alive after disconnect.
+			return nil
+		case <-ticker.C:
+			if info.IsStream {
+				_, _ = c.Writer.WriteString(": 图片生成中\n\n")
+				c.Writer.Flush()
+			}
+			latest, found, err := model.GetByTaskId(task.UserId, task.TaskID)
+			if err == nil && found {
+				task = latest
+			}
+		}
+	}
+}

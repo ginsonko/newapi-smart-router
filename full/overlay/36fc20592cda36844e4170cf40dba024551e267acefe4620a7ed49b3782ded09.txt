@@ -1,0 +1,89 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupTenantReportingAuthDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previousDB := model.DB
+	previousMain := common.MainDatabaseType()
+	db, err := gorm.Open(sqlite.Open("file:tenant-reporting-auth-"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() { model.DB = previousDB; common.SetMainDatabaseType(previousMain) })
+	require.NoError(t, db.AutoMigrate(&model.TenantCostDownstream{}, &model.TenantReportingToken{}))
+	require.NoError(t, model.EnsureDefaultTenantCostDownstream())
+	return db
+}
+
+func runTenantReportingAuth(t *testing.T, authorization, tenant string) *httptest.ResponseRecorder {
+	return runTenantReportingAuthPath(t, authorization, tenant, "")
+}
+
+func runTenantReportingAuthPath(t *testing.T, authorization, tenant, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/internal/cost/v1/health"+query, nil)
+	if authorization != "" {
+		ctx.Request.Header.Set("Authorization", authorization)
+	}
+	if tenant != "" {
+		ctx.Request.Header.Set("X-Downstream-Tenant", tenant)
+	}
+	called := false
+	TenantCostReportingAuth()(ctx)
+	if !ctx.IsAborted() {
+		called = true
+	}
+	if called {
+		ctx.Status(http.StatusOK)
+	}
+	return recorder
+}
+
+func TestTenantCostReportingAuthRejectsMissingAndCrossTenant(t *testing.T) {
+	setupTenantReportingAuthDB(t)
+	recorder := runTenantReportingAuth(t, "", "")
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+
+	row, secret, err := model.CreateTenantReportingToken(model.DownstreamTenantID, model.TenantCostReportingPermission, time.Now().Add(time.Hour).Unix())
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	recorder = runTenantReportingAuth(t, "Bearer "+secret, "other-tenant")
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
+	recorder = runTenantReportingAuth(t, "Bearer "+secret, model.DownstreamTenantID)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	recorder = runTenantReportingAuthPath(t, "Bearer "+secret, model.DownstreamTenantID, "?tenant_id=other-tenant")
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
+	recorder = runTenantReportingAuthPath(t, "Bearer "+secret, "", "?tenant_id="+model.DownstreamTenantID)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+}
+
+func TestTenantCostReportingAuthRejectsExpiredAndDataPlaneLikeSecret(t *testing.T) {
+	db := setupTenantReportingAuthDB(t)
+	_, secret, err := model.CreateTenantReportingToken(model.DownstreamTenantID, model.TenantCostReportingPermission, time.Now().Add(-time.Minute).Unix())
+	require.NoError(t, err)
+	recorder := runTenantReportingAuth(t, "Bearer "+secret, "")
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+
+	// A normal data-plane key is not stored in the reporting-token table and
+	// cannot cross the middleware boundary.
+	recorder = runTenantReportingAuth(t, "Bearer sk-data-plane-only", "")
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	assert.NotNil(t, db)
+}

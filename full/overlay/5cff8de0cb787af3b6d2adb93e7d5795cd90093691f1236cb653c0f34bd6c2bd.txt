@@ -1,0 +1,107 @@
+package controller
+
+import (
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+
+	"github.com/gin-gonic/gin"
+)
+
+func perfMetricsUsableGroups(context *gin.Context) (map[string]string, bool) {
+	context.Header("Cache-Control", "private, no-store")
+	context.Writer.Header().Add("Vary", "Cookie, Authorization, New-Api-User")
+	userGroup := ""
+	if identity, exists := context.Get("id"); exists {
+		userID, valid := identity.(int)
+		if !valid || userID <= 0 {
+			context.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": "invalid user identity"})
+			return nil, false
+		}
+		user, err := model.GetUserById(userID, false)
+		if err != nil {
+			context.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "unable to resolve user permissions"})
+			return nil, false
+		}
+		if user.Status != common.UserStatusEnabled || strings.TrimSpace(user.Group) == "" {
+			context.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "user access is unavailable"})
+			return nil, false
+		}
+		userGroup = user.Group
+	}
+	usableGroups := service.GetUserUsableGroups(userGroup)
+	activeRatios := ratio_setting.GetGroupRatioCopy()
+	for group := range usableGroups {
+		if _, active := activeRatios[group]; !active && group != "auto" {
+			delete(usableGroups, group)
+		}
+	}
+	return usableGroups, true
+}
+
+func GetPerfMetricsSummary(context *gin.Context) {
+	usableGroups, resolved := perfMetricsUsableGroups(context)
+	if !resolved {
+		return
+	}
+	hours := 24
+	if rawHours := context.Query("hours"); rawHours != "" {
+		if parsed, err := strconv.Atoi(rawHours); err == nil {
+			hours = parsed
+		}
+	}
+	groups := make([]string, 0, len(usableGroups))
+	for group := range usableGroups {
+		groups = append(groups, group)
+	}
+	result, err := perfmetrics.QuerySummaryAll(hours, groups)
+	if err != nil {
+		context.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	context.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func GetPerfMetrics(context *gin.Context) {
+	usableGroups, resolved := perfMetricsUsableGroups(context)
+	if !resolved {
+		return
+	}
+	modelName := context.Query("model")
+	if modelName == "" {
+		context.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "model is required"})
+		return
+	}
+	group := context.Query("group")
+	if group != "" {
+		if _, allowed := usableGroups[group]; !allowed {
+			context.JSON(http.StatusForbidden, gin.H{"success": false, "message": "group is not available"})
+			return
+		}
+	}
+	hours := 24
+	if rawHours := context.Query("hours"); rawHours != "" {
+		if parsed, err := strconv.Atoi(rawHours); err == nil {
+			hours = parsed
+		}
+	}
+	result, err := perfmetrics.Query(perfmetrics.QueryParams{Model: modelName, Group: group, Hours: hours})
+	if err != nil {
+		context.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	visible := make([]perfmetrics.GroupResult, 0, len(result.Groups))
+	for _, metrics := range result.Groups {
+		if _, allowed := usableGroups[metrics.Group]; allowed {
+			visible = append(visible, metrics)
+		}
+	}
+	result.Groups = visible
+	context.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}

@@ -10,6 +10,9 @@ func (price RoutePrice) QuoteMedia(shape *MediaRequestShape) (RoutePrice, Reject
 	if shape == nil {
 		return price, ""
 	}
+	if price.BillingMode=="parameter_price" && price.BillingUnit=="priced_request" {
+		return price,""
+	}
 	if !price.StaticComparable || price.ScorePPM < 0 {
 		return mediaIncomparablePrice(price, price.IncomparableReason), ""
 	}

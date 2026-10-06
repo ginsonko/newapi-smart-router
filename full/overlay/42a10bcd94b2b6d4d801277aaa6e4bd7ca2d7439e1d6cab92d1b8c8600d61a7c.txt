@@ -1,0 +1,406 @@
+package model
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"reflect"
+	"strconv"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+)
+
+// ParameterReservationCostContext is private, durable request state. Async
+// submissions freeze their context here before sending; accepted tasks retain
+// sole settlement ownership through TaskBillingReceipt.
+type ParameterReservationCostContext struct {
+	SchemaVersion   int                          `json:"schema_version"`
+	Quote           types.ParameterPriceSnapshot `json:"quote"`
+	Binding         TenantCostTaskContext        `json:"binding"`
+	RequestID       string                       `json:"request_id"`
+	OccurredAt      int64                        `json:"occurred_at"`
+	Terminal        *TenantCostEventSpec         `json:"terminal,omitempty"`
+	TaskPublicID    string                       `json:"task_public_id,omitempty"`
+	TaskBilling     *TaskBillingContext          `json:"task_billing_context,omitempty"`
+	SubmissionState string                       `json:"submission_state,omitempty"`
+}
+
+var ErrParameterTaskSubmissionPending = errors.New("parameter task submission is already dispatched; reconcile the original task without resending")
+
+func validateParameterReservationContext(cost ParameterReservationCostContext) error {
+	q, b := &cost.Quote, &cost.Binding
+	if cost.SchemaVersion != 1 || q.SchemaVersion != 1 || q.Currency != "USD" || q.ChannelID <= 0 ||
+		cost.OccurredAt <= 0 || !validTenantCostPublicIdentifier(cost.RequestID, 128) ||
+		!validTenantCostPublicIdentifier(q.Revision, 512) || q.Model == "" || q.Group == "" || q.UnitPrice == "" || cost.Terminal != nil {
+		return ErrTenantCostInvalidInput
+	}
+	if b.TenantID != "" && (!IsValidTenantCostTenantID(b.TenantID) || b.BindingID <= 0 || !validTenantCostPublicIdentifier(b.KeyID, 128)) {
+		return ErrTenantCostInvalidInput
+	}
+	if cost.TaskPublicID != "" {
+		if !validTenantCostPublicIdentifier(cost.TaskPublicID, 128) || cost.SubmissionState != "dispatching" || cost.TaskBilling == nil ||
+			cost.TaskBilling.ParameterPricing == nil || !reflect.DeepEqual(cost.TaskBilling.ParameterPricing, &cost.Quote) {
+			return ErrTenantCostInvalidInput
+		}
+		if b.TenantID != "" && !reflect.DeepEqual(cost.TaskBilling.TenantCost, b) {
+			return ErrTenantCostInvalidInput
+		}
+	} else if cost.TaskBilling != nil || cost.SubmissionState != "" {
+		return ErrTenantCostInvalidInput
+	}
+	for _, key := range []string{"size", "requested_resolution"} {
+		if value, ok := q.Parameters[key]; ok && (len(value) == 0 || len(value) > 512) {
+			return ErrTenantCostInvalidInput
+		}
+	}
+	price, err := parseTenantParameterDecimal(q.UnitPrice, 18)
+	if err != nil {
+		return err
+	}
+	quantity, err := parseTenantParameterDecimal(q.Quantity, 18)
+	if err != nil || !quantity.IsPositive() {
+		return ErrTenantCostInvalidInput
+	}
+	amount, err := parseTenantParameterDecimal(q.Amount, 36)
+	if err != nil || !amount.Equal(price.Mul(quantity)) {
+		return ErrTenantCostInvalidInput
+	}
+	factorAmount, err := parameterQuotaAmount(q.Quota)
+	if err != nil {
+		return err
+	}
+	// Compare through the same final quota boundary, not by rounding a unit price.
+	factor, err := decimal.NewFromString(strconv.FormatFloat(common.QuotaPerUnit, 'f', -1, 64))
+	if err != nil {
+		return err
+	}
+	quota, clamp := common.QuotaFromDecimalChecked(amount.Mul(factor))
+	if clamp != nil || quota != q.Quota || q.Quota < 0 || factorAmount == "" {
+		return ErrTenantCostInvalidInput
+	}
+	source, provider := TenantParameterCostBasis(q)
+	// Validate the sales unit/quantity even when no source catalog price exists.
+	basis := &TenantSourcePrice{SchemaVersion: "parameter-source-price.v1", Unit: q.Unit, UnitPrice: q.UnitPrice, Quantity: q.Quantity,
+		EstimatedAmount: q.Amount, Currency: q.Currency, RuleRevision: q.Revision, Parameters: parameterCostPricingDimensions(q.Parameters), Evidence: "catalog_estimate"}
+	if err := validateTenantParameterCosts(TenantCostEventSpec{OperationID: "validation", SourcePrice: basis, ProviderCost: provider}); err != nil {
+		return err
+	}
+	return validateTenantParameterCosts(TenantCostEventSpec{OperationID: "validation", SourcePrice: source, ProviderCost: provider})
+}
+
+// PersistParameterReservationCost binds the quote after authorization/preconsume
+// and before each permitted send. Candidate changes may replace only supply
+// metadata; the original customer amount, scope and parameters remain fixed.
+func PersistParameterReservationCost(ctx context.Context, reservationID string, userID, tokenID int, cost ParameterReservationCostContext) error {
+	if DB == nil || reservationID == "" || userID <= 0 || tokenID < 0 {
+		return ErrTenantCostInvalidInput
+	}
+	if err := validateParameterReservationContext(cost); err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var reservation QuotaReservation
+		if err := lockForUpdate(tx).Where("reservation_id = ?", reservationID).First(&reservation).Error; err != nil {
+			return err
+		}
+		if reservation.UserId != userID || reservation.TokenId != tokenID {
+			return ErrTenantCostScope
+		}
+		if reservation.Status != QuotaReservationStatusActive || reservation.SettlementPending {
+			return ErrQuotaReservationFinalized
+		}
+		if cost.Binding.TenantID != "" {
+			var binding TenantCredentialBinding
+			if err := tx.Where("id = ? AND token_id = ?", cost.Binding.BindingID, tokenID).First(&binding).Error; err != nil {
+				return ErrTenantCostScope
+			}
+			if binding.TenantID != cost.Binding.TenantID || binding.KeyID != cost.Binding.KeyID || binding.ProductPoolID != cost.Binding.ProductPoolID ||
+				binding.ServiceTier != cost.Binding.ServiceTier || binding.RouteProfileID != cost.Binding.RouteProfileID || binding.ProfileRevision != cost.Binding.ProfileRevision ||
+				binding.ModelCatalogRevision != cost.Binding.ModelCatalogRevision ||
+				binding.CredentialPurpose != TenantCredentialPurposeDataPlane || binding.BindingStatus != TenantBindingEnabled {
+				return ErrTenantCostScope
+			}
+			if _, err := requireTenantCostDownstreamTx(tx, binding.TenantID, true); err != nil {
+				return err
+			}
+		}
+		if reservation.ParameterCostContext != nil {
+			var old ParameterReservationCostContext
+			if err := common.UnmarshalJsonStr(*reservation.ParameterCostContext, &old); err != nil {
+				return err
+			}
+			if old.Terminal != nil || old.RequestID != cost.RequestID || !reflect.DeepEqual(old.Binding, cost.Binding) ||
+				old.TaskPublicID != cost.TaskPublicID ||
+				old.Quote.Revision != cost.Quote.Revision || old.Quote.RuleID != cost.Quote.RuleID ||
+				old.Quote.Model != cost.Quote.Model || old.Quote.Group != cost.Quote.Group || old.Quote.Currency != cost.Quote.Currency ||
+				old.Quote.Unit != cost.Quote.Unit || old.Quote.UnitPrice != cost.Quote.UnitPrice || old.Quote.Quantity != cost.Quote.Quantity ||
+				old.Quote.Amount != cost.Quote.Amount || old.Quote.Quota != cost.Quote.Quota || !reflect.DeepEqual(old.Quote.Parameters, cost.Quote.Parameters) {
+				return ErrTenantCostConflict
+			}
+			if old.TaskPublicID != "" && old.SubmissionState != "rejected" {
+				return ErrParameterTaskSubmissionPending
+			}
+			cost.OccurredAt = old.OccurredAt
+		}
+		raw, err := common.Marshal(cost)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&reservation).Updates(map[string]any{"parameter_cost_context": string(raw), "channel_id": cost.Quote.ChannelID}).Error
+	})
+}
+
+func parameterOperationEventID(tenantID, operationID string) string {
+	digest := sha256.Sum256([]byte(tenantID + ":" + operationID))
+	return "uce_" + hex.EncodeToString(digest[:])
+}
+
+func buildParameterReservationSpec(reservation *QuotaReservation, cost *ParameterReservationCostContext) (TenantCostEventSpec, error) {
+	if reservation == nil || cost == nil {
+		return TenantCostEventSpec{}, ErrTenantCostInvalidInput
+	}
+	if cost.Terminal != nil {
+		return cost.Terminal.normalize()
+	}
+	if reservation.Status != QuotaReservationStatusSettled && reservation.Status != QuotaReservationStatusRefunded {
+		return TenantCostEventSpec{}, ErrQuotaReservationSettlementPending
+	}
+	q, b := &cost.Quote, &cost.Binding
+	amount, err := parameterQuotaAmount(reservation.FinalQuota)
+	if err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	eventType, evidence := TenantCostEventSettlement, TenantCostEvidenceFallback
+	if reservation.FinalQuota == 0 {
+		eventType, evidence = TenantCostEventObservedZero, TenantCostEvidenceExact
+	}
+	op := "reservation:" + reservation.ReservationId + ":terminal"
+	source, provider := TenantParameterCostBasis(q)
+	usage := TenantCostBillingUsage{RequestCount: "1"}
+	if q.Unit == "per_second" {
+		usage.Seconds = q.Quantity
+	}
+	requestID := b.DownstreamRequestId
+	if requestID == "" {
+		requestID = cost.RequestID
+	}
+	return TenantCostEventSpec{TenantID: b.TenantID, EventID: parameterOperationEventID(b.TenantID, op), OperationID: op, EventType: eventType,
+		OccurredAt: time.Unix(0, cost.OccurredAt).UTC(), FinalizedAt: time.Unix(reservation.FinalizedAt, 0).UTC(),
+		DownstreamRequestId: requestID, GatewayRequestId: cost.RequestID, ReservationID: reservation.ReservationId,
+		TaskPublicID:  cost.TaskPublicID,
+		ProductPoolID: b.ProductPoolID, ServiceTier: b.ServiceTier, RouteProfileID: b.RouteProfileID, ProfileRevision: b.ProfileRevision, KeyID: b.KeyID,
+		RequestedModel: q.Model, CanonicalModel: q.Model, MappingRevision: q.MappingRevision,
+		BillingMode: "parameter_price", BillingUnit: q.Unit, Usage: usage, GatewayChargeQuota: int64(reservation.FinalQuota), GatewayChargeAmount: amount, Currency: q.Currency,
+		ProcurementAmount: &amount, ProcurementCurrency: q.Currency, Evidence: evidence, BasisKind: "gateway_charge_fallback", BasisRevision: q.Revision,
+		Formula: "procurement=gateway_charge (fallback)", Status: TenantCostStatusFinal, SitePriceRevision: q.Revision, Rounding: "half_away_from_zero_after_total",
+		SourcePrice: source, ProviderCost: provider}, nil
+}
+
+func enqueueParameterReservationTerminalTx(tx *gorm.DB, reservation *QuotaReservation) error {
+	if reservation.ParameterCostContext == nil {
+		return nil
+	}
+	var cost ParameterReservationCostContext
+	if err := common.UnmarshalJsonStr(*reservation.ParameterCostContext, &cost); err != nil {
+		return err
+	}
+	if cost.Binding.TenantID == "" {
+		return nil
+	}
+	if cost.TaskPublicID != "" {
+		// Accepted tasks own settlement through their receipt. A rejected or
+		// acceptance-unknown submission can still receive a real zero refund
+		// before any accepted task exists; retain that financial fact as zero,
+		// without guessing the provider's bill or authorizing another send.
+		var accepted int64
+		if err := tx.Model(&Task{}).Where("user_id = ? AND task_id = ? AND billing_reservation_id = ? AND status <> ?",
+			reservation.UserId, cost.TaskPublicID, reservation.ReservationId, TaskStatusUnknown).Count(&accepted).Error; err != nil {
+			return err
+		}
+		if accepted > 0 {
+			return nil
+		}
+		if reservation.FinalQuota != 0 {
+			return ErrTaskBillingReceiptConflict
+		}
+	}
+	spec, err := buildParameterReservationSpec(reservation, &cost)
+	if err != nil {
+		return err
+	}
+	if cost.Terminal == nil {
+		cost.Terminal = &spec
+		raw, err := common.Marshal(cost)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		reservation.ParameterCostContext = &value
+		if err := tx.Model(reservation).Update("parameter_cost_context", value).Error; err != nil {
+			return err
+		}
+	}
+	return EnqueueTenantCostProjectionTx(tx, spec, nil)
+}
+
+// ReadParameterReservationTerminal exposes only the redacted immutable event to
+// the projector. A later API refund must not rewrite the original charge fact.
+func ReadParameterReservationTerminal(ctx context.Context, tenantID, reservationID string) (TenantCostEventSpec, error) {
+	if DB == nil {
+		return TenantCostEventSpec{}, ErrTenantCostInvalidInput
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var reservation QuotaReservation
+	if err := DB.WithContext(ctx).Where("reservation_id = ?", reservationID).First(&reservation).Error; err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	if reservation.ParameterCostContext == nil {
+		return TenantCostEventSpec{}, ErrTenantCostInvalidInput
+	}
+	var cost ParameterReservationCostContext
+	if err := common.UnmarshalJsonStr(*reservation.ParameterCostContext, &cost); err != nil {
+		return TenantCostEventSpec{}, err
+	}
+	if cost.Binding.TenantID != tenantID {
+		return TenantCostEventSpec{}, ErrTenantCostScope
+	}
+	if cost.Terminal == nil {
+		return TenantCostEventSpec{}, ErrQuotaReservationSettlementPending
+	}
+	return cost.Terminal.normalize()
+}
+
+// ApplyParameterReservationRefund is a real wallet/subscription refund, not a
+// synthetic negative event. One operation ID can be retried; distinct partial
+// refunds have distinct IDs and atomically move money and publish their facts.
+func ApplyParameterReservationRefund(ctx context.Context, tenantID string, userID int, reservationID, operationID string, refundQuota int) (TenantCostAppendResult, error) {
+	var output TenantCostAppendResult
+	if DB == nil || !IsValidTenantCostTenantID(tenantID) || !validTenantCostPublicIdentifier(operationID, 128) || refundQuota <= 0 || refundQuota > common.MaxQuota || userID <= 0 {
+		return output, ErrTenantCostInvalidInput
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mutation := quotaReservationCacheMutation{}
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var reservation QuotaReservation
+		if err := lockForUpdate(tx).Where("reservation_id = ?", reservationID).First(&reservation).Error; err != nil {
+			return err
+		}
+		if reservation.UserId != userID || reservation.ParameterCostContext == nil {
+			return ErrTenantCostScope
+		}
+		var cost ParameterReservationCostContext
+		if err := common.UnmarshalJsonStr(*reservation.ParameterCostContext, &cost); err != nil {
+			return err
+		}
+		if cost.Binding.TenantID != tenantID || cost.Terminal == nil {
+			return ErrTenantCostScope
+		}
+		parent := *cost.Terminal
+		spec, err := parameterRefundSpec(parent, operationID, refundQuota)
+		if err != nil {
+			return err
+		}
+		if existing, found, err := replayParameterRefundTx(tx, spec); err != nil || found {
+			output = existing
+			return err
+		}
+		if reservation.Status != QuotaReservationStatusSettled || reservation.FinalQuota < refundQuota {
+			return ErrQuotaReservationSettlementConflict
+		}
+		if _, err := AppendTenantCostEventTx(tx, parent); err != nil {
+			return err
+		}
+		if err := correctCommissionReservationRefundTx(tx, &reservation, spec, refundQuota); err != nil {
+			return err
+		}
+		if err := adjustReservationFundingTx(tx, &reservation, -refundQuota, &mutation); err != nil {
+			return err
+		}
+		if _, err := adjustReservationTokenFinalizationTx(tx, &reservation, -refundQuota, &mutation); err != nil {
+			return err
+		}
+		if err := applyParameterRefundUsageTx(tx, reservation.UserId, reservation.ChannelId, refundQuota, &mutation); err != nil {
+			return err
+		}
+		if err := tx.Model(&reservation).Updates(map[string]any{"final_quota": reservation.FinalQuota - refundQuota, "pending_final_quota": reservation.FinalQuota - refundQuota, "updated_at": common.GetTimestamp()}).Error; err != nil {
+			return err
+		}
+		output, err = AppendTenantCostEventTx(tx, spec)
+		return err
+	})
+	if err == nil && mutation.changed() {
+		invalidateQuotaReservationCaches(mutation)
+	}
+	return output, err
+}
+
+func parameterRefundSpec(parent TenantCostEventSpec, operationID string, refundQuota int) (TenantCostEventSpec, error) {
+	if parent.GatewayChargeQuota <= 0 || refundQuota <= 0 || int64(refundQuota) > parent.GatewayChargeQuota {
+		return TenantCostEventSpec{}, ErrTenantCostInvalidInput
+	}
+	spec := parent
+	op := "refund:" + operationID
+	spec.OperationID = op
+	spec.EventID = parameterOperationEventID(parent.TenantID, op)
+	spec.EventType = TenantCostEventRefund
+	spec.ParentEventID = &parent.EventID
+	spec.FinalizedAt = time.Now().UTC()
+	spec.OccurredAt = spec.FinalizedAt
+	amount, err := parameterQuotaAmount(-refundQuota)
+	if err != nil {
+		return spec, err
+	}
+	spec.GatewayChargeQuota = -int64(refundQuota)
+	spec.GatewayChargeAmount = amount
+	spec.ProcurementAmount = &amount
+	spec.Usage = TenantCostBillingUsage{}
+	spec.Evidence = TenantCostEvidenceExact
+	// A user refund says nothing about the supplier's own refund.
+	spec.ProviderCost = &TenantProviderCost{Currency: "USD", Evidence: TenantCostEvidenceUnknown, AmountKind: "cumulative"}
+	return spec, nil
+}
+
+func replayParameterRefundTx(tx *gorm.DB, spec TenantCostEventSpec) (TenantCostAppendResult, bool, error) {
+	var event TenantCostEvent
+	err := tx.Where("tenant_id = ? AND event_id = ?", spec.TenantID, spec.EventID).First(&event).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return TenantCostAppendResult{}, false, nil
+	}
+	if err != nil {
+		return TenantCostAppendResult{}, false, err
+	}
+	replayed, err := AppendTenantCostEventTx(tx, spec)
+	return replayed, true, err
+}
+
+func applyParameterRefundUsageTx(tx *gorm.DB, userID, channelID, quota int, mutation *quotaReservationCacheMutation) error {
+	result := tx.Unscoped().Model(&User{}).Where("id = ? AND used_quota >= ?", userID, quota).Update("used_quota", gorm.Expr("used_quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrQuotaReservationAccountingInvariant
+	}
+	mutation.userId = userID
+	mutation.walletChanged = true
+	if channelID > 0 {
+		result = tx.Model(&Channel{}).Where("id = ? AND used_quota >= ?", channelID, quota).Update("used_quota", gorm.Expr("used_quota - ?", quota))
+		if result.Error != nil {
+			return result.Error
+		}
+		// Deleted channels are a secondary projection; wallet/tenant authority remains valid.
+	}
+	return nil
+}

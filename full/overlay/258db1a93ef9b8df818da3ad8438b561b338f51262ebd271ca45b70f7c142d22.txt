@@ -1,0 +1,156 @@
+package service
+
+import (
+	"testing"
+	"time"
+
+	corecommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTenantCostTaskSpecFreezesAnonymousBindingAndMediaUnit(t *testing.T) {
+	task := &model.Task{
+		ID: 42, TaskID: "task_media_42", CreatedAt: time.Now().Unix(), UserId: 7,
+		ChannelId: 12, Group: "public-group", BillingReservationID: "res-42", Quota: 2400,
+		Status:     model.TaskStatusSuccess,
+		Properties: model.Properties{OriginModelName: "video-model", UpstreamModelName: "provider-video", MediaDuration: 6},
+		PrivateData: model.TaskPrivateData{
+			BillingRequestID: "req-gateway-42",
+			BillingContext: &model.TaskBillingContext{
+				OriginModelName: "video-model", BillingMode: "task", TaskBillingUnit: "per_second",
+				PricingRevision: "price-rev-42",
+				TenantCost: &model.TenantCostTaskContext{
+					BindingID: 42, TenantID: model.DownstreamTenantID, DownstreamRequestId: "tvreq-42", ProductPoolID: "video_generation",
+					ServiceTier: "pro", RouteProfileID: "profile-video", ProfileRevision: "profile-rev-42",
+					ModelCatalogRevision: "catalog-42", KeyID: "key-suffix-safe",
+				},
+			},
+		},
+	}
+	receipt := &model.TaskBillingReceipt{AppliedQuota: 2200, ReservationID: stringPtrForProjection("res-42")}
+	spec, err := tenantCostTaskSpec(task, receipt, model.TenantCostEventSettlement, model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, "")
+	require.NoError(t, err)
+	assert.Equal(t, "tvreq-42", spec.DownstreamRequestId)
+	assert.Equal(t, "video_generation", spec.ProductPoolID)
+	assert.Equal(t, "per_second", spec.BillingUnit)
+	assert.Equal(t, "6", spec.Usage.Seconds)
+	assert.EqualValues(t, 2200, spec.GatewayChargeQuota)
+	assert.Equal(t, "task_media_42", spec.TaskPublicID)
+	assert.NotContains(t, spec.ProviderReferenceHash, "provider-video")
+	assert.NotContains(t, spec.RouteReceiptID, "public-group")
+	assert.NotContains(t, spec.RouteReceiptID, ":12:")
+}
+
+func TestTenantCostTaskPendingUsesUnknownAmount(t *testing.T) {
+	task := &model.Task{
+		ID: 43, TaskID: "task_pending_43", CreatedAt: time.Now().Unix(), Quota: 100,
+		PrivateData: model.TaskPrivateData{BillingRequestID: "req-43", BillingContext: &model.TaskBillingContext{
+			OriginModelName: "image-model", BillingMode: "task", TaskBillingUnit: "per_request",
+			TenantCost: &model.TenantCostTaskContext{TenantID: model.DownstreamTenantID, DownstreamRequestId: "tvreq-43",
+				ProductPoolID: "image_generation", ServiceTier: "basic", RouteProfileID: "p", ProfileRevision: "r", KeyID: "k"},
+		}},
+	}
+	spec, err := tenantCostTaskSpec(task, nil, model.TenantCostEventSettlement, model.TenantCostStatusPending, model.TenantCostEvidenceUnknown, "task_not_terminal")
+	require.NoError(t, err)
+	assert.Nil(t, spec.ProcurementAmount)
+	assert.Equal(t, model.TenantCostEvidenceUnknown, spec.Evidence)
+	assert.Equal(t, "task_not_terminal", spec.UnknownReason)
+}
+
+func TestTenantCostTaskSpecUsesStableRowIDWhenPublicTaskIDMissing(t *testing.T) {
+	task := &model.Task{
+		ID: 99, UserId: 7, ChannelId: 4, Group: "private-group", Quota: 100,
+		Properties: model.Properties{OriginModelName: "image-model"},
+		PrivateData: model.TaskPrivateData{BillingRequestID: "req-row-99", BillingContext: &model.TaskBillingContext{
+			OriginModelName: "image-model", BillingMode: "task", TaskBillingUnit: "per_request",
+			TenantCost: &model.TenantCostTaskContext{BindingID: 9, TenantID: model.DownstreamTenantID, DownstreamRequestId: "tvreq-row-99",
+				ProductPoolID: "image_generation", ServiceTier: "basic", RouteProfileID: "p", ProfileRevision: "r", KeyID: "safe-key"},
+		}},
+	}
+	spec, err := tenantCostTaskSpec(task, nil, model.TenantCostEventSettlement, model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, "")
+	require.NoError(t, err)
+	assert.Equal(t, "99", spec.TaskPublicID)
+	assert.Contains(t, spec.EventID, "uce_")
+}
+
+func TestTenantCostBillingUnitDoesNotExposeInternalQuotaForTextOrTasks(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		StartTime: time.Now().UTC(), OriginModelName: "gpt-test", RequestId: "req-unit",
+		TenantCostRequestID: "tvreq-unit",
+		PriceData:           types.PriceData{BillingMode: "ratio"},
+		TenantCostBinding: &corecommon.TenantCostBindingContext{
+			TenantID: model.DownstreamTenantID, CredentialPurpose: model.TenantCredentialPurposeDataPlane,
+			BindingID: 1, KeyID: "safe-key", ProductPoolID: "openai_gpt", ServiceTier: "pro",
+			RouteProfileID: "profile", ProfileRevision: "revision", ModelCatalogRevision: "catalog",
+		},
+	}
+	spec, err := buildTenantCostSpec(info, model.TenantCostEventSettlement, nil, 10, model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, "")
+	require.NoError(t, err)
+	assert.Equal(t, "token", spec.BillingUnit)
+
+	task := &model.Task{ID: 101, TaskID: "unit-task", Status: model.TaskStatusSuccess, Quota: 10,
+		Properties: model.Properties{OriginModelName: "image-model"},
+		PrivateData: model.TaskPrivateData{BillingRequestID: "req-task-unit", BillingContext: &model.TaskBillingContext{
+			BillingMode: "task", OriginModelName: "image-model",
+			TenantCost: &model.TenantCostTaskContext{TenantID: model.DownstreamTenantID, BindingID: 2,
+				DownstreamRequestId: "tvreq-task-unit", ProductPoolID: "image_generation", ServiceTier: "basic",
+				RouteProfileID: "profile", ProfileRevision: "revision", KeyID: "safe-key"},
+		}},
+	}
+	taskSpec, err := tenantCostTaskSpec(task, nil, model.TenantCostEventSettlement, model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, "")
+	require.NoError(t, err)
+	assert.Equal(t, "per_request", taskSpec.BillingUnit)
+}
+
+func TestTenantCostTaskLegacySuccessUsesTaskQuotaWithoutReceipt(t *testing.T) {
+	task := &model.Task{
+		ID: 100, TaskID: "legacy-task-100", UserId: 7, Quota: 321, Status: model.TaskStatusSuccess,
+		Properties: model.Properties{OriginModelName: "video-model", MediaDuration: 4},
+		PrivateData: model.TaskPrivateData{BillingRequestID: "req-legacy-100", BillingContext: &model.TaskBillingContext{
+			OriginModelName: "video-model", BillingMode: "task", TaskBillingUnit: "per_second",
+			TenantCost: &model.TenantCostTaskContext{BindingID: 10, TenantID: model.DownstreamTenantID, DownstreamRequestId: "tvreq-legacy-100",
+				ProductPoolID: "video_generation", ServiceTier: "pro", RouteProfileID: "p", ProfileRevision: "r", KeyID: "safe-key"},
+		}},
+	}
+	spec, err := tenantCostTaskSpec(task, nil, model.TenantCostEventSettlement, model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, "")
+	require.NoError(t, err)
+	assert.EqualValues(t, 321, spec.GatewayChargeQuota)
+}
+
+func TestTenantCostMissingParentUsesPendingUnknownAndDoesNotBlockLaterSettlement(t *testing.T) {
+	setupTenantCostWorkerDB(t)
+	info := &relaycommon.RelayInfo{
+		StartTime: time.Unix(1_700_000_000, 0).UTC(), OriginModelName: "gpt-test", RequestId: "req-parent-race",
+		TenantCostRequestID: "tvreq-parent-race",
+		TenantCostBinding: &corecommon.TenantCostBindingContext{
+			BindingID: 77, TenantID: model.DownstreamTenantID, CredentialPurpose: model.TenantCredentialPurposeDataPlane,
+			KeyID: "safe-key", ProductPoolID: "openai_gpt", ServiceTier: "pro", RouteProfileID: "profile-parent",
+			ProfileRevision: "rev-parent", ModelCatalogRevision: "catalog-parent",
+		},
+	}
+	pending, err := buildTenantCostPendingUnknownSpec(info, "parent_charge_not_projected")
+	require.NoError(t, err)
+	assert.Equal(t, model.TenantCostStatusPending, pending.Status)
+	assert.Equal(t, model.TenantCostEvidenceUnknown, pending.Evidence)
+	assert.Nil(t, pending.ProcurementAmount)
+	assert.EqualValues(t, 0, pending.GatewayChargeQuota)
+	assert.NotEqual(t, tenantCostEventID(model.TenantCostEventSettlement, "binding:77:tvreq-parent-race"), pending.EventID)
+
+	first, err := model.AppendTenantCostEvent(pending)
+	require.NoError(t, err)
+	replayed, err := model.AppendTenantCostEvent(pending)
+	require.NoError(t, err)
+	assert.True(t, replayed.Replayed)
+	settlement, err := buildTenantCostSpec(info, model.TenantCostEventSettlement, nil, 1234,
+		model.TenantCostStatusFinal, model.TenantCostEvidenceFallback, "")
+	require.NoError(t, err)
+	second, err := model.AppendTenantCostEvent(settlement)
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Event.EventID, second.Event.EventID)
+}
+
+func stringPtrForProjection(value string) *string { return &value }

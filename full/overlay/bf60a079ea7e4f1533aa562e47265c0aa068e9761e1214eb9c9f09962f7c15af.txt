@@ -1,0 +1,425 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupParameterFinanceDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db := setupTenantCostTestDB(t)
+	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &QuotaReservation{}, &Task{}, &TaskBillingReceipt{}))
+	oldBatch, oldRedis := common.BatchUpdateEnabled, common.RedisEnabled
+	common.BatchUpdateEnabled, common.RedisEnabled = false, false
+	t.Cleanup(func() { common.BatchUpdateEnabled, common.RedisEnabled = oldBatch, oldRedis })
+	seedQuotaReservationUser(t, 1, 1000000)
+	seedQuotaReservationToken(t, 1, 1, 1000000, false)
+	require.NoError(t, db.Create(&Channel{Id: 109, Name: "parameter test channel"}).Error)
+	require.NoError(t, db.Create(&TenantCredentialBinding{ID: 1, TokenID: 1, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "test-key", KeySuffix: "12345678", ProductPoolID: "image_generation", ServiceTier: "pro", RouteProfileID: "route", ProfileRevision: "route-v1",
+		ModelCatalogRevision: "models-v1", BindingStatus: TenantBindingEnabled}).Error)
+	return db
+}
+
+func parameterFinanceContext() ParameterReservationCostContext {
+	return ParameterReservationCostContext{SchemaVersion: 1, RequestID: "request-param", OccurredAt: time.Unix(1700000000, 0).UnixNano(),
+		Quote: types.ParameterPriceSnapshot{SchemaVersion: 1, Revision: "price-v1", RuleID: "image-rule", Group: "retail", Model: "image-model", ChannelID: 109,
+			UpstreamModel: "provider-image", MappingRevision: "mapping-v1", Unit: "per_request", Currency: "USD", UnitPrice: "0.036", Quantity: "1", Amount: "0.036", Quota: 18000,
+			SourceUnitPrice: "0.03", SourceCurrency: "USD", SourceAmount: "0.03", Parameters: map[string]string{"count": "1"}},
+		Binding: TenantCostTaskContext{BindingID: 1, TenantID: DownstreamTenantID, DownstreamRequestId: "tv-request", ProductPoolID: "image_generation", ServiceTier: "pro",
+			RouteProfileID: "route", ProfileRevision: "route-v1", ModelCatalogRevision: "models-v1", KeyID: "test-key"}}
+}
+
+func reserveParameterFinance(t *testing.T, id string, cost ParameterReservationCostContext) {
+	t.Helper()
+	_, err := ReserveQuotaTo(context.Background(), quotaReservationWalletSpec(id, 1, 1, false), cost.Quote.Quota)
+	require.NoError(t, err)
+	require.NoError(t, PersistParameterReservationCost(context.Background(), id, 1, 1, cost))
+}
+
+func TestParameterFinanceSettlementAndQueueRollbackTogether(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	cost := parameterFinanceContext()
+	reserveParameterFinance(t, "direct:atomic", cost)
+	require.NoError(t, db.Exec(`CREATE TRIGGER fail_parameter_outbox BEFORE INSERT ON tenant_cost_projection_retries BEGIN SELECT RAISE(FAIL, 'injected outbox failure'); END`).Error)
+	_, err := SettleQuotaReservation(context.Background(), "direct:atomic", 18000)
+	require.ErrorContains(t, err, "injected outbox failure")
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 982000, user.Quota)
+	assert.Zero(t, user.UsedQuota, "usage must roll back with the queue write")
+	reservation, err := GetQuotaReservation(context.Background(), "direct:atomic")
+	require.NoError(t, err)
+	assert.Equal(t, QuotaReservationStatusActive, reservation.Status)
+	assert.True(t, reservation.SettlementPending)
+	require.NoError(t, db.Exec("DROP TRIGGER fail_parameter_outbox").Error)
+	_, err = SettleQuotaReservation(context.Background(), "direct:atomic", 18000)
+	require.NoError(t, err)
+	_, err = SettleQuotaReservation(context.Background(), "direct:atomic", 18000)
+	require.NoError(t, err)
+	var queue []TenantCostProjectionRetry
+	require.NoError(t, db.Find(&queue).Error)
+	require.Len(t, queue, 1)
+	spec, err := DecodeTenantCostProjectionRetry(queue[0])
+	require.NoError(t, err)
+	assert.Equal(t, "0.036", spec.GatewayChargeAmount)
+	assert.Equal(t, "0.03", spec.SourcePrice.EstimatedAmount)
+	assert.Nil(t, spec.ProviderCost.Amount)
+	assert.Equal(t, "reservation:direct:atomic:terminal", spec.OperationID)
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 18000, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	first, err := AppendTenantCostEvent(spec)
+	require.NoError(t, err)
+	read, err := ReadParameterReservationTerminal(context.Background(), DownstreamTenantID, "direct:atomic")
+	require.NoError(t, err)
+	replayed, err := AppendTenantCostEvent(read)
+	require.NoError(t, err)
+	assert.True(t, replayed.Replayed)
+	assert.Equal(t, first.Event.EventID, replayed.Event.EventID)
+	encoded, err := common.Marshal(reservation)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "source_unit_price")
+	assert.NotContains(t, string(encoded), "parameter_cost_context")
+}
+
+func TestParameterFinanceUsesSelectedSupplyAndRejectsScopeOrPriceMutation(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	cost := parameterFinanceContext()
+	reserveParameterFinance(t, "direct:supply", cost)
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), "direct:supply", 2, 1, cost), ErrTenantCostScope)
+	changed := parameterFinanceContext()
+	changed.Binding.TenantID = "another-tenant"
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), "direct:supply", 1, 1, changed), ErrTenantCostScope)
+	changed = parameterFinanceContext()
+	changed.Quote.Amount, changed.Quote.UnitPrice, changed.Quote.Quota = "0.04", "0.04", 20000
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), "direct:supply", 1, 1, changed), ErrTenantCostConflict)
+	require.NoError(t, db.Create(&Channel{Id: 110, Name: "selected supply"}).Error)
+	changed = parameterFinanceContext()
+	changed.Quote.ChannelID = 110
+	changed.Quote.UpstreamModel = "actual-provider-model"
+	changed.Quote.SourceUnitPrice, changed.Quote.SourceAmount = "0.025", "0.025"
+	changed.Quote.MappingRevision = "selected-mapping"
+	changed.Quote.SupplyRevision = "supply-price-v2"
+	changed.OccurredAt = time.Unix(1700000099, 0).UnixNano()
+	require.NoError(t, PersistParameterReservationCost(context.Background(), "direct:supply", 1, 1, changed))
+	_, err := SettleQuotaReservation(context.Background(), "direct:supply", 18000)
+	require.NoError(t, err)
+	spec, err := ReadParameterReservationTerminal(context.Background(), DownstreamTenantID, "direct:supply")
+	require.NoError(t, err)
+	assert.Equal(t, "0.025", spec.SourcePrice.EstimatedAmount)
+	assert.Empty(t, spec.UpstreamModel)
+	assert.Equal(t, "supply-price-v2", spec.SourcePrice.RuleRevision)
+	assert.Equal(t, "price-v1", spec.SitePriceRevision)
+	assert.Equal(t, "selected-mapping", spec.MappingRevision)
+	assert.Equal(t, cost.OccurredAt, spec.OccurredAt.UnixNano())
+	require.ErrorIs(t, PersistParameterReservationCost(context.Background(), "direct:supply", 1, 1, changed), ErrQuotaReservationFinalized)
+	_, err = ReadParameterReservationTerminal(context.Background(), "another-tenant", "direct:supply")
+	require.ErrorIs(t, err, ErrTenantCostScope)
+}
+
+func TestParameterFinanceUnknownRefundHasDurableZeroButUnknownProvider(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	reserveParameterFinance(t, "direct:unknown", parameterFinanceContext())
+	_, err := HoldQuotaReservationForReconciliation(context.Background(), "direct:unknown", "provider result unknown")
+	require.NoError(t, err)
+	_, err = RefundUnknownPendingQuotaReservation(context.Background(), "direct:unknown")
+	require.NoError(t, err)
+	spec, err := ReadParameterReservationTerminal(context.Background(), DownstreamTenantID, "direct:unknown")
+	require.NoError(t, err)
+	assert.Equal(t, TenantCostEventObservedZero, spec.EventType)
+	assert.Equal(t, "0", spec.GatewayChargeAmount)
+	assert.Equal(t, "0.03", spec.SourcePrice.EstimatedAmount)
+	assert.Nil(t, spec.ProviderCost.Amount)
+	assert.Nil(t, spec.ProviderCost.RefundAmount)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 1000000, user.Quota)
+	var count int64
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestParameterFinanceDistinctPartialRefundOperationsMoveMoneyOnce(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	reserveParameterFinance(t, "direct:partial", parameterFinanceContext())
+	_, err := SettleQuotaReservation(context.Background(), "direct:partial", 18000)
+	require.NoError(t, err)
+	first, err := ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:partial", "adjustment-one", 5000)
+	require.NoError(t, err)
+	assert.False(t, first.Replayed)
+	second, err := ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:partial", "adjustment-two", 3000)
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Event.EventID, second.Event.EventID)
+	replay, err := ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:partial", "adjustment-one", 5000)
+	require.NoError(t, err)
+	assert.True(t, replay.Replayed)
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:partial", "adjustment-one", 6000)
+	require.ErrorIs(t, err, ErrTenantCostConflict)
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:partial", "too-much", 10001)
+	require.Error(t, err)
+	_, err = ApplyParameterReservationRefund(context.Background(), "another-tenant", 1, "direct:partial", "cross-tenant", 1)
+	require.ErrorIs(t, err, ErrTenantCostScope)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 990000, user.Quota)
+	assert.Equal(t, 10000, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	var token Token
+	require.NoError(t, db.First(&token, 1).Error)
+	assert.Equal(t, 990000, token.RemainQuota)
+	assert.Equal(t, "-0.01", first.Payload.Billing.GatewayChargeAmount)
+	assert.Equal(t, "0.03", first.Payload.SourcePrice.EstimatedAmount)
+	assert.Nil(t, first.Payload.ProviderCost.Amount)
+	original, err := ReadParameterReservationTerminal(context.Background(), DownstreamTenantID, "direct:partial")
+	require.NoError(t, err)
+	assert.EqualValues(t, 18000, original.GatewayChargeQuota, "refunds must not rewrite the original settlement")
+	repeated, err := AppendTenantCostEvent(original)
+	require.NoError(t, err)
+	assert.True(t, repeated.Replayed)
+	var events int64
+	require.NoError(t, db.Model(&TenantCostEvent{}).Count(&events).Error)
+	assert.EqualValues(t, 3, events)
+}
+
+func TestParameterFinanceProviderCorrectionPrecisionAndIdempotency(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	reserveParameterFinance(t, "direct:provider", parameterFinanceContext())
+	_, err := SettleQuotaReservation(context.Background(), "direct:provider", 18000)
+	require.NoError(t, err)
+	parent, err := ReadParameterReservationTerminal(context.Background(), DownstreamTenantID, "direct:provider")
+	require.NoError(t, err)
+	_, err = AppendTenantCostEvent(parent)
+	require.NoError(t, err)
+	amount, refund := ".0300", "0"
+	fact := TenantProviderCost{Amount: &amount, RefundAmount: &refund, Currency: "USD", Evidence: TenantCostEvidenceExact, AmountKind: "cumulative", ReceiptReference: "supplier-receipt"}
+	first, err := AppendTenantProviderCostCorrection(DownstreamTenantID, parent.EventID, "invoice-v1", fact)
+	require.NoError(t, err)
+	replayed, err := AppendTenantProviderCostCorrection(DownstreamTenantID, parent.EventID, "invoice-v1", fact)
+	require.NoError(t, err)
+	assert.True(t, replayed.Replayed)
+	assert.Equal(t, first.Event.FinalizedAt, replayed.Event.FinalizedAt)
+	assert.Equal(t, "0.03", *first.Payload.ProviderCost.Amount)
+	amount = "0.04"
+	_, err = AppendTenantProviderCostCorrection(DownstreamTenantID, parent.EventID, "invoice-v1", fact)
+	require.ErrorIs(t, err, ErrTenantCostConflict)
+	second, err := AppendTenantProviderCostCorrection(DownstreamTenantID, parent.EventID, "invoice-v2", fact)
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Event.EventID, second.Event.EventID)
+	assert.Equal(t, "0", second.Payload.Billing.GatewayChargeAmount)
+	assert.Equal(t, "0.03", second.Payload.SourcePrice.EstimatedAmount)
+	_, err = AppendTenantProviderCostCorrection("another-tenant", parent.EventID, "cross", fact)
+	require.Error(t, err)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 982000, user.Quota, "provider corrections never change the customer charge")
+}
+
+func TestParameterFinanceValidationRejectsUnboundedAndInconsistentFacts(t *testing.T) {
+	quote := parameterFinanceContext().Quote
+	for _, tc := range []struct {
+		name   string
+		change func(*TenantSourcePrice, *TenantProviderCost)
+	}{
+		{"price exponent", func(s *TenantSourcePrice, p *TenantProviderCost) { s.UnitPrice = "1e99999999" }},
+		{"negative quantity", func(s *TenantSourcePrice, p *TenantProviderCost) { s.Quantity = "-1" }},
+		{"price precision", func(s *TenantSourcePrice, p *TenantProviderCost) { s.UnitPrice = "0.0000000000000000001" }},
+		{"inconsistent total", func(s *TenantSourcePrice, p *TenantProviderCost) { s.EstimatedAmount = "0.04" }},
+		{"non USD", func(s *TenantSourcePrice, p *TenantProviderCost) { s.Currency = "CNY" }},
+		{"unknown actual is not zero", func(s *TenantSourcePrice, p *TenantProviderCost) { z := "0"; p.Amount = &z }},
+		{"source secret fields", func(s *TenantSourcePrice, p *TenantProviderCost) { s.Parameters["prompt"] = "sensitive" }},
+		{"refund exceeds gross", func(s *TenantSourcePrice, p *TenantProviderCost) {
+			a, r := "0.03", "0.04"
+			p.Amount = &a
+			p.RefundAmount = &r
+			p.Evidence = TenantCostEvidenceExact
+			p.ReceiptReference = "invoice"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, p := TenantParameterCostBasis(&quote)
+			tc.change(s, p)
+			require.Error(t, validateTenantParameterCosts(TenantCostEventSpec{OperationID: "op", SourcePrice: s, ProviderCost: p}))
+		})
+	}
+}
+
+func TestParameterFinanceProjectionLeasePreventsConcurrentClaimAndRecoversCrash(t *testing.T) {
+	setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("lease-test")
+	require.NoError(t, EnqueueTenantCostProjection(spec, nil))
+	now := time.Now().UnixNano()
+	first, err := ClaimTenantCostProjectionRetries(1, now)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	second, err := ClaimTenantCostProjectionRetries(1, now+int64(time.Second))
+	require.NoError(t, err)
+	assert.Empty(t, second)
+	require.NoError(t, EnqueueTenantCostProjection(spec, errors.New("duplicate producer")))
+	second, err = ClaimTenantCostProjectionRetries(1, now+int64(time.Minute))
+	require.NoError(t, err)
+	assert.Empty(t, second)
+	recovered, err := ClaimTenantCostProjectionRetries(1, now+int64(11*time.Minute))
+	require.NoError(t, err)
+	require.Len(t, recovered, 1)
+	assert.Equal(t, 2, recovered[0].Attempts)
+}
+
+func TestParameterFinanceQueueReconstructedTimeKeepsOperationIdentity(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	spec := tenantCostTestSpec("parameter-queue-operation")
+	spec.OperationID = "reservation:example:terminal"
+	require.NoError(t, EnqueueTenantCostProjection(spec, nil))
+	reconstructed := spec
+	reconstructed.FinalizedAt = spec.FinalizedAt.Add(time.Hour)
+	require.NoError(t, EnqueueTenantCostProjection(reconstructed, nil))
+	var row TenantCostProjectionRetry
+	require.NoError(t, db.First(&row).Error)
+	decoded, err := DecodeTenantCostProjectionRetry(row)
+	require.NoError(t, err)
+	assert.Equal(t, spec.FinalizedAt, decoded.FinalizedAt)
+	reconstructed.GatewayChargeQuota++
+	require.ErrorIs(t, EnqueueTenantCostProjection(reconstructed, nil), ErrTenantCostConflict)
+}
+
+func TestParameterFinanceTaskRefundKeepsOriginalTerminalOperation(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	cost := parameterFinanceContext()
+	reservationID := "direct:task-finance"
+	_, err := ReserveQuotaTo(context.Background(), quotaReservationWalletSpec(reservationID, 1, 1, false), 18000)
+	require.NoError(t, err)
+	task := Task{TaskID: "task-parameter", UserId: 1, ChannelId: 109, Status: TaskStatusInProgress, Quota: 18000, BillingReservationID: reservationID,
+		StartTime: 1700000000, PrivateData: TaskPrivateData{TokenId: 1, BillingSource: QuotaReservationFundingWallet, BillingRequestID: "task-request",
+			BillingContext: &TaskBillingContext{ParameterPricing: &cost.Quote, TenantCost: &cost.Binding}}}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		_, err := ensureTaskBillingReceiptTx(tx, &task, false)
+		return err
+	}))
+	_, err = ApplyTaskBillingSubmission(task.ID)
+	require.NoError(t, err)
+	require.NoError(t, StageTaskBillingTerminal(&task, TaskStatusSuccess, 18000))
+	receipt, err := ApplyTaskBillingTerminal(task.ID)
+	require.NoError(t, err)
+	require.NotNil(t, receipt.ParameterTerminalCost)
+	parent, err := BuildParameterTaskCostSpec(&task, receipt)
+	require.NoError(t, err)
+	first, err := ApplyParameterTaskRefund(context.Background(), DownstreamTenantID, 1, task.ID, "task-refund-one", 5000)
+	require.NoError(t, err)
+	_, err = ApplyParameterTaskRefund(context.Background(), DownstreamTenantID, 1, task.ID, "task-refund-two", 3000)
+	require.NoError(t, err)
+	replay, err := ApplyParameterTaskRefund(context.Background(), DownstreamTenantID, 1, task.ID, "task-refund-one", 5000)
+	require.NoError(t, err)
+	assert.True(t, replay.Replayed)
+	assert.Equal(t, parent.EventID, *first.Event.ParentEventID)
+	reloaded, err := ApplyTaskBillingTerminal(task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 10000, reloaded.AppliedQuota)
+	frozen, err := BuildParameterTaskCostSpec(&task, reloaded)
+	require.NoError(t, err)
+	assert.Equal(t, parent.EventID, frozen.EventID)
+	assert.EqualValues(t, 18000, frozen.GatewayChargeQuota)
+	var reservation QuotaReservation
+	require.NoError(t, db.Where("reservation_id = ?", reservationID).First(&reservation).Error)
+	assert.Nil(t, reservation.ParameterCostContext, "task and reservation must not both own cost publication")
+	var queueCount int64
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Count(&queueCount).Error)
+	assert.EqualValues(t, 1, queueCount)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 990000, user.Quota)
+	assert.Equal(t, 10000, user.UsedQuota)
+}
+
+func TestParameterFinanceRefundOutboxFailureCannotSplitWallet(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	reserveParameterFinance(t, "direct:refund-rollback", parameterFinanceContext())
+	_, err := SettleQuotaReservation(context.Background(), "direct:refund-rollback", 18000)
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TRIGGER fail_parameter_refund BEFORE INSERT ON tenant_cost_events WHEN NEW.event_type = 'refund' BEGIN SELECT RAISE(FAIL, 'injected refund outbox failure'); END`).Error)
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:refund-rollback", "rollback-operation", 5000)
+	require.ErrorContains(t, err, "injected refund outbox failure")
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 982000, user.Quota)
+	assert.Equal(t, 18000, user.UsedQuota)
+	var token Token
+	require.NoError(t, db.First(&token, 1).Error)
+	assert.Equal(t, 982000, token.RemainQuota)
+	require.NoError(t, db.Exec("DROP TRIGGER fail_parameter_refund").Error)
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:refund-rollback", "rollback-operation", 5000)
+	require.NoError(t, err)
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 987000, user.Quota)
+}
+
+func TestParameterFinanceSubscriptionUsesSameDurableRefundPath(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	seedQuotaReservationSubscription(t, 1, 1, 1000000)
+	cost := parameterFinanceContext()
+	_, err := ReserveQuotaTo(context.Background(), QuotaReservationSpec{ReservationId: "direct:subscription", RequestId: "direct:subscription", UserId: 1, TokenId: 1,
+		FundingSource: QuotaReservationFundingSubscription, UserSubscriptionId: 1}, 18000)
+	require.NoError(t, err)
+	require.NoError(t, PersistParameterReservationCost(context.Background(), "direct:subscription", 1, 1, cost))
+	_, err = SettleQuotaReservation(context.Background(), "direct:subscription", 18000)
+	require.NoError(t, err)
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:subscription", "subscription-adjustment", 5000)
+	require.NoError(t, err)
+	var subscription UserSubscription
+	require.NoError(t, db.First(&subscription, 1).Error)
+	assert.EqualValues(t, 13000, subscription.AmountUsed)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 1000000, user.Quota, "subscription refund never credits wallet money")
+	var token Token
+	require.NoError(t, db.First(&token, 1).Error)
+	assert.Equal(t, 987000, token.RemainQuota)
+}
+
+func TestParameterFinanceOrdinaryAccountPersistsQuoteWithoutTenantFact(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	cost := parameterFinanceContext()
+	cost.Binding = TenantCostTaskContext{}
+	reserveParameterFinance(t, "direct:ordinary", cost)
+	_, err := SettleQuotaReservation(context.Background(), "direct:ordinary", 18000)
+	require.NoError(t, err)
+	reservation, err := GetQuotaReservation(context.Background(), "direct:ordinary")
+	require.NoError(t, err)
+	require.NotNil(t, reservation.ParameterCostContext)
+	var frozen ParameterReservationCostContext
+	require.NoError(t, common.UnmarshalJsonStr(*reservation.ParameterCostContext, &frozen))
+	assert.Equal(t, "0.036", frozen.Quote.Amount)
+	var facts int64
+	require.NoError(t, db.Model(&TenantCostProjectionRetry{}).Count(&facts).Error)
+	assert.Zero(t, facts)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 18000, user.UsedQuota)
+}
+
+func TestParameterFinanceAlreadyProjectedCommissionRefundDoesNotSplitLedgers(t *testing.T) {
+	db := setupParameterFinanceDB(t)
+	require.NoError(t, migrateCommissionSchema())
+	reserveParameterFinance(t, "direct:commission-boundary", parameterFinanceContext())
+	_, err := SettleQuotaReservation(context.Background(), "direct:commission-boundary", 18000)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&QuotaReservation{}).Where("reservation_id = ?", "direct:commission-boundary").Update("commission_operation_id", 1).Error)
+	_, err = ApplyParameterReservationRefund(context.Background(), DownstreamTenantID, 1, "direct:commission-boundary", "commission-aware-refund", 5000)
+	require.ErrorIs(t, err, ErrCommissionProjectionConflict)
+	var user User
+	require.NoError(t, db.First(&user, 1).Error)
+	assert.Equal(t, 982000, user.Quota)
+	var events int64
+	require.NoError(t, db.Model(&TenantCostEvent{}).Count(&events).Error)
+	assert.Zero(t, events)
+}

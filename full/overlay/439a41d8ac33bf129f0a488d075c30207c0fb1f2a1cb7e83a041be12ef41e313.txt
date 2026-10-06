@@ -1,0 +1,54 @@
+package main
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestMigrationOnlyRequested(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "unset", value: "", want: false},
+		{name: "true", value: "true", want: true},
+		{name: "mixed case", value: " TRUE ", want: true},
+		{name: "one", value: "1", want: true},
+		{name: "false", value: "false", want: false},
+		{name: "invalid", value: "yes please", want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("MIGRATION_ONLY", testCase.value)
+			assert.Equal(t, testCase.want, migrationOnlyRequested())
+		})
+	}
+}
+
+func TestSmartRouterProcessRole(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		value string
+		want  string
+		err   bool
+	}{
+		{name: "unset defaults to web", value: "", want: "web"},
+		{name: "web", value: "WEB", want: "web"},
+		{name: "worker", value: "smart-router-worker", want: "smart-router-worker"},
+		{name: "route analytics worker", value: " ROUTE-ANALYTICS-WORKER ", want: "route-analytics-worker"},
+		{name: "all", value: " all ", want: "all"},
+		{name: "invalid", value: "worker", err: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("PROCESS_ROLE", testCase.value)
+			got, err := smartRouterProcessRole()
+			if testCase.err {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.want, got)
+		})
+	}
+}

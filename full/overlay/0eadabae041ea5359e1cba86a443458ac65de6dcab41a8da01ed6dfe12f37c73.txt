@@ -1,0 +1,247 @@
+package openai
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+const responsesClientGoneDrainTimeout = 2 * time.Second
+
+func responsesClientDisconnected(c *gin.Context, info *relaycommon.RelayInfo, sr *helper.StreamResult) bool {
+	if sr != nil && sr.ClientDisconnected() {
+		return true
+	}
+	if c == nil || c.Request == nil {
+		return false
+	}
+	requestErr := c.Request.Context().Err()
+	if requestErr == nil {
+		return false
+	}
+	if info != nil && info.StreamStatus != nil {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, requestErr)
+	}
+	return true
+}
+
+func responsesStreamScannerOptions() helper.StreamScannerOptions {
+	return helper.StreamScannerOptions{ClientGoneDrainTimeout: responsesClientGoneDrainTimeout}
+}
+
+func responsesFailureRetryBoundary(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr == nil {
+		return nil
+	}
+	committed := SmartResponsesSemanticCommitted(c)
+	if !isSmartResponsesRequest(c) && c != nil && c.Writer != nil {
+		committed = c.Writer.Written()
+	}
+	clientGone := responsesClientDisconnected(c, info, nil) ||
+		(info != nil && info.StreamStatus != nil && info.StreamStatus.ClientDisconnected())
+	if committed || clientGone {
+		types.ErrOptionWithSkipRetry()(apiErr)
+	}
+	return PreserveSmartResponsesSingleRouteError(c, apiErr)
+}
+
+func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
+
+	// read response body
+	var responsesResponse dto.OpenAIResponsesResponse
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway))
+	}
+	err = common.Unmarshal(responseBody, &responsesResponse)
+	if err != nil {
+		return nil, MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+	}
+	if isSmartResponsesRequest(c) {
+		if semanticErr := smartResponsesResponseSemanticError(&responsesResponse); semanticErr != nil {
+			return nil, semanticErr
+		}
+	}
+	if smartResponsesStatus(responsesResponse.Status) == "completed" {
+		// Non-stream Responses completion must be visible to the same exact-route
+		// success observer for Smart, fixed-group, and ordinary Keys. This marker
+		// is observational; only Smart requests activate retry semantics.
+		markSmartResponsesTerminal(c, true)
+	}
+	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+		return nil, MarkSmartResponsesUpstreamError(c, types.WithOpenAIError(*oaiError, resp.StatusCode, types.ErrOptionWithUpstreamResponseReceived()))
+	}
+
+	if responsesResponse.HasImageGenerationCall() {
+		c.Set("image_generation_call", true)
+		c.Set("image_generation_call_quality", responsesResponse.GetQuality())
+		c.Set("image_generation_call_size", responsesResponse.GetSize())
+	}
+
+	// 写入新的 response body
+	service.IOCopyBytesGracefully(c, resp, responseBody)
+
+	// compute usage
+	usage := dto.Usage{}
+	if responsesResponse.Usage != nil {
+		usage.PromptTokens = responsesResponse.Usage.InputTokens
+		usage.InputTokens = responsesResponse.Usage.InputTokens
+		usage.CompletionTokens = responsesResponse.Usage.OutputTokens
+		usage.OutputTokens = responsesResponse.Usage.OutputTokens
+		usage.TotalTokens = responsesResponse.Usage.TotalTokens
+		if responsesResponse.Usage.InputTokens > 0 {
+			usage.UsageSource = "openai-responses"
+		}
+		if responsesResponse.Usage.InputTokensDetails != nil {
+			usage.PromptTokensDetails.CachedTokens = responsesResponse.Usage.InputTokensDetails.CachedTokens
+			usage.CacheUsageReliable = true
+		}
+	}
+	applyUsagePostProcessing(info, &usage, responseBody)
+	toolCalls := newResponsesToolCounter(info)
+	toolCalls.observeOutputs(responsesResponse.Output)
+	return &usage, nil
+}
+
+func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (result *dto.Usage, apiErr *types.NewAPIError) {
+	defer func() {
+		apiErr = responsesFailureRetryBoundary(c, info, apiErr)
+	}()
+	if resp == nil || resp.Body == nil {
+		logger.LogError(c, "invalid response or response body")
+		return nil, types.NewError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse)
+	}
+
+	defer service.CloseResponseBodyGracefully(resp)
+	if semanticErr := guardSmartResponsesStream(c, info, resp); semanticErr != nil {
+		return nil, semanticErr
+	}
+
+	var usage = &dto.Usage{}
+	explicitInputUsageSeen := false
+	var streamErr *types.NewAPIError
+	completedSeen := false
+	toolCalls := newResponsesToolCounter(info)
+
+	helper.StreamScannerHandlerWithOptions(c, resp, info, responsesStreamScannerOptions(), func(data string, sr *helper.StreamResult) {
+
+		// 检查当前数据是否包含 completed 状态和 usage 信息
+		var streamResponse dto.ResponsesStreamResponse
+		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
+			streamErr = MarkSmartResponsesUpstreamError(c, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway))
+			sr.Stop(streamErr)
+			return
+		}
+		observedTerminal, observedCompleted := observeSmartResponsesStreamEvent(c, info, &streamResponse)
+		semanticErr := smartResponsesStreamSemanticError(&streamResponse)
+		if semanticErr == nil && observedTerminal && !observedCompleted {
+			semanticErr = MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+				fmt.Errorf("Responses terminal %s did not complete", streamResponse.Type),
+				types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway,
+			))
+		}
+		if semanticErr != nil {
+			if (!isSmartResponsesRequest(c) || SmartResponsesSemanticCommitted(c)) && !responsesClientDisconnected(c, info, sr) {
+				if writeErr := sendResponsesStreamData(c, streamResponse, data); writeErr != nil && !responsesClientDisconnected(c, info, sr) {
+					semanticErr = types.NewOpenAIError(writeErr, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+				}
+			}
+			streamErr = semanticErr
+			sr.Stop(semanticErr)
+			return
+		}
+		if observedTerminal {
+			completedSeen = observedCompleted
+		}
+		wroteToClient := false
+		if !responsesClientDisconnected(c, info, sr) {
+			if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+				if !responsesClientDisconnected(c, info, sr) {
+					streamErr = types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
+					sr.Stop(streamErr)
+					return
+				}
+			} else {
+				wroteToClient = true
+			}
+		}
+		if wroteToClient && isSmartResponsesRequest(c) && !isSmartResponsesPreludeControl(&streamResponse) {
+			markSmartResponsesSemanticCommitted(c)
+		}
+		switch streamResponse.Type {
+		case "response.completed", "response.done":
+			if streamResponse.Response != nil {
+				toolCalls.observeOutputs(streamResponse.Response.Output)
+				if streamResponse.Response.Usage != nil {
+					usage.PromptTokens = streamResponse.Response.Usage.InputTokens
+					usage.InputTokens = streamResponse.Response.Usage.InputTokens
+					usage.CompletionTokens = streamResponse.Response.Usage.OutputTokens
+					usage.OutputTokens = streamResponse.Response.Usage.OutputTokens
+					usage.TotalTokens = streamResponse.Response.Usage.TotalTokens
+					if streamResponse.Response.Usage.InputTokens != 0 {
+						explicitInputUsageSeen = true
+						usage.UsageSource = "openai-responses"
+					}
+					if streamResponse.Response.Usage.InputTokensDetails != nil {
+						usage.PromptTokensDetails.CachedTokens = streamResponse.Response.Usage.InputTokensDetails.CachedTokens
+						usage.CacheUsageReliable = true
+					}
+				}
+				if streamResponse.Response.HasImageGenerationCall() {
+					c.Set("image_generation_call", true)
+					c.Set("image_generation_call_quality", streamResponse.Response.GetQuality())
+					c.Set("image_generation_call_size", streamResponse.Response.GetSize())
+				}
+			}
+		case "response.output_text.delta":
+			if streamResponse.Delta != "" {
+				info.SetFirstTextTime()
+			}
+		case dto.ResponsesOutputTypeItemDone:
+			if streamResponse.Item != nil {
+				toolCalls.observe(*streamResponse.Item, streamResponse.OutputIndex)
+			}
+		}
+	})
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	if !completedSeen {
+		if responsesClientDisconnected(c, info, nil) || (info.StreamStatus != nil && info.StreamStatus.ClientDisconnected()) {
+			clientErr := fmt.Errorf("Responses client disconnected before response.completed")
+			if c.Request != nil && c.Request.Context().Err() != nil {
+				clientErr = c.Request.Context().Err()
+			}
+			return nil, types.NewErrorWithStatusCode(clientErr, types.ErrorCodeDoRequestFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
+		incompleteErr := MarkSmartResponsesUpstreamError(c, types.NewErrorWithStatusCode(
+			fmt.Errorf("Responses stream ended before response.completed"),
+			types.ErrorCodeReadResponseBodyFailed,
+			http.StatusBadGateway,
+		))
+		return nil, incompleteErr
+	}
+
+	if explicitInputUsageSeen {
+		markExplicitOpenAIInputUsage(usage, "openai-responses")
+	}
+
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+
+	return usage, nil
+}

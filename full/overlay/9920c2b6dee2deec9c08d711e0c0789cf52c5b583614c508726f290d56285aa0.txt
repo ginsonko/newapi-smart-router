@@ -1,0 +1,1564 @@
+package model
+
+// This file contains the durable, append-only Downstream cost projection.  It
+// is deliberately separate from Token and the existing billing tables: the
+// latter remain the only balance/charge authorities, while these records are
+// an auditable export fact that can be replayed without touching user money.
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+const (
+	// DefaultTenantCostTenantID keeps the first downstream compatible with the
+	// original single-tenant contract while all new code remains tenant-scoped.
+	DefaultTenantCostTenantID = "downstream-v1"
+	// DownstreamTenantID is retained as a compatibility alias for existing
+	// callers and historical receipts. It is not the only valid tenant.
+	DownstreamTenantID = DefaultTenantCostTenantID
+	// TenantCostReportingPermission is the only permission accepted by the
+	// partner read API.  Keeping the value closed prevents an accidentally
+	// broad permission string from becoming a reporting capability.
+	TenantCostReportingPermission = "cost:read"
+
+	TenantCredentialPurposeDataPlane = "data_plane"
+	TenantCredentialPurposeReporting = "reporting"
+
+	TenantBindingPending  = "pending"
+	TenantBindingEnabled  = "enabled"
+	TenantBindingDisabled = "disabled"
+	TenantBindingRevoked  = "revoked"
+
+	TenantCostEventSettlement     = "settlement"
+	TenantCostEventChargedFailure = "charged_failure"
+	TenantCostEventRefund         = "refund"
+	TenantCostEventReversal       = "reversal"
+	TenantCostEventSupplement     = "supplement"
+	TenantCostEventCorrection     = "correction"
+	TenantCostEventObservedZero   = "observed_zero"
+
+	TenantCostEvidenceExact     = "exact"
+	TenantCostEvidenceObserved  = "observed"
+	TenantCostEvidenceEstimated = "estimated"
+	TenantCostEvidenceFallback  = "fallback"
+	TenantCostEvidenceUnknown   = "unknown"
+
+	TenantCostStatusFinal   = "final"
+	TenantCostStatusPending = "pending"
+	TenantCostStatusReview  = "review"
+
+	TenantOutboxPending = "pending"
+	TenantOutboxReady   = "ready"
+	TenantOutboxSent    = "sent"
+	TenantOutboxFailed  = "failed"
+)
+
+var (
+	ErrTenantCostInvalidInput       = errors.New("invalid tenant cost input")
+	ErrTenantCostConflict           = errors.New("tenant cost event conflict")
+	ErrTenantCostScope              = errors.New("tenant cost scope denied")
+	ErrTenantCostReportingToken     = errors.New("invalid tenant reporting token")
+	ErrTenantCostBindingUnavailable = errors.New("tenant credential binding unavailable")
+)
+
+func validTenantCostPublicIdentifier(value string, maxLength int) bool {
+	value = strings.TrimSpace(value)
+	lowerValue := strings.ToLower(value)
+	if value == "" || len(value) > maxLength || containsTenantCostSecretMarker(lowerValue) ||
+		strings.Contains(lowerValue, "://") {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// containsTenantCostSecretMarker rejects API-key-shaped identifiers while
+// allowing ordinary IDs such as "task-123", where "sk-" only occurs across
+// letters inside a larger word.
+func containsTenantCostSecretMarker(lowerValue string) bool {
+	for offset := 0; offset < len(lowerValue); {
+		index := strings.Index(lowerValue[offset:], "sk-")
+		if index < 0 {
+			return false
+		}
+		index += offset
+		if index == 0 || !((lowerValue[index-1] >= 'a' && lowerValue[index-1] <= 'z') ||
+			(lowerValue[index-1] >= '0' && lowerValue[index-1] <= '9')) {
+			return true
+		}
+		offset = index + len("sk-")
+	}
+	return false
+}
+
+func validTenantCostKeySuffix(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 4 || len(value) > 8 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validTenantBindingStatus(value string) bool {
+	switch strings.TrimSpace(value) {
+	case TenantBindingPending, TenantBindingEnabled, TenantBindingDisabled, TenantBindingRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
+// TenantCredentialBinding is the server-owned association between a data
+// plane token and a logical Downstream product slot.  Secret material is never
+// copied here; KeyID/KeySuffix are safe identifiers for operator displays.
+type TenantCredentialBinding struct {
+	ID                   int64  `json:"id" gorm:"primaryKey"`
+	TokenID              int    `json:"token_id" gorm:"uniqueIndex:idx_tenant_binding_token;not null"`
+	TenantID             string `json:"tenant_id" gorm:"type:varchar(64);index;uniqueIndex:idx_tenant_binding_slot;not null"`
+	CredentialPurpose    string `json:"credential_purpose" gorm:"type:varchar(32);not null"`
+	KeyID                string `json:"key_id" gorm:"type:varchar(128);not null"`
+	KeySuffix            string `json:"key_suffix" gorm:"type:varchar(8);not null"`
+	ProductPoolID        string `json:"product_pool_id" gorm:"type:varchar(64);index;uniqueIndex:idx_tenant_binding_slot;not null"`
+	ServiceTier          string `json:"service_tier" gorm:"type:varchar(32);index;uniqueIndex:idx_tenant_binding_slot;not null"`
+	RouteProfileID       string `json:"route_profile_id" gorm:"type:varchar(128);not null"`
+	ProfileRevision      string `json:"profile_revision" gorm:"type:varchar(96);not null"`
+	ModelCatalogRevision string `json:"model_catalog_revision" gorm:"type:varchar(96);not null"`
+	BindingStatus        string `json:"binding_status" gorm:"type:varchar(24);index;not null"`
+	CreatedAt            int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt            int64  `json:"updated_at" gorm:"type:bigint;not null"`
+	RevokedAt            int64  `json:"revoked_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCredentialBinding) TableName() string { return "tenant_credential_bindings" }
+
+// TenantRouteProfile stores an anonymous public tier plus the private route
+// selection contract.  Private fields intentionally have json:"-" so an
+// accidental admin/report response cannot expose physical candidates.
+type TenantRouteProfile struct {
+	ID             int64  `json:"id" gorm:"primaryKey"`
+	TenantID       string `json:"tenant_id" gorm:"type:varchar(64);index;uniqueIndex:idx_tenant_profile;not null"`
+	ProfileID      string `json:"profile_id" gorm:"type:varchar(128);uniqueIndex:idx_tenant_profile;not null"`
+	Revision       string `json:"revision" gorm:"type:varchar(96);not null"`
+	ProductPoolID  string `json:"product_pool_id" gorm:"type:varchar(64);index;not null"`
+	ServiceTier    string `json:"service_tier" gorm:"type:varchar(32);index;not null"`
+	PublicLabel    string `json:"public_label" gorm:"type:varchar(32);not null"`
+	ModelSelector  string `json:"-" gorm:"type:varchar(256);not null"`
+	MinRatioPPM    int64  `json:"-" gorm:"type:bigint;not null"`
+	MaxRatioPPM    int64  `json:"-" gorm:"type:bigint;not null"`
+	ProviderClass  string `json:"-" gorm:"type:varchar(128);not null"`
+	CandidateSpec  string `json:"-" gorm:"type:text"`
+	CapabilitySpec string `json:"-" gorm:"type:text"`
+	Status         string `json:"status" gorm:"type:varchar(24);index;not null"`
+	DisabledReason string `json:"disabled_reason,omitempty" gorm:"type:text"`
+	CreatedAt      int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt      int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantRouteProfile) TableName() string { return "tenant_route_profiles" }
+
+// TenantCostSequence is the durable per-tenant cursor allocator.  It is
+// locked inside the same short transaction that creates an event.
+type TenantCostSequence struct {
+	TenantID     string `json:"tenant_id" gorm:"primaryKey;type:varchar(64)"`
+	NextSequence int64  `json:"next_sequence" gorm:"type:bigint;not null"`
+	UpdatedAt    int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostSequence) TableName() string { return "tenant_cost_sequences" }
+
+// TenantCostEvent is the indexed envelope. Payload contains the canonical
+// upstream-cost.v2 JSON and is never updated after insertion.
+type TenantCostEvent struct {
+	ID                  int64   `json:"id" gorm:"primaryKey"`
+	TenantID            string  `json:"tenant_id" gorm:"type:varchar(64);uniqueIndex:idx_tenant_cost_event;index:idx_tenant_cost_sequence;not null"`
+	EventID             string  `json:"event_id" gorm:"type:varchar(128);uniqueIndex:idx_tenant_cost_event;not null"`
+	Sequence            int64   `json:"sequence" gorm:"type:bigint;uniqueIndex:idx_tenant_cost_sequence;not null"`
+	EventType           string  `json:"event_type" gorm:"type:varchar(32);index;not null"`
+	ParentEventID       *string `json:"parent_event_id,omitempty" gorm:"type:varchar(128);index"`
+	OccurredAt          int64   `json:"occurred_at" gorm:"type:bigint;index;not null"`
+	FinalizedAt         int64   `json:"finalized_at" gorm:"type:bigint;index;not null"`
+	PublishedAt         int64   `json:"published_at" gorm:"type:bigint;not null"`
+	DownstreamRequestId  string  `json:"downstream_request_id,omitempty" gorm:"type:varchar(128);index"`
+	GatewayRequestId      string  `json:"gateway_request_id,omitempty" gorm:"type:varchar(128);index"`
+	ReservationID       string  `json:"reservation_id,omitempty" gorm:"type:varchar(128);index"`
+	RouteReceiptID      string  `json:"route_receipt_id,omitempty" gorm:"type:varchar(128)"`
+	UpstreamAttemptID   string  `json:"upstream_attempt_id,omitempty" gorm:"type:varchar(128)"`
+	TaskPublicID        string  `json:"task_public_id,omitempty" gorm:"type:varchar(191);index"`
+	ProductPoolID       string  `json:"product_pool_id" gorm:"type:varchar(64);index;not null"`
+	ServiceTier         string  `json:"service_tier" gorm:"type:varchar(32);index;not null"`
+	RouteProfileID      string  `json:"route_profile_id" gorm:"type:varchar(128);not null"`
+	ProfileRevision     string  `json:"profile_revision" gorm:"type:varchar(96);not null"`
+	KeyID               string  `json:"key_id" gorm:"type:varchar(128);not null"`
+	RequestedModel      string  `json:"requested_model" gorm:"type:varchar(191);not null"`
+	CanonicalModel      string  `json:"canonical_model" gorm:"type:varchar(191);index;not null"`
+	UpstreamModel       string  `json:"upstream_model,omitempty" gorm:"type:varchar(191)"`
+	MappingRevision     string  `json:"mapping_revision,omitempty" gorm:"type:varchar(96)"`
+	BillingMode         string  `json:"billing_mode" gorm:"type:varchar(32);not null"`
+	BillingUnit         string  `json:"billing_unit" gorm:"type:varchar(32);not null"`
+	GatewayChargeQuota    int64   `json:"gateway_charge_quota" gorm:"type:bigint;not null"`
+	GatewayChargeAmount   string  `json:"gateway_charge_amount" gorm:"type:varchar(64);not null"`
+	Currency            string  `json:"currency" gorm:"type:varchar(16);not null"`
+	ProcurementAmount   *string `json:"procurement_amount,omitempty" gorm:"type:varchar(64)"`
+	ProcurementCurrency string  `json:"procurement_currency,omitempty" gorm:"type:varchar(16)"`
+	Evidence            string  `json:"evidence" gorm:"type:varchar(24);index;not null"`
+	BasisKind           string  `json:"basis_kind,omitempty" gorm:"type:varchar(32)"`
+	BasisRevision       string  `json:"basis_revision,omitempty" gorm:"type:varchar(96)"`
+	Formula             string  `json:"formula,omitempty" gorm:"type:text"`
+	UnknownReason       string  `json:"unknown_reason,omitempty" gorm:"type:varchar(128)"`
+	Status              string  `json:"status" gorm:"type:varchar(24);index;not null"`
+	PayloadHash         string  `json:"payload_hash" gorm:"type:char(71);not null"`
+	Payload             string  `json:"-" gorm:"type:text;not null"`
+	CreatedAt           int64   `json:"created_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostEvent) TableName() string { return "tenant_cost_events" }
+
+type TenantCostOutbox struct {
+	ID            int64  `json:"id" gorm:"primaryKey"`
+	TenantID      string `json:"tenant_id" gorm:"type:varchar(64);index:idx_tenant_outbox_due;uniqueIndex:idx_tenant_outbox_event;not null"`
+	EventID       string `json:"event_id" gorm:"type:varchar(128);uniqueIndex:idx_tenant_outbox_event;not null"`
+	State         string `json:"state" gorm:"type:varchar(24);index:idx_tenant_outbox_due;not null"`
+	Attempts      int    `json:"attempts" gorm:"not null"`
+	NextAttemptAt int64  `json:"next_attempt_at" gorm:"type:bigint;index:idx_tenant_outbox_due;not null"`
+	LastError     string `json:"last_error,omitempty" gorm:"type:text"`
+	CreatedAt     int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt     int64  `json:"updated_at" gorm:"type:bigint;not null"`
+	PublishedAt   int64  `json:"published_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostOutbox) TableName() string { return "tenant_cost_outbox" }
+
+type TenantReportingToken struct {
+	ID         int64  `json:"id" gorm:"primaryKey"`
+	TenantID   string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	TokenID    string `json:"token_id" gorm:"type:varchar(128);uniqueIndex;not null"`
+	TokenHash  string `json:"-" gorm:"type:char(64);uniqueIndex;not null"`
+	Permission string `json:"permission" gorm:"type:varchar(64);not null"`
+	ExpiresAt  int64  `json:"expires_at" gorm:"type:bigint;not null"`
+	RevokedAt  int64  `json:"revoked_at" gorm:"type:bigint;not null"`
+	LastUsedAt int64  `json:"last_used_at" gorm:"type:bigint;not null"`
+	CreatedAt  int64  `json:"created_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantReportingToken) TableName() string { return "tenant_reporting_tokens" }
+
+// TenantReportingTokenReceipt is the durable idempotency record for an
+// administrative reporting-token mutation.  RequestID is globally unique
+// across create and rotate operations, so a retry can never mint a second
+// secret or rotate a different tenant by accident.  Only safe metadata is
+// retained; the one-time secret is never persisted here.
+type TenantReportingTokenReceipt struct {
+	ID               int64  `json:"id" gorm:"primaryKey"`
+	RequestID        string `json:"request_id" gorm:"type:varchar(96);uniqueIndex:idx_tenant_reporting_token_request;not null"`
+	Operation        string `json:"operation" gorm:"type:varchar(24);not null"`
+	TenantID         string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	TargetTokenID    string `json:"target_token_id" gorm:"type:varchar(128);not null"`
+	InputFingerprint string `json:"input_fingerprint" gorm:"type:char(64);index;not null"`
+	ResultTokenID    string `json:"result_token_id" gorm:"type:varchar(128);not null"`
+	Permission       string `json:"permission" gorm:"type:varchar(64);not null"`
+	// RequestedExpiresAt preserves the caller's normalized input semantics.
+	// In particular, zero means "use the default TTL" and must remain
+	// distinguishable from an explicitly supplied timestamp on replay.
+	RequestedExpiresAt int64 `json:"requested_expires_at" gorm:"type:bigint;not null"`
+	ExpiresAt          int64 `json:"expires_at" gorm:"type:bigint;not null"`
+	CreatedAt          int64 `json:"created_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantReportingTokenReceipt) TableName() string { return "tenant_reporting_token_receipts" }
+
+type TenantCostAuditEvent struct {
+	ID          int64  `json:"id" gorm:"primaryKey"`
+	TenantID    string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	ActorUserID int    `json:"actor_user_id" gorm:"index;not null"`
+	Action      string `json:"action" gorm:"type:varchar(64);index;not null"`
+	SubjectID   string `json:"subject_id,omitempty" gorm:"type:varchar(128)"`
+	Details     string `json:"details,omitempty" gorm:"type:text"`
+	CreatedAt   int64  `json:"created_at" gorm:"type:bigint;index;not null"`
+}
+
+func (TenantCostAuditEvent) TableName() string { return "tenant_cost_audit_events" }
+
+// TenantCostEventPayload is the canonical JSON envelope. Amounts are strings
+// so JSON consumers never lose decimal precision.
+type TenantCostEventPayload struct {
+	OperationID string `json:"operation_id,omitempty"`
+	SourcePrice *TenantSourcePrice `json:"source_price,omitempty"`
+	ProviderCost *TenantProviderCost `json:"provider_cost,omitempty"`
+	SchemaVersion string                       `json:"schema_version"`
+	EventID       string                       `json:"event_id"`
+	Sequence      int64                        `json:"sequence"`
+	TenantID      string                       `json:"tenant_id"`
+	EventType     string                       `json:"event_type"`
+	ParentEventID *string                      `json:"parent_event_id"`
+	OccurredAt    string                       `json:"occurred_at"`
+	FinalizedAt   string                       `json:"finalized_at"`
+	PublishedAt   string                       `json:"published_at"`
+	Correlation   TenantCostCorrelation        `json:"correlation"`
+	Binding       TenantCostBindingPayload     `json:"binding"`
+	Model         TenantCostModelPayload       `json:"model"`
+	Billing       TenantCostBillingPayload     `json:"billing"`
+	Procurement   TenantCostProcurementPayload `json:"procurement_cost"`
+	Status        string                       `json:"status"`
+	PayloadHash   string                       `json:"payload_hash"`
+}
+
+type TenantCostCorrelation struct {
+	DownstreamRequestId    string `json:"downstream_request_id,omitempty"`
+	GatewayRequestId        string `json:"gateway_request_id,omitempty"`
+	ReservationID         string `json:"reservation_id,omitempty"`
+	RouteReceiptID        string `json:"route_receipt_id,omitempty"`
+	UpstreamAttemptID     string `json:"upstream_attempt_id,omitempty"`
+	ProviderReferenceHash string `json:"provider_reference_hash,omitempty"`
+	TaskPublicID          string `json:"task_public_id,omitempty"`
+}
+
+type TenantCostBindingPayload struct {
+	ProductPoolID   string `json:"product_pool_id"`
+	ServiceTier     string `json:"service_tier"`
+	RouteProfileID  string `json:"route_profile_id"`
+	ProfileRevision string `json:"profile_revision"`
+	KeyID           string `json:"key_id"`
+}
+
+type TenantCostModelPayload struct {
+	Requested       string `json:"requested"`
+	Canonical       string `json:"canonical"`
+	Upstream        string `json:"upstream,omitempty"`
+	MappingRevision string `json:"mapping_revision,omitempty"`
+}
+
+type TenantCostBillingUsage struct {
+	InputTokens       string `json:"input_tokens,omitempty"`
+	OutputTokens      string `json:"output_tokens,omitempty"`
+	CacheReadTokens   string `json:"cache_read_tokens,omitempty"`
+	CacheWrite5m      string `json:"cache_write_5m_tokens,omitempty"`
+	CacheWrite1h      string `json:"cache_write_1h_tokens,omitempty"`
+	AudioInputTokens  string `json:"audio_input_tokens,omitempty"`
+	AudioOutputTokens string `json:"audio_output_tokens,omitempty"`
+	Seconds           string `json:"seconds,omitempty"`
+	RequestCount      string `json:"request_count,omitempty"`
+}
+
+type TenantCostBillingPayload struct {
+	Mode              string                 `json:"mode"`
+	Unit              string                 `json:"unit"`
+	Usage             TenantCostBillingUsage `json:"usage"`
+	GatewayChargeQuota  string                 `json:"gateway_charge_quota"`
+	GatewayChargeAmount string                 `json:"gateway_charge_amount"`
+	Currency          string                 `json:"currency"`
+	SitePriceRevision string                 `json:"site_price_revision,omitempty"`
+	Rounding          string                 `json:"rounding,omitempty"`
+}
+
+type TenantCostProcurementPayload struct {
+	Amount        *string `json:"amount"`
+	Currency      string  `json:"currency,omitempty"`
+	Evidence      string  `json:"evidence"`
+	BasisKind     string  `json:"basis_kind,omitempty"`
+	UpstreamBasis *string `json:"upstream_basis,omitempty"`
+	LocalBasis    *string `json:"local_basis,omitempty"`
+	BasisRevision string  `json:"basis_revision,omitempty"`
+	Formula       string  `json:"formula,omitempty"`
+	UnknownReason *string `json:"unknown_reason,omitempty"`
+}
+
+type TenantCostEventSpec struct {
+	OperationID string
+	SourcePrice *TenantSourcePrice
+	ProviderCost *TenantProviderCost
+	TenantID              string
+	EventID               string
+	EventType             string
+	ParentEventID         *string
+	OccurredAt            time.Time
+	FinalizedAt           time.Time
+	DownstreamRequestId    string
+	GatewayRequestId        string
+	ReservationID         string
+	RouteReceiptID        string
+	UpstreamAttemptID     string
+	ProviderReferenceHash string
+	TaskPublicID          string
+	ProductPoolID         string
+	ServiceTier           string
+	RouteProfileID        string
+	ProfileRevision       string
+	KeyID                 string
+	RequestedModel        string
+	CanonicalModel        string
+	UpstreamModel         string
+	MappingRevision       string
+	BillingMode           string
+	BillingUnit           string
+	Usage                 TenantCostBillingUsage
+	GatewayChargeQuota      int64
+	GatewayChargeAmount     string
+	Currency              string
+	ProcurementAmount     *string
+	ProcurementCurrency   string
+	Evidence              string
+	BasisKind             string
+	BasisRevision         string
+	Formula               string
+	UnknownReason         string
+	Status                string
+	SitePriceRevision     string
+	Rounding              string
+}
+
+type TenantCostAppendResult struct {
+	Event    TenantCostEvent
+	Payload  TenantCostEventPayload
+	Replayed bool
+}
+
+func (s TenantCostEventSpec) normalize() (TenantCostEventSpec, error) {
+	if err := validateTenantParameterCosts(s); err != nil {return s, err}
+	s.TenantID = strings.TrimSpace(s.TenantID)
+	s.EventID = strings.TrimSpace(s.EventID)
+	s.EventType = strings.TrimSpace(s.EventType)
+	s.ProductPoolID = strings.TrimSpace(s.ProductPoolID)
+	s.ServiceTier = strings.TrimSpace(s.ServiceTier)
+	s.RouteProfileID = strings.TrimSpace(s.RouteProfileID)
+	s.ProfileRevision = strings.TrimSpace(s.ProfileRevision)
+	s.KeyID = strings.TrimSpace(s.KeyID)
+	s.RequestedModel = strings.TrimSpace(s.RequestedModel)
+	s.CanonicalModel = strings.TrimSpace(s.CanonicalModel)
+	s.BillingMode = strings.TrimSpace(s.BillingMode)
+	s.BillingUnit = strings.TrimSpace(s.BillingUnit)
+	s.Evidence = strings.TrimSpace(s.Evidence)
+	s.Status = strings.TrimSpace(s.Status)
+	if s.TenantID == "" {
+		// A missing tenant is an identity failure, not a request for the first
+		// registered downstream.  Falling back here would silently attribute a
+		// malformed or forged projection to Downstream.  Compatibility callers
+		// must choose the default explicitly before entering this normalizer.
+		return s, ErrTenantCostScope
+	}
+	if s.EventID == "" {
+		s.EventID = "uce_" + uuid.New().String()
+	}
+	if s.OccurredAt.IsZero() {
+		s.OccurredAt = time.Now().UTC()
+	}
+	if s.FinalizedAt.IsZero() {
+		s.FinalizedAt = s.OccurredAt
+	}
+	if s.Status == "" {
+		s.Status = TenantCostStatusFinal
+	}
+	if s.Currency == "" {
+		s.Currency = "USD"
+	}
+	if s.ProcurementCurrency == "" {
+		s.ProcurementCurrency = s.Currency
+	}
+	if !IsValidTenantCostTenantID(s.TenantID) || s.EventType == "" || s.ProductPoolID == "" ||
+		s.ServiceTier == "" || s.RouteProfileID == "" || s.ProfileRevision == "" ||
+		!validTenantCostPublicIdentifier(s.KeyID, 128) || s.CanonicalModel == "" || s.BillingMode == "" || s.BillingUnit == "" ||
+		s.GatewayChargeAmount == "" || s.Evidence == "" {
+		return s, ErrTenantCostInvalidInput
+	}
+	if !validTenantCostEventType(s.EventType) || !validTenantCostEvidence(s.Evidence) {
+		return s, ErrTenantCostInvalidInput
+	}
+	if s.EventType == TenantCostEventSettlement || s.EventType == TenantCostEventChargedFailure ||
+		s.EventType == TenantCostEventObservedZero {
+		if s.GatewayChargeQuota < 0 {
+			return s, ErrTenantCostInvalidInput
+		}
+	}
+	if s.EventType == TenantCostEventObservedZero && s.GatewayChargeQuota != 0 {
+		return s, ErrTenantCostInvalidInput
+	}
+	if s.EventType == TenantCostEventRefund || s.EventType == TenantCostEventReversal || s.EventType == TenantCostEventCorrection {
+		if s.ParentEventID == nil || strings.TrimSpace(*s.ParentEventID) == "" {
+			return s, ErrTenantCostInvalidInput
+		}
+	}
+	if s.Evidence == TenantCostEvidenceUnknown {
+		if s.ProcurementAmount != nil || strings.TrimSpace(s.UnknownReason) == "" {
+			return s, ErrTenantCostInvalidInput
+		}
+	} else if s.ProcurementAmount == nil {
+		return s, ErrTenantCostInvalidInput
+	}
+	return s, nil
+}
+
+func validTenantCostEventType(value string) bool {
+	switch value {
+	case TenantCostEventSettlement, TenantCostEventChargedFailure, TenantCostEventRefund,
+		TenantCostEventReversal, TenantCostEventSupplement, TenantCostEventCorrection,
+		TenantCostEventObservedZero:
+		return true
+	default:
+		return false
+	}
+}
+
+func validTenantCostEvidence(value string) bool {
+	switch value {
+	case TenantCostEvidenceExact, TenantCostEvidenceObserved, TenantCostEvidenceEstimated,
+		TenantCostEvidenceFallback, TenantCostEvidenceUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func tenantCostSemanticPayload(s TenantCostEventSpec) TenantCostEventPayload {
+	return TenantCostEventPayload{
+		SchemaVersion: "upstream-cost.v2",
+		OperationID:s.OperationID,SourcePrice:s.SourcePrice,ProviderCost:s.ProviderCost,
+		EventID:       s.EventID, TenantID: s.TenantID, EventType: s.EventType, ParentEventID: s.ParentEventID,
+		OccurredAt: s.OccurredAt.UTC().Format(time.RFC3339Nano), FinalizedAt: s.FinalizedAt.UTC().Format(time.RFC3339Nano),
+		Correlation: TenantCostCorrelation{
+			DownstreamRequestId: s.DownstreamRequestId, GatewayRequestId: s.GatewayRequestId, ReservationID: s.ReservationID,
+			RouteReceiptID: s.RouteReceiptID, UpstreamAttemptID: s.UpstreamAttemptID,
+			ProviderReferenceHash: s.ProviderReferenceHash, TaskPublicID: s.TaskPublicID,
+		},
+		Binding: TenantCostBindingPayload{ProductPoolID: s.ProductPoolID, ServiceTier: s.ServiceTier,
+			RouteProfileID: s.RouteProfileID, ProfileRevision: s.ProfileRevision, KeyID: s.KeyID},
+		Model: TenantCostModelPayload{Requested: s.RequestedModel, Canonical: s.CanonicalModel,
+			Upstream: s.UpstreamModel, MappingRevision: s.MappingRevision},
+		Billing: TenantCostBillingPayload{Mode: s.BillingMode, Unit: s.BillingUnit, Usage: s.Usage,
+			GatewayChargeQuota: fmt.Sprintf("%d", s.GatewayChargeQuota), GatewayChargeAmount: s.GatewayChargeAmount,
+			Currency: s.Currency, SitePriceRevision: s.SitePriceRevision, Rounding: s.Rounding},
+		Procurement: TenantCostProcurementPayload{Amount: s.ProcurementAmount, Currency: s.ProcurementCurrency,
+			Evidence: s.Evidence, BasisKind: s.BasisKind, BasisRevision: s.BasisRevision,
+			Formula: s.Formula, UnknownReason: nullableString(s.UnknownReason)},
+		Status: s.Status,
+	}
+}
+
+func nullableString(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return &value
+}
+
+func tenantCostPayloadHash(payload TenantCostEventPayload) (string, []byte, error) {
+	// Hash only semantic fields; sequence/publish time are assigned by the
+	// append transaction, so retries with the same source fact remain idempotent.
+	payload.PayloadHash = ""
+	b, err := common.Marshal(payload)
+	if err != nil {
+		return "", nil, err
+	}
+	sum := sha256.Sum256(b)
+	hash := "sha256:" + hex.EncodeToString(sum[:])
+	payload.PayloadHash = hash
+	finalBytes, err := common.Marshal(payload)
+	return hash, finalBytes, err
+}
+
+// tenantCostEventIdentityHash is used only to decide whether a retry with an
+// already-used event ID is the same business fact.  Sequence and publication
+// time are assigned by the append transaction and are intentionally absent;
+// occurred/finalized timestamps are also excluded because the existing relay
+// and task paths may reconstruct the same terminal fact after a process
+// restart.  All financial, correlation, binding, model, evidence and parent
+// fields remain part of the identity, so a changed charge or route cannot be
+// silently accepted as a replay.
+func tenantCostEventIdentityHash(payload TenantCostEventPayload) (string, error) {
+	identity := payload
+	identity.Sequence = 0
+	identity.OccurredAt = ""
+	identity.FinalizedAt = ""
+	identity.PublishedAt = ""
+	identity.PayloadHash = ""
+	b, err := common.Marshal(identity)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func tenantCostCorrelationQuery(tx *gorm.DB, spec TenantCostEventSpec) *gorm.DB {
+	conditions := make([]string, 0, 4)
+	args := make([]interface{}, 0, 4)
+	for _, item := range []struct {
+		column string
+		value  string
+	}{
+		{"downstream_request_id", spec.DownstreamRequestId},
+		{"gateway_request_id", spec.GatewayRequestId},
+		{"reservation_id", spec.ReservationID},
+		{"task_public_id", spec.TaskPublicID},
+	} {
+		if value := strings.TrimSpace(item.value); value != "" {
+			conditions = append(conditions, item.column+" = ?")
+			args = append(args, value)
+		}
+	}
+	if len(conditions) == 0 {
+		return tx.Where("1 = 0")
+	}
+	return tx.Where("("+strings.Join(conditions, " OR ")+")", args...)
+}
+
+// rejectTerminalCorrelationConflict prevents an asynchronous refund/zero
+// projection from being followed by a second positive charge for the same
+// durable request after a process restart. The billing authority remains the
+// source of truth; this guard turns an impossible state into an auditable
+// projection conflict instead of silently double-counting it.
+func rejectTerminalCorrelationConflict(tx *gorm.DB, spec TenantCostEventSpec) error {
+	var existing TenantCostEvent
+	positiveTypes := []string{TenantCostEventSettlement, TenantCostEventChargedFailure, TenantCostEventSupplement}
+	zeroTypes := []string{TenantCostEventObservedZero}
+	var types []string
+	if spec.EventType == TenantCostEventObservedZero {
+		types = positiveTypes
+	} else if spec.EventType == TenantCostEventSettlement || spec.EventType == TenantCostEventChargedFailure || spec.EventType == TenantCostEventSupplement {
+		types = zeroTypes
+	} else {
+		return nil
+	}
+	query := tx.Where("tenant_id = ? AND status = ? AND event_type IN ?", spec.TenantID, TenantCostStatusFinal, types)
+	query = tenantCostCorrelationQuery(query, spec)
+	err := query.Order("sequence desc").First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return ErrTenantCostConflict
+}
+
+func nextTenantCostSequence(tx *gorm.DB, tenantID string, now int64) (int64, error) {
+	var row TenantCostSequence
+	err := lockForUpdate(tx).Where("tenant_id = ?", tenantID).First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		row = TenantCostSequence{TenantID: tenantID, NextSequence: 2, UpdatedAt: now}
+		if err := tx.Create(&row).Error; err != nil {
+			// A concurrent initializer can win. Re-read under the transaction
+			// lock; the unique tenant key prevents two cursors.
+			if retryErr := lockForUpdate(tx).Where("tenant_id = ?", tenantID).First(&row).Error; retryErr != nil {
+				return 0, retryErr
+			}
+			seq := row.NextSequence
+			row.NextSequence++
+			row.UpdatedAt = now
+			return seq, tx.Save(&row).Error
+		}
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	sequence := row.NextSequence
+	row.NextSequence++
+	row.UpdatedAt = now
+	return sequence, tx.Save(&row).Error
+}
+
+// AppendTenantCostEvent appends exactly one immutable event and one outbox
+// row. Replaying the same semantic event ID/hash is a successful no-op.
+func AppendTenantCostEvent(spec TenantCostEventSpec) (TenantCostAppendResult, error) {
+	if DB == nil {
+		return TenantCostAppendResult{}, errors.New("database is not initialized")
+	}
+	var result TenantCostAppendResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		result, err = AppendTenantCostEventTx(tx, spec)
+		return err
+	})
+	return result, err
+}
+
+// AppendTenantCostEventTx is the transaction-aware variant used by an
+// existing authoritative settlement transaction when one is available. It
+// never starts or commits a transaction itself.
+func AppendTenantCostEventTx(tx *gorm.DB, spec TenantCostEventSpec) (TenantCostAppendResult, error) {
+	var result TenantCostAppendResult
+	normalized, err := spec.normalize()
+	if err != nil {
+		return result, err
+	}
+	semanticPayload := tenantCostSemanticPayload(normalized)
+	semanticHash, _, err := tenantCostPayloadHash(semanticPayload)
+	if err != nil {
+		return result, err
+	}
+	if tx == nil {
+		return result, errors.New("database is not initialized")
+	}
+	// A tenant namespace must be registered before an immutable fact can be
+	// projected. Disabled tenants remain readable and can receive historical
+	// reconciliation, but unknown IDs cannot be manufactured by an internal
+	// caller or a forged request context.
+	if _, err := requireTenantCostDownstreamTx(tx, normalized.TenantID, false); err != nil {
+		return result, err
+	}
+	err = func() error {
+		var existing TenantCostEvent
+		lookupErr := tx.Where("tenant_id = ? AND event_id = ?", normalized.TenantID, normalized.EventID).First(&existing).Error
+		if lookupErr == nil {
+			var existingPayload TenantCostEventPayload
+			if err := common.Unmarshal([]byte(existing.Payload), &existingPayload); err != nil {
+				return err
+			}
+			incomingPayload := tenantCostSemanticPayload(normalized)
+			existingIdentity, err := tenantCostEventIdentityHash(existingPayload)
+			if err != nil {
+				return err
+			}
+			incomingIdentity, err := tenantCostEventIdentityHash(incomingPayload)
+			if err != nil {
+				return err
+			}
+			if existingIdentity != incomingIdentity {
+				return ErrTenantCostConflict
+			}
+			result.Event = existing
+			result.Payload = existingPayload
+			result.Replayed = true
+			return nil
+		}
+		if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return lookupErr
+		}
+		if err := rejectTerminalCorrelationConflict(tx, normalized); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		sequence, seqErr := nextTenantCostSequence(tx, normalized.TenantID, now.UnixNano())
+		if seqErr != nil {
+			return seqErr
+		}
+		payload := tenantCostSemanticPayload(normalized)
+		payload.Sequence = sequence
+		payload.PublishedAt = now.Format(time.RFC3339Nano)
+		payloadHash, payloadBytes, hashErr := tenantCostPayloadHash(payload)
+		if hashErr != nil {
+			return hashErr
+		}
+		// The semantic hash is stable across retries. The final JSON includes
+		// the assigned sequence and publication time for consumers.
+		payload.PayloadHash = semanticHash
+		payloadBytes, hashErr = common.Marshal(payload)
+		if hashErr != nil {
+			return hashErr
+		}
+		_ = payloadHash
+		parent := normalized.ParentEventID
+		row := TenantCostEvent{
+			TenantID: normalized.TenantID, EventID: normalized.EventID, Sequence: sequence,
+			EventType: normalized.EventType, ParentEventID: parent,
+			OccurredAt: normalized.OccurredAt.UnixNano(), FinalizedAt: normalized.FinalizedAt.UnixNano(),
+			PublishedAt: now.UnixNano(), DownstreamRequestId: normalized.DownstreamRequestId,
+			GatewayRequestId: normalized.GatewayRequestId, ReservationID: normalized.ReservationID,
+			RouteReceiptID: normalized.RouteReceiptID, UpstreamAttemptID: normalized.UpstreamAttemptID,
+			TaskPublicID: normalized.TaskPublicID, ProductPoolID: normalized.ProductPoolID,
+			ServiceTier: normalized.ServiceTier, RouteProfileID: normalized.RouteProfileID,
+			ProfileRevision: normalized.ProfileRevision, KeyID: normalized.KeyID,
+			RequestedModel: normalized.RequestedModel, CanonicalModel: normalized.CanonicalModel,
+			UpstreamModel: normalized.UpstreamModel, MappingRevision: normalized.MappingRevision,
+			BillingMode: normalized.BillingMode, BillingUnit: normalized.BillingUnit,
+			GatewayChargeQuota: normalized.GatewayChargeQuota, GatewayChargeAmount: normalized.GatewayChargeAmount,
+			Currency: normalized.Currency, ProcurementAmount: normalized.ProcurementAmount,
+			ProcurementCurrency: normalized.ProcurementCurrency, Evidence: normalized.Evidence,
+			BasisKind: normalized.BasisKind, BasisRevision: normalized.BasisRevision,
+			Formula: normalized.Formula, UnknownReason: normalized.UnknownReason, Status: normalized.Status,
+			PayloadHash: semanticHash, Payload: string(payloadBytes), CreatedAt: now.UnixNano(),
+		}
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		outbox := TenantCostOutbox{TenantID: row.TenantID, EventID: row.EventID, State: TenantOutboxReady,
+			NextAttemptAt: now.UnixNano(), CreatedAt: now.UnixNano(), UpdatedAt: now.UnixNano()}
+		if err := tx.Create(&outbox).Error; err != nil {
+			return err
+		}
+		result.Event = row
+		result.Payload = payload
+		return nil
+	}()
+	return result, err
+}
+
+func GetTenantCredentialBindingByTokenID(tokenID int) (*TenantCredentialBinding, error) {
+	if DB == nil || tokenID <= 0 {
+		return nil, errors.New("database is not initialized or token id is invalid")
+	}
+	var binding TenantCredentialBinding
+	err := DB.Where("token_id = ?", tokenID).First(&binding).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err == nil {
+		if _, scopeErr := RequireRegisteredTenantCostDownstream(binding.TenantID); scopeErr != nil {
+			return nil, scopeErr
+		}
+	}
+	return &binding, err
+}
+
+func UpsertTenantCredentialBinding(binding *TenantCredentialBinding) error {
+	if binding == nil || binding.TokenID <= 0 || strings.TrimSpace(binding.TenantID) == "" ||
+		strings.TrimSpace(binding.ProductPoolID) == "" || strings.TrimSpace(binding.ServiceTier) == "" ||
+		strings.TrimSpace(binding.RouteProfileID) == "" || strings.TrimSpace(binding.ProfileRevision) == "" ||
+		strings.TrimSpace(binding.ModelCatalogRevision) == "" ||
+		!validTenantCostPublicIdentifier(binding.KeyID, 128) || !validTenantCostKeySuffix(binding.KeySuffix) {
+		return ErrTenantCostInvalidInput
+	}
+	if !IsValidTenantCostTenantID(binding.TenantID) || binding.CredentialPurpose != TenantCredentialPurposeDataPlane {
+		return ErrTenantCostScope
+	}
+	if binding.BindingStatus == "" {
+		binding.BindingStatus = TenantBindingPending
+	}
+	if !validTenantBindingStatus(binding.BindingStatus) {
+		return ErrTenantCostInvalidInput
+	}
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	now := common.GetTimestamp()
+	if binding.CreatedAt == 0 {
+		binding.CreatedAt = now
+	}
+	binding.UpdatedAt = now
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, binding.TenantID, binding.BindingStatus == TenantBindingEnabled); err != nil {
+			return err
+		}
+		var profile TenantRouteProfile
+		if err := lockForUpdate(tx).Where("tenant_id = ? AND profile_id = ?", binding.TenantID, binding.RouteProfileID).First(&profile).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrTenantCostBindingUnavailable
+			}
+			return err
+		}
+		if profile.ProductPoolID != binding.ProductPoolID || profile.ServiceTier != binding.ServiceTier ||
+			profile.Revision != binding.ProfileRevision {
+			return ErrTenantCostInvalidInput
+		}
+		if err := ValidateTenantRouteProfile(&profile); err != nil {
+			return err
+		}
+		if binding.BindingStatus == TenantBindingEnabled && profile.Status != TenantBindingEnabled {
+			return fmt.Errorf("route profile is not enabled")
+		}
+		var existing TenantCredentialBinding
+		err := lockForUpdate(tx).Where("token_id = ?", binding.TokenID).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return tx.Create(binding).Error
+		}
+		if err != nil {
+			return err
+		}
+		if existing.TenantID != binding.TenantID || existing.CredentialPurpose != binding.CredentialPurpose {
+			return ErrTenantCostConflict
+		}
+		if existing.BindingStatus == TenantBindingRevoked && binding.BindingStatus != TenantBindingRevoked {
+			return fmt.Errorf("revoked binding cannot be re-enabled")
+		}
+		if existing.BindingStatus == TenantBindingEnabled &&
+			(existing.KeyID != binding.KeyID || existing.KeySuffix != binding.KeySuffix ||
+				existing.ProductPoolID != binding.ProductPoolID || existing.ServiceTier != binding.ServiceTier ||
+				existing.RouteProfileID != binding.RouteProfileID || existing.ProfileRevision != binding.ProfileRevision ||
+				existing.ModelCatalogRevision != binding.ModelCatalogRevision) {
+			return ErrTenantCostConflict
+		}
+		binding.ID = existing.ID
+		return tx.Save(binding).Error
+	})
+}
+
+func ListTenantCredentialBindings(limit int) ([]TenantCredentialBinding, error) {
+	return ListTenantCredentialBindingsForTenant(DefaultTenantCostTenantID, limit)
+}
+
+func ListTenantCredentialBindingsForTenant(tenantID string, limit int) ([]TenantCredentialBinding, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []TenantCredentialBinding
+	err := DB.Where("tenant_id = ?", tenantID).Order("id asc").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+// TenantCostKeyUsageView is an admin-only, secret-free projection of a bound
+// data-plane key and its current quota counters.
+type TenantCostKeyUsageView struct {
+	BindingID          int64  `json:"binding_id"`
+	TenantID           string `json:"tenant_id"`
+	KeyID              string `json:"key_id"`
+	KeySuffix          string `json:"key_suffix"`
+	ProductPoolID      string `json:"product_pool_id"`
+	ServiceTier        string `json:"service_tier"`
+	BindingStatus      string `json:"binding_status"`
+	TokenID            int    `json:"token_id"`
+	TokenName          string `json:"token_name"`
+	UsedQuota          int    `json:"used_quota"`
+	RemainQuota        int    `json:"remain_quota"`
+	UnlimitedQuota     bool   `json:"unlimited_quota"`
+	CapDisplayAmount   string `json:"cap_display_amount"`
+	CapDisplayCurrency string `json:"cap_display_currency"`
+	QuotaUnit          string `json:"quota_unit"`
+	UsageState         string `json:"usage_state"`
+}
+
+func ListTenantCostKeyUsageForTenant(tenantID string, limit int) ([]TenantCostKeyUsageView, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var bindings []TenantCredentialBinding
+	if err := DB.Where("tenant_id = ? AND credential_purpose = ?", tenantID, TenantCredentialPurposeDataPlane).Order("id asc").Limit(limit).Find(&bindings).Error; err != nil {
+		return nil, err
+	}
+	views := make([]TenantCostKeyUsageView, 0, len(bindings))
+	for _, binding := range bindings {
+		var token Token
+		state := "available"
+		if err := DB.Select("id, name, used_quota, remain_quota, unlimited_quota").Where("id = ? AND tenant_cost_binding_id = ?", binding.TokenID, binding.ID).First(&token).Error; err != nil {
+			state = "token_missing"
+		}
+		views = append(views, TenantCostKeyUsageView{BindingID: binding.ID, TenantID: binding.TenantID,
+			KeyID: binding.KeyID, KeySuffix: binding.KeySuffix,
+			ProductPoolID: binding.ProductPoolID, ServiceTier: binding.ServiceTier,
+			BindingStatus: binding.BindingStatus, TokenID: binding.TokenID, TokenName: token.Name,
+			UsedQuota: token.UsedQuota, RemainQuota: token.RemainQuota, UnlimitedQuota: token.UnlimitedQuota,
+			CapDisplayAmount: "1000000", CapDisplayCurrency: "CNY", QuotaUnit: "gateway_internal_quota", UsageState: state})
+	}
+	return views, nil
+}
+
+func ListTenantCostEvents(tenantID string, afterSequence int64, limit int) ([]TenantCostEvent, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if afterSequence < 0 {
+		return nil, ErrTenantCostScope
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 501 {
+		limit = 501
+	}
+	var rows []TenantCostEvent
+	err := DB.Where("tenant_id = ? AND sequence > ?", tenantID, afterSequence).
+		Order("sequence asc").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func GetTenantCostEvent(tenantID, eventID string) (*TenantCostEvent, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if strings.TrimSpace(eventID) == "" {
+		return nil, ErrTenantCostScope
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	var row TenantCostEvent
+	if err := DB.Where("tenant_id = ? AND event_id = ?", tenantID, strings.TrimSpace(eventID)).First(&row).Error; err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// FindTenantCostChargeEvent locates the immutable positive-charge fact for a
+// refund/correction parent. Correlation fields are all server-owned; callers
+// cannot select another tenant. The query is intentionally bounded to charge
+// event types and newest sequence so a late refund never points at an older
+// unrelated request.
+func FindTenantCostChargeEvent(tenantID, downstreamRequestID, gatewayRequestID, reservationID, taskPublicID string) (*TenantCostEvent, error) {
+	if DB == nil {
+		return nil, ErrTenantCostScope
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	conditions := make([]string, 0, 4)
+	args := make([]interface{}, 0, 4)
+	for _, item := range []struct {
+		column string
+		value  string
+	}{
+		{"downstream_request_id", downstreamRequestID},
+		{"gateway_request_id", gatewayRequestID},
+		{"reservation_id", reservationID},
+		{"task_public_id", taskPublicID},
+	} {
+		if value := strings.TrimSpace(item.value); value != "" {
+			conditions = append(conditions, item.column+" = ?")
+			args = append(args, value)
+		}
+	}
+	if len(conditions) == 0 {
+		return nil, ErrTenantCostInvalidInput
+	}
+	query := DB.Where("tenant_id = ?", tenantID).Where(
+		"event_type IN ?",
+		[]string{TenantCostEventSettlement, TenantCostEventChargedFailure, TenantCostEventSupplement},
+	).Where("status = ?", TenantCostStatusFinal)
+	query = query.Where("("+strings.Join(conditions, " OR ")+")", args...)
+	var row TenantCostEvent
+	if err := query.Order("sequence desc").First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &row, nil
+}
+
+type TenantCostReconciliation struct {
+	TenantID                 string `json:"tenant_id"`
+	ExpectedEvents           int64  `json:"expected_events"`
+	PublishedEvents          int64  `json:"published_events"`
+	ExactCount               int64  `json:"exact_count"`
+	ObservedCount            int64  `json:"observed_count"`
+	EstimatedCount           int64  `json:"estimated_count"`
+	FallbackCount            int64  `json:"fallback_count"`
+	UnknownCount             int64  `json:"unknown_count"`
+	PendingOutbox            int64  `json:"pending_outbox"`
+	OldestPendingAt          int64  `json:"oldest_pending_at"`
+	PendingProjectionRetries int64  `json:"pending_projection_retries"`
+	OldestProjectionRetryAt  int64  `json:"oldest_projection_retry_at"`
+	ConflictCount            int64  `json:"conflict_count"`
+	LastSequence             int64  `json:"last_sequence"`
+	GeneratedAt              int64  `json:"generated_at"`
+	Blocker                  string `json:"blocker,omitempty"`
+}
+
+// ClaimTenantCostOutbox atomically moves a bounded due batch to pending. A
+// stale pending row is reclaimable after 10 minutes, which makes process
+// crashes recoverable without allowing concurrent workers to double-claim.
+func ClaimTenantCostOutbox(limit int, now int64) ([]TenantCostOutbox, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	claimed := make([]TenantCostOutbox, 0, limit)
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var rows []TenantCostOutbox
+		staleBefore := now - int64(10*time.Minute)
+		query := lockForUpdate(tx).Where("((state IN ? AND next_attempt_at <= ?) OR (state = ? AND updated_at <= ?))",
+			[]string{TenantOutboxReady, TenantOutboxFailed}, now, TenantOutboxPending, staleBefore).Order("id asc").Limit(limit).Find(&rows)
+		if query.Error != nil {
+			return query.Error
+		}
+		for i := range rows {
+			row := rows[i]
+			row.State = TenantOutboxPending
+			row.Attempts++
+			row.UpdatedAt = now
+			if err := tx.Model(&TenantCostOutbox{}).Where("id = ? AND tenant_id = ?", row.ID, row.TenantID).Updates(map[string]interface{}{
+				"state": row.State, "attempts": row.Attempts, "updated_at": row.UpdatedAt,
+			}).Error; err != nil {
+				return err
+			}
+			claimed = append(claimed, row)
+		}
+		return nil
+	})
+	return claimed, err
+}
+
+func MarkTenantCostOutboxSent(eventID string, now int64) error {
+	return MarkTenantCostOutboxSentForTenant(DefaultTenantCostTenantID, eventID, now)
+}
+
+func MarkTenantCostOutboxSentForTenant(tenantID, eventID string, now int64) error {
+	if DB == nil || !IsValidTenantCostTenantID(strings.TrimSpace(tenantID)) || strings.TrimSpace(eventID) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	return DB.Model(&TenantCostOutbox{}).Where("tenant_id = ? AND event_id = ? AND state = ?", strings.TrimSpace(tenantID), strings.TrimSpace(eventID), TenantOutboxPending).
+		Updates(map[string]interface{}{"state": TenantOutboxSent, "published_at": now, "updated_at": now}).Error
+}
+
+func MarkTenantCostOutboxFailed(eventID string, cause error, now int64) error {
+	return MarkTenantCostOutboxFailedForTenant(DefaultTenantCostTenantID, eventID, cause, now)
+}
+
+func MarkTenantCostOutboxFailedForTenant(tenantID, eventID string, cause error, now int64) error {
+	if DB == nil || !IsValidTenantCostTenantID(strings.TrimSpace(tenantID)) || strings.TrimSpace(eventID) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	message := "unknown error"
+	if cause != nil {
+		message = cause.Error()
+	}
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	var row TenantCostOutbox
+	if err := DB.Where("tenant_id = ? AND event_id = ?", strings.TrimSpace(tenantID), strings.TrimSpace(eventID)).First(&row).Error; err != nil {
+		return err
+	}
+	backoff := time.Second * time.Duration(1<<minInt(row.Attempts, 10))
+	if backoff > time.Hour {
+		backoff = time.Hour
+	}
+	return DB.Model(&TenantCostOutbox{}).Where("id = ? AND tenant_id = ? AND state = ?", row.ID, strings.TrimSpace(tenantID), TenantOutboxPending).
+		Updates(map[string]interface{}{"state": TenantOutboxFailed, "last_error": message, "next_attempt_at": now + backoff.Nanoseconds(), "updated_at": now}).Error
+}
+
+// ReleaseTenantCostOutboxClaim returns a claimed row to the ready state when
+// its tenant is paused. It is intentionally idempotent and never increments
+// the attempt counter a second time.
+func ReleaseTenantCostOutboxClaim(tenantID, eventID string, now int64) error {
+	if DB == nil || !IsValidTenantCostTenantID(strings.TrimSpace(tenantID)) || strings.TrimSpace(eventID) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	if now <= 0 {
+		now = time.Now().UTC().UnixNano()
+	}
+	return DB.Model(&TenantCostOutbox{}).Where("tenant_id = ? AND event_id = ? AND state = ?", strings.TrimSpace(tenantID), strings.TrimSpace(eventID), TenantOutboxPending).
+		Updates(map[string]interface{}{"state": TenantOutboxReady, "next_attempt_at": now, "updated_at": now}).Error
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func GetTenantCostReconciliation(tenantID string) (TenantCostReconciliation, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	result := TenantCostReconciliation{TenantID: tenantID, GeneratedAt: time.Now().UTC().UnixNano()}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return result, err
+	}
+	if err := DB.Model(&TenantCostEvent{}).Where("tenant_id = ?", tenantID).Count(&result.ExpectedEvents).Error; err != nil {
+		return result, err
+	}
+	// An event is durable as soon as it is appended, but it is not published
+	// to the partner sink until its outbox row reaches sent.  Keep these two
+	// notions separate so the reconciliation endpoint exposes real lag.
+	if err := DB.Model(&TenantCostOutbox{}).Where("tenant_id = ? AND state = ?", tenantID, TenantOutboxSent).Count(&result.PublishedEvents).Error; err != nil {
+		return result, err
+	}
+	for evidence, target := range map[string]*int64{
+		TenantCostEvidenceExact: &result.ExactCount, TenantCostEvidenceObserved: &result.ObservedCount,
+		TenantCostEvidenceEstimated: &result.EstimatedCount, TenantCostEvidenceFallback: &result.FallbackCount,
+		TenantCostEvidenceUnknown: &result.UnknownCount,
+	} {
+		var count int64
+		if err := DB.Model(&TenantCostEvent{}).Where("tenant_id = ? AND evidence = ?", tenantID, evidence).Count(&count).Error; err != nil {
+			return result, err
+		}
+		*target = count
+	}
+	if err := DB.Model(&TenantCostOutbox{}).Where("tenant_id = ? AND state IN ?", tenantID, []string{TenantOutboxReady, TenantOutboxPending, TenantOutboxFailed}).Count(&result.PendingOutbox).Error; err != nil {
+		return result, err
+	}
+	var oldest TenantCostOutbox
+	if err := DB.Where("tenant_id = ? AND state IN ?", tenantID, []string{TenantOutboxReady, TenantOutboxPending, TenantOutboxFailed}).Order("created_at asc").First(&oldest).Error; err == nil {
+		result.OldestPendingAt = oldest.CreatedAt
+	}
+	var latest TenantCostEvent
+	if err := DB.Where("tenant_id = ?", tenantID).Order("sequence desc").First(&latest).Error; err == nil {
+		result.LastSequence = latest.Sequence
+	}
+	if err := DB.Model(&TenantCostProjectionRetry{}).Where("tenant_id = ? AND state IN ?", tenantID,
+		[]string{TenantCostProjectionPending, TenantCostProjectionFailed}).Count(&result.PendingProjectionRetries).Error; err != nil {
+		return result, err
+	}
+	var oldestProjection TenantCostProjectionRetry
+	if err := DB.Where("tenant_id = ? AND state IN ?", tenantID,
+		[]string{TenantCostProjectionPending, TenantCostProjectionFailed}).Order("created_at asc").First(&oldestProjection).Error; err == nil {
+		result.OldestProjectionRetryAt = oldestProjection.CreatedAt
+	}
+	if err := DB.Model(&TenantCostEvent{}).Where("tenant_id = ? AND status = ?", tenantID, TenantCostStatusReview).Count(&result.ConflictCount).Error; err != nil {
+		return result, err
+	}
+	if result.PendingOutbox > 0 {
+		result.Blocker = "outbox_pending"
+	} else if result.PendingProjectionRetries > 0 {
+		result.Blocker = "projection_retry_pending"
+	}
+	return result, nil
+}
+
+func HashTenantReportingToken(secret string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(secret)))
+	return hex.EncodeToString(sum[:])
+}
+
+func GenerateTenantReportingToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "tvr_" + hex.EncodeToString(buf), nil
+}
+
+func CreateTenantReportingToken(tenantID, permission string, expiresAt int64) (*TenantReportingToken, string, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if strings.TrimSpace(permission) != TenantCostReportingPermission {
+		return nil, "", ErrTenantCostScope
+	}
+	if _, err := RequireActiveTenantCostDownstream(tenantID); err != nil {
+		return nil, "", err
+	}
+	if DB == nil {
+		return nil, "", errors.New("database is not initialized")
+	}
+	secret, err := GenerateTenantReportingToken()
+	if err != nil {
+		return nil, "", err
+	}
+	now := common.GetTimestamp()
+	row := &TenantReportingToken{TenantID: tenantID, TokenID: "trt_" + uuid.New().String(), TokenHash: HashTenantReportingToken(secret), Permission: permission, ExpiresAt: expiresAt, CreatedAt: now}
+	if err := DB.Create(row).Error; err != nil {
+		return nil, "", err
+	}
+	return row, secret, nil
+}
+
+func LookupTenantReportingToken(secret string) (*TenantReportingToken, error) {
+	secret = strings.TrimSpace(secret)
+	if secret == "" || DB == nil {
+		return nil, ErrTenantCostReportingToken
+	}
+	var row TenantReportingToken
+	if err := DB.Where("token_hash = ?", HashTenantReportingToken(secret)).First(&row).Error; err != nil {
+		return nil, ErrTenantCostReportingToken
+	}
+	now := common.GetTimestamp()
+	if _, scopeErr := RequireActiveTenantCostDownstream(row.TenantID); scopeErr != nil || row.RevokedAt > 0 || (row.ExpiresAt > 0 && row.ExpiresAt <= now) {
+		return nil, ErrTenantCostReportingToken
+	}
+	// Last-used is telemetry only; failure to update it must not turn a valid
+	// read into a 5xx response.
+	_ = DB.Model(&TenantReportingToken{}).Where("id = ?", row.ID).Update("last_used_at", now).Error
+	return &row, nil
+}
+
+func ListTenantRouteProfiles(limit int) ([]TenantRouteProfile, error) {
+	return ListTenantRouteProfilesForTenant(DefaultTenantCostTenantID, limit)
+}
+
+func ListTenantRouteProfilesForTenant(tenantID string, limit int) ([]TenantRouteProfile, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []TenantRouteProfile
+	err := DB.Where("tenant_id = ?", tenantID).Order("product_pool_id asc, service_tier asc, id asc").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func ListTenantCostOutbox(limit int) ([]TenantCostOutbox, error) {
+	return ListTenantCostOutboxForTenant(DefaultTenantCostTenantID, limit)
+}
+
+func ListTenantCostOutboxForTenant(tenantID string, limit int) ([]TenantCostOutbox, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []TenantCostOutbox
+	err := DB.Where("tenant_id = ?", tenantID).Order("id asc").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func ListTenantCostAuditEvents(limit int) ([]TenantCostAuditEvent, error) {
+	return ListTenantCostAuditEventsForTenant(DefaultTenantCostTenantID, limit)
+}
+
+func ListTenantCostAuditEventsForTenant(tenantID string, limit int) ([]TenantCostAuditEvent, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []TenantCostAuditEvent
+	err := DB.Where("tenant_id = ?", tenantID).Order("id desc").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func AppendTenantCostAuditEvent(actorUserID int, action, subjectID, details string) error {
+	return AppendTenantCostAuditEventForTenant(DefaultTenantCostTenantID, actorUserID, action, subjectID, details)
+}
+
+func AppendTenantCostAuditEventForTenant(tenantID string, actorUserID int, action, subjectID, details string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	if actorUserID <= 0 || strings.TrimSpace(action) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	if len(details) > 8192 {
+		details = details[:8192]
+	}
+	return DB.Create(&TenantCostAuditEvent{
+		TenantID: strings.TrimSpace(tenantID), ActorUserID: actorUserID, Action: strings.TrimSpace(action),
+		SubjectID: strings.TrimSpace(subjectID), Details: details, CreatedAt: common.GetTimestamp(),
+	}).Error
+}
+
+func UpsertTenantRouteProfile(profile *TenantRouteProfile) error {
+	if err := ValidateTenantRouteProfile(profile); err != nil {
+		return err
+	}
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	now := common.GetTimestamp()
+	if profile.CreatedAt == 0 {
+		profile.CreatedAt = now
+	}
+	profile.UpdatedAt = now
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, profile.TenantID, profile.Status == TenantBindingEnabled); err != nil {
+			return err
+		}
+		// Revalidate inside the transaction so a concurrent profile mutation
+		// cannot make an enabled binding point at a mismatched pool/tier or an
+		// invalid anonymous contract after the initial read.
+		if err := ValidateTenantRouteProfile(profile); err != nil {
+			return err
+		}
+		var existing TenantRouteProfile
+		err := lockForUpdate(tx).Where("tenant_id = ? AND profile_id = ?", profile.TenantID, profile.ProfileID).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return tx.Create(profile).Error
+		}
+		if err != nil {
+			return err
+		}
+		if existing.ID != 0 {
+			var enabledBindings int64
+			if err := tx.Model(&TenantCredentialBinding{}).Where("tenant_id = ? AND route_profile_id = ? AND binding_status = ?", profile.TenantID, profile.ProfileID, TenantBindingEnabled).Count(&enabledBindings).Error; err != nil {
+				return err
+			}
+			if enabledBindings > 0 {
+				if profile.Status != TenantBindingEnabled || existing.ProductPoolID != profile.ProductPoolID ||
+					existing.ServiceTier != profile.ServiceTier || existing.Revision != profile.Revision ||
+					existing.ModelSelector != profile.ModelSelector || existing.MinRatioPPM != profile.MinRatioPPM ||
+					existing.MaxRatioPPM != profile.MaxRatioPPM || existing.ProviderClass != profile.ProviderClass ||
+					existing.CandidateSpec != profile.CandidateSpec || existing.CapabilitySpec != profile.CapabilitySpec {
+					return fmt.Errorf("enabled bindings require an immutable enabled route profile revision")
+				}
+			}
+		}
+		profile.ID = existing.ID
+		return tx.Save(profile).Error
+	})
+}
+
+// TenantCostCatalogSlot is the deliberately anonymous catalog representation
+// exposed to a reporting consumer. Physical candidates and provider details
+// remain in TenantRouteProfile.CandidateSpec/ProviderClass and never cross
+// this boundary.
+type TenantCostCatalogSlot struct {
+	ProductPoolID        string `json:"product_pool_id"`
+	ProductFamily        string `json:"product_family"`
+	ServiceTier          string `json:"service_tier"`
+	PublicLabel          string `json:"public_label"`
+	Status               string `json:"status"`
+	KeyID                string `json:"key_id,omitempty"`
+	KeySuffix            string `json:"key_suffix,omitempty"`
+	RouteProfileID       string `json:"route_profile_id,omitempty"`
+	ProfileRevision      string `json:"profile_revision,omitempty"`
+	ModelCatalogRevision string `json:"model_catalog_revision,omitempty"`
+	DisabledReason       string `json:"disabled_reason,omitempty"`
+}
+
+// BuildTenantCostCatalog returns every explicitly registered public slot even
+// when it has not yet been bound. Unbound slots are pending rather than
+// fabricated as available.
+func BuildTenantCostCatalog() ([]TenantCostCatalogSlot, error) {
+	return BuildTenantCostCatalogForTenant(DefaultTenantCostTenantID)
+}
+
+func BuildTenantCostCatalogForTenant(tenantID string) ([]TenantCostCatalogSlot, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	slots, err := ListTenantCostProductSlotsForTenant(tenantID, 500)
+	if err != nil {
+		return nil, err
+	}
+	bindings, err := ListTenantCredentialBindingsForTenant(tenantID, 500)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := ListTenantRouteProfilesForTenant(tenantID, 500)
+	if err != nil {
+		return nil, err
+	}
+	type bindingView struct {
+		keyID, suffix, profileRevision, catalogRevision, profileID, status string
+	}
+	bindingsBySlot := make(map[string]bindingView, len(bindings))
+	for _, binding := range bindings {
+		if binding.CredentialPurpose != TenantCredentialPurposeDataPlane {
+			continue
+		}
+		key := binding.ProductPoolID + "\x00" + binding.ServiceTier
+		bindingsBySlot[key] = bindingView{binding.KeyID, binding.KeySuffix, binding.ProfileRevision,
+			binding.ModelCatalogRevision, binding.RouteProfileID, binding.BindingStatus}
+	}
+	profilesByID := make(map[string]TenantRouteProfile, len(profiles))
+	for _, profile := range profiles {
+		profilesByID[profile.ProfileID] = profile
+	}
+	result := make([]TenantCostCatalogSlot, 0, len(slots))
+	for _, registered := range slots {
+		validated := registered
+		if validated.TenantID != tenantID || normalizeTenantCostProductSlot(&validated) != nil {
+			return nil, fmt.Errorf("%w: malformed registered product slot", ErrTenantCostInvalidInput)
+		}
+		pool, tier := validated.ProductPoolID, validated.ServiceTier
+		slot := TenantCostCatalogSlot{
+			ProductPoolID: pool, ProductFamily: validated.ProductFamily, ServiceTier: tier,
+			PublicLabel: validated.PublicLabel, Status: TenantBindingPending, DisabledReason: "尚未绑定服务凭据",
+		}
+		key := pool + "\x00" + tier
+		if binding, ok := bindingsBySlot[key]; ok {
+			// Validate every server-owned identity before copying any status into
+			// the public projection.  In particular, never let a later assignment
+			// overwrite the disabled result for a malformed key/profile.
+			identifiersValid := validTenantCostPublicIdentifier(binding.keyID, 128) &&
+				validTenantCostKeySuffix(binding.suffix) &&
+				validTenantCostPublicIdentifier(binding.profileID, 128) &&
+				validTenantCostPublicIdentifier(binding.profileRevision, 96) &&
+				validTenantCostPublicIdentifier(binding.catalogRevision, 96) &&
+				validTenantBindingStatus(binding.status)
+			profile, profileExists := profilesByID[binding.profileID]
+			profileValid := profileExists && profile.TenantID == tenantID &&
+				profile.ProductPoolID == pool && profile.ServiceTier == tier &&
+				profile.PublicLabel == validated.PublicLabel &&
+				profile.Revision == binding.profileRevision && ValidateTenantRouteProfile(&profile) == nil
+			if !identifiersValid {
+				slot.Status = TenantBindingDisabled
+				slot.DisabledReason = "服务标识或绑定状态未通过校验"
+			} else if !profileExists {
+				slot.Status = TenantBindingDisabled
+				slot.DisabledReason = "绑定的路由档位不存在"
+			} else if !profileValid {
+				slot.Status = TenantBindingDisabled
+				slot.DisabledReason = "路由档位与产品/档位合同不一致"
+			} else {
+				slot.KeyID, slot.KeySuffix = binding.keyID, binding.suffix
+				slot.ProfileRevision, slot.ModelCatalogRevision = binding.profileRevision, binding.catalogRevision
+				slot.RouteProfileID = binding.profileID
+				effectiveStatus := binding.status
+				profileStatus := strings.TrimSpace(profile.Status)
+				if profileStatus == "" {
+					profileStatus = TenantBindingPending
+				}
+				if binding.status == TenantBindingEnabled && profileStatus != TenantBindingEnabled {
+					effectiveStatus = TenantBindingDisabled
+					slot.DisabledReason = "服务绑定未满足已启用路由档位"
+				} else if profileStatus == TenantBindingDisabled || profileStatus == TenantBindingRevoked {
+					effectiveStatus = profileStatus
+					slot.DisabledReason = profile.DisabledReason
+				} else if binding.status != TenantBindingEnabled {
+					slot.DisabledReason = profile.DisabledReason
+					if slot.DisabledReason == "" {
+						slot.DisabledReason = "服务凭据尚未启用"
+					}
+				}
+				slot.Status = effectiveStatus
+				if slot.Status == TenantBindingEnabled {
+					slot.DisabledReason = ""
+				}
+			}
+		}
+		result = append(result, slot)
+	}
+	return result, nil
+}
+
+type TenantCostOperationSummary struct {
+	EventCount       int64            `json:"event_count"`
+	GatewayChargeQuota int64            `json:"gateway_charge_quota"`
+	ByProductPool    map[string]int64 `json:"by_product_pool"`
+	ByServiceTier    map[string]int64 `json:"by_service_tier"`
+	ByEvidence       map[string]int64 `json:"by_evidence"`
+	GeneratedAt      int64            `json:"generated_at"`
+}
+
+// SummarizeTenantCostEvents is intentionally bounded. It is an operator
+// overview, not a replacement for the sequence API or a full-table report.
+func SummarizeTenantCostEvents(tenantID string, since int64, limit int) (TenantCostOperationSummary, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	result := TenantCostOperationSummary{ByProductPool: map[string]int64{}, ByServiceTier: map[string]int64{}, ByEvidence: map[string]int64{}, GeneratedAt: time.Now().UTC().UnixNano()}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return result, err
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 5000
+	}
+	query := DB.Where("tenant_id = ?", tenantID)
+	if since > 0 {
+		query = query.Where("occurred_at >= ?", since)
+	}
+	var rows []TenantCostEvent
+	if err := query.Order("sequence asc").Limit(limit).Find(&rows).Error; err != nil {
+		return result, err
+	}
+	for _, row := range rows {
+		result.EventCount++
+		result.GatewayChargeQuota += row.GatewayChargeQuota
+		result.ByProductPool[row.ProductPoolID]++
+		result.ByServiceTier[row.ServiceTier]++
+		result.ByEvidence[row.Evidence]++
+	}
+	return result, nil
+}

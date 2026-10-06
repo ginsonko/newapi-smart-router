@@ -1,0 +1,80 @@
+package media
+
+import (
+	"github.com/QuantumNous/new-api/constant"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestImagePresetContractMatrix(t *testing.T) {
+	expected := []struct{ size, resolution, ratio string }{
+		{"1024x1024", "1k", "1:1"},
+		{"2048x2048", "2k", "1:1"},
+		{"2880x2880", "4k", "1:1"},
+		{"1536x1024", "1k", "3:2"},
+		{"2160x1440", "2k", "3:2"},
+		{"3456x2304", "4k", "3:2"},
+		{"1280x720", "1k", "16:9"},
+		{"2560x1440", "2k", "16:9"},
+		{"3840x2160", "4k", "16:9"},
+		{"720x1280", "1k", "9:16"},
+		{"1440x2560", "2k", "9:16"},
+		{"2160x3840", "4k", "9:16"},
+		{"1024x768", "1k", "4:3"},
+		{"2048x1536", "2k", "4:3"},
+		{"3200x2400", "4k", "4:3"},
+		{"768x1024", "1k", "3:4"},
+		{"1536x2048", "2k", "3:4"},
+		{"2400x3200", "4k", "3:4"},
+		{"1280x544", "1k", "21:9"},
+		{"2560x1088", "2k", "21:9"},
+		{"3840x1600", "4k", "21:9"},
+	}
+	for _, name := range []string{"image2", "image2.5", "gpt-image-2", "gpt-image-2.5"} {
+		for _, endpoint := range []string{"openai-images-generations-v1", "openai-images-edits-v1"} {
+			t.Run(name+endpoint, func(t *testing.T) {
+				cap := ResolveCapabilityForRoute(987654, constant.ChannelTypeOpenAI, name, endpoint, "")
+				for _, item := range expected {
+					got, err := cap.NormalizeResolution(item.resolution, item.size)
+					require.NoError(t, err, item.size)
+					assert.Equal(t, item.resolution, got)
+					assert.Equal(t, item.ratio, cap.SizeAspectRatios[item.size])
+					got, err = cap.NormalizeResolution("", item.size)
+					require.NoError(t, err)
+					assert.Equal(t, item.resolution, got)
+					other := "1k"
+					if item.resolution == other {
+						other = "2k"
+					}
+					_, err = cap.NormalizeResolution(other, item.size)
+					require.Error(t, err)
+				}
+				assert.NotContains(t, cap.ResolutionAliases, "4096x4096")
+				assert.NotContains(t, cap.ResolutionAliases, "1024x576")
+			})
+		}
+	}
+	assert.Empty(t, ResolveCapabilityForRoute(987654, constant.ChannelTypeOpenAI, "unrelated-model", "openai-images-generations-v1", "").ResolutionAliases)
+	assert.Empty(t, ResolveCapabilityForRoute(987654, constant.ChannelTypeOpenAI, "gpt-image-2", "openai-video", "").ResolutionAliases)
+}
+func TestImageDimensionRouteNarrowing(t *testing.T) {
+	previous := mediasetting.Get()
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previous)) })
+	next := previous
+	next.CapabilityOverrides = []mediasetting.CapabilityOverride{{ChannelID: 987654, Model: "gpt-image-2", Endpoint: "openai-images-edits-v1", Resolutions: []string{"1k"}, ResolutionAliases: map[string]string{"1280x544": "1k"}, SizeAspectRatios: map[string]string{"1280x544": "21:9"}}}
+	require.NoError(t, mediasetting.Replace(next))
+	edit := ResolveCapabilityForRoute(987654, constant.ChannelTypeOpenAI, "gpt-image-2", "openai-images-edits-v1", "")
+	assert.Equal(t, []string{"1k"}, edit.Resolutions)
+	_, err := edit.NormalizeResolution("4k", "3840x1600")
+	require.Error(t, err)
+	gen := ResolveCapabilityForRoute(987654, constant.ChannelTypeOpenAI, "gpt-image-2", "openai-images-generations-v1", "")
+	assert.Len(t, gen.ResolutionAliases, 21)
+}
+func TestImageDimensionConflictingRatioIsNotAdvertised(t *testing.T) {
+	a := Capability{SizeAspectRatios: map[string]string{"1280x544": "21:9"}}
+	b := Capability{SizeAspectRatios: map[string]string{"1280x544": "40:17"}}
+	assert.Empty(t, MergeSizeAspectRatios([]Capability{a, b}, map[string]string{"1280x544": "1k"}, false))
+	assert.Empty(t, MergeSizeAspectRatios([]Capability{a, {}}, map[string]string{"1280x544": "1k"}, true))
+}

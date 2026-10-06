@@ -1,0 +1,206 @@
+package media
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"unicode"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+)
+
+const unknownVideoFailure = "上游已确认视频生成失败，但未提供具体原因。请提供任务编号联系支持核对。"
+
+// VideoFailureDiagnostic is a bounded public diagnostic, never a provider body.
+// Only callers that already know the task failed may use it as a terminal error.
+type VideoFailureDiagnostic struct {
+	Message string `json:"message"`
+	Code    string `json:"code,omitempty"`
+}
+
+var videoFailureCredential = regexp.MustCompile(`(?i)(?:sk-[a-z0-9_-]+|bearer\s+[^\s,;"<>]+|(?:api[_-]?key|access[_-]?token|token|secret|authorization|cookie|password)["']?\s*[:=]\s*["']?[^\s,;"'<>]+)`)
+var videoFailureURL = regexp.MustCompile(`(?i)https?://[^\s<>"'，。]+`)
+var videoFailureOpaque = regexp.MustCompile(`[a-zA-Z0-9+/=_-]{96,}`)
+var videoFailureCode = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,96}$`)
+
+// VideoFailureDetails reads diagnostic fields only. It never walks prompts,
+// references or outputs, and never decides whether a polling error is terminal.
+func VideoFailureDetails(reason string, raw []byte, secrets ...string) VideoFailureDiagnostic {
+	var messages, codes []string
+	if len(raw) > 0 && len(raw) <= 256*1024 {
+		var value any
+		if common.Unmarshal(raw, &value) == nil {
+			collectVideoFailure(value, 0, &messages, &codes)
+		}
+	}
+	// A parsed provider-specific reason takes precedence over generic outer
+	// envelopes. A generic parser fallback must not hide a nested real reason.
+	messages = append([]string{reason}, messages...)
+	diagnostic := VideoFailureDiagnostic{}
+	for _, code := range codes {
+		code = sanitizeVideoFailureText(code, secrets...)
+		if videoFailureCode.MatchString(code) && code != "0" && code != "200" && code != "success" {
+			diagnostic.Code = code
+			break
+		}
+	}
+	for _, message := range messages {
+		message = sanitizeVideoFailureText(message, secrets...)
+		if message != "" && !genericVideoFailure(message) {
+			diagnostic.Message = localizeVideoFailure(message)
+			break
+		}
+	}
+	if diagnostic.Message == "" && diagnostic.Code != "" {
+		diagnostic.Message = localizeVideoFailure(diagnostic.Code)
+		if diagnostic.Message == diagnostic.Code {
+			diagnostic.Message = "上游报告视频生成失败，错误代码：" + diagnostic.Code + "。请提供任务编号联系支持核对。"
+		}
+	}
+	if diagnostic.Message == "" {
+		diagnostic.Message = unknownVideoFailure
+	}
+	return diagnostic
+}
+
+func collectVideoFailure(value any, depth int, messages, codes *[]string) {
+	if depth > 5 || len(*messages) >= 24 {
+		return
+	}
+	switch data := value.(type) {
+	case string:
+		var nested any
+		if len(data) <= 16*1024 && common.Unmarshal([]byte(data), &nested) == nil {
+			collectVideoFailure(nested, depth+1, messages, codes)
+		} else {
+			*messages = append(*messages, data)
+		}
+	case []any:
+		for index, item := range data {
+			if index >= 4 {
+				break
+			}
+			collectVideoFailure(item, depth+1, messages, codes)
+		}
+	case map[string]any:
+		for _, key := range []string{"error", "failure", "detail"} {
+			collectVideoFailure(data[key], depth+1, messages, codes)
+		}
+		for _, key := range []string{"fail_reason", "failure_reason", "reason", "error_message", "message", "msg", "status_msg"} {
+			if message, ok := data[key].(string); ok {
+				collectVideoFailure(message, depth+1, messages, codes)
+			}
+		}
+		for _, key := range []string{"error_code", "code"} {
+			switch code := data[key].(type) {
+			case string:
+				*codes = append(*codes, code)
+			case float64:
+				*codes = append(*codes, fmt.Sprintf("%g", code))
+			}
+		}
+		for _, key := range []string{"data", "result", "task"} {
+			collectVideoFailure(data[key], depth+1, messages, codes)
+		}
+	}
+}
+
+func sanitizeVideoFailureText(message string, secrets ...string) string {
+	if len(message) > 16*1024 {
+		return ""
+	}
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[敏感信息已隐藏]")
+		}
+	}
+	message = videoFailureCredential.ReplaceAllString(message, "[凭据已隐藏]")
+	message = videoFailureURL.ReplaceAllString(message, "[链接已隐藏]")
+	lower := strings.ToLower(message)
+	for _, marker := range []string{"<html", "<!doctype", "<script", "data:", "base64", "b64_json", "\"messages\"", "\"input\"", "\"prompt\"", "request body", "request_body", "prompt:", "prompt :", "prompt=", "prompt =", "input:", "input :", "input=", "input =", "提示词：", "提示词:", "提示词=", "输入内容：", "输入内容:", "请求内容：", "请求内容:"} {
+		if index := strings.Index(lower, marker); index >= 0 {
+			message = message[:index]
+			lower = lower[:index]
+		}
+	}
+	message = videoFailureOpaque.ReplaceAllString(message, "[长数据已隐藏]")
+	message = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return ' '
+		}
+		return r
+	}, message)
+	message = strings.Trim(strings.Join(strings.Fields(common.MaskSensitiveInfo(message)), " "), " :：,，;；{\"'")
+	runes := []rune(message)
+	if len(runes) > 512 {
+		message = string(runes[:512]) + "…"
+	}
+	return message
+}
+
+func genericVideoFailure(message string) bool {
+	switch strings.ToLower(strings.TrimSpace(message)) {
+	case "", "failed", "failure", "error", "task failed", "video generation failed", "generation failed", "success", "ok", "任务失败", "生成失败", "视频生成失败", "上游生成失败", "上游报告视频生成失败，请提供任务编号核对", unknownVideoFailure:
+		return true
+	}
+	return false
+}
+
+func localizeVideoFailure(message string) string {
+	// Translate known complete diagnostics; do not infer a copyright/face
+	// rejection merely because the provider mentions content or an image.
+	switch strings.ToLower(strings.TrimSpace(strings.TrimSuffix(message, "."))) {
+	case "video_generation_failed", "task_failed":
+		return unknownVideoFailure
+	case "content_policy_violation", "content policy violation", "content rejected by safety system":
+		return "上游内容审核未通过，请检查提示词和参考素材后调整。"
+	case "copyright_violation", "copyright policy violation":
+		return "上游返回版权审核未通过，请调整提示词或参考素材。"
+	case "invalid_image", "invalid image":
+		return "上游无法读取参考图片，请检查图片格式及文件是否完整。"
+	case "unsupported_resolution", "unsupported resolution":
+		return "上游不支持本次分辨率，请选择该模型支持的尺寸。"
+	case "insufficient_quota", "insufficient account balance":
+		return "上游账户额度不足，请联系站点支持处理。"
+	case "rate_limit_exceeded", "rate limit exceeded":
+		return "上游请求频率或并发达到限制，请稍后重试。"
+	case "internal_error", "internal server error", "service unavailable":
+		return "上游服务内部错误，请稍后重试；若持续发生，请提供任务编号联系支持。"
+	}
+	// Preserve unfamiliar provider wording instead of inventing a diagnosis.
+	return message
+}
+
+// PublicVideoFailure also repairs the view of old failed tasks from the data
+// already stored. It performs no writes, refunds, polling or upstream requests.
+func PublicVideoFailure(task *model.Task) VideoFailureDiagnostic {
+	if task == nil || task.Status != model.TaskStatusFailure {
+		return VideoFailureDiagnostic{}
+	}
+	return VideoFailureDetails(task.FailReason, task.Data, task.PrivateData.Key, task.Properties.Input)
+}
+
+// FailedVideoResponse is shared by compatibility APIs. Failed responses contain
+// no deliverable media; never return a provider's echoed request as task data.
+func FailedVideoResponse(task *model.Task) ([]byte, error) {
+	diagnostic := PublicVideoFailure(task)
+	return common.Marshal(map[string]any{
+		"id": task.TaskID, "task_id": task.TaskID, "object": "video",
+		"status": "failed", "progress": 100, "model": task.Properties.OriginModelName,
+		"created_at": task.CreatedAt, "completed_at": task.FinishTime,
+		"error": diagnostic, "fail_reason": diagnostic.Message, "artifacts": []any{},
+	})
+}
+
+// IsFailedVideoTask keeps unrelated image/music task DTOs unchanged.
+func IsFailedVideoTask(task *model.Task) bool {
+	if task == nil || task.Status != model.TaskStatusFailure {
+		return false
+	}
+	if mode := strings.ToLower(strings.TrimSpace(task.Properties.MediaMode)); mode != "" {
+		return mode == "videos"
+	}
+	return task.Platform != "" && task.Platform != constant.TaskPlatformSuno && task.Platform != constant.TaskPlatformMidjourney
+}

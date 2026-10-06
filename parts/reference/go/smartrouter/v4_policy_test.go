@@ -36,6 +36,12 @@ func TestV4StrategiesArePerPolicyAndDeterministic(t *testing.T) {
 			},
 		},
 		{
+			name: "custom weighted", strategy: StrategyCustomWeighted, want: "route-plus",
+			mutate: func(input *PlanInput) {
+				input.Policy.CustomWeights = CustomWeights{Stability: 100}
+			},
+		},
+		{
 			name: "manual", strategy: StrategyManual, want: "route-plus",
 			mutate: func(input *PlanInput) { input.Policy.ManualGroupOrder = []string{"plus", "cheap"} },
 		},
@@ -57,7 +63,7 @@ func TestV4StrategiesArePerPolicyAndDeterministic(t *testing.T) {
 	}
 }
 
-func TestV4KeyThresholdIsDerivedFromSharedEvidence(t *testing.T) {
+func TestV4UnavailableStateIsNotSoftenedByPerKeyFailureThreshold(t *testing.T) {
 	input := basePlanInput()
 	input.Quality.Routes["route-cheap"] = QualityState{
 		Phase: QualityOpen, Epoch: 7, ConsecutiveHardFailures: 2,
@@ -65,29 +71,17 @@ func TestV4KeyThresholdIsDerivedFromSharedEvidence(t *testing.T) {
 		ReliabilityPPM: 600_000, ReliabilitySamples: 10,
 	}
 
-	tolerant := input
-	tolerant.Policy.FailureThreshold = 3
-	result, err := Plan(tolerant)
-	require.NoError(t, err)
-	assert.Equal(t, "route-cheap", result.RouteID)
-	assert.False(t, result.Candidates[0].KeySuppressed)
-
-	sensitive := input
-	sensitive.Policy.FailureThreshold = 2
-	result, err = Plan(sensitive)
-	require.NoError(t, err)
-	assert.Equal(t, "route-plus", result.RouteID)
-	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectKeySuppressed})
-
-	expired := input
-	expired.Policy.FailureThreshold = 1
-	expired.NowMS = input.Quality.Routes["route-cheap"].FailureWindowUntilMS + 1
-	result, err = Plan(expired)
-	require.NoError(t, err)
-	assert.Equal(t, "route-cheap", result.RouteID)
+	for _, threshold := range []int{1, 2, 3, 99} {
+		candidate := input
+		candidate.Policy.FailureThreshold = threshold
+		result, err := Plan(candidate)
+		require.NoError(t, err)
+		assert.Equal(t, "route-plus", result.RouteID)
+		assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
+	}
 }
 
-func TestV4BackgroundRecoveryStillHonorsPerKeyOpenThreshold(t *testing.T) {
+func TestV4BackgroundProbeSuccessImmediatelyRestoresForegroundEligibility(t *testing.T) {
 	input := basePlanInput()
 	input.BackgroundRecovery = true
 	input.Quality.Routes["route-cheap"] = QualityState{
@@ -95,17 +89,20 @@ func TestV4BackgroundRecoveryStillHonorsPerKeyOpenThreshold(t *testing.T) {
 		FailureWindowUntilMS: input.NowMS + 60_000, NextProbeAtMS: input.NowMS + 30_000,
 	}
 
-	input.Policy.FailureThreshold = 3
 	result, err := Plan(input)
 	require.NoError(t, err)
-	assert.Equal(t, "route-cheap", result.RouteID)
-	assert.Equal(t, AdmissionDegraded, result.Admission)
+	assert.Equal(t, "route-plus", result.RouteID)
+	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectHealthUnavailable})
 
-	input.Policy.FailureThreshold = 2
+	input.Quality.Routes["route-cheap"] = ReduceQuality(
+		input.Quality.Routes["route-cheap"],
+		QualityEvent{AtMS: input.NowMS, Outcome: OutcomeSuccess, Probe: true},
+		DefaultQualityConfig(),
+	)
 	result, err = Plan(input)
 	require.NoError(t, err)
-	assert.Equal(t, "route-plus", result.RouteID)
-	assert.Contains(t, result.Rejections, Rejection{RouteID: "route-cheap", Reason: RejectKeySuppressed})
+	assert.Equal(t, "route-cheap", result.RouteID)
+	assert.Equal(t, AdmissionNormal, result.Admission)
 }
 
 func TestV4CredentialDomainBlocksEveryRouteUsingTheCredential(t *testing.T) {

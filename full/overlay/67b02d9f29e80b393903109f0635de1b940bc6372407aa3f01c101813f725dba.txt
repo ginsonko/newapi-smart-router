@@ -1,0 +1,49 @@
+package controller
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+)
+
+func applyPublicParameterPricing(prices []model.Pricing) []model.Pricing {
+	abilities, err := model.GetAllEnableAbilityWithChannels()
+	if err != nil {
+		return prices
+	}
+	channels := map[string][]int{}
+	for _, a := range abilities {
+		if a.ChannelStatus == common.ChannelStatusEnabled {
+			key := a.Group + "\x00" + a.Model
+			channels[key] = append(channels[key], a.ChannelId)
+		}
+	}
+	result := make([]model.Pricing, len(prices))
+	for i, item := range prices {
+		result[i] = item
+		groups := make(map[string]model.GroupPricing, len(item.GroupPricing))
+		for g, p := range item.GroupPricing {
+			groups[g] = p
+		}
+		for _, g := range item.EnableGroup {
+			if !billing_setting.HasParameterPricing(item.ModelName, g) {
+				continue
+			}
+			rows := model.PublicParameterPrices(item.ModelName, g, channels[g+"\x00"+item.ModelName])
+			// An explicit parameter model must never advertise legacy token/zero prices.
+			groups[g] = model.GroupPricing{Group: g, Scope: "parameter", ContractRevision: billing_setting.GetParameterPricingContract().Revision,
+				BillingMode: "parameter_price", BillingUnit: "parameter", QuotaType: 1, BaseGroupRatio: 1, EffectiveGroupRatio: 1, ParameterPrices: rows}
+		}
+		result[i].GroupPricing = groups
+	}
+	return result
+}
+
+func publicPricingCapabilities(prices []model.Pricing,usableGroups map[string]string) []*publicModelCapabilityContract {
+ result:=[]*publicModelCapabilityContract{}
+ bundle,err:=model.GetActiveModelCapabilityBundle();if err!=nil{return result}
+ allowed:=map[string]bool{}
+ for _,p:=range prices {for _,g:=range p.EnableGroup {if _,ok:=usableGroups[g];ok{allowed[g+"\x00"+p.ModelName]=true}}}
+ for _,contract:=range bundle.Contracts {if allowed[contract.Target.Group+"\x00"+contract.Target.Model] {result=append(result,sanitizePublicCapabilityContract(contract))}}
+ return result
+}

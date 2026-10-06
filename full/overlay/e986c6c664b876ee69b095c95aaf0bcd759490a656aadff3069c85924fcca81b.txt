@@ -1,0 +1,948 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func coldStartWorkerHint(
+	session *SmartRoutingSession,
+	routeCount int,
+) SmartRouteRecoveryHint {
+	routes := make([]smartrouter.CertifiedRoute, 0, routeCount)
+	prices := make(map[string]int64, routeCount)
+	quality := make(map[string]smartrouter.QualityState, routeCount)
+	for index := 1; index <= routeCount; index++ {
+		routeID := fmt.Sprintf("cold-%02d", index)
+		routes = append(routes, smartrouter.CertifiedRoute{
+			RouteID: routeID, Group: "economy", ChannelID: 100 + index,
+			ChannelGeneration: fmt.Sprintf("generation-%02d", index), UpstreamModel: "gpt-test",
+			Capabilities: smartroutersetting.CapabilityText, MaxContext: 128_000,
+			CapacityDomain: "capacity-" + routeID,
+		})
+		prices[routeID] = int64(index) * 1_000
+		quality[routeID] = smartrouter.QualityState{Phase: smartrouter.QualityUnknown, Epoch: 1}
+	}
+	policy := session.policy
+	policy.AllowFutureGroups = true
+	policy.MaxEffectiveRatioPPM = 100_000
+	hint := SmartRouteRecoveryHint{
+		CatalogVersion: "cold-catalog", ScopeKey: "token-cold",
+		Request: session.request, Policy: policy, UserGroup: session.userGroup,
+		AllowedGroups: []string{"economy"}, Routes: routes,
+		Prices: smartrouter.PriceSnapshot{Version: "cold-prices", RatiosPPM: prices},
+		Runtime: SmartRouteRuntimeSnapshot{
+			Quality:     smartrouter.QualitySnapshot{Version: "cold-quality", Routes: quality},
+			Credentials: smartrouter.CredentialSnapshot{Domains: map[string]smartrouter.CredentialState{}},
+		},
+	}
+	if len(routes) > 0 {
+		hint.ForegroundPhysicalKey = smartRoutePhysicalProbeKey(
+			hint.Request.ContractID,
+			hint.Request.Endpoint,
+			routes[0],
+		)
+	}
+	return hint
+}
+
+func probeWorkerFixture(
+	t *testing.T,
+	executor SmartRouteProbeExecutor,
+) (*SmartRouteProbeWorker, *MemorySmartRouteStateStore, *SmartRoutingSession, *smartroutersetting.Setting) {
+	t.Helper()
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	session, _ := managerTestSession(t, state)
+	setting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	immediateProbe := 0
+	setting.TextRecoveryProbeAfterSeconds = &immediateProbe // Explicit legacy worker policy; staged policy has separate tests.
+	setting.Enabled = true
+	setting.BackgroundProbeEnabled = true
+	setting.ProbeScanIntervalMS = 100
+	setting.ProbeQueueCapacity = 16
+	setting.ProbeMaxConcurrency = 2
+	setting.ProbeBudgetPerMinute = 10
+	setting.ProbeTimeoutSeconds = 45
+	setting.ProbeCompletionGraceSeconds = 15
+	setting.DefaultPolicy = session.policy
+	setting.MaxAttempts = 3
+	setting = smartroutersetting.Normalize(setting)
+	settingPointer := &setting
+	session.engine.Settings = func() smartroutersetting.Setting { return *settingPointer }
+	worker, err := NewSmartRouteProbeWorker(session.engine, executor)
+	require.NoError(t, err)
+	return worker, state, session, settingPointer
+}
+
+func publishProbeWorkerHint(t *testing.T, worker *SmartRouteProbeWorker, session *SmartRoutingSession) {
+	t.Helper()
+	// These tests exercise the ordinary failed-route recovery worker. Virgin
+	// discovery has its own post-plan cold-start tests below and is intentionally
+	// not scheduled from a pre-plan hint in V4.4.
+	if state, ok := worker.engine.State.(*MemorySmartRouteStateStore); ok {
+		state.mu.Lock()
+		quality, exists := state.quality["cheap"]
+		if !exists {
+			quality = smartrouter.InitialQuality(false)
+		}
+		if smartrouter.IsVirginUnknown(quality) {
+			nowMS := time.Now().UnixMilli()
+			quality.Phase = smartrouter.QualityOpen
+			quality.Revision = 1
+			quality.LastFailureMS = nowMS - 1
+			quality.LastUpdatedMS = nowMS - 1
+			quality.NextProbeAtMS = nowMS - 1
+			state.quality["cheap"] = quality
+		}
+		state.mu.Unlock()
+	}
+	catalog, ok := session.engine.Catalogs.Current()
+	require.True(t, ok)
+	routes, err := session.contractRoutes(*catalog)
+	require.NoError(t, err)
+	runtime, err := session.engine.State.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(routes),
+	})
+	require.NoError(t, err)
+	prices, err := session.engine.Prices.GetOrRefresh(context.Background(), session.userGroup)
+	require.NoError(t, err)
+	worker.Hint(SmartRouteRecoveryHint{
+		CatalogVersion: catalog.Version, Request: session.request, Policy: session.policy,
+		UserGroup: session.userGroup, AllowedGroups: session.allowedGroups,
+		Routes: routes, Prices: *prices, Runtime: runtime,
+	})
+}
+
+func TestBackgroundProbeWorkerPromotesSemanticTextSuccessImmediately(t *testing.T) {
+	var calls atomic.Int64
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		_ context.Context,
+		request SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		assert.Equal(t, 45*time.Second, request.FirstTextTimeout)
+		assert.Equal(t, 15*time.Second, request.CompletionGrace)
+		return SmartRouteProbeExecutionResult{
+			Outcome: SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFE:    100 * time.Millisecond, TTFEObserved: true,
+			TTFT: 8 * time.Second, TTFTObserved: true, Completed: true,
+		}
+	}))
+	publishProbeWorkerHint(t, worker, session)
+
+	require.True(t, worker.RunOne())
+	assert.Equal(t, int64(1), calls.Load())
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "cheap", CapacityDomain: "cheap-capacity"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes["cheap"].Phase)
+	assert.Equal(t, int64(8_000), snapshot.TTFT.Routes["cheap"].P95MS)
+	assert.Equal(t, int64(1), worker.Stats().Succeeded)
+	assert.Zero(t, worker.Stats().Queued, "the first successful probe ends recovery immediately")
+
+	publishProbeWorkerHint(t, worker, session)
+	assert.Zero(t, worker.Stats().Queued, "healthy routes do not restart synthetic probing")
+}
+
+func TestBackgroundProbeWorkerStopsAfterUnavailableRouteRecovers(t *testing.T) {
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Second, Completed: true,
+		}
+	}))
+	nowMS := time.Now().UnixMilli()
+	state.mu.Lock()
+	state.quality["cheap"] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, Epoch: 1,
+		LastFailureMS: nowMS - 1_000, NextProbeAtMS: nowMS - 1,
+	}
+	state.mu.Unlock()
+
+	publishProbeWorkerHint(t, worker, session)
+	require.True(t, worker.RunOne())
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "cheap", CapacityDomain: "cheap-capacity"},
+	}})
+	require.NoError(t, err)
+	quality := snapshot.Quality.Routes["cheap"]
+	assert.Equal(t, smartrouter.QualityHealthy, quality.Phase)
+	assert.Equal(t, int64(1_000_000), quality.WarmingTrafficPPM)
+	assert.Greater(t, quality.LastSuccessMS, quality.LastFailureMS)
+	assert.Zero(t, worker.Stats().Queued)
+
+	publishProbeWorkerHint(t, worker, session)
+	assert.Zero(t, worker.Stats().Queued, "a confirmed recovery stops all further probes")
+}
+
+func TestBackgroundProbeWorkerAcceptsTerminalSuccessWithoutSemanticText(t *testing.T) {
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{
+			Outcome: SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFE:    50 * time.Millisecond, TTFEObserved: true, Completed: true,
+		}
+	}))
+	publishProbeWorkerHint(t, worker, session)
+
+	require.True(t, worker.RunOne())
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "cheap", CapacityDomain: "cheap-capacity"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes["cheap"].Phase)
+	assert.Equal(t, int64(1), worker.Stats().Succeeded)
+	assert.Zero(t, worker.Stats().Queued, "a terminal completion is sufficient evidence and ends synthetic recovery")
+}
+
+func TestBackgroundProbeWorkerRecordsResultAfterProbeContextCancellation(t *testing.T) {
+	var cancelWorker context.CancelFunc
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		ctx context.Context,
+		_ SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		cancelWorker()
+		<-ctx.Done()
+		return SmartRouteProbeExecutionResult{
+			Outcome: backgroundProbeFailure(ctx.Err(), "probe deadline"),
+		}
+	}))
+	workerContext, cancel := context.WithCancel(context.Background())
+	cancelWorker = cancel
+	worker.mu.Lock()
+	worker.ctx = workerContext
+	worker.mu.Unlock()
+	publishProbeWorkerHint(t, worker, session)
+
+	require.True(t, worker.RunOne())
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: []SmartRouteStateRoute{
+		{RouteID: "cheap", CapacityDomain: "cheap-capacity"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityOpen, snapshot.Quality.Routes["cheap"].Phase)
+	assert.Zero(t, snapshot.Quality.Routes["cheap"].TotalHardFailures)
+	assert.Zero(t, snapshot.Quality.Routes["cheap"].TotalProbeFailures)
+	assert.Equal(t, int64(1), worker.Stats().Queued)
+}
+
+func TestBackgroundProbeWorkerOrdersDueJobsByPrice(t *testing.T) {
+	seen := make([]string, 0, 1)
+	worker, _, _, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		_ context.Context,
+		request SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		seen = append(seen, request.Route.RouteID)
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Second, Completed: true,
+		}
+	}))
+	now := time.Now().Add(-time.Second)
+	for _, job := range []smartRouteProbeJob{
+		{
+			canonicalModel: "gpt-test", endpoint: SmartEndpointResponses,
+			key: "expensive", route: smartrouter.CertifiedRoute{RouteID: "expensive", CapacityDomain: "expensive-capacity"},
+			aliases:  map[string]smartrouter.CertifiedRoute{"expensive": {RouteID: "expensive", CapacityDomain: "expensive-capacity"}},
+			ratioPPM: 80_000, priceKnown: true, notBefore: now, lastHint: time.Now(), forceProbe: true,
+		},
+		{
+			canonicalModel: "gpt-test", endpoint: SmartEndpointResponses,
+			key: "cheap", route: smartrouter.CertifiedRoute{RouteID: "cheap-priority", CapacityDomain: "cheap-priority-capacity"},
+			aliases:  map[string]smartrouter.CertifiedRoute{"cheap-priority": {RouteID: "cheap-priority", CapacityDomain: "cheap-priority-capacity"}},
+			ratioPPM: 20_000, priceKnown: true, notBefore: now, lastHint: time.Now(), forceProbe: true,
+		},
+	} {
+		worker.enqueue(job, setting.ProbeQueueCapacity)
+	}
+
+	require.True(t, worker.RunOne())
+	assert.Equal(t, []string{"cheap-priority"}, seen)
+}
+
+func TestBackgroundProbeWorkerDoesNotStarveOlderExpensiveRecovery(t *testing.T) {
+	seen := make([]string, 0, 1)
+	worker, _, _, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		_ context.Context,
+		request SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		seen = append(seen, request.Route.RouteID)
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Second, Completed: true,
+		}
+	}))
+	now := time.Now()
+	worker.enqueue(smartRouteProbeJob{
+		canonicalModel: "gpt-test", endpoint: SmartEndpointResponses,
+		key: "older-expensive", route: smartrouter.CertifiedRoute{
+			RouteID: "older-expensive", CapacityDomain: "older-expensive-capacity",
+		},
+		aliases: map[string]smartrouter.CertifiedRoute{
+			"older-expensive": {RouteID: "older-expensive", CapacityDomain: "older-expensive-capacity"},
+		},
+		ratioPPM: 160_000, priceKnown: true, notBefore: now.Add(-time.Second), lastHint: now, forceProbe: true,
+	}, setting.ProbeQueueCapacity)
+	worker.enqueue(smartRouteProbeJob{
+		canonicalModel: "gpt-test", endpoint: SmartEndpointResponses,
+		key: "newer-cheap", route: smartrouter.CertifiedRoute{
+			RouteID: "newer-cheap", CapacityDomain: "newer-cheap-capacity",
+		},
+		aliases: map[string]smartrouter.CertifiedRoute{
+			"newer-cheap": {RouteID: "newer-cheap", CapacityDomain: "newer-cheap-capacity"},
+		},
+		ratioPPM: 80_000, priceKnown: true, notBefore: now.Add(-time.Millisecond), lastHint: now, forceProbe: true,
+	}, setting.ProbeQueueCapacity)
+
+	require.True(t, worker.RunOne())
+	assert.Equal(t, []string{"older-expensive"}, seen)
+}
+
+func TestBackgroundProbeWorkerYieldsToForegroundCapacity(t *testing.T) {
+	var calls atomic.Int64
+	worker, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Second, Completed: true,
+		}
+	}))
+	foreground, err := session.engine.State.TryAcquireCapacity(context.Background(), SmartRouteCapacityRequest{
+		CapacityDomain: "cheap-capacity", MaxInflight: 2,
+	})
+	require.NoError(t, err)
+	require.True(t, foreground.Granted())
+	publishProbeWorkerHint(t, worker, session)
+
+	require.True(t, worker.RunOne())
+	assert.Zero(t, calls.Load())
+	assert.Equal(t, int64(1), worker.Stats().Deferred)
+	require.NoError(t, foreground.Lease.Release(context.Background()))
+
+	worker.mu.Lock()
+	for _, job := range worker.pending {
+		job.notBefore = time.Now()
+	}
+	worker.mu.Unlock()
+	require.True(t, worker.RunOne())
+	assert.Equal(t, int64(1), calls.Load())
+	assert.Equal(t, 45, setting.ProbeTimeoutSeconds)
+}
+
+func TestBackgroundProbeWorkerUsesHotTimeoutSnapshot(t *testing.T) {
+	seen := make([]time.Duration, 0, 2)
+	worker, state, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		_ context.Context,
+		request SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		seen = append(seen, request.FirstTextTimeout)
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Second, Completed: true,
+		}
+	}))
+	publishProbeWorkerHint(t, worker, session)
+	require.True(t, worker.RunOne())
+
+	recordConfirmedAutomaticRouteFailure(t, state, "cheap")
+	_, err := state.ScheduleProbe(context.Background(), "cheap")
+	require.NoError(t, err)
+	state.mu.Lock()
+	state.probeSubjects = make(map[string]int64)
+	state.mu.Unlock()
+	setting.ProbeTimeoutSeconds = 60
+	publishProbeWorkerHint(t, worker, session)
+	require.True(t, worker.RunOne())
+	assert.Equal(t, []time.Duration{45 * time.Second, 60 * time.Second}, seen)
+}
+
+func TestBackgroundProbeWorkerQueueIsBoundedAndPhysicallyDeduplicated(t *testing.T) {
+	worker, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	setting.ProbeQueueCapacity = 1
+	publishProbeWorkerHint(t, worker, session)
+	publishProbeWorkerHint(t, worker, session)
+	stats := worker.Stats()
+	assert.Equal(t, int64(1), stats.Queued)
+	assert.Zero(t, stats.Dropped, "duplicate physical hints merge without consuming queue capacity")
+	disposition := worker.enqueue(smartRouteProbeJob{
+		key: "different-physical-route", route: smartrouter.CertifiedRoute{RouteID: "other"},
+		aliases: map[string]smartrouter.CertifiedRoute{}, notBefore: time.Now(), lastHint: time.Now(),
+	}, setting.ProbeQueueCapacity)
+	assert.Equal(t, SmartRouteProbeQueueFull, disposition)
+	assert.Equal(t, int64(1), worker.Stats().Dropped, "a distinct job beyond the bound is dropped")
+}
+
+func TestBackgroundProbeWorkerDoesNotQueueBehindRunningPhysicalProbe(t *testing.T) {
+	worker, _, _, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	worker.mu.Lock()
+	worker.running["same-physical-route"] = struct{}{}
+	worker.mu.Unlock()
+
+	disposition := worker.enqueue(smartRouteProbeJob{
+		key: "same-physical-route", route: smartrouter.CertifiedRoute{RouteID: "alias"},
+		aliases:   map[string]smartrouter.CertifiedRoute{"alias": {RouteID: "alias"}},
+		notBefore: time.Now(), lastHint: time.Now(), forceProbe: true,
+	}, setting.ProbeQueueCapacity)
+
+	assert.Equal(t, SmartRouteProbeAlreadyQueued, disposition)
+	assert.Zero(t, worker.Stats().Queued, "a running physical check already owns this work")
+}
+
+func TestBackgroundProbeWorkerMergesEveryDurableSubscriberForOnePhysicalRoute(t *testing.T) {
+	worker, _, _, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	base := smartRouteProbeJob{
+		key: "shared-physical", route: smartrouter.CertifiedRoute{RouteID: "alias"},
+		aliases:   map[string]smartrouter.CertifiedRoute{"alias": {RouteID: "alias"}},
+		notBefore: time.Now(), lastHint: time.Now(), durableKey: "scope-a",
+	}
+	assert.Equal(t, SmartRouteProbeEnqueued, worker.enqueue(base, setting.ProbeQueueCapacity))
+	base.durableKey = "scope-b"
+	base.durableKeys = map[string]struct{}{"scope-b": {}}
+	assert.Equal(t, SmartRouteProbeAlreadyQueued, worker.enqueue(base, setting.ProbeQueueCapacity))
+
+	worker.mu.Lock()
+	keys := smartRouteJobDurableKeys(worker.pending["shared-physical"])
+	worker.mu.Unlock()
+	assert.Equal(t, []string{"scope-a", "scope-b"}, keys)
+}
+
+func TestBackgroundProbeWorkerCarriesAllPhysicalAliasesIntoOneProbe(t *testing.T) {
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	routes := []smartrouter.CertifiedRoute{
+		{
+			RouteID: "allowed-alias", Group: "allowed", ChannelID: 7, ChannelGeneration: "generation-1",
+			UpstreamModel: "upstream-model", CapacityDomain: "shared-capacity",
+		},
+		{
+			RouteID: "other-alias", Group: "other", ChannelID: 7, ChannelGeneration: "generation-1",
+			UpstreamModel: "upstream-model", CapacityDomain: "shared-capacity",
+		},
+	}
+	disposition := worker.hint(SmartRouteRecoveryHint{
+		CatalogVersion: "catalog-v1",
+		Request: smartrouter.RouteRequest{
+			ContractID: "contract-v1", CanonicalModel: "model", Endpoint: SmartEndpointResponses,
+			ReplayClass: smartrouter.ReplaySafeText,
+		},
+		Policy: session.policy, AllowedGroups: []string{"allowed"}, Routes: routes,
+		Runtime: SmartRouteRuntimeSnapshot{Quality: smartrouter.QualitySnapshot{Routes: map[string]smartrouter.QualityState{
+			"allowed-alias": {Phase: smartrouter.QualityOpen, Epoch: 1, LastFailureMS: 1, NextProbeAtMS: 1},
+			"other-alias":   {Phase: smartrouter.QualityOpen, Epoch: 1, LastFailureMS: 1, NextProbeAtMS: 1},
+		}}},
+	}, false)
+
+	assert.Equal(t, SmartRouteProbeEnqueued, disposition)
+	worker.mu.Lock()
+	pendingCount := len(worker.pending)
+	aliasIDs := make([]string, 0, 2)
+	for _, job := range worker.pending {
+		aliasIDs = append(aliasIDs,
+			job.aliases["allowed-alias"].RouteID,
+			job.aliases["other-alias"].RouteID,
+		)
+	}
+	worker.mu.Unlock()
+	require.Equal(t, 1, pendingCount)
+	assert.ElementsMatch(t, []string{"allowed-alias", "other-alias"}, aliasIDs)
+}
+
+func TestBackgroundProbeWorkerCountsSharedCredentialOutcomeOnceAcrossAliases(t *testing.T) {
+	worker, state, _, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	routes := []smartrouter.CertifiedRoute{
+		{
+			RouteID: "group-a", Group: "a", ChannelID: 7, ChannelGeneration: "generation-1",
+			CredentialDomain: "shared-credential", CapacityDomain: "shared-capacity",
+		},
+		{
+			RouteID: "group-b", Group: "b", ChannelID: 7, ChannelGeneration: "generation-1",
+			CredentialDomain: "shared-credential", CapacityDomain: "shared-capacity",
+		},
+	}
+	runtime, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(routes),
+	})
+	require.NoError(t, err)
+	worker.recordProbeResult(context.Background(), &smartRouteProbeJob{
+		route: routes[0], aliases: map[string]smartrouter.CertifiedRoute{
+			routes[0].RouteID: routes[0], routes[1].RouteID: routes[1],
+		},
+	}, runtime, nil, SmartRouteProbeExecutionResult{
+		Outcome: SmartRouteOutcome{
+			Outcome: smartrouter.OutcomeCredential, AffectsRouteHealth: true,
+		},
+	})
+
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(routes),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, snapshot.Credentials.Domains["shared-credential"].ConsecutiveFailures)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["group-a"].Phase)
+	assert.Equal(t, smartrouter.QualityUnknown, snapshot.Quality.Routes["group-b"].Phase)
+}
+
+func TestSmartRouteProbeRetryDelayBacksOffSharedBudgetPressure(t *testing.T) {
+	setting := smartroutersetting.Setting{ProbeScanIntervalMS: 100}
+	assert.Equal(t, 15*time.Second, smartRouteProbeRetryDelay(setting, "probe_lease_or_budget"))
+	assert.Equal(t, 2*time.Second, smartRouteProbeRetryDelay(setting, "capacity_busy"))
+	assert.Equal(t, time.Second, smartRouteProbeRetryDelay(setting, "state_unavailable"))
+}
+
+func TestSmartRouteRecoveryDueOnlySchedulesUnavailableRoutes(t *testing.T) {
+	nowMS := int64(100_000)
+	tests := []struct {
+		name    string
+		quality smartrouter.QualityState
+		due     bool
+	}{
+		{
+			name: "open route whose deadline arrived is due",
+			quality: smartrouter.QualityState{
+				Phase: smartrouter.QualityOpen, NextProbeAtMS: nowMS,
+				LastFailureMS: nowMS - 1_000,
+			},
+			due: true,
+		},
+		{
+			name: "open route before its deadline is not due",
+			quality: smartrouter.QualityState{
+				Phase: smartrouter.QualityOpen, NextProbeAtMS: nowMS + 1,
+				LastFailureMS: nowMS - 1_000,
+			},
+		},
+		{
+			name: "legacy warming without evidence normalizes to unknown",
+			quality: smartrouter.QualityState{
+				Phase: smartrouter.QualityWarming, SampleDueAtMS: nowMS,
+			},
+		},
+		{name: "unknown is usable and never auto probed", quality: smartrouter.InitialQuality(false)},
+		{name: "healthy needs no probe", quality: smartrouter.QualityState{Phase: smartrouter.QualityHealthy}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.due, smartRouteRecoveryDue(test.quality, nowMS))
+		})
+	}
+	assert.False(t, smartRouteQualityHasObservedSuccess(smartrouter.InitialQuality(true)),
+		"an unobserved stable bootstrap alias is available but is not shared success evidence")
+	assert.True(t, smartRouteQualityHasObservedSuccess(smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy,
+	}))
+}
+
+func TestUnknownRoutesDoNotStartAutomaticProbeWave(t *testing.T) {
+	var calls atomic.Int64
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{}
+	}))
+
+	disposition := worker.hint(coldStartWorkerHint(session, 32), false)
+	assert.Equal(t, SmartRouteProbeNotDue, disposition)
+	worker.mu.Lock()
+	assert.Empty(t, worker.pending)
+	assert.Empty(t, worker.coldStartWaves)
+	worker.mu.Unlock()
+	assert.False(t, worker.RunOne())
+	assert.Zero(t, calls.Load(), "unknown routes are foreground-eligible and must not consume probe capacity")
+}
+
+func TestAdministratorForceProbeCanInspectOneUnknownRoute(t *testing.T) {
+	var calls atomic.Int64
+	worker, state, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Millisecond, Completed: true,
+		}
+	}))
+	hint := coldStartWorkerHint(session, 1)
+	hint.ForceProbe = true
+
+	assert.Equal(t, SmartRouteProbeEnqueued, worker.hint(hint, false))
+	require.True(t, worker.RunOne())
+	assert.Equal(t, int64(1), calls.Load())
+	snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(hint.Routes),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.QualityHealthy, snapshot.Quality.Routes["cold-01"].Phase)
+}
+
+func TestAutomaticRecoveryHintQueuesOnlyExistingFailures(t *testing.T) {
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := coldStartWorkerHint(session, 4)
+	hint.ForegroundPhysicalKey = ""
+	nowMS := time.Now().UnixMilli()
+	hint.Runtime.Quality.Routes["cold-03"] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, Epoch: 2, LastFailureMS: nowMS - 60_000,
+		NextProbeAtMS: nowMS - 1,
+	}
+	hint.Runtime.Quality.Routes["cold-04"] = smartrouter.QualityState{
+		Phase: smartrouter.QualityHealthy, Epoch: 2, LastSuccessMS: nowMS,
+		LastOutcome: smartrouter.OutcomeSuccess,
+	}
+
+	disposition := worker.hint(hint, false)
+	assert.Equal(t, SmartRouteProbeEnqueued, disposition)
+	worker.mu.Lock()
+	require.Len(t, worker.pending, 1)
+	for _, job := range worker.pending {
+		assert.Equal(t, "cold-03", job.route.RouteID)
+	}
+	assert.Empty(t, worker.coldStartWaves)
+	worker.mu.Unlock()
+}
+
+func TestUnknownOnlyHintWithoutForegroundIdentityQueuesNothing(t *testing.T) {
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := coldStartWorkerHint(session, 3)
+	hint.ForegroundPhysicalKey = ""
+
+	disposition := worker.hint(hint, false)
+	assert.Equal(t, SmartRouteProbeNotDue, disposition)
+	worker.mu.Lock()
+	assert.Empty(t, worker.pending)
+	assert.Empty(t, worker.coldStartWaves)
+	worker.mu.Unlock()
+}
+
+func TestUnknownHintsNeverCreateAutomaticProbeJobs(t *testing.T) {
+	_, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := coldStartWorkerHint(session, 3)
+	jobs, scope, hasVirgin := smartRouteColdStartJobs(hint)
+	assert.Empty(t, jobs)
+	assert.Empty(t, scope)
+	assert.False(t, hasVirgin)
+}
+
+func TestUnknownHintsDoNotConsumeSlotsAroundRunningRecovery(t *testing.T) {
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := coldStartWorkerHint(session, 4)
+	occupiedKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, hint.Routes[1])
+	worker.mu.Lock()
+	worker.running[occupiedKey] = struct{}{}
+	worker.mu.Unlock()
+
+	worker.Hint(hint)
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	assert.Empty(t, worker.pending)
+	assert.Empty(t, worker.coldStartWaves)
+}
+
+func TestProbeDispatcherHonorsBoundedRecoveryConcurrency(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{}, 2)
+	worker, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		_ context.Context,
+		request SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		started <- request.Route.RouteID
+		<-release
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Millisecond, Completed: true,
+		}
+	}))
+	setting.ProbeMaxConcurrency = 1
+	now := time.Now()
+	routes := []smartrouter.CertifiedRoute{
+		{RouteID: "recovery-a", Group: "economy", ChannelID: 900, ChannelGeneration: "a", UpstreamModel: "gpt-test", CapacityDomain: "capacity-a"},
+		{RouteID: "recovery-b", Group: "economy", ChannelID: 901, ChannelGeneration: "b", UpstreamModel: "gpt-test", CapacityDomain: "capacity-b"},
+	}
+	for _, route := range routes {
+		worker.enqueue(smartRouteProbeJob{
+			key: "physical-" + route.RouteID, catalogVersion: "catalog",
+			contractID: session.request.ContractID, canonicalModel: session.request.CanonicalModel,
+			endpoint: session.request.Endpoint, route: route,
+			aliases:   map[string]smartrouter.CertifiedRoute{route.RouteID: route},
+			notBefore: now, lastHint: now, forceProbe: true,
+		}, setting.ProbeQueueCapacity)
+	}
+
+	worker.dispatch(*setting)
+	var first string
+	select {
+	case first = <-started:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "first bounded recovery probe did not start")
+	}
+	worker.dispatch(*setting)
+	select {
+	case second := <-started:
+		require.FailNow(t, "dispatcher exceeded recovery concurrency", "%s then %s", first, second)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release <- struct{}{}
+	require.Eventually(t, func() bool {
+		worker.mu.Lock()
+		defer worker.mu.Unlock()
+		return len(worker.running) == 0
+	}, time.Second, 10*time.Millisecond)
+	worker.dispatch(*setting)
+	var second string
+	select {
+	case second = <-started:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "second bounded recovery probe did not start")
+	}
+	assert.NotEqual(t, first, second)
+	release <- struct{}{}
+	worker.wg.Wait()
+}
+
+func TestRecoveryProbePhysicalLeaseSingleFlightsAcrossWorkersAndAliases(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	executor := SmartRouteProbeExecutorFunc(func(
+		_ context.Context,
+		_ SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return SmartRouteProbeExecutionResult{Outcome: SmartRouteOutcome{
+			Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true, AffectsRouteHealth: true,
+		}}
+	})
+	workerA, state, session, setting := probeWorkerFixture(t, executor)
+	workerB, err := NewSmartRouteProbeWorker(session.engine, executor)
+	require.NoError(t, err)
+	now := time.Now()
+	physicalKey := "shared-physical-key"
+	routeA := smartrouter.CertifiedRoute{RouteID: "alias-a", ChannelID: 1, CapacityDomain: "capacity-a"}
+	routeB := smartrouter.CertifiedRoute{RouteID: "alias-b", ChannelID: 1, CapacityDomain: "capacity-b"}
+	for worker, route := range map[*SmartRouteProbeWorker]smartrouter.CertifiedRoute{workerA: routeA, workerB: routeB} {
+		worker.enqueue(smartRouteProbeJob{
+			key: physicalKey, catalogVersion: "catalog", contractID: session.request.ContractID,
+			canonicalModel: session.request.CanonicalModel, endpoint: session.request.Endpoint,
+			route: route, aliases: map[string]smartrouter.CertifiedRoute{route.RouteID: route},
+			notBefore: now, lastHint: now, forceProbe: true,
+		}, setting.ProbeQueueCapacity)
+	}
+	_ = state
+
+	doneA := make(chan struct{})
+	go func() {
+		workerA.RunOne()
+		close(doneA)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "first physical probe did not start")
+	}
+	require.True(t, workerB.RunOne())
+	assert.Equal(t, int64(1), calls.Load(), "the alias must not dispatch a second physical probe")
+	close(release)
+	<-doneA
+}
+
+func TestProbeWorkerHotDisableClearsAndRebuildsPendingRecovery(t *testing.T) {
+	worker, _, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := coldStartWorkerHint(session, 1)
+	nowMS := time.Now().UnixMilli()
+	hint.Runtime.Quality.Routes["cold-01"] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, Epoch: 2, LastFailureMS: nowMS - 1_000, NextProbeAtMS: nowMS - 1,
+	}
+	worker.Hint(hint)
+	worker.mu.Lock()
+	require.Len(t, worker.pending, 1)
+	assert.Empty(t, worker.coldStartWaves)
+	worker.mu.Unlock()
+
+	disabled := *setting
+	disabled.BackgroundProbeEnabled = false
+	worker.dispatch(disabled)
+	worker.mu.Lock()
+	assert.Empty(t, worker.coldStartWaves)
+	assert.Len(t, worker.pending, 1, "disabling execution must retain the bounded recovery work item")
+	worker.mu.Unlock()
+
+	worker.Hint(hint)
+	worker.mu.Lock()
+	assert.Empty(t, worker.coldStartWaves)
+	assert.Len(t, worker.pending, 1, "re-enabling must merge rather than duplicate the physical recovery item")
+	worker.mu.Unlock()
+}
+
+func TestForcedProbeCandidateCarriesAllPublishedPhysicalAliases(t *testing.T) {
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		return SmartRouteProbeExecutionResult{}
+	}))
+	hint := coldStartWorkerHint(session, 2)
+	hint.ForceProbe = true
+	hint.Routes[1].Group = "alias-hidden"
+	hint.Routes[1].ChannelID = hint.Routes[0].ChannelID
+	hint.Routes[1].ChannelGeneration = hint.Routes[0].ChannelGeneration
+	hint.Routes[1].UpstreamModel = hint.Routes[0].UpstreamModel
+	hint.AllowedGroups = []string{"economy"}
+	jobs, scope, allVirgin := smartRouteColdStartJobs(hint)
+	require.True(t, allVirgin)
+	require.Len(t, jobs, 1)
+	assert.Len(t, jobs[0].aliases, 2)
+	assert.Len(t, scope, 1)
+	physicalKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, hint.Routes[1])
+	assert.Equal(t, jobs[0].key, physicalKey)
+	_ = worker
+}
+
+func TestAutomaticProbeWorkerNeverSynthesizesMediaRequests(t *testing.T) {
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		require.Fail(t, "media must not reach the synthetic probe executor")
+		return SmartRouteProbeExecutionResult{}
+	}))
+	for _, endpoint := range []string{
+		SmartEndpointImages,
+		SmartEndpointImageEdits,
+		SmartEndpointVideos,
+		SmartEndpointVideoTasks,
+		SmartEndpointAudioSpeech,
+		SmartEndpointAudioTranscription,
+		SmartEndpointAudioTranslation,
+	} {
+		hint := coldStartWorkerHint(session, 3)
+		hint.Request.Endpoint = endpoint
+		disposition := worker.hint(hint, false)
+		assert.Equal(t, SmartRouteProbeUnsupported, disposition)
+	}
+	assert.Zero(t, worker.Stats().Queued)
+}
+
+func TestUnknownRouteWaitTimeoutDoesNotCreateBackgroundProbe(t *testing.T) {
+	var calls atomic.Int64
+	worker, _, session, _ := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(
+		context.Context,
+		SmartRouteProbeExecutionRequest,
+	) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{
+			Outcome:      SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess},
+			TTFTObserved: true, TTFT: time.Millisecond, Completed: true,
+		}
+	}))
+	hint := coldStartWorkerHint(session, 3)
+	worker.Hint(hint)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := session.waitForColdStartDiscovery(
+		ctx,
+		hint.Routes,
+		500,
+		10,
+		func(SmartRouteRuntimeSnapshot) bool { return false },
+	)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.False(t, worker.RunOne(), "unknown routes remain foreground-eligible and do not create a background wave")
+	assert.Zero(t, calls.Load())
+}
+
+func TestSmartRouteRecoveryHintHasDueWorkIgnoresHealthyAndExcludedRoutes(t *testing.T) {
+	nowMS := time.Now().UnixMilli()
+	policy := smartrouter.NormalizePolicy(smartrouter.Policy{
+		Version: smartrouter.PolicyVersion, Enabled: true, AllowFutureGroups: true,
+		AllowFutureCertifiedRoutes: true,
+	})
+	hint := SmartRouteRecoveryHint{
+		Request:       smartrouter.RouteRequest{ReplayClass: smartrouter.ReplaySafeText},
+		Policy:        policy,
+		AllowedGroups: []string{"default"},
+		Routes: []smartrouter.CertifiedRoute{
+			{RouteID: "route", Group: "default"},
+		},
+		Runtime: SmartRouteRuntimeSnapshot{Quality: smartrouter.QualitySnapshot{Routes: map[string]smartrouter.QualityState{
+			"route": {Phase: smartrouter.QualityHealthy, Epoch: 1},
+		}}},
+	}
+	assert.False(t, smartRouteRecoveryHintHasDueWork(hint, nowMS))
+
+	hint.Runtime.Quality.Routes["route"] = smartrouter.QualityState{
+		Phase: smartrouter.QualityOpen, Epoch: 1, NextProbeAtMS: nowMS,
+	}
+	assert.True(t, smartRouteRecoveryHintHasDueWork(hint, nowMS))
+
+	hint.ExcludedRoutes = []string{"route"}
+	assert.False(t, smartRouteRecoveryHintHasDueWork(hint, nowMS))
+}

@@ -1,0 +1,441 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useVirtualizer, defaultRangeExtractor } from '@tanstack/react-virtual'
+import {
+  CheckIcon,
+  ChevronsUpDownIcon,
+  SearchIcon,
+  StarIcon,
+} from 'lucide-react'
+import {
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { Button } from '@/components/ui/button'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
+import { cn } from '@/lib/utils'
+
+import {
+  leaderboardModelOptionKey,
+  type LeaderboardModelOption,
+} from './leaderboard-preferences'
+
+type ModelContractComboboxProps = {
+  options: LeaderboardModelOption[]
+  value?: string
+  recent: string[]
+  favorites: string[]
+  onValueChange: (value: string) => void
+  onToggleFavorite: (value: string) => void
+  disabled?: boolean
+}
+
+type PreparedOption = {
+  key: string
+  option: LeaderboardModelOption
+  searchText: string
+}
+type ListRow =
+  | { kind: 'heading'; key: string; label: string }
+  | { kind: 'option'; key: string; item: PreparedOption; position: number }
+const MODALITY_ORDER = ['text', 'image', 'video', 'audio', 'other']
+const CATEGORY_LABELS: Record<string, string> = {
+  text: '文本模型',
+  image: '图片模型',
+  video: '视频模型',
+  audio: '音频模型',
+  other: '其他模型',
+}
+
+export function ModelContractCombobox(props: ModelContractComboboxProps) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const prepared = useMemo(
+    () =>
+      props.options
+        .map((option) => ({
+          key: leaderboardModelOptionKey(option),
+          option,
+          searchText: [
+            option.model,
+            option.displayName,
+            option.endpoint,
+            option.family,
+            option.modality,
+            ...option.aliases,
+          ]
+            .join(' ')
+            .toLowerCase(),
+        }))
+        .sort(
+          (left, right) =>
+            right.option.recentUsageCount - left.option.recentUsageCount ||
+            left.option.displayName.localeCompare(right.option.displayName) ||
+            left.option.endpoint.localeCompare(right.option.endpoint)
+        ),
+    [props.options]
+  )
+  const optionByKey = useMemo(
+    () => new Map(prepared.map((item) => [item.key, item])),
+    [prepared]
+  )
+  const selected = props.value
+    ? optionByKey.get(props.value)?.option
+    : undefined
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        render={
+          <Button
+            type='button'
+            variant='outline'
+            role='combobox'
+            aria-expanded={open}
+            disabled={props.disabled}
+            className='h-10 w-full min-w-0 justify-between px-3 font-normal'
+          />
+        }
+      >
+        <span className='min-w-0 truncate text-left'>
+          {selected
+            ? `${selected.displayName} · ${selected.endpoint}`
+            : t('Select a model contract', { defaultValue: '选择模型与协议' })}
+        </span>
+        <ChevronsUpDownIcon
+          aria-hidden='true'
+          className='size-4 shrink-0 opacity-50'
+        />
+      </PopoverTrigger>
+      <PopoverContent
+        className='w-[min(42rem,var(--anchor-width))] max-w-[calc(100vw-2rem)] gap-0 p-0'
+        onWheel={(event) => event.stopPropagation()}
+      >
+        {open && (
+          <VirtualModelList
+            {...props}
+            prepared={prepared}
+            onSelect={(value) => {
+              props.onValueChange(value)
+              setOpen(false)
+            }}
+            onClose={() => setOpen(false)}
+          />
+        )}
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function VirtualModelList(
+  props: ModelContractComboboxProps & {
+    prepared: PreparedOption[]
+    onSelect: (value: string) => void
+    onClose: () => void
+  }
+) {
+  const { t } = useTranslation()
+  const id = useId()
+  const listId = `${id}-list`
+  const inputRef = useRef<HTMLInputElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [search, setSearch] = useState('')
+  const [activeKey, setActiveKey] = useState(props.value)
+  const favoriteKeys = useMemo(
+    () => new Set(props.favorites),
+    [props.favorites]
+  )
+  const { rows, optionRows } = useMemo(() => {
+    const needle = search.trim().toLowerCase()
+    const eligible = props.prepared.filter(
+      (item) => !needle || item.searchText.includes(needle)
+    )
+    const byKey = new Map(eligible.map((item) => [item.key, item]))
+    const used = new Set<string>()
+    const rows: ListRow[] = []
+    const optionRows: number[] = []
+    const addSection = (label: string, items: PreparedOption[]) => {
+      if (items.length === 0) return
+      rows.push({ kind: 'heading', key: `heading:${label}`, label })
+      for (const item of items) {
+        used.add(item.key)
+        optionRows.push(rows.length)
+        rows.push({
+          kind: 'option',
+          key: item.key,
+          item,
+          position: optionRows.length,
+        })
+      }
+    }
+    const take = (keys: string[]) => {
+      const items: PreparedOption[] = []
+      for (const key of keys) {
+        const item = byKey.get(key)
+        if (!item || used.has(key)) continue
+        used.add(key)
+        items.push(item)
+      }
+      return items
+    }
+    addSection(
+      t('Recently viewed', { defaultValue: '最近查看' }),
+      take(props.recent)
+    )
+    addSection(
+      t('Favorites', { defaultValue: '收藏模型' }),
+      take(props.favorites)
+    )
+    const modalities = [
+      ...new Set([
+        ...MODALITY_ORDER,
+        ...eligible.map((item) => item.option.modality || 'other'),
+      ]),
+    ]
+    for (const modality of modalities) {
+      addSection(
+        t(`Model category: ${modality}`, {
+          defaultValue: CATEGORY_LABELS[modality] || modality,
+        }),
+        eligible.filter(
+          (item) =>
+            !used.has(item.key) &&
+            (item.option.modality || 'other') === modality
+        )
+      )
+    }
+    return { rows, optionRows }
+  }, [props.prepared, props.recent, props.favorites, search, t])
+  const activePosition = Math.max(
+    0,
+    optionRows.findIndex((index) => rows[index].key === activeKey)
+  )
+  const activeRowIndex = optionRows[activePosition]
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    getItemKey: (index) => rows[index].key,
+    estimateSize: (index) => (rows[index].kind === 'heading' ? 32 : 60),
+    overscan: 4,
+    rangeExtractor: (range) => {
+      const visible = defaultRangeExtractor(range)
+      if (activeRowIndex !== undefined && !visible.includes(activeRowIndex)) {
+        visible.push(activeRowIndex)
+      }
+      return visible.sort((a, b) => a - b)
+    },
+  })
+  useLayoutEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+  useLayoutEffect(() => {
+    if (activeRowIndex !== undefined) {
+      virtualizer.scrollToIndex(activeRowIndex, { align: 'auto' })
+    }
+  }, [activeRowIndex, search, virtualizer])
+
+  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      props.onClose()
+      return
+    }
+    if (optionRows.length === 0) return
+    let next = activePosition
+    switch (event.key) {
+      case 'ArrowDown':
+        next = (activePosition + 1) % optionRows.length
+        break
+      case 'ArrowUp':
+        next = (activePosition - 1 + optionRows.length) % optionRows.length
+        break
+      case 'Home':
+        next = 0
+        break
+      case 'End':
+        next = optionRows.length - 1
+        break
+      case 'Enter':
+        event.preventDefault()
+        props.onSelect(rows[activeRowIndex].key)
+        return
+      default:
+        return
+    }
+    event.preventDefault()
+    setActiveKey(rows[optionRows[next]].key)
+    virtualizer.scrollToIndex(optionRows[next], { align: 'auto' })
+  }
+
+  return (
+    <div className='min-w-0'>
+      <div className='flex items-center gap-2 border-b px-3'>
+        <SearchIcon aria-hidden='true' className='size-4 shrink-0 opacity-50' />
+        <input
+          ref={inputRef}
+          role='combobox'
+          aria-expanded='true'
+          aria-autocomplete='list'
+          aria-controls={listId}
+          aria-activedescendant={
+            activeRowIndex === undefined
+              ? undefined
+              : `${id}-option-${activeRowIndex}`
+          }
+          aria-label={t('Search model, protocol, family, or alias', {
+            defaultValue: '搜索模型、协议、系列或别名',
+          })}
+          placeholder={t('Search model, protocol, family, or alias', {
+            defaultValue: '搜索模型、协议、系列或别名',
+          })}
+          className='placeholder:text-muted-foreground h-11 w-full min-w-0 bg-transparent text-sm outline-none'
+          value={search}
+          onChange={(event) => {
+            setSearch(event.target.value)
+            setActiveKey(undefined)
+            scrollRef.current?.scrollTo({ top: 0 })
+          }}
+          onKeyDown={onKeyDown}
+        />
+      </div>
+      <div
+        ref={scrollRef}
+        id={listId}
+        role='listbox'
+        aria-label={t('Select a model contract', {
+          defaultValue: '选择模型与协议',
+        })}
+        className='max-h-80 overflow-y-auto overscroll-contain'
+        style={{ height: Math.min(320, virtualizer.getTotalSize() || 64) }}
+      >
+        {optionRows.length === 0 && (
+          <p className='p-5 text-center text-sm'>
+            {t('No matching model contract', {
+              defaultValue: '没有匹配的模型或协议',
+            })}
+          </p>
+        )}
+        <div
+          className='relative w-full'
+          style={{ height: virtualizer.getTotalSize() }}
+        >
+          {virtualizer.getVirtualItems().map((virtualRow) => {
+            const row = rows[virtualRow.index]
+            const style = {
+              height: virtualRow.size,
+              transform: `translateY(${virtualRow.start}px)`,
+            }
+            if (row.kind === 'heading') {
+              return (
+                <div
+                  key={row.key}
+                  role='presentation'
+                  style={style}
+                  className='text-muted-foreground absolute top-0 left-0 flex w-full items-center px-3 text-xs font-medium'
+                >
+                  {row.label}
+                </div>
+              )
+            }
+            const option = row.item.option
+            const favorite = favoriteKeys.has(row.key)
+            return (
+              <div
+                key={row.key}
+                id={`${id}-option-${virtualRow.index}`}
+                role='option'
+                aria-selected={row.key === props.value}
+                aria-posinset={row.position}
+                aria-setsize={optionRows.length}
+                style={style}
+                className={cn(
+                  'absolute top-0 left-0 flex w-full cursor-pointer items-center gap-2 px-3 text-sm',
+                  virtualRow.index === activeRowIndex &&
+                    'bg-accent text-accent-foreground'
+                )}
+                onMouseMove={() => setActiveKey(row.key)}
+                onClick={() => props.onSelect(row.key)}
+              >
+                <CheckIcon
+                  aria-hidden='true'
+                  className={cn(
+                    'size-4 shrink-0',
+                    row.key === props.value ? 'opacity-100' : 'opacity-0'
+                  )}
+                />
+                <span className='min-w-0 flex-1'>
+                  <span className='block truncate font-medium'>
+                    {option.displayName}
+                  </span>
+                  <span className='text-muted-foreground block truncate text-xs'>
+                    {option.endpoint} ·{' '}
+                    {t(`Model family: ${option.family}`, {
+                      defaultValue: option.family,
+                    })}{' '}
+                    ·{' '}
+                    {t('{{count}} recent requests', {
+                      defaultValue: '近期 {{count}} 次请求',
+                      count: option.recentUsageCount,
+                    })}
+                  </span>
+                </span>
+                <button
+                  type='button'
+                  className='hover:bg-muted rounded p-1'
+                  aria-label={
+                    favorite
+                      ? t('Remove from favorites', { defaultValue: '取消收藏' })
+                      : t('Add to favorites', { defaultValue: '收藏模型' })
+                  }
+                  onPointerDown={(event) => {
+                    event.stopPropagation()
+                    event.preventDefault()
+                  }}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    props.onToggleFavorite(row.key)
+                  }}
+                >
+                  <StarIcon
+                    aria-hidden='true'
+                    className={cn(
+                      'size-4',
+                      favorite && 'fill-amber-400 text-amber-500'
+                    )}
+                  />
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}

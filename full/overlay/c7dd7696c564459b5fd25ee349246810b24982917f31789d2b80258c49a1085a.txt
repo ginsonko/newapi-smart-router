@@ -1,0 +1,14 @@
+package controller
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStandaloneSearchDisablesLegacyRetryLoop(t *testing.T) {
+	require.Zero(t, relayRetryLimit(types.RelayFormatStandaloneSearch))
+	require.Equal(t, common.RetryTimes, relayRetryLimit(types.RelayFormatOpenAIResponses))
+}

@@ -1,0 +1,114 @@
+package media
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAIZZZCapabilityIsExactAndModelAware(t *testing.T) {
+	variable := ResolveCapabilityForRoute(
+		57, constant.ChannelTypeOpenAI, "mg-seedance2.0 -480p mini",
+		"openai-videos-v1", "https://api.aizzz.xyz",
+	)
+	assert.Equal(t, "aizzz-video-v1", variable.ProviderContract)
+	assert.Equal(t, 4, variable.MaxImages)
+	assert.Equal(t, 3, variable.MaxVideos)
+	assert.Equal(t, 1, variable.MaxAudios)
+	assert.Equal(t, 15, variable.MaxTotalReferences)
+	assert.Equal(t, []string{"480p"}, variable.Resolutions)
+	assert.Equal(t, DurationCapability{Mode: "range", Min: 5, Max: 15, Step: 1, Default: 5}, variable.Duration)
+	require.NoError(t, variable.Validate([]ReferenceDescriptor{
+		{Type: "image", Role: "reference"},
+		{Type: "video", Role: "reference"},
+		{Type: "audio", Role: "reference"},
+	}))
+
+	fixed := ResolveCapabilityForRoute(
+		57, constant.ChannelTypeOpenAI, "mg-seedance2.0 -720p-fast-gz-15s",
+		"openai-videos-v1", "https://api.aizzz.xyz",
+	)
+	assert.Equal(t, DurationCapability{Mode: "fixed", Step: 1, Default: 15, Fixed: 15}, fixed.Duration)
+	assert.Equal(t, 9, fixed.MaxImages)
+	assert.Equal(t, 3, fixed.MaxVideos)
+	assert.Equal(t, 3, fixed.MaxAudios)
+}
+
+func TestUnknownVideoContractsDoNotInventLocalReferenceLimits(t *testing.T) {
+	unknown := ResolveCapabilityForRoute(
+		57, constant.ChannelTypeOpenAI, "future-video-model",
+		"openai-videos-v1", "https://api.aizzz.xyz",
+	)
+	assert.Empty(t, unknown.ProviderContract)
+	assert.True(t, unknown.ReferenceImage)
+	assert.True(t, unknown.ReferenceVideo)
+	assert.True(t, unknown.ReferenceAudio)
+	assert.Zero(t, unknown.MaxImages)
+	assert.Zero(t, unknown.MaxVideos)
+	assert.Zero(t, unknown.MaxAudios)
+	references := make([]ReferenceDescriptor, 0, 12)
+	for index := 0; index < 4; index++ {
+		references = append(references,
+			ReferenceDescriptor{Type: "image", Role: "future-image-role"},
+			ReferenceDescriptor{Type: "video", Role: "future-video-role"},
+			ReferenceDescriptor{Type: "audio", Role: "future-audio-role"},
+		)
+	}
+	require.NoError(t, unknown.Validate(references))
+	require.NoError(t, unknown.ValidateGeneration(7200, "future:ratio", "future-resolution"))
+
+	other := ResolveCapabilityForRoute(
+		57, constant.ChannelTypeOpenAI, "mg-seedance2.0 -480p mini",
+		"openai-videos-v1", "https://other.example",
+	)
+	assert.Empty(t, other.ProviderContract)
+	assert.True(t, other.ReferenceImage)
+	assert.True(t, other.ReferenceVideo)
+	assert.Zero(t, other.MaxImages)
+	assert.Zero(t, other.MaxVideos)
+}
+
+func TestCapabilityRejectsOversizedAndOutOfRangeUploadedReferences(t *testing.T) {
+	capability := Capability{
+		ReferenceImage: true, ReferenceVideo: true, ReferenceAudio: true,
+		ImageRoles: []string{"reference"}, VideoRoles: []string{"reference"}, AudioRoles: []string{"reference"},
+		MaxImages: 2, MaxVideos: 2, MaxAudios: 1,
+		MaxImageBytes: 10, MaxVideoBytes: 20, MaxAudioBytes: 30,
+		MinReferenceVideoSeconds: 2, MaxReferenceVideoSeconds: 15,
+		MaxTotalReferenceVideoSecond: 15,
+	}
+
+	assert.ErrorContains(t, capability.Validate([]ReferenceDescriptor{
+		{Type: "image", Role: "reference", SizeBytes: 11, MetadataTrusted: true},
+	}), "byte limit")
+	assert.ErrorContains(t, capability.Validate([]ReferenceDescriptor{
+		{Type: "video", Role: "reference", SizeBytes: 20, MetadataTrusted: true},
+	}), "duration could not be verified")
+	assert.ErrorContains(t, capability.Validate([]ReferenceDescriptor{
+		{Type: "video", Role: "reference", SizeBytes: 20, DurationSeconds: 1.5, MetadataTrusted: true},
+	}), "at least 2 seconds")
+	assert.ErrorContains(t, capability.Validate([]ReferenceDescriptor{
+		{Type: "video", Role: "reference", SizeBytes: 20, DurationSeconds: 8, MetadataTrusted: true},
+		{Type: "video", Role: "reference", SizeBytes: 20, DurationSeconds: 8, MetadataTrusted: true},
+	}), "total at most 15 seconds")
+
+	// A remote URL has no trusted local metadata. The provider remains the
+	// authority for that URL; local upload limits must not invent measurements.
+	require.NoError(t, capability.Validate([]ReferenceDescriptor{
+		{Type: "video", Role: "reference"},
+	}))
+}
+
+func TestCapabilityRejectsUnsupportedGenerationControls(t *testing.T) {
+	capability := Capability{
+		Duration:     DurationCapability{Mode: "range", Min: 5, Max: 15, Step: 1, Default: 5},
+		AspectRatios: []string{"16:9", "9:16"},
+		Resolutions:  []string{"480p"},
+	}
+	require.NoError(t, capability.ValidateGeneration(5, "16:9", "480p"))
+	assert.ErrorContains(t, capability.ValidateGeneration(4, "16:9", "480p"), "durations from 5 to 15")
+	assert.ErrorContains(t, capability.ValidateGeneration(5, "1:1", "480p"), "aspect ratio")
+	assert.ErrorContains(t, capability.ValidateGeneration(5, "16:9", "720p"), "resolution")
+}

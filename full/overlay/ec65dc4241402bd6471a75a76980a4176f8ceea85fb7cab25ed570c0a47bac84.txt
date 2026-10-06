@@ -1,0 +1,181 @@
+package helper
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+)
+
+// ResolveRequestParameterPrice consumes parsed fields, not media bytes. It is
+// shared by per-call tasks and synchronous image requests, including edits.
+func ResolveRequestParameterPrice(c *gin.Context, info *relaycommon.RelayInfo) (*types.ParameterPriceSnapshot, error) {
+	if !billing_setting.HasParameterPricing(info.OriginModelName, info.UsingGroup) {
+		return bindParameterCommitment(c, nil)
+	}
+	if info.ChannelMeta == nil {
+		info.InitChannelMeta(c)
+	}
+	if err := ModelMappedHelper(c, info, nil); err != nil {
+		return nil, err
+	}
+	var requestSize, requestResolution string
+	input := billing_setting.ParameterPriceInput{Group: info.UsingGroup, Model: info.OriginModelName, ChannelID: info.ChannelId, Count: 1}
+	if req, err := relaycommon.GetTaskRequest(c); err == nil {
+		input.Resolution = strings.TrimSpace(req.Resolution)
+		if input.Resolution == "" {
+			input.Resolution = strings.TrimSpace(req.Size)
+		}
+		input.DurationSeconds = req.Seconds
+		if input.DurationSeconds == "" && req.Duration != 0 {
+			input.DurationSeconds = strconv.Itoa(req.Duration)
+		}
+		if req.Seconds != "" && req.Duration != 0 {
+			seconds, err := decimal.NewFromString(req.Seconds)
+			if err != nil || !seconds.Equal(decimal.NewFromInt(int64(req.Duration))) {
+				return nil, fmt.Errorf("duration and seconds conflict")
+			}
+		}
+		if req.Metadata != nil {
+			if q, ok := req.Metadata["quality"].(string); ok {
+				input.Quality = q
+			}
+		}
+	} else if req, ok := info.Request.(*dto.ImageRequest); ok {
+		normalized, err := info.ImageAdapter().Normalize(*req, info.OriginModelName)
+		if err != nil {
+			return nil, err
+		}
+		req = &normalized
+		requestSize = strings.TrimSpace(req.Size)
+		input.Resolution = req.Size
+		input.Quality = req.Quality
+		if req.N != nil {
+			if *req.N < 1 || *req.N > dto.MaxImageN {
+				return nil, fmt.Errorf("n must be between 1 and %d", dto.MaxImageN)
+			}
+			input.Count = int(*req.N)
+		}
+		if raw, ok := req.Extra["resolution"]; ok {
+			var resolution string
+			if err := common.Unmarshal(raw, &resolution); err != nil {
+				return nil, fmt.Errorf("resolution must be a string")
+			}
+			requestResolution = strings.TrimSpace(resolution)
+			input.Resolution = resolution
+		}
+		capability, err := parameterMediaCapability(info)
+		if err != nil {
+			return nil, err
+		}
+		input.Resolution, err = normalizeParameterResolution(capability, requestResolution, req.Size)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if cfg := info.ImageAdapter(); cfg != nil && cfg.NativeChatPricing {
+			return bindParameterCommitment(c, nil)
+		}
+		return nil, fmt.Errorf("parameter pricing requires an image or video request")
+	}
+	quote, err := billing_setting.ResolveParameterPrice(input)
+	if err != nil || quote == nil {
+		return quote, err
+	}
+	quote.UpstreamModel = info.UpstreamModelName
+	// Keep the literal client controls alongside the canonical pricing
+	// resolution. Wire validation uses these values to accept a declared alias
+	// while ensuring a converted request cannot silently change its size.
+	if requestSize != "" && !strings.EqualFold(requestSize, quote.Parameters["resolution"]) {
+		quote.Parameters["size"] = requestSize
+	}
+	if requestResolution != "" && !strings.EqualFold(requestResolution, quote.Parameters["resolution"]) {
+		quote.Parameters["requested_resolution"] = requestResolution
+	}
+	quote.MappingRevision = common.Sha1([]byte(fmt.Sprintf("%d:%s:%s", info.ChannelId, info.OriginModelName, info.UpstreamModelName)))
+	if quote.Unit == billing_setting.TaskBillingUnitFixedDuration {
+		if req, err := relaycommon.GetTaskRequest(c); err == nil && req.Seconds == "" && req.Duration == 0 {
+			req.Seconds = quote.Parameters["duration_seconds"]
+			c.Set("task_request", req)
+		}
+	}
+	return bindParameterCommitment(c, quote)
+}
+
+func parameterPriceData(quote *types.ParameterPriceSnapshot, groupRatio types.GroupRatioInfo) types.PriceData {
+	// Parameter prices are final group prices. Legacy group and adaptor ratios
+	// must not be applied to the frozen integer quota a second time.
+	groupRatio.GroupRatio = 1
+	revision := quote.SupplyRevision
+	if revision == "" {
+		revision = quote.Revision
+	}
+	return types.PriceData{ParameterPricing: quote, PricingScope: "parameter", PricingRevision: revision,
+		PricingGroup: quote.Group, PricingModel: quote.Model, BillingMode: "parameter_price", TaskBillingUnit: quote.Unit,
+		HasTaskBillingProfile: true, UsePrice: true, FreeModel: quote.Quota == 0, Quota: quote.Quota,
+		QuotaToPreConsume: quote.Quota, GroupRatioInfo: groupRatio}
+}
+
+// RefreshParameterPricingSupply binds each accepted candidate to its own
+// procurement rule while preserving the customer amount already reserved.
+func RefreshParameterPricingSupply(c *gin.Context, info *relaycommon.RelayInfo) error {
+	previous := info.PriceData.ParameterPricing
+	if previous == nil {
+		return nil
+	}
+	FreezeParameterCommitment(c, previous)
+	current, err := ResolveRequestParameterPrice(c, info)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return fmt.Errorf("candidate has no parameter price")
+	}
+	info.PriceData.ParameterPricing = current
+	return nil
+}
+
+func parameterMediaCapability(info *relaycommon.RelayInfo) (mediaservice.Capability, error) {
+	if info == nil || info.ChannelId <= 0 || info.OriginModelName == "" {
+		return mediaservice.Capability{}, nil
+	}
+	endpoint := "openai-images-generations-v1"
+	if strings.Contains(info.RequestURLPath, "/images/edits") {
+		endpoint = "openai-images-edits-v1"
+	} else if strings.Contains(info.RequestURLPath, "/videos") {
+		endpoint = "openai-videos-v1"
+	}
+	capability, err := mediaservice.ResolveCapabilityForRequest(info.ChannelId, info.ChannelType, info.OriginModelName, info.UpstreamModelName, info.UsingGroup, endpoint, info.ChannelBaseUrl)
+	if err != nil {
+		// A legacy installation or an isolated pricing test may not have the
+		// optional managed capability tables yet. Preserve the established
+		// built-in route behavior in that case; enforce a managed contract error
+		// once the catalog exists and explicitly rejects this route.
+		if strings.Contains(err.Error(), "active media capability contract is unavailable") {
+			return mediaservice.ResolveCapabilityForRoute(info.ChannelId, info.ChannelType, info.UpstreamModelName, endpoint, info.ChannelBaseUrl), nil
+		}
+		return mediaservice.Capability{}, err
+	}
+	return capability, nil
+}
+
+func normalizeParameterResolution(capability mediaservice.Capability, resolution, size string) (string, error) {
+	if capability.RuntimeEnforced || len(capability.ResolutionAliases) > 0 || len(capability.Resolutions) > 0 {
+		return capability.NormalizeResolution(resolution, size)
+	}
+	if resolution != "" && size != "" && !strings.EqualFold(strings.TrimSpace(resolution), strings.TrimSpace(size)) {
+		return "", fmt.Errorf("resolution and size conflict; use one explicit pricing dimension")
+	}
+	if strings.TrimSpace(resolution) != "" {
+		return strings.TrimSpace(resolution), nil
+	}
+	return strings.TrimSpace(size), nil
+}

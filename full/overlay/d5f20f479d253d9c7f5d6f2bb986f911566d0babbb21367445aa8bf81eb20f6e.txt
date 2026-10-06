@@ -1,0 +1,861 @@
+package model
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	RouteAnalyticsGranularity5m = "5m"
+	RouteAnalyticsGranularity1h = "1h"
+)
+
+// RouteAnalyticsDimensionV1 is the privacy boundary between internal physical
+// routes and the opaque detail ids exposed by analytics APIs.
+type RouteAnalyticsDimensionV1 struct {
+	DetailID               string `json:"detail_id" gorm:"type:char(32);primaryKey"`
+	RouteFingerprintDigest string `json:"-" gorm:"type:char(64);uniqueIndex;not null"`
+	ChannelID              int    `json:"-" gorm:"not null;index"`
+	ChannelGeneration      string `json:"-" gorm:"type:varchar(128);not null"`
+	UpstreamModel          string `json:"-" gorm:"type:varchar(255);not null"`
+	Model                  string `json:"model" gorm:"type:varchar(255);not null;index"`
+	Endpoint               string `json:"endpoint" gorm:"type:varchar(96);not null;index"`
+	CapabilityContract     string `json:"-" gorm:"type:varchar(191);not null"`
+	PublicGroupName        string `json:"group_name" gorm:"type:varchar(191);not null"`
+	GroupRatioPPM          int64  `json:"group_ratio_ppm" gorm:"not null"`
+	ProjectionVersion      string `json:"projection_version" gorm:"type:varchar(64);not null"`
+	FirstSeenAtMS          int64  `json:"first_seen_at_ms" gorm:"not null;index"`
+	LastSeenAtMS           int64  `json:"last_seen_at_ms" gorm:"not null;index"`
+	RetiredAtMS            int64  `json:"retired_at_ms,omitempty" gorm:"index"`
+}
+
+func (RouteAnalyticsDimensionV1) TableName() string { return "route_analytics_dimensions_v1" }
+
+type RouteAnalyticsObservationV1 struct {
+	ObservationDigest      string `json:"-" gorm:"type:char(64);primaryKey"`
+	ProjectionHash         string `json:"-" gorm:"type:char(64);not null"`
+	ProjectionRank         int    `json:"-" gorm:"not null"`
+	EventTimeMS            int64  `json:"event_time_ms" gorm:"not null;index"`
+	IngestedAtMS           int64  `json:"ingested_at_ms" gorm:"not null;index"`
+	EventKind              string `json:"event_kind" gorm:"type:varchar(48);not null;index"`
+	Granularity            string `json:"granularity" gorm:"type:varchar(8);not null;index"`
+	RouteFingerprintDigest string `json:"-" gorm:"type:char(64);index"`
+	UserDigest             string `json:"-" gorm:"type:char(64);index"`
+	TokenID                int    `json:"-" gorm:"index"`
+	LegacyIdentity         bool   `json:"legacy_identity" gorm:"not null"`
+	RouteBucketKey         string `json:"-" gorm:"type:char(64);index"`
+	KeyBucketKey           string `json:"-" gorm:"type:char(64);index"`
+	RouteMeasuresJSON      string `json:"-" gorm:"type:text;not null"`
+	KeyMeasuresJSON        string `json:"-" gorm:"type:text;not null"`
+}
+
+func (RouteAnalyticsObservationV1) TableName() string { return "route_analytics_observations_v1" }
+
+type RouteAnalyticsBucketV1 struct {
+	BucketKey               string `json:"-" gorm:"type:char(64);primaryKey"`
+	RouteFingerprintDigest  string `json:"-" gorm:"type:char(64);not null;index:idx_route_analytics_lookup,priority:1"`
+	DetailID                string `json:"detail_id" gorm:"type:char(32);not null;index"`
+	BucketStartMS           int64  `json:"bucket_start_ms" gorm:"not null;index:idx_route_analytics_lookup,priority:2"`
+	Granularity             string `json:"granularity" gorm:"type:varchar(8);not null;index:idx_route_analytics_lookup,priority:3"`
+	Model                   string `json:"model" gorm:"type:varchar(255);not null;index"`
+	Endpoint                string `json:"endpoint" gorm:"type:varchar(96);not null;index"`
+	CapabilityContract      string `json:"-" gorm:"type:varchar(191);not null"`
+	LogicalRequests         int64  `json:"logical_requests" gorm:"not null"`
+	FinalSuccesses          int64  `json:"final_successes" gorm:"not null"`
+	FirstHitSuccesses       int64  `json:"first_hit_successes" gorm:"not null"`
+	RetryRecoveries         int64  `json:"retry_recoveries" gorm:"not null"`
+	ConfirmedFailures       int64  `json:"confirmed_failures" gorm:"not null"`
+	TTFTSumMS               int64  `json:"ttft_sum_ms" gorm:"not null"`
+	TTFTCount               int64  `json:"ttft_count" gorm:"not null"`
+	TTFTHistogramJSON       string `json:"-" gorm:"type:text;not null"`
+	CacheReadTokens         int64  `json:"cache_read_tokens" gorm:"not null"`
+	TotalInputTokens        int64  `json:"total_input_tokens" gorm:"not null"`
+	PredictedInputMicros    int64  `json:"predicted_input_micros" gorm:"not null"`
+	PredictedInputTokens    int64  `json:"predicted_input_tokens" gorm:"not null"`
+	HealthAvailableEvents   int64  `json:"health_available_events" gorm:"not null"`
+	HealthUnknownEvents     int64  `json:"health_unknown_events" gorm:"not null"`
+	HealthUnavailableEvents int64  `json:"health_unavailable_events" gorm:"not null"`
+	ProbeSuccesses          int64  `json:"probe_successes" gorm:"not null"`
+	ProbeFailures           int64  `json:"probe_failures" gorm:"not null"`
+	PriceRevisionCountsJSON string `json:"-" gorm:"type:text;not null"`
+	UpdatedAtMS             int64  `json:"updated_at_ms" gorm:"not null;index"`
+}
+
+func (RouteAnalyticsBucketV1) TableName() string { return "route_analytics_buckets_v1" }
+
+type KeyUsageAnalyticsBucketV1 struct {
+	BucketKey     string `json:"-" gorm:"type:char(64);primaryKey"`
+	UserID        int    `json:"-" gorm:"not null;index:idx_key_analytics_lookup,priority:1;index:idx_user_key_analytics_lookup,priority:1"`
+	TokenID       int    `json:"token_id" gorm:"not null;index:idx_key_analytics_lookup,priority:2"`
+	BucketStartMS int64  `json:"bucket_start_ms" gorm:"not null;index:idx_key_analytics_lookup,priority:3;index:idx_user_key_analytics_lookup,priority:3"`
+	Granularity   string `json:"granularity" gorm:"type:varchar(8);not null;index:idx_key_analytics_lookup,priority:4;index:idx_user_key_analytics_lookup,priority:2"`
+	Model         string `json:"model" gorm:"type:varchar(255);not null;index"`
+	Endpoint      string `json:"endpoint" gorm:"type:varchar(96);not null;index"`
+	// Group is the physical Smart Router group that handled the request. Empty
+	// is retained for legacy rows where the group was not recorded.
+	Group             string `json:"group" gorm:"type:varchar(255);index"`
+	LogicalRequests   int64  `json:"logical_requests" gorm:"not null"`
+	Successes         int64  `json:"successes" gorm:"not null"`
+	Failures          int64  `json:"failures" gorm:"not null"`
+	PositiveQuota     int64  `json:"positive_quota" gorm:"not null"`
+	RefundQuota       int64  `json:"refund_quota" gorm:"not null"`
+	InputTokens       int64  `json:"input_tokens" gorm:"not null"`
+	OutputTokens      int64  `json:"output_tokens" gorm:"not null"`
+	CacheReadTokens   int64  `json:"cache_read_tokens" gorm:"not null"`
+	TTFTSumMS         int64  `json:"ttft_sum_ms" gorm:"not null"`
+	TTFTCount         int64  `json:"ttft_count" gorm:"not null"`
+	TTFTHistogramJSON string `json:"-" gorm:"type:text;not null"`
+	UpdatedAtMS       int64  `json:"updated_at_ms" gorm:"not null;index"`
+}
+
+func (KeyUsageAnalyticsBucketV1) TableName() string { return "key_usage_analytics_buckets_v1" }
+
+type RouteAnalyticsHistoryV1 struct {
+	RouteFingerprintDigest string `json:"-" gorm:"type:char(64);primaryKey"`
+	EstimatorVersion       string `json:"estimator_version" gorm:"type:varchar(64);not null"`
+	PayloadJSON            string `json:"-" gorm:"type:text;not null"`
+	UpdatedAtMS            int64  `json:"updated_at_ms" gorm:"not null;index"`
+}
+
+func (RouteAnalyticsHistoryV1) TableName() string { return "route_analytics_history_v1" }
+
+type RouteAnalyticsWorkerStateV1 struct {
+	ID                      string `json:"-" gorm:"type:varchar(32);primaryKey"`
+	WatermarkEventTimeMS    int64  `json:"watermark_event_time_ms" gorm:"not null"`
+	CursorCreatedAt         int64  `json:"cursor_created_at" gorm:"not null"`
+	CursorRequestDigest     string `json:"-" gorm:"type:char(64);not null"`
+	ScanMode                string `json:"scan_mode,omitempty" gorm:"type:varchar(16);not null"`
+	ScanTargetEndMS         int64  `json:"scan_target_end_ms" gorm:"not null"`
+	BackfillCursorCreatedAt int64  `json:"backfill_cursor_created_at" gorm:"not null"`
+	BackfillTargetStartMS   int64  `json:"backfill_target_start_ms" gorm:"not null"`
+	BackfillTargetEndMS     int64  `json:"backfill_target_end_ms" gorm:"not null"`
+	CoverageStartMS         int64  `json:"coverage_start_ms" gorm:"not null"`
+	CoverageEndMS           int64  `json:"coverage_end_ms" gorm:"not null"`
+	FreshnessAtMS           int64  `json:"freshness_at_ms" gorm:"not null"`
+	BackfillInProgress      bool   `json:"backfill_in_progress" gorm:"not null"`
+	PausedUntilMS           int64  `json:"paused_until_ms" gorm:"not null;index"`
+	ConsecutiveFailures     int    `json:"consecutive_failures" gorm:"not null"`
+	LeaseOwner              string `json:"-" gorm:"type:varchar(128);not null;index"`
+	LeaseUntilMS            int64  `json:"-" gorm:"not null;index"`
+	LastError               string `json:"last_error,omitempty" gorm:"type:text"`
+	UpdatedAtMS             int64  `json:"updated_at_ms" gorm:"not null;index"`
+}
+
+func (RouteAnalyticsWorkerStateV1) TableName() string { return "route_analytics_worker_state_v1" }
+
+type RouteAnalyticsBucketIdentityV1 struct {
+	BucketKey              string
+	RouteFingerprintDigest string
+	DetailID               string
+	BucketStartMS          int64
+	Granularity            string
+	Model                  string
+	Endpoint               string
+	CapabilityContract     string
+}
+
+type KeyUsageAnalyticsBucketIdentityV1 struct {
+	BucketKey     string
+	UserID        int
+	TokenID       int
+	BucketStartMS int64
+	Granularity   string
+	Model         string
+	Endpoint      string
+	Group         string
+}
+
+type RouteAnalyticsMeasuresV1 struct {
+	LogicalRequests         int64  `json:"logical_requests,omitempty"`
+	FinalSuccesses          int64  `json:"final_successes,omitempty"`
+	FirstHitSuccesses       int64  `json:"first_hit_successes,omitempty"`
+	RetryRecoveries         int64  `json:"retry_recoveries,omitempty"`
+	ConfirmedFailures       int64  `json:"confirmed_failures,omitempty"`
+	TTFTMS                  *int64 `json:"ttft_ms,omitempty"`
+	CacheReadTokens         int64  `json:"cache_read_tokens,omitempty"`
+	TotalInputTokens        int64  `json:"total_input_tokens,omitempty"`
+	PredictedInputMicros    int64  `json:"predicted_input_micros,omitempty"`
+	PredictedInputTokens    int64  `json:"predicted_input_tokens,omitempty"`
+	HealthAvailableEvents   int64  `json:"health_available_events,omitempty"`
+	HealthUnknownEvents     int64  `json:"health_unknown_events,omitempty"`
+	HealthUnavailableEvents int64  `json:"health_unavailable_events,omitempty"`
+	ProbeSuccesses          int64  `json:"probe_successes,omitempty"`
+	ProbeFailures           int64  `json:"probe_failures,omitempty"`
+	PriceRevision           string `json:"price_revision,omitempty"`
+}
+
+type KeyUsageAnalyticsMeasuresV1 struct {
+	LogicalRequests int64  `json:"logical_requests,omitempty"`
+	Successes       int64  `json:"successes,omitempty"`
+	Failures        int64  `json:"failures,omitempty"`
+	PositiveQuota   int64  `json:"positive_quota,omitempty"`
+	RefundQuota     int64  `json:"refund_quota,omitempty"`
+	InputTokens     int64  `json:"input_tokens,omitempty"`
+	OutputTokens    int64  `json:"output_tokens,omitempty"`
+	CacheReadTokens int64  `json:"cache_read_tokens,omitempty"`
+	TTFTMS          *int64 `json:"ttft_ms,omitempty"`
+}
+
+type RouteAnalyticsProjectionV1 struct {
+	ObservationDigest      string
+	ProjectionHash         string
+	ProjectionRank         int
+	EventTimeMS            int64
+	IngestedAtMS           int64
+	EventKind              string
+	Granularity            string
+	RouteFingerprintDigest string
+	UserDigest             string
+	TokenID                int
+	LegacyIdentity         bool
+	RouteBucket            *RouteAnalyticsBucketIdentityV1
+	KeyBucket              *KeyUsageAnalyticsBucketIdentityV1
+	RouteMeasures          RouteAnalyticsMeasuresV1
+	KeyMeasures            KeyUsageAnalyticsMeasuresV1
+}
+
+func EnsureRouteAnalyticsDimensionV1(ctx context.Context, dimension RouteAnalyticsDimensionV1) (RouteAnalyticsDimensionV1, error) {
+	if DB == nil {
+		return RouteAnalyticsDimensionV1{}, errors.New("main database is not initialized")
+	}
+	dimension.RouteFingerprintDigest = strings.TrimSpace(dimension.RouteFingerprintDigest)
+	if !validAnalyticsHex(dimension.RouteFingerprintDigest, 64) {
+		return RouteAnalyticsDimensionV1{}, errors.New("route fingerprint digest must be 64 hexadecimal characters")
+	}
+	dimension.DetailID = strings.TrimSpace(dimension.DetailID)
+	if dimension.DetailID != "" && !validAnalyticsHex(dimension.DetailID, 32) {
+		return RouteAnalyticsDimensionV1{}, errors.New("route analytics detail id must be 32 hexadecimal characters")
+	}
+	dimension.ChannelGeneration = strings.TrimSpace(dimension.ChannelGeneration)
+	dimension.UpstreamModel = strings.TrimSpace(dimension.UpstreamModel)
+	dimension.Model = strings.TrimSpace(dimension.Model)
+	dimension.Endpoint = strings.TrimSpace(dimension.Endpoint)
+	dimension.CapabilityContract = strings.TrimSpace(dimension.CapabilityContract)
+	dimension.PublicGroupName = strings.TrimSpace(dimension.PublicGroupName)
+	dimension.ProjectionVersion = strings.TrimSpace(dimension.ProjectionVersion)
+	if dimension.ChannelID <= 0 || dimension.ChannelGeneration == "" || dimension.UpstreamModel == "" ||
+		dimension.Model == "" || dimension.Endpoint == "" || dimension.CapabilityContract == "" ||
+		dimension.PublicGroupName == "" || dimension.ProjectionVersion == "" || dimension.GroupRatioPPM < 0 {
+		return RouteAnalyticsDimensionV1{}, errors.New("route analytics dimension is incomplete")
+	}
+	nowMS := time.Now().UnixMilli()
+	if dimension.FirstSeenAtMS <= 0 {
+		dimension.FirstSeenAtMS = nowMS
+	}
+	if dimension.LastSeenAtMS <= 0 {
+		dimension.LastSeenAtMS = nowMS
+	}
+	if dimension.DetailID == "" {
+		buffer := make([]byte, 16)
+		if _, err := rand.Read(buffer); err != nil {
+			return RouteAnalyticsDimensionV1{}, err
+		}
+		dimension.DetailID = hex.EncodeToString(buffer)
+	}
+	result := DB.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "route_fingerprint_digest"}}, DoNothing: true}).Create(&dimension)
+	if result.Error != nil {
+		return RouteAnalyticsDimensionV1{}, result.Error
+	}
+	if result.RowsAffected == 1 {
+		return dimension, nil
+	}
+	var existing RouteAnalyticsDimensionV1
+	if err := DB.WithContext(ctx).Where("route_fingerprint_digest = ?", dimension.RouteFingerprintDigest).First(&existing).Error; err != nil {
+		return RouteAnalyticsDimensionV1{}, err
+	}
+	if dimension.LastSeenAtMS > existing.LastSeenAtMS {
+		if err := DB.WithContext(ctx).Model(&RouteAnalyticsDimensionV1{}).
+			Where("detail_id = ?", existing.DetailID).
+			Updates(map[string]any{"last_seen_at_ms": dimension.LastSeenAtMS, "public_group_name": dimension.PublicGroupName,
+				"group_ratio_ppm": dimension.GroupRatioPPM, "projection_version": dimension.ProjectionVersion}).Error; err != nil {
+			return RouteAnalyticsDimensionV1{}, err
+		}
+		existing.LastSeenAtMS = dimension.LastSeenAtMS
+		existing.PublicGroupName = dimension.PublicGroupName
+		existing.GroupRatioPPM = dimension.GroupRatioPPM
+		existing.ProjectionVersion = dimension.ProjectionVersion
+	}
+	return existing, nil
+}
+
+func ApplyRouteAnalyticsProjectionsV1(ctx context.Context, projections []RouteAnalyticsProjectionV1) (int, error) {
+	if DB == nil {
+		return 0, errors.New("main database is not initialized")
+	}
+	applied := 0
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, projection := range projections {
+			changed, err := applyRouteAnalyticsProjectionV1(tx, projection)
+			if err != nil {
+				return err
+			}
+			if changed {
+				applied++
+			}
+		}
+		return nil
+	})
+	return applied, err
+}
+
+func applyRouteAnalyticsProjectionV1(tx *gorm.DB, projection RouteAnalyticsProjectionV1) (bool, error) {
+	if tx == nil {
+		return false, errors.New("analytics transaction is nil")
+	}
+	projection.ObservationDigest = strings.TrimSpace(projection.ObservationDigest)
+	projection.ProjectionHash = strings.TrimSpace(projection.ProjectionHash)
+	projection.RouteFingerprintDigest = strings.TrimSpace(projection.RouteFingerprintDigest)
+	projection.UserDigest = strings.TrimSpace(projection.UserDigest)
+	projection.EventKind = strings.TrimSpace(projection.EventKind)
+	if projection.RouteBucket != nil {
+		projection.RouteBucket.BucketKey = strings.TrimSpace(projection.RouteBucket.BucketKey)
+	}
+	if projection.KeyBucket != nil {
+		projection.KeyBucket.BucketKey = strings.TrimSpace(projection.KeyBucket.BucketKey)
+	}
+	if !validAnalyticsHex(projection.ObservationDigest, 64) || !validAnalyticsHex(projection.ProjectionHash, 64) {
+		return false, errors.New("analytics observation and projection hashes must be 64 hexadecimal characters")
+	}
+	if projection.RouteFingerprintDigest != "" && !validAnalyticsHex(projection.RouteFingerprintDigest, 64) {
+		return false, errors.New("route fingerprint digest must be 64 hexadecimal characters")
+	}
+	if projection.UserDigest != "" && !validAnalyticsHex(projection.UserDigest, 64) {
+		return false, errors.New("user digest must be 64 hexadecimal characters")
+	}
+	if projection.EventKind == "" || projection.ProjectionRank < 0 || projection.EventTimeMS <= 0 ||
+		(projection.Granularity != RouteAnalyticsGranularity5m && projection.Granularity != RouteAnalyticsGranularity1h) {
+		return false, errors.New("analytics projection has invalid event time or granularity")
+	}
+	if err := validateRouteAnalyticsMeasuresV1(projection.RouteMeasures); err != nil {
+		return false, err
+	}
+	if err := validateKeyUsageAnalyticsMeasuresV1(projection.KeyMeasures); err != nil {
+		return false, err
+	}
+	if err := validateRouteAnalyticsBucketIdentityV1(projection, projection.RouteBucket); err != nil {
+		return false, err
+	}
+	if err := validateKeyUsageAnalyticsBucketIdentityV1(projection, projection.KeyBucket); err != nil {
+		return false, err
+	}
+	if projection.IngestedAtMS <= 0 {
+		projection.IngestedAtMS = time.Now().UnixMilli()
+	}
+	routeJSON, err := common.Marshal(projection.RouteMeasures)
+	if err != nil {
+		return false, err
+	}
+	keyJSON, err := common.Marshal(projection.KeyMeasures)
+	if err != nil {
+		return false, err
+	}
+	row := RouteAnalyticsObservationV1{
+		ObservationDigest: projection.ObservationDigest, ProjectionHash: projection.ProjectionHash,
+		ProjectionRank: projection.ProjectionRank,
+		EventTimeMS:    projection.EventTimeMS, IngestedAtMS: projection.IngestedAtMS,
+		EventKind: projection.EventKind, Granularity: projection.Granularity,
+		RouteFingerprintDigest: projection.RouteFingerprintDigest, UserDigest: projection.UserDigest,
+		TokenID: projection.TokenID, LegacyIdentity: projection.LegacyIdentity,
+		RouteMeasuresJSON: string(routeJSON), KeyMeasuresJSON: string(keyJSON),
+	}
+	if projection.RouteBucket != nil {
+		row.RouteBucketKey = projection.RouteBucket.BucketKey
+	}
+	if projection.KeyBucket != nil {
+		row.KeyBucketKey = projection.KeyBucket.BucketKey
+	}
+	insert := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+	if insert.Error != nil {
+		return false, insert.Error
+	}
+	if insert.RowsAffected == 1 {
+		if err := applyRouteAnalyticsBucketDeltaV1(tx, projection.RouteBucket, projection.RouteMeasures, 1, projection.IngestedAtMS); err != nil {
+			return false, err
+		}
+		if err := applyKeyUsageAnalyticsBucketDeltaV1(tx, projection.KeyBucket, projection.KeyMeasures, 1, projection.IngestedAtMS); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	var existing RouteAnalyticsObservationV1
+	if err := lockForUpdate(tx).Where("observation_digest = ?", projection.ObservationDigest).First(&existing).Error; err != nil {
+		return false, err
+	}
+	if existing.ProjectionHash == projection.ProjectionHash {
+		return false, nil
+	}
+	if existing.ProjectionRank > projection.ProjectionRank ||
+		(existing.ProjectionRank == projection.ProjectionRank && existing.EventTimeMS > projection.EventTimeMS) {
+		return false, nil
+	}
+	var oldRoute RouteAnalyticsMeasuresV1
+	var oldKey KeyUsageAnalyticsMeasuresV1
+	if err := common.UnmarshalJsonStr(existing.RouteMeasuresJSON, &oldRoute); err != nil {
+		return false, fmt.Errorf("decode prior route analytics projection: %w", err)
+	}
+	if err := common.UnmarshalJsonStr(existing.KeyMeasuresJSON, &oldKey); err != nil {
+		return false, fmt.Errorf("decode prior key analytics projection: %w", err)
+	}
+	if existingRouteBucketKey := strings.TrimSpace(existing.RouteBucketKey); existingRouteBucketKey != "" {
+		if err := applyRouteAnalyticsBucketDeltaByKeyV1(tx, existingRouteBucketKey, oldRoute, -1, projection.IngestedAtMS); err != nil {
+			return false, err
+		}
+	}
+	if existingKeyBucketKey := strings.TrimSpace(existing.KeyBucketKey); existingKeyBucketKey != "" {
+		if err := applyKeyUsageAnalyticsBucketDeltaByKeyV1(tx, existingKeyBucketKey, oldKey, -1, projection.IngestedAtMS); err != nil {
+			return false, err
+		}
+	}
+	if err := applyRouteAnalyticsBucketDeltaV1(tx, projection.RouteBucket, projection.RouteMeasures, 1, projection.IngestedAtMS); err != nil {
+		return false, err
+	}
+	if err := applyKeyUsageAnalyticsBucketDeltaV1(tx, projection.KeyBucket, projection.KeyMeasures, 1, projection.IngestedAtMS); err != nil {
+		return false, err
+	}
+	return true, tx.Model(&RouteAnalyticsObservationV1{}).
+		Where("observation_digest = ?", projection.ObservationDigest).
+		Updates(routeAnalyticsObservationUpdateMapV1(row)).Error
+}
+
+func applyRouteAnalyticsBucketDeltaV1(tx *gorm.DB, identity *RouteAnalyticsBucketIdentityV1, measures RouteAnalyticsMeasuresV1, sign int64, nowMS int64) error {
+	if identity == nil {
+		return nil
+	}
+	if sign < 0 {
+		return errors.New("cannot subtract a route analytics bucket without its prior identity")
+	}
+	seed := RouteAnalyticsBucketV1{
+		BucketKey: identity.BucketKey, RouteFingerprintDigest: identity.RouteFingerprintDigest,
+		DetailID: identity.DetailID, BucketStartMS: identity.BucketStartMS, Granularity: identity.Granularity,
+		Model: identity.Model, Endpoint: identity.Endpoint, CapabilityContract: identity.CapabilityContract,
+		TTFTHistogramJSON: "[]", PriceRevisionCountsJSON: "{}",
+	}
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&seed).Error; err != nil {
+		return err
+	}
+	var bucket RouteAnalyticsBucketV1
+	if err := lockForUpdate(tx).Where("bucket_key = ?", identity.BucketKey).First(&bucket).Error; err != nil {
+		return err
+	}
+	if err := mutateRouteAnalyticsBucketV1(&bucket, measures, sign, nowMS); err != nil {
+		return err
+	}
+	if bucket.UpdatedAtMS == 0 {
+		return errors.New("route analytics bucket mutation did not set update time")
+	}
+	return tx.Save(&bucket).Error
+}
+
+func applyRouteAnalyticsBucketDeltaByKeyV1(tx *gorm.DB, bucketKey string, measures RouteAnalyticsMeasuresV1, sign int64, nowMS int64) error {
+	bucketKey = strings.TrimSpace(bucketKey)
+	if bucketKey == "" {
+		if sign < 0 {
+			return nil
+		}
+		return errors.New("route analytics bucket key is empty")
+	}
+	var bucket RouteAnalyticsBucketV1
+	if err := lockForUpdate(tx).Where("bucket_key = ?", bucketKey).First(&bucket).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) && sign < 0 {
+			// Retention can prune a time bucket before its deduplication
+			// observation. Its aggregate contribution is already zero, so a
+			// later higher-rank replay has nothing left to subtract.
+			return nil
+		}
+		return err
+	}
+	if err := mutateRouteAnalyticsBucketV1(&bucket, measures, sign, nowMS); err != nil {
+		return err
+	}
+	return tx.Save(&bucket).Error
+}
+
+func mutateRouteAnalyticsBucketV1(bucket *RouteAnalyticsBucketV1, measures RouteAnalyticsMeasuresV1, sign int64, nowMS int64) error {
+	if bucket == nil || (sign != 1 && sign != -1) {
+		return errors.New("invalid route analytics bucket mutation")
+	}
+	fields := []struct {
+		name    string
+		current *int64
+		delta   int64
+	}{
+		{"logical requests", &bucket.LogicalRequests, measures.LogicalRequests},
+		{"final successes", &bucket.FinalSuccesses, measures.FinalSuccesses},
+		{"first hit successes", &bucket.FirstHitSuccesses, measures.FirstHitSuccesses},
+		{"retry recoveries", &bucket.RetryRecoveries, measures.RetryRecoveries},
+		{"confirmed failures", &bucket.ConfirmedFailures, measures.ConfirmedFailures},
+		{"cache read tokens", &bucket.CacheReadTokens, measures.CacheReadTokens},
+		{"total input tokens", &bucket.TotalInputTokens, measures.TotalInputTokens},
+		{"predicted input micros", &bucket.PredictedInputMicros, measures.PredictedInputMicros},
+		{"predicted input tokens", &bucket.PredictedInputTokens, measures.PredictedInputTokens},
+		{"health available events", &bucket.HealthAvailableEvents, measures.HealthAvailableEvents},
+		{"health unknown events", &bucket.HealthUnknownEvents, measures.HealthUnknownEvents},
+		{"health unavailable events", &bucket.HealthUnavailableEvents, measures.HealthUnavailableEvents},
+		{"probe successes", &bucket.ProbeSuccesses, measures.ProbeSuccesses},
+		{"probe failures", &bucket.ProbeFailures, measures.ProbeFailures},
+	}
+	for _, field := range fields {
+		value, err := applyAnalyticsMeasureDeltaV1(*field.current, field.delta, sign, "route analytics "+field.name)
+		if err != nil {
+			return fmt.Errorf("route analytics %s: %w", field.name, err)
+		}
+		*field.current = value
+	}
+	if measures.TTFTMS != nil {
+		var err error
+		bucket.TTFTSumMS, err = applyAnalyticsMeasureDeltaV1(bucket.TTFTSumMS, *measures.TTFTMS, sign, "route analytics TTFT sum")
+		if err != nil {
+			return fmt.Errorf("route analytics TTFT sum: %w", err)
+		}
+		bucket.TTFTCount, err = applyAnalyticsMeasureDeltaV1(bucket.TTFTCount, 1, sign, "route analytics TTFT count")
+		if err != nil {
+			return fmt.Errorf("route analytics TTFT count: %w", err)
+		}
+		histogram, err := mutateTTFTHistogram(bucket.TTFTHistogramJSON, *measures.TTFTMS, sign)
+		if err != nil && sign < 0 && strings.Contains(err.Error(), "would become negative") {
+			common.SysLog("route analytics replay correction clamped route TTFT histogram to zero")
+			histogram, err = "[]", nil
+		}
+		if err != nil {
+			return err
+		}
+		bucket.TTFTHistogramJSON = histogram
+	}
+	if measures.PriceRevision != "" {
+		updated, err := mutateStringCounterJSON(bucket.PriceRevisionCountsJSON, measures.PriceRevision, sign)
+		if err != nil && sign < 0 && strings.Contains(err.Error(), "would become negative") {
+			common.SysLog("route analytics replay correction removed missing price revision counter")
+			updated, err = mutateStringCounterJSON(bucket.PriceRevisionCountsJSON, measures.PriceRevision, 0)
+		}
+		if err != nil {
+			return err
+		}
+		bucket.PriceRevisionCountsJSON = updated
+	}
+	bucket.UpdatedAtMS = nowMS
+	return nil
+}
+
+func applyKeyUsageAnalyticsBucketDeltaV1(tx *gorm.DB, identity *KeyUsageAnalyticsBucketIdentityV1, measures KeyUsageAnalyticsMeasuresV1, sign int64, nowMS int64) error {
+	if identity == nil {
+		return nil
+	}
+	if sign < 0 {
+		return errors.New("cannot subtract a key analytics bucket without its prior identity")
+	}
+	seed := KeyUsageAnalyticsBucketV1{
+		BucketKey: identity.BucketKey, UserID: identity.UserID, TokenID: identity.TokenID,
+		BucketStartMS: identity.BucketStartMS, Granularity: identity.Granularity,
+		Model: identity.Model, Endpoint: identity.Endpoint, Group: identity.Group, TTFTHistogramJSON: "[]",
+	}
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&seed).Error; err != nil {
+		return err
+	}
+	var bucket KeyUsageAnalyticsBucketV1
+	if err := lockForUpdate(tx).Where("bucket_key = ?", identity.BucketKey).First(&bucket).Error; err != nil {
+		return err
+	}
+	if err := mutateKeyUsageAnalyticsBucketV1(&bucket, measures, sign, nowMS); err != nil {
+		return err
+	}
+	return tx.Save(&bucket).Error
+}
+
+func applyKeyUsageAnalyticsBucketDeltaByKeyV1(tx *gorm.DB, bucketKey string, measures KeyUsageAnalyticsMeasuresV1, sign int64, nowMS int64) error {
+	var bucket KeyUsageAnalyticsBucketV1
+	if err := lockForUpdate(tx).Where("bucket_key = ?", bucketKey).First(&bucket).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) && sign < 0 {
+			// See the route-bucket counterpart above: a pruned aggregate has
+			// no remaining contribution to subtract during replay correction.
+			return nil
+		}
+		return err
+	}
+	if err := mutateKeyUsageAnalyticsBucketV1(&bucket, measures, sign, nowMS); err != nil {
+		return err
+	}
+	return tx.Save(&bucket).Error
+}
+
+func mutateKeyUsageAnalyticsBucketV1(bucket *KeyUsageAnalyticsBucketV1, measures KeyUsageAnalyticsMeasuresV1, sign int64, nowMS int64) error {
+	if bucket == nil || (sign != 1 && sign != -1) {
+		return errors.New("invalid key analytics bucket mutation")
+	}
+	fields := []struct {
+		name    string
+		current *int64
+		delta   int64
+	}{
+		{"logical requests", &bucket.LogicalRequests, measures.LogicalRequests},
+		{"successes", &bucket.Successes, measures.Successes},
+		{"failures", &bucket.Failures, measures.Failures},
+		{"positive quota", &bucket.PositiveQuota, measures.PositiveQuota},
+		{"refund quota", &bucket.RefundQuota, measures.RefundQuota},
+		{"input tokens", &bucket.InputTokens, measures.InputTokens},
+		{"output tokens", &bucket.OutputTokens, measures.OutputTokens},
+		{"cache read tokens", &bucket.CacheReadTokens, measures.CacheReadTokens},
+	}
+	for _, field := range fields {
+		value, err := applyAnalyticsMeasureDeltaV1(*field.current, field.delta, sign, "key analytics "+field.name)
+		if err != nil {
+			return fmt.Errorf("key analytics %s: %w", field.name, err)
+		}
+		*field.current = value
+	}
+	if measures.TTFTMS != nil {
+		var err error
+		bucket.TTFTSumMS, err = applyAnalyticsMeasureDeltaV1(bucket.TTFTSumMS, *measures.TTFTMS, sign, "key analytics TTFT sum")
+		if err != nil {
+			return fmt.Errorf("key analytics TTFT sum: %w", err)
+		}
+		bucket.TTFTCount, err = applyAnalyticsMeasureDeltaV1(bucket.TTFTCount, 1, sign, "key analytics TTFT count")
+		if err != nil {
+			return fmt.Errorf("key analytics TTFT count: %w", err)
+		}
+		histogram, err := mutateTTFTHistogram(bucket.TTFTHistogramJSON, *measures.TTFTMS, sign)
+		if err != nil && sign < 0 && strings.Contains(err.Error(), "would become negative") {
+			common.SysLog("key analytics replay correction clamped TTFT histogram to zero")
+			histogram, err = "[]", nil
+		}
+		if err != nil {
+			return err
+		}
+		bucket.TTFTHistogramJSON = histogram
+	}
+	bucket.UpdatedAtMS = nowMS
+	return nil
+}
+
+var ttftHistogramUpperBoundsMS = []int64{100, 250, 500, 1_000, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000, 45_000, 60_000, 90_000, 120_000, 180_000, 300_000, math.MaxInt64}
+
+func mutateTTFTHistogram(raw string, value int64, delta int64) (string, error) {
+	if value < 0 {
+		return "", errors.New("TTFT cannot be negative")
+	}
+	counts := make([]int64, len(ttftHistogramUpperBoundsMS))
+	if strings.TrimSpace(raw) != "" && strings.TrimSpace(raw) != "[]" {
+		if err := common.UnmarshalJsonStr(raw, &counts); err != nil {
+			return "", err
+		}
+		if len(counts) != len(ttftHistogramUpperBoundsMS) {
+			return "", errors.New("TTFT histogram schema mismatch")
+		}
+	}
+	index := len(ttftHistogramUpperBoundsMS) - 1
+	for current, upper := range ttftHistogramUpperBoundsMS {
+		if value <= upper {
+			index = current
+			break
+		}
+	}
+	counts[index] += delta
+	if counts[index] < 0 {
+		return "", errors.New("TTFT histogram correction would become negative")
+	}
+	encoded, err := common.Marshal(counts)
+	return string(encoded), err
+}
+
+func mutateStringCounterJSON(raw string, key string, delta int64) (string, error) {
+	values := map[string]int64{}
+	if strings.TrimSpace(raw) != "" && strings.TrimSpace(raw) != "{}" {
+		if err := common.UnmarshalJsonStr(raw, &values); err != nil {
+			return "", err
+		}
+	}
+	values[key] += delta
+	if values[key] < 0 {
+		return "", errors.New("string counter correction would become negative")
+	}
+	if values[key] == 0 {
+		delete(values, key)
+	}
+	encoded, err := common.Marshal(values)
+	return string(encoded), err
+}
+
+func validAnalyticsHex(value string, expectedLength int) bool {
+	if len(value) != expectedLength {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validateRouteAnalyticsMeasuresV1(measures RouteAnalyticsMeasuresV1) error {
+	values := []int64{
+		measures.LogicalRequests,
+		measures.FinalSuccesses,
+		measures.FirstHitSuccesses,
+		measures.RetryRecoveries,
+		measures.ConfirmedFailures,
+		measures.CacheReadTokens,
+		measures.TotalInputTokens,
+		measures.PredictedInputMicros,
+		measures.PredictedInputTokens,
+		measures.HealthAvailableEvents,
+		measures.HealthUnknownEvents,
+		measures.HealthUnavailableEvents,
+		measures.ProbeSuccesses,
+		measures.ProbeFailures,
+	}
+	for _, value := range values {
+		if value < 0 {
+			return errors.New("route analytics measures cannot be negative")
+		}
+	}
+	if measures.TTFTMS != nil && *measures.TTFTMS < 0 {
+		return errors.New("route analytics TTFT cannot be negative")
+	}
+	if len(measures.PriceRevision) > 128 {
+		return errors.New("route analytics price revision is too long")
+	}
+	return nil
+}
+
+func validateKeyUsageAnalyticsMeasuresV1(measures KeyUsageAnalyticsMeasuresV1) error {
+	values := []int64{
+		measures.LogicalRequests,
+		measures.Successes,
+		measures.Failures,
+		measures.PositiveQuota,
+		measures.RefundQuota,
+		measures.InputTokens,
+		measures.OutputTokens,
+		measures.CacheReadTokens,
+	}
+	for _, value := range values {
+		if value < 0 {
+			return errors.New("key analytics measures cannot be negative")
+		}
+	}
+	if measures.TTFTMS != nil && *measures.TTFTMS < 0 {
+		return errors.New("key analytics TTFT cannot be negative")
+	}
+	return nil
+}
+
+func validateRouteAnalyticsBucketIdentityV1(projection RouteAnalyticsProjectionV1, identity *RouteAnalyticsBucketIdentityV1) error {
+	if identity == nil {
+		if !routeAnalyticsMeasuresEmptyV1(projection.RouteMeasures) {
+			return errors.New("route analytics measures require a route bucket")
+		}
+		return nil
+	}
+	if !validAnalyticsHex(strings.TrimSpace(identity.BucketKey), 64) ||
+		!validAnalyticsHex(strings.TrimSpace(identity.RouteFingerprintDigest), 64) ||
+		!validAnalyticsHex(strings.TrimSpace(identity.DetailID), 32) {
+		return errors.New("route analytics bucket identity has an invalid digest")
+	}
+	if strings.TrimSpace(identity.RouteFingerprintDigest) != projection.RouteFingerprintDigest ||
+		identity.Granularity != projection.Granularity ||
+		strings.TrimSpace(identity.Model) == "" || strings.TrimSpace(identity.Endpoint) == "" ||
+		strings.TrimSpace(identity.CapabilityContract) == "" {
+		return errors.New("route analytics bucket identity does not match its projection")
+	}
+	if identity.BucketStartMS != analyticsBucketStartMS(projection.EventTimeMS, projection.Granularity) {
+		return errors.New("route analytics bucket start does not match event time")
+	}
+	return nil
+}
+
+func validateKeyUsageAnalyticsBucketIdentityV1(projection RouteAnalyticsProjectionV1, identity *KeyUsageAnalyticsBucketIdentityV1) error {
+	if identity == nil {
+		if !keyUsageAnalyticsMeasuresEmptyV1(projection.KeyMeasures) {
+			return errors.New("key analytics measures require a key bucket")
+		}
+		return nil
+	}
+	if !validAnalyticsHex(strings.TrimSpace(identity.BucketKey), 64) || identity.UserID <= 0 || identity.TokenID <= 0 ||
+		identity.TokenID != projection.TokenID || identity.Granularity != projection.Granularity ||
+		strings.TrimSpace(identity.Model) == "" || strings.TrimSpace(identity.Endpoint) == "" {
+		return errors.New("key analytics bucket identity does not match its projection")
+	}
+	if identity.BucketStartMS != analyticsBucketStartMS(projection.EventTimeMS, projection.Granularity) {
+		return errors.New("key analytics bucket start does not match event time")
+	}
+	return nil
+}
+
+func routeAnalyticsMeasuresEmptyV1(measures RouteAnalyticsMeasuresV1) bool {
+	return measures.LogicalRequests == 0 && measures.FinalSuccesses == 0 && measures.FirstHitSuccesses == 0 &&
+		measures.RetryRecoveries == 0 && measures.ConfirmedFailures == 0 && measures.TTFTMS == nil &&
+		measures.CacheReadTokens == 0 && measures.TotalInputTokens == 0 && measures.PredictedInputMicros == 0 &&
+		measures.PredictedInputTokens == 0 && measures.HealthAvailableEvents == 0 &&
+		measures.HealthUnknownEvents == 0 && measures.HealthUnavailableEvents == 0 &&
+		measures.ProbeSuccesses == 0 && measures.ProbeFailures == 0 && measures.PriceRevision == ""
+}
+
+func keyUsageAnalyticsMeasuresEmptyV1(measures KeyUsageAnalyticsMeasuresV1) bool {
+	return measures.LogicalRequests == 0 && measures.Successes == 0 && measures.Failures == 0 &&
+		measures.PositiveQuota == 0 && measures.RefundQuota == 0 && measures.InputTokens == 0 &&
+		measures.OutputTokens == 0 && measures.CacheReadTokens == 0 && measures.TTFTMS == nil
+}
+
+func analyticsBucketStartMS(eventTimeMS int64, granularity string) int64 {
+	widthMS := int64((5 * time.Minute) / time.Millisecond)
+	if granularity == RouteAnalyticsGranularity1h {
+		widthMS = int64(time.Hour / time.Millisecond)
+	}
+	return eventTimeMS - eventTimeMS%widthMS
+}
+
+func addAnalyticsMeasureV1(current int64, delta int64, sign int64) (int64, error) {
+	if current < 0 || delta < 0 || (sign != 1 && sign != -1) {
+		return 0, errors.New("invalid additive measure")
+	}
+	if sign > 0 {
+		if current > math.MaxInt64-delta {
+			return 0, errors.New("additive measure would overflow")
+		}
+		return current + delta, nil
+	}
+	if current < delta {
+		return 0, errors.New("additive measure would become negative")
+	}
+	return current - delta, nil
+}
+
+// applyAnalyticsMeasureDeltaV1 keeps replay corrections convergent after a
+// bucket was partially pruned or corrected by another worker. Forward writes
+// remain strict; only a negative replay delta may floor an already exhausted
+// aggregate at zero. The clamp is logged so data repair is observable rather
+// than silently discarded.
+func applyAnalyticsMeasureDeltaV1(current int64, delta int64, sign int64, field string) (int64, error) {
+	value, err := addAnalyticsMeasureV1(current, delta, sign)
+	if err != nil && sign < 0 && strings.Contains(err.Error(), "would become negative") {
+		common.SysLog(field + " replay correction clamped to zero")
+		return 0, nil
+	}
+	return value, err
+}
+
+func routeAnalyticsObservationUpdateMapV1(row RouteAnalyticsObservationV1) map[string]any {
+	return map[string]any{
+		"projection_hash":          row.ProjectionHash,
+		"projection_rank":          row.ProjectionRank,
+		"event_time_ms":            row.EventTimeMS,
+		"ingested_at_ms":           row.IngestedAtMS,
+		"event_kind":               row.EventKind,
+		"granularity":              row.Granularity,
+		"route_fingerprint_digest": row.RouteFingerprintDigest,
+		"user_digest":              row.UserDigest,
+		"token_id":                 row.TokenID,
+		"legacy_identity":          row.LegacyIdentity,
+		"route_bucket_key":         row.RouteBucketKey,
+		"key_bucket_key":           row.KeyBucketKey,
+		"route_measures_json":      row.RouteMeasuresJSON,
+		"key_measures_json":        row.KeyMeasuresJSON,
+	}
+}

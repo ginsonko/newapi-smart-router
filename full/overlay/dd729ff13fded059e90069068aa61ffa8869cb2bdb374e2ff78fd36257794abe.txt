@@ -1,0 +1,151 @@
+package openai
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func newClaudeEntryTestContext(t *testing.T, path string, body string) (*gin.Context, *httptest.ResponseRecorder, *http.Response, *relaycommon.RelayInfo) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	if oldTimeout <= 0 {
+		constant.StreamingTimeout = 30
+		t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, path, nil)
+	c.Set(common.RequestIdKey, "claude-entry-test")
+	now := time.Now()
+	info := &relaycommon.RelayInfo{
+		StartTime:         now,
+		FirstResponseTime: now.Add(-time.Second),
+		RelayMode:         relayconstant.RelayModeChatCompletions,
+		RelayFormat:       types.RelayFormatClaude,
+		IsStream:          true,
+		DisablePing:       true,
+		ChannelMeta:       &relaycommon.ChannelMeta{UpstreamModelName: "claude-power"},
+		ClaudeConvertInfo: relaycommon.NewClaudeConvertInfo(),
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	return c, recorder, resp, info
+}
+
+func TestOaiStreamHandlerClaudeEntryProducesLegalToolLifecycle(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"id":"chatcmpl_1","model":"claude-power","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_1","model":"claude-power","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_1","model":"claude-power","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	c, recorder, resp, info := newClaudeEntryTestContext(t, "/v1/chat/completions", body)
+	usage, apiErr := OaiStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	require.Equal(t, 5, usage.TotalTokens)
+
+	output := recorder.Body.String()
+	require.Contains(t, output, "event: message_start")
+	require.Contains(t, output, "event: content_block_start")
+	require.Contains(t, output, "\"type\":\"tool_use\"")
+	require.Contains(t, output, "event: content_block_delta")
+	require.Contains(t, output, "event: content_block_stop")
+	require.Contains(t, output, "event: message_stop")
+	require.Equal(t, 2, strings.Count(output, "event: content_block_start\n"))
+	require.Equal(t, 2, strings.Count(output, "event: content_block_stop\n"))
+	assertClaudeEntryEventOrder(t, output,
+		"event: message_start",
+		"event: content_block_start",
+		"event: content_block_delta",
+		"event: content_block_stop",
+		"event: message_stop",
+	)
+}
+
+func TestOaiStreamHandlerClaudeEntryStopsOnMalformedToolLifecycle(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"id":"chatcmpl_2","model":"claude-power","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_2","model":"claude-power","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	c, recorder, resp, info := newClaudeEntryTestContext(t, "/v1/chat/completions", body)
+	usage, apiErr := OaiStreamHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	require.True(t, types.IsSkipRetryError(apiErr))
+	require.Contains(t, apiErr.Error(), "valid name")
+	// The malformed stream is terminated; no second upstream attempt is made
+	// by this entry handler, and no fabricated block stop is emitted.
+	require.NotContains(t, recorder.Body.String(), "event: content_block_stop")
+}
+
+func TestOaiResponsesToChatClaudeEntryProducesLegalToolLifecycle(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	if oldTimeout <= 0 {
+		constant.StreamingTimeout = 30
+		t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	}
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"claude-power","created_at":1710000000}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup"}}`,
+		`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"q\":\"x\"}"}`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	info.RelayFormat = types.RelayFormatClaude
+	info.ClaudeConvertInfo = relaycommon.NewClaudeConvertInfo()
+
+	usage, apiErr := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	require.Equal(t, 5, usage.TotalTokens)
+	output := recorder.Body.String()
+	require.Contains(t, output, "event: message_start")
+	require.Contains(t, output, "event: content_block_start")
+	require.Contains(t, output, "event: content_block_delta")
+	require.Contains(t, output, "event: content_block_stop")
+	require.Contains(t, output, "event: message_stop")
+	assertClaudeEntryEventOrder(t, output,
+		"event: message_start",
+		"event: content_block_start",
+		"event: content_block_delta",
+		"event: content_block_stop",
+		"event: message_stop",
+	)
+}
+
+func assertClaudeEntryEventOrder(t *testing.T, output string, events ...string) {
+	t.Helper()
+	offset := 0
+	for _, event := range events {
+		idx := strings.Index(output[offset:], event)
+		require.NotEqualf(t, -1, idx, "missing %q after offset %d", event, offset)
+		offset += idx + len(event)
+	}
+}
+
+// Keep the compiler tied to the same relay constants used by production
+// setup; this catches accidental test drift if the mode contract changes.
+var _ = constant.FinishReasonToolCalls

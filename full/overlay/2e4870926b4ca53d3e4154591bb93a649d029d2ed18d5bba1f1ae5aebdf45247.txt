@@ -1,0 +1,117 @@
+package service
+
+import (
+	"context"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStandaloneSearchSuccessCacheIsIdempotentAndRejectsIDReuse(t *testing.T) {
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	identity := StandaloneSearchIdentity(7, 9, "search-id")
+	digest := StandaloneSearchRequestDigest([]byte(`{"id":"search-id"}`))
+	require.NoError(t, PutStandaloneSearchResult(identity, digest, []byte(`{"output":"ok","results":[]}`)))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	served, err := ServeCachedStandaloneSearch(c, identity, digest)
+	require.NoError(t, err)
+	require.True(t, served)
+	require.JSONEq(t, `{"output":"ok","results":[]}`, w.Body.String())
+
+	served, err = ServeCachedStandaloneSearch(c, identity, "different")
+	require.False(t, served)
+	require.ErrorContains(t, err, "different request")
+}
+
+func TestStandaloneSearchPendingPreventsAmbiguousReplay(t *testing.T) {
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	identity := StandaloneSearchIdentity(8, 10, "pending-id")
+	digest := StandaloneSearchRequestDigest([]byte(`{"id":"pending-id"}`))
+	require.NoError(t, MarkStandaloneSearchPending(identity, digest))
+	require.ErrorContains(t, MarkStandaloneSearchPending(identity, digest), "refusing to replay")
+	ClearStandaloneSearchPending(identity)
+}
+
+func TestPrepareStandaloneSearchDispatchAllowsExactlyOneAttempt(t *testing.T) {
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	identity := StandaloneSearchIdentity(81, 101, "dispatch-id")
+	digest := StandaloneSearchRequestDigest([]byte(`{"id":"dispatch-id"}`))
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(StandaloneSearchIdentityContextKey, identity)
+	c.Set(StandaloneSearchDigestContextKey, digest)
+	c.Set(StandaloneSearchDispatchOwnerContextKey, true)
+	require.NoError(t, PrepareStandaloneSearchDispatch(c))
+	require.True(t, StandaloneSearchSubmissionStarted(c))
+	require.ErrorContains(t, PrepareStandaloneSearchDispatch(c), "refusing to replay")
+	ClearStandaloneSearchPending(identity)
+}
+
+func TestStandaloneSearchExplicitRejectionReleasesExactlyOneNewDispatch(t *testing.T) {
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	identity := StandaloneSearchIdentity(82, 102, "explicit-rejection-id")
+	digest := StandaloneSearchRequestDigest([]byte(`{"id":"explicit-rejection-id"}`))
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(StandaloneSearchIdentityContextKey, identity)
+	c.Set(StandaloneSearchDigestContextKey, digest)
+	c.Set(StandaloneSearchDispatchOwnerContextKey, true)
+	require.NoError(t, PrepareStandaloneSearchDispatch(c))
+
+	ReleaseStandaloneSearchAfterExplicitRejection(c)
+	require.False(t, StandaloneSearchSubmissionStarted(c))
+	require.NoError(t, PrepareStandaloneSearchDispatch(c))
+	require.True(t, StandaloneSearchSubmissionStarted(c))
+	require.ErrorContains(t, PrepareStandaloneSearchDispatch(c), "refusing to replay")
+	ClearStandaloneSearchPending(identity)
+}
+
+func TestStandaloneSearchRedisFenceSurvivesProcessLocalCacheAndCachesSuccess(t *testing.T) {
+	server, err := miniredis.Run()
+	require.NoError(t, err)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	require.NoError(t, client.Ping(context.Background()).Err())
+	oldRedis, oldEnabled := common.RDB, common.RedisEnabled
+	common.RDB = client
+	common.RedisEnabled = true
+	standaloneSearchCacheOnce = sync.Once{}
+	standaloneSearchCache, standaloneSearchPending, standaloneSearchLocal = nil, nil, nil
+	t.Cleanup(func() {
+		common.RDB = oldRedis
+		common.RedisEnabled = oldEnabled
+		standaloneSearchCacheOnce = sync.Once{}
+		standaloneSearchCache, standaloneSearchPending, standaloneSearchLocal = nil, nil, nil
+		_ = client.Close()
+		server.Close()
+	})
+
+	identity := StandaloneSearchIdentity(91, 111, "redis-fence-id")
+	digest := StandaloneSearchRequestDigest([]byte(`{"id":"redis-fence-id"}`))
+	require.NoError(t, MarkStandaloneSearchPending(identity, digest))
+	require.ErrorContains(t, MarkStandaloneSearchPending(identity, digest), "refusing to replay")
+	require.NoError(t, PutStandaloneSearchResult(identity, digest, []byte(`{"output":"cached","future":{"opaque":true}}`)))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	served, err := ServeCachedStandaloneSearch(c, identity, digest)
+	require.NoError(t, err)
+	require.True(t, served)
+	require.JSONEq(t, `{"output":"cached","future":{"opaque":true}}`, w.Body.String())
+	resultExists, err := client.Exists(context.Background(), standaloneSearchResultCache().FullKey(identity)).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, resultExists)
+}

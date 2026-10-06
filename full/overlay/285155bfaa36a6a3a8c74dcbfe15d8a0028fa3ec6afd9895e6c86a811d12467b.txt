@@ -1,0 +1,44 @@
+package model
+
+import (
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const ImageRouteSpoolReservationExpiresAt int64 = 253402300799
+
+var ErrImageRouteSpoolReservationUnavailable = errors.New("image route spool reservation is unavailable")
+
+func HoldImageRouteSpoolTx(tx *gorm.DB, token string) error {
+	if token == "" {
+		return nil
+	}
+	if tx == nil {
+		return ErrImageRouteSpoolReservationUnavailable
+	}
+	var reservation MediaStorageReservation
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("token = ? AND user_id = ? AND state = ? AND expires_at > ?", token, 0, "reserved", time.Now().Unix()).First(&reservation).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrImageRouteSpoolReservationUnavailable
+	}
+	if err != nil {
+		return err
+	}
+	if reservation.ExpiresAt == ImageRouteSpoolReservationExpiresAt {
+		return nil
+	}
+	result := tx.Model(&MediaStorageReservation{}).
+		Where("id = ? AND user_id = ? AND state = ? AND expires_at > ?", reservation.ID, 0, "reserved", time.Now().Unix()).
+		Update("expires_at", ImageRouteSpoolReservationExpiresAt)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrImageRouteSpoolReservationUnavailable
+	}
+	return nil
+}

@@ -1,0 +1,78 @@
+package service
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/require"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestStagedTextRecoveryWorkerWaitsForContinuousFiveMinuteOutage(t *testing.T) {
+	var calls atomic.Int64
+	worker, state, session, setting := probeWorkerFixture(t, SmartRouteProbeExecutorFunc(func(context.Context, SmartRouteProbeExecutionRequest) SmartRouteProbeExecutionResult {
+		calls.Add(1)
+		return SmartRouteProbeExecutionResult{Completed: true, Outcome: SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess}}
+	}))
+	setting.TextRecoveryProbeAfterSeconds = nil
+	*setting = smartroutersetting.Normalize(*setting)
+	hint := durableRecoveryTestHint(session)
+	route := hint.Routes[0]
+	now := time.Now().UnixMilli()
+	q := smartrouter.QualityState{Phase: smartrouter.QualityOpen, DemandRecovery: true, RecoveryStartedMS: now - 299_000, LastFailureMS: now - 299_000, NextProbeAtMS: now - 1, RealHardFailures: 1, Epoch: 1}
+	state.mu.Lock()
+	state.quality[route.RouteID] = q
+	state.mu.Unlock()
+	hint.Runtime.Quality.Routes[route.RouteID] = q
+	require.Equal(t, SmartRouteProbeEnqueued, worker.hint(hint, false))
+	require.False(t, worker.RunOne())
+	require.Zero(t, calls.Load())
+	job := &smartRouteProbeJob{key: "boundary", canonicalModel: hint.Request.CanonicalModel, endpoint: hint.Request.Endpoint, route: route, aliases: map[string]smartrouter.CertifiedRoute{route.RouteID: route}, forceProbe: true}
+	worker.execute(job, *setting)
+	require.Zero(t, calls.Load(), "even manual/legacy queued work respects the grace period")
+	state.mu.Lock()
+	q.RecoveryStartedMS = now - 301_000
+	q.LastFailureMS = now - 301_000
+	state.quality[route.RouteID] = q
+	state.mu.Unlock()
+	worker.execute(job, *setting)
+	require.Equal(t, int64(1), calls.Load())
+	state.mu.Lock()
+	q = state.quality[route.RouteID]
+	state.mu.Unlock()
+	require.Equal(t, smartrouter.QualityHealthy, q.Phase)
+	require.Zero(t, q.DemandRecoveryFailures)
+	require.Zero(t, q.RecoveryStartedMS)
+	require.Equal(t, int64(-1), smartRouteSyntheticRecoveryAt(q, *setting))
+}
+
+func TestStagedRecoveryFixedGroupSuccessResetsExactPhysicalRoute(t *testing.T) {
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	session, _ := managerTestSession(t, state)
+	catalog, _ := session.engine.Catalogs.Current()
+	entry := catalog.Contracts[session.request.ContractID]
+	for key, pool := range entry.Pools {
+		for i := range pool.Candidates {
+			pool.Candidates[i].ChannelGeneration = "generation"
+		}
+		entry.Pools[key] = pool
+	}
+	catalog.Contracts[session.request.ContractID] = entry
+	now := time.Now().UnixMilli()
+	state.mu.Lock()
+	state.quality["cheap"] = smartrouter.QualityState{Phase: smartrouter.QualityOpen, DemandRecovery: true, DemandRecoveryFailures: 10, RecoveryStartedMS: now - 400_000, LastFailureMS: now - 10_000, NextProbeAtMS: now + 600_000, RealHardFailures: 10, Epoch: 1}
+	state.mu.Unlock()
+	count, err := session.engine.ObserveExternalSuccess(context.Background(), SmartRouteExternalSuccess{ChannelID: 1, ChannelGeneration: "generation", CanonicalModel: "gpt-test", UpstreamModel: "gpt-test", RequestPath: "/v1/chat/completions", ObservationID: "fixed-group-real-success", StartedAtMS: now - 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	state.mu.Lock()
+	q := state.quality["cheap"]
+	state.mu.Unlock()
+	require.Equal(t, smartrouter.QualityHealthy, q.Phase)
+	require.Zero(t, q.DemandRecoveryFailures)
+	require.Zero(t, q.RecoveryStartedMS)
+	require.Zero(t, q.NextProbeAtMS)
+}

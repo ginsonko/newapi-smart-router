@@ -1,0 +1,48 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestListUserMediaTaskTimelineMergesSynchronousStudioImagesBeforePagination(t *testing.T) {
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open("file:media-task-timeline?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() { DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&Task{}, &MediaBlob{}))
+
+	tasks := []Task{
+		{TaskID: "task_video_old", UserId: 9, Platform: constant.TaskPlatform("sora"), CreatedAt: 100, SubmitTime: 100},
+		{TaskID: "studio_has_task", UserId: 9, Platform: constant.TaskPlatform("sora"), CreatedAt: 250, SubmitTime: 250},
+	}
+	require.NoError(t, db.Create(&tasks).Error)
+	blobs := []MediaBlob{
+		{PublicID: "image_a", UserID: 9, TaskPublicID: "studio_images_new", CreatedAt: 300, StorageBackend: MediaStorageBackendRemote, PrivateSource: "https://cdn.example/a.png", Status: MediaBlobStatusReady},
+		{PublicID: "image_b", UserID: 9, TaskPublicID: "studio_images_new", CreatedAt: 301, StorageBackend: MediaStorageBackendRemote, PrivateSource: "https://cdn.example/b.png", Status: MediaBlobStatusReady},
+		{PublicID: "image_existing_task", UserID: 9, TaskPublicID: "studio_has_task", CreatedAt: 250, StorageBackend: MediaStorageBackendRemote, PrivateSource: "https://cdn.example/c.png", Status: MediaBlobStatusReady},
+		{PublicID: "other_user", UserID: 10, TaskPublicID: "studio_other", CreatedAt: 999, StorageBackend: MediaStorageBackendRemote, PrivateSource: "https://cdn.example/d.png", Status: MediaBlobStatusReady},
+	}
+	require.NoError(t, db.Create(&blobs).Error)
+
+	firstPage, total, err := ListUserMediaTaskTimeline(9, 0, 2)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, total, "one studio operation with two outputs counts once and a task-backed operation is not duplicated")
+	require.Len(t, firstPage, 2)
+	assert.Equal(t, "studio_images_new", firstPage[0].PublicID)
+	assert.Equal(t, "studio_blob", firstPage[0].Kind)
+	assert.Len(t, firstPage[0].Blobs, 2)
+	assert.Equal(t, "studio_has_task", firstPage[1].PublicID)
+	assert.NotNil(t, firstPage[1].Task)
+
+	secondPage, _, err := ListUserMediaTaskTimeline(9, 2, 2)
+	require.NoError(t, err)
+	require.Len(t, secondPage, 1)
+	assert.Equal(t, "task_video_old", secondPage[0].PublicID)
+}

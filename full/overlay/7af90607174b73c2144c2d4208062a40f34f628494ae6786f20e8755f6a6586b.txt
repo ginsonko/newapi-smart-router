@@ -1,0 +1,487 @@
+package media
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/shirou/gopsutil/disk"
+	"gorm.io/gorm"
+)
+
+type CleanupSummary struct {
+	RunID          int64 `json:"run_id"`
+	CapacityBefore int64 `json:"capacity_before"`
+	CapacityAfter  int64 `json:"capacity_after"`
+	ExaminedCount  int   `json:"examined_count"`
+	DeletedCount   int   `json:"deleted_count"`
+	FreedBytes     int64 `json:"freed_bytes"`
+	ErrorCount     int   `json:"error_count"`
+}
+
+var cleanupLoop struct {
+	sync.Mutex
+	cancel context.CancelFunc
+}
+
+var cleanupWake = make(chan struct{}, 1)
+
+const mediaTrashRetention = 24 * time.Hour
+
+func purgeMediaTrash(root string, now time.Time) error {
+	dir := filepath.Join(root, ".trash")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	cutoff := now.Add(-mediaTrashRetention)
+	var cleanupErr error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect media trash %q: %w", entry.Name(), infoErr))
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if removeErr := os.Remove(filepath.Join(dir, entry.Name())); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("purge media trash %q: %w", entry.Name(), removeErr))
+		}
+	}
+	return cleanupErr
+}
+
+// RequestCapacityCleanup coalesces soft-watermark reclamation requests. The
+// worker still owns the database lease, so concurrent writers never race a
+// deletion and a burst of uploads cannot spawn unbounded goroutines.
+func RequestCapacityCleanup() {
+	select {
+	case cleanupWake <- struct{}{}:
+	default:
+	}
+}
+
+func StartCleanupLoop() func() {
+	cleanupLoop.Lock()
+	defer cleanupLoop.Unlock()
+	if cleanupLoop.cancel != nil {
+		return cleanupLoop.cancel
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanupLoop.cancel = cancel
+	go func() {
+		defer func() {
+			cleanupLoop.Lock()
+			cleanupLoop.cancel = nil
+			cleanupLoop.Unlock()
+		}()
+		for {
+			setting := mediasetting.Get()
+			interval := time.Duration(setting.CleanupIntervalMinutes) * time.Minute
+			if interval < time.Minute {
+				interval = time.Minute
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-cleanupWake:
+				timer.Stop()
+				if setting.Enabled {
+					if _, err := RunCleanup(ctx, "scheduled", 0, false); err != nil && !errors.Is(err, context.Canceled) {
+						common.SysLog("media cleanup wake skipped or failed: " + err.Error())
+					}
+				}
+			case <-timer.C:
+				if setting.Enabled {
+					if _, err := RunCleanup(ctx, "scheduled", 0, false); err != nil && !errors.Is(err, context.Canceled) {
+						common.SysLog("media cleanup skipped or failed: " + err.Error())
+					}
+				}
+			}
+		}
+	}()
+	return cancel
+}
+
+func claimCleanupLease(owner string, ttl time.Duration) (bool, error) {
+	now := time.Now().Unix()
+	result := model.DB.Model(&model.MediaStorageState{}).
+		Where("id = ? AND (cleanup_lease_until < ? OR cleanup_lease_owner = ?)", 1, now, owner).
+		Updates(map[string]any{"cleanup_lease_owner": owner, "cleanup_lease_until": time.Now().Add(ttl).Unix()})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return true, nil
+	}
+	if err := model.DB.FirstOrCreate(&model.MediaStorageState{ID: 1}, model.MediaStorageState{ID: 1}).Error; err != nil {
+		return false, err
+	}
+	result = model.DB.Model(&model.MediaStorageState{}).
+		Where("id = ? AND cleanup_lease_until < ?", 1, now).
+		Updates(map[string]any{"cleanup_lease_owner": owner, "cleanup_lease_until": time.Now().Add(ttl).Unix()})
+	return result.RowsAffected > 0, result.Error
+}
+
+func releaseCleanupLease(owner string) {
+	_ = model.DB.Model(&model.MediaStorageState{}).Where("id = ? AND cleanup_lease_owner = ?", 1, owner).
+		Updates(map[string]any{"cleanup_lease_owner": "", "cleanup_lease_until": 0}).Error
+}
+
+func RunCleanup(ctx context.Context, trigger string, requestedBy int, aggressive bool) (*CleanupSummary, error) {
+	if err := CleanupTemporaryFiles(time.Duration(mediasetting.Get().TemporaryFileTTLHours) * time.Hour); err != nil {
+		common.SysLog("media temporary cleanup partially failed: " + err.Error())
+	}
+	if root, rootErr := storageRoot(); rootErr == nil {
+		if err := purgeMediaTrash(root, time.Now()); err != nil {
+			common.SysLog("media trash purge partially failed: " + err.Error())
+		}
+	}
+	if err := ReconcileStorageState(); err != nil {
+		return nil, err
+	}
+	owner, err := NewPublicID("cleanup_")
+	if err != nil {
+		return nil, err
+	}
+	claimed, err := claimCleanupLease(owner, 10*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, fmt.Errorf("another media cleanup is already running")
+	}
+	defer releaseCleanupLease(owner)
+
+	setting := mediasetting.Get()
+	state := model.MediaStorageState{}
+	if err := model.DB.First(&state, 1).Error; err != nil {
+		return nil, err
+	}
+	run := &model.MediaCleanupRun{
+		Trigger: trigger, RequestedBy: requestedBy, CapacityBefore: state.UsedBytes,
+		StartedAt: time.Now().Unix(),
+	}
+	if err := model.DB.Create(run).Error; err != nil {
+		return nil, err
+	}
+	highBytes := setting.GlobalMaxBytes * int64(setting.HighWatermarkPercent) / 100
+	lowBytes := setting.GlobalMaxBytes * int64(setting.LowWatermarkPercent) / 100
+	capacityPressure := state.UsedBytes+state.ReservedBytes >= highBytes
+	// A scheduled pass is the durable reclamation queue. It runs only when a
+	// global or per-user watermark is exceeded (or an item has expired), and
+	// uses the same lease/protection predicate as manual cleanup.
+	var overLimitUsers []int
+	overLimitRemaining := map[int]int64{}
+	if setting.PerUserMaxBytes > 0 {
+		rows, queryErr := model.DB.Model(&model.MediaBlob{}).
+			Select("user_id, COALESCE(SUM(size_bytes), 0) AS used_bytes").
+			Where("deleted_at = 0 AND storage_backend = ? AND status IN ?", model.MediaStorageBackendLocal, []string{model.MediaBlobStatusUploading, model.MediaBlobStatusReady}).
+			Group("user_id").Having("COALESCE(SUM(size_bytes), 0) > ?", setting.PerUserMaxBytes).Rows()
+		if queryErr != nil {
+			run.ErrorCount++
+		} else {
+			defer rows.Close()
+			for rows.Next() {
+				var userID int
+				var usedBytes int64
+				if rows.Scan(&userID, &usedBytes) == nil && userID > 0 && usedBytes > setting.PerUserMaxBytes {
+					overLimitUsers = append(overLimitUsers, userID)
+					overLimitRemaining[userID] = usedBytes - setting.PerUserMaxBytes
+				}
+			}
+		}
+	}
+	targetBytes := state.UsedBytes
+	reclaimOldest := capacityPressure || len(overLimitUsers) > 0 || (aggressive && state.UsedBytes > lowBytes)
+	diskMountUnsafe := false
+	if reclaimOldest {
+		targetBytes = lowBytes
+	}
+	if root, rootErr := storageRoot(); rootErr == nil {
+		if usage, usageErr := disk.Usage(root); usageErr == nil && setting.ReservedFreeBytes > 0 && usage.Free < uint64(setting.ReservedFreeBytes) {
+			// A reserve larger than the filesystem can never be satisfied. Treat
+			// this as a configuration/mount fault, not as pressure: deleting
+			// unexpired user assets would only hide the real problem.
+			if uint64(setting.ReservedFreeBytes) >= usage.Total {
+				diskMountUnsafe = true
+				common.SysLog("media cleanup skipped disk-pressure deletion: reserved free space exceeds filesystem capacity")
+			} else {
+				shortfall := setting.ReservedFreeBytes - int64(usage.Free)
+				diskTarget := state.UsedBytes - shortfall
+				if diskTarget < 0 {
+					diskTarget = 0
+				}
+				if !reclaimOldest || diskTarget < targetBytes {
+					targetBytes = diskTarget
+				}
+				reclaimOldest = true
+			}
+		}
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		now := time.Now().Unix()
+		reclaimForCapacity := reclaimOldest && !diskMountUnsafe && ((capacityPressure && state.UsedBytes > targetBytes) || len(overLimitUsers) > 0 || (aggressive && state.UsedBytes > lowBytes))
+		if strings.EqualFold(strings.TrimSpace(trigger), "scheduled") && !reclaimForCapacity {
+			break
+		}
+		evidenceCutoff := now - int64(setting.EvidenceRetentionDays)*24*60*60
+		recentEvidence := model.DB.Model(&model.MediaModerationEvent{}).
+			Select("1").
+			Where("media_blob_id = media_blobs.id AND created_at >= ?", evidenceCutoff)
+		query := model.DB.Where("deleted_at = 0 AND admin_hold = ? AND task_lease_count = 0 AND (access_lease_count = 0 OR access_lease_until < ?) AND status = ? AND (cleanup_next_retry_at = 0 OR cleanup_next_retry_at <= ?)", false, time.Now().Unix(), model.MediaBlobStatusReady, now).
+			Where("NOT (moderation_status = ? AND EXISTS (?))", model.MediaModerationViolation, recentEvidence).
+			Where("delete_lease_until < ?", now)
+		if reclaimForCapacity {
+			if capacityPressure {
+				query = query.Where("(expires_at > 0 AND expires_at <= ?) OR storage_backend = ?", now, model.MediaStorageBackendLocal)
+			} else if len(overLimitUsers) > 0 {
+				query = query.Where("user_id IN ? AND storage_backend = ?", overLimitUsers, model.MediaStorageBackendLocal)
+			} else {
+				query = query.Where("expires_at > 0 AND expires_at <= ?", now)
+			}
+		} else {
+			query = query.Where("expires_at > 0 AND expires_at <= ?", now)
+		}
+		var candidates []model.MediaBlob
+		if err := query.Order("CASE WHEN expires_at > 0 AND expires_at <= " + fmt.Sprint(now) + " THEN 0 ELSE 1 END, last_accessed_at ASC, created_at ASC").
+			Limit(setting.CleanupBatchSize).Find(&candidates).Error; err != nil {
+			run.ErrorCount++
+			break
+		}
+		if len(candidates) == 0 {
+			break
+		}
+		deletedThisBatch := 0
+		for index := range candidates {
+			if !capacityPressure && len(overLimitUsers) > 0 && overLimitRemaining[candidates[index].UserID] <= 0 {
+				continue
+			}
+			run.ExaminedCount++
+			freed, deleteErr := deleteBlobWithLease(&candidates[index], owner, false)
+			if deleteErr != nil {
+				run.ErrorCount++
+				run.LastError = deleteErr.Error()
+				recordMediaCleanupFailure(candidates[index].ID, deleteErr)
+				continue
+			}
+			run.DeletedCount++
+			deletedThisBatch++
+			run.FreedBytes += freed
+			if remaining, tracked := overLimitRemaining[candidates[index].UserID]; tracked {
+				overLimitRemaining[candidates[index].UserID] = remaining - candidates[index].SizeBytes
+			}
+			state.UsedBytes -= freed
+			if state.UsedBytes < 0 {
+				state.UsedBytes = 0
+			}
+		}
+		if deletedThisBatch == 0 {
+			break
+		}
+		if len(candidates) < setting.CleanupBatchSize {
+			break
+		}
+	}
+
+	_ = ReconcileStorageState()
+	if err := model.DB.First(&state, 1).Error; err == nil {
+		run.CapacityAfter = state.UsedBytes
+	}
+	run.FinishedAt = time.Now().Unix()
+	_ = model.DB.Save(run).Error
+	return &CleanupSummary{
+		RunID: run.ID, CapacityBefore: run.CapacityBefore, CapacityAfter: run.CapacityAfter,
+		ExaminedCount: run.ExaminedCount, DeletedCount: run.DeletedCount,
+		FreedBytes: run.FreedBytes, ErrorCount: run.ErrorCount,
+	}, nil
+}
+
+func recordMediaCleanupFailure(blobID int64, cleanupErr error) {
+	if blobID <= 0 || cleanupErr == nil || model.DB == nil {
+		return
+	}
+	var blob model.MediaBlob
+	if err := model.DB.Select("id", "cleanup_attempts").First(&blob, blobID).Error; err != nil {
+		return
+	}
+	attempts := blob.CleanupAttempts + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := time.Minute * time.Duration(1<<(cleanupMinInt(attempts-1, 9)))
+	if backoff > time.Hour {
+		backoff = time.Hour
+	}
+	_ = model.DB.Model(&model.MediaBlob{}).Where("id = ? AND deleted_at = 0", blobID).Updates(map[string]any{
+		"cleanup_attempts":      attempts,
+		"cleanup_next_retry_at": time.Now().Add(backoff).Unix(),
+		"cleanup_last_error":    cleanupErr.Error(),
+	}).Error
+}
+
+func cleanupMinInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func DeleteBlob(publicID, leaseOwner string, force bool) error {
+	var blob model.MediaBlob
+	if err := model.DB.Where("public_id = ? AND deleted_at = 0", publicID).First(&blob).Error; err != nil {
+		return err
+	}
+	_, err := deleteBlobWithLease(&blob, leaseOwner, force)
+	return err
+}
+
+func deleteBlobWithLease(blob *model.MediaBlob, leaseOwner string, force bool) (int64, error) {
+	if blob == nil {
+		return 0, gorm.ErrRecordNotFound
+	}
+	if !force && (blob.AdminHold || blob.TaskLeaseCount > 0 || (blob.AccessLeaseCount > 0 && blob.AccessLeaseUntil >= time.Now().Unix())) {
+		return 0, fmt.Errorf("media asset is currently retained")
+	}
+	if !force && blob.ModerationStatus == model.MediaModerationViolation {
+		cutoff := time.Now().Add(-time.Duration(mediasetting.Get().EvidenceRetentionDays) * 24 * time.Hour).Unix()
+		var recentEvidence int64
+		if err := model.DB.Model(&model.MediaModerationEvent{}).
+			Where("media_blob_id = ? AND created_at >= ?", blob.ID, cutoff).
+			Count(&recentEvidence).Error; err != nil {
+			return 0, err
+		}
+		if recentEvidence > 0 {
+			return 0, fmt.Errorf("media asset is retained as moderation evidence")
+		}
+	}
+	localPath := ""
+	localSize := int64(0)
+	if blob.StorageBackend == model.MediaStorageBackendLocal {
+		if strings.TrimSpace(blob.ObjectKey) == "" {
+			return 0, fmt.Errorf("local media object key is missing")
+		}
+		resolvedPath, err := ResolveObjectPath(blob.ObjectKey)
+		if err != nil {
+			return 0, err
+		}
+		info, err := os.Stat(resolvedPath)
+		if err != nil {
+			return 0, fmt.Errorf("verify local media object before deletion: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return 0, fmt.Errorf("local media object is not a regular file")
+		}
+		localPath = resolvedPath
+		localSize = info.Size()
+	}
+	now := time.Now().Unix()
+	result := model.DB.Model(&model.MediaBlob{}).
+		Where("id = ? AND deleted_at = 0 AND (delete_lease_until < ? OR delete_lease_owner = ?)", blob.ID, now, leaseOwner).
+		Updates(map[string]any{
+			"status": model.MediaBlobStatusDeleting, "delete_lease_owner": leaseOwner,
+			"delete_lease_until": time.Now().Add(5 * time.Minute).Unix(),
+		})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return 0, fmt.Errorf("media asset is already being deleted")
+	}
+
+	quarantinePath := ""
+	if localPath != "" {
+		root, err := storageRoot()
+		if err != nil {
+			resetDeleteLease(blob.ID)
+			return 0, err
+		}
+		quarantineDirectory := filepath.Join(root, ".trash")
+		if err := os.MkdirAll(quarantineDirectory, 0o750); err != nil {
+			resetDeleteLease(blob.ID)
+			return 0, fmt.Errorf("create media deletion quarantine: %w", err)
+		}
+		quarantinePath = filepath.Join(
+			quarantineDirectory,
+			fmt.Sprintf("%d-%d-%s", blob.ID, time.Now().UnixNano(), filepath.Base(localPath)),
+		)
+		if err := os.Rename(localPath, quarantinePath); err != nil {
+			resetDeleteLease(blob.ID)
+			return 0, fmt.Errorf("quarantine local media object: %w", err)
+		}
+		// Retention starts when the object enters quarantine, not when the
+		// original asset was created or last modified.
+		if err := os.Chtimes(quarantinePath, time.Now(), time.Now()); err != nil {
+			_ = os.Rename(quarantinePath, localPath)
+			resetDeleteLease(blob.ID)
+			return 0, fmt.Errorf("timestamp media quarantine object: %w", err)
+		}
+	}
+
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		updates := map[string]any{
+			"status": model.MediaBlobStatusDeleted, "deleted_at": now, "object_key": "",
+			"private_source": "", "delete_lease_owner": "", "delete_lease_until": 0,
+		}
+		if err := tx.Model(&model.MediaBlob{}).Where("id = ? AND delete_lease_owner = ?", blob.ID, leaseOwner).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.TaskArtifact{}).Where("media_blob_id = ?", blob.ID).Update("status", "deleted").Error; err != nil {
+			return err
+		}
+		if localPath != "" && blob.SizeBytes > 0 {
+			state, err := model.EnsureMediaStorageState(tx)
+			if err != nil {
+				return err
+			}
+			return tx.Model(state).Update("used_bytes", gorm.Expr("CASE WHEN used_bytes >= ? THEN used_bytes - ? ELSE 0 END", blob.SizeBytes, blob.SizeBytes)).Error
+		}
+		return nil
+	})
+	if err != nil {
+		if quarantinePath != "" {
+			restoreErr := os.Rename(quarantinePath, localPath)
+			resetDeleteLease(blob.ID)
+			if restoreErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("restore quarantined media object: %w", restoreErr))
+			}
+		} else {
+			resetDeleteLease(blob.ID)
+		}
+		return 0, err
+	}
+	if quarantinePath == "" {
+		return 0, nil
+	}
+	// Keep the quarantined object for a bounded recovery window. A later
+	// cleanup pass purges only trash older than mediaTrashRetention.
+	common.SysLog(fmt.Sprintf("media object %d moved to deletion quarantine", blob.ID))
+	return localSize, nil
+}
+
+func resetDeleteLease(blobID int64) {
+	_ = model.DB.Model(&model.MediaBlob{}).Where("id = ?", blobID).Updates(map[string]any{
+		"status": model.MediaBlobStatusReady, "delete_lease_owner": "", "delete_lease_until": 0,
+	}).Error
+}

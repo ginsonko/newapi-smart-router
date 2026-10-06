@@ -1,0 +1,370 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
+)
+
+type mediaResponseCaptureWriter struct {
+	gin.ResponseWriter
+	file        *os.File
+	reservation *mediaservice.RequestSpoolReservation
+	maxBytes    int64
+	written     int64
+	overflow    bool
+	hold        bool
+	status      int
+	passthrough bool
+}
+
+func (writer *mediaResponseCaptureWriter) Write(data []byte) (int, error) {
+	if writer.hold && strings.Contains(strings.ToLower(writer.Header().Get("Content-Type")), "text/event-stream") {
+		if err := writer.releaseBuffered(); err != nil {
+			return 0, err
+		}
+	}
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	if writer.hold && !writer.overflow {
+		remaining := writer.maxBytes - writer.written
+		if remaining >= int64(len(data)) && writer.reserveCaptureBytes(writer.written+int64(len(data))) {
+			captured, err := writer.file.Write(data)
+			if err == nil && captured == len(data) {
+				writer.written += int64(captured)
+				return len(data), nil
+			}
+		}
+		writer.overflow = true
+		if err := writer.releaseBuffered(); err != nil {
+			return 0, err
+		}
+	}
+	written, err := writer.ResponseWriter.Write(data)
+	if written <= 0 || writer.file == nil || writer.overflow {
+		return written, err
+	}
+	if !writer.reserveCaptureBytes(writer.written + int64(written)) {
+		writer.overflow = true
+		return written, err
+	}
+	if captured, captureErr := writer.file.Write(data[:written]); captureErr != nil || captured != written {
+		writer.overflow = true
+	} else {
+		writer.written += int64(captured)
+	}
+	return written, err
+}
+
+func (writer *mediaResponseCaptureWriter) reserveCaptureBytes(bytes int64) bool {
+	if writer.reservation == nil {
+		return true
+	}
+	if err := writer.reservation.GrowTo(bytes); err != nil {
+		common.SysLog("media response capture stopped growing its spool reservation: " + err.Error())
+		return false
+	}
+	return true
+}
+
+func (writer *mediaResponseCaptureWriter) WriteString(value string) (int, error) {
+	return writer.Write([]byte(value))
+}
+
+func (writer *mediaResponseCaptureWriter) WriteHeader(code int) {
+	if writer.status != 0 {
+		return
+	}
+	writer.status = code
+	if writer.hold && strings.Contains(strings.ToLower(writer.Header().Get("Content-Type")), "text/event-stream") {
+		if err := writer.releaseBuffered(); err != nil {
+			writer.overflow = true
+			return
+		}
+	}
+	if !writer.hold {
+		writer.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (writer *mediaResponseCaptureWriter) WriteHeaderNow() {
+	if writer.hold {
+		if writer.status == 0 {
+			writer.status = http.StatusOK
+		}
+		// Gin and a few provider adapters eagerly call WriteHeaderNow even for
+		// ordinary JSON responses. Keep image JSON buffered until finish so its
+		// temporary provider URLs can still be replaced with durable asset URLs.
+		return
+	}
+	writer.ResponseWriter.WriteHeaderNow()
+}
+
+func (writer *mediaResponseCaptureWriter) Flush() {
+	if writer.hold {
+		if err := writer.releaseBuffered(); err != nil {
+			writer.overflow = true
+			return
+		}
+	}
+	writer.ResponseWriter.Flush()
+}
+
+func (writer *mediaResponseCaptureWriter) Status() int {
+	if writer.status != 0 {
+		return writer.status
+	}
+	return writer.ResponseWriter.Status()
+}
+
+func (writer *mediaResponseCaptureWriter) Size() int {
+	if writer.hold {
+		return int(writer.written)
+	}
+	return writer.ResponseWriter.Size()
+}
+
+func (writer *mediaResponseCaptureWriter) Written() bool {
+	if writer.hold {
+		// status and written describe the private capture buffer while hold is
+		// active; they do not mean that the client has received a response.
+		return writer.passthrough || writer.ResponseWriter.Written()
+	}
+	return writer.ResponseWriter.Written()
+}
+
+func (writer *mediaResponseCaptureWriter) releaseBuffered() error {
+	if !writer.hold || writer.passthrough {
+		return nil
+	}
+	writer.hold = false
+	writer.passthrough = true
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	writer.ResponseWriter.WriteHeader(writer.status)
+	if writer.written == 0 || writer.file == nil {
+		return nil
+	}
+	if _, err := writer.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.CopyN(writer.ResponseWriter, writer.file, writer.written); err != nil {
+		return err
+	}
+	_, err := writer.file.Seek(0, io.SeekEnd)
+	return err
+}
+
+func (writer *mediaResponseCaptureWriter) commitBuffered(data []byte, rewritten bool) error {
+	if !writer.hold {
+		return nil
+	}
+	writer.hold = false
+	writer.passthrough = true
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	if rewritten {
+		writer.Header().Del("Content-Length")
+		writer.Header().Del("Content-Encoding")
+		writer.Header().Del("ETag")
+	}
+	writer.ResponseWriter.WriteHeader(writer.status)
+	if len(data) == 0 {
+		return nil
+	}
+	_, err := writer.ResponseWriter.Write(data)
+	return err
+}
+
+type mediaResponseCapture struct {
+	writer       *mediaResponseCaptureWriter
+	kind         string
+	path         string
+	prompt       string
+	operationID  string
+	releaseSpool func()
+}
+
+func beginMediaResponseCapture(c *gin.Context, relayFormat types.RelayFormat) *mediaResponseCapture {
+	if c.GetInt64(service.ImageRouteJobContextKey) > 0 && c.GetBool("image_task_no_retention") {
+		return nil
+	}
+	if !mediasetting.Get().Enabled {
+		return nil
+	}
+	kind := ""
+	path := c.Request.URL.Path
+	if relayFormat == types.RelayFormatOpenAIImage && (strings.Contains(path, "/images/generations") || strings.Contains(path, "/images/edits")) {
+		kind = "image"
+	}
+	if relayFormat == types.RelayFormatOpenAIAudio && strings.Contains(path, "/audio/speech") {
+		kind = "audio"
+	}
+	if kind == "" {
+		return nil
+	}
+	maxBytes := mediasetting.Get().MaxRequestBytes
+	spoolReservation, err := mediaservice.BeginRequestSpoolReservation(maxBytes, 0)
+	if err != nil {
+		common.SysLog("media response capture capacity unavailable: " + err.Error())
+		return nil
+	}
+	file, err := mediaservice.CreateResponseCapture()
+	if err != nil {
+		spoolReservation.Release()
+		common.SysLog("media response capture unavailable: " + err.Error())
+		return nil
+	}
+	writer := &mediaResponseCaptureWriter{
+		ResponseWriter: c.Writer, file: file, reservation: spoolReservation, maxBytes: maxBytes,
+		hold: kind == "image",
+	}
+	c.Writer = writer
+	operationID, _ := c.Get(mediaStudioOperationContextKey)
+	operationIDString, _ := operationID.(string)
+	if c.GetInt64(service.ImageRouteJobContextKey) > 0 {
+		operationIDString = c.GetString("image_route_public_id")
+	}
+	return &mediaResponseCapture{
+		writer: writer, kind: kind, path: file.Name(),
+		operationID: operationIDString, releaseSpool: spoolReservation.Release,
+	}
+}
+
+func (capture *mediaResponseCapture) finish(c *gin.Context, info *relaycommon.RelayInfo, success bool) {
+	if capture == nil || capture.writer == nil || capture.writer.file == nil {
+		return
+	}
+	if err := capture.writer.file.Sync(); err != nil {
+		common.SysLog("media response capture sync failed: " + err.Error())
+	}
+	if capture.writer.hold {
+		defer func() {
+			capture.releaseSpool()
+			if err := capture.writer.file.Close(); err != nil {
+				common.SysLog("media response capture close failed: " + err.Error())
+			}
+			if err := os.Remove(capture.path); err != nil && !os.IsNotExist(err) {
+				common.SysLog("media response capture cleanup failed: " + err.Error())
+			}
+		}()
+		original := make([]byte, capture.writer.written)
+		if _, err := capture.writer.file.Seek(0, io.SeekStart); err != nil {
+			common.SysLog("media response capture seek failed: " + err.Error())
+			if releaseErr := capture.writer.releaseBuffered(); releaseErr != nil {
+				common.SysLog("media response passthrough failed: " + releaseErr.Error())
+			}
+			return
+		}
+		if _, err := io.ReadFull(capture.writer.file, original); err != nil {
+			common.SysLog("media response capture read failed: " + err.Error())
+			if releaseErr := capture.writer.releaseBuffered(); releaseErr != nil {
+				common.SysLog("media response passthrough failed: " + releaseErr.Error())
+			}
+			return
+		}
+		if c.GetBool(service.ImageTaskOwnedContextKey) || !success || capture.writer.overflow || capture.writer.written == 0 || capture.writer.Status() >= 400 || info == nil {
+			if err := capture.writer.commitBuffered(original, false); err != nil {
+				common.SysLog("media response passthrough commit failed: " + err.Error())
+			}
+			return
+		}
+		input := capture.archiveInput(c, info)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		blobs, archiveErr := mediaservice.ArchiveSynchronousResponse(ctx, input, bytes.NewReader(original))
+		cancel()
+		decorated := original
+		rewritten := false
+		if len(blobs) > 0 {
+			if next, err := mediaservice.DecorateOpenAIImageResponse(original, blobs); err == nil {
+				decorated = next
+				rewritten = true
+			}
+		}
+		if archiveErr != nil {
+			common.SysLog("media response archive partially failed: " + archiveErr.Error())
+		}
+		if err := capture.writer.commitBuffered(decorated, rewritten); err != nil {
+			common.SysLog("media response commit failed: " + err.Error())
+		}
+		return
+	}
+	if err := capture.writer.file.Close(); err != nil {
+		capture.releaseSpool()
+		common.SysLog("media response capture close failed: " + err.Error())
+		if removeErr := os.Remove(capture.path); removeErr != nil && !os.IsNotExist(removeErr) {
+			common.SysLog("media response capture cleanup failed: " + removeErr.Error())
+		}
+		return
+	}
+	if !success || capture.writer.overflow || capture.writer.written == 0 || capture.writer.Status() >= 400 || info == nil {
+		capture.releaseSpool()
+		if err := os.Remove(capture.path); err != nil && !os.IsNotExist(err) {
+			common.SysLog("media response capture cleanup failed: " + err.Error())
+		}
+		return
+	}
+	input := capture.archiveInput(c, info)
+	path := capture.path
+	gopool.Go(func() {
+		defer func() {
+			capture.releaseSpool()
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				common.SysLog("media response capture cleanup failed: " + err.Error())
+			}
+		}()
+		file, err := os.Open(path)
+		if err != nil {
+			common.SysLog("media response archive open failed: " + err.Error())
+			return
+		}
+		defer file.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if _, err := mediaservice.ArchiveSynchronousResponse(ctx, input, io.Reader(file)); err != nil {
+			common.SysLog("media response archive failed: " + err.Error())
+		}
+	})
+}
+
+func mediaArchiveChannelID(c *gin.Context, info *relaycommon.RelayInfo) int {
+	if info != nil && info.ChannelMeta != nil && info.ChannelMeta.ChannelId > 0 {
+		return info.ChannelMeta.ChannelId
+	}
+	if c != nil {
+		return c.GetInt("channel_id")
+	}
+	return 0
+}
+
+func (capture *mediaResponseCapture) archiveInput(c *gin.Context, info *relaycommon.RelayInfo) mediaservice.SynchronousArchiveInput {
+	if info == nil {
+		return mediaservice.SynchronousArchiveInput{}
+	}
+	input := mediaservice.SynchronousArchiveInput{
+		UserID: info.UserId, RequestID: info.RequestId, ChannelID: mediaArchiveChannelID(c, info), Model: info.OriginModelName,
+		Group: info.UsingGroup, Kind: capture.kind, ContentType: capture.writer.Header().Get("Content-Type"),
+		Prompt: capture.prompt, TaskPublicID: capture.operationID,
+	}
+	if user, err := model.GetUserById(info.UserId, false); err == nil && user != nil {
+		input.Username = user.Username
+	}
+	return input
+}

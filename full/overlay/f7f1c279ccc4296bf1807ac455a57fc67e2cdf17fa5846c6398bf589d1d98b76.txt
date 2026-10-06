@@ -1,0 +1,199 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const smartRelayTestProChannel = 9103
+
+func TestRelaySmartV4ZeroPriceLimitUsesResolvedSiteDefault(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 1_000)
+	ctx, _, routeRequest := h.newRequest(t, "v4-inherited-price-limit")
+	policy := h.setting.DefaultPolicy
+	policy.Version = 4
+	policy.MaxEffectiveRatioPPM = 0
+
+	dispatched := false
+	resultErr := relaySmartWithEngine(
+		ctx,
+		types.RelayFormatOpenAI,
+		&relaycommon.RelayInfo{
+			TokenId: smartRelayTestTokenID, UserGroup: "default",
+			OriginModelName: smartRelayTestModel,
+		},
+		100,
+		&types.TokenCountMeta{},
+		policy,
+		routeRequest,
+		h.engine,
+		func(_ *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+			dispatched = true
+			require.Equal(t, smartRelayTestCheapChannel, info.ChannelId)
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		},
+	)
+
+	require.Nil(t, resultErr)
+	require.True(t, dispatched, "the inherited site limit must not reject every positive-price route")
+}
+
+func TestRelaySmartV4ContractAffinityFailureFallsThroughAndSettlesFinalRoute(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 2_000)
+
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(
+		`{"default":1,"cheap":0.02,"mid":0.035,"plus":0.05,"pro":0.08}`,
+	))
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(
+		`{"default":"default","cheap":"cheap","mid":"mid","plus":"plus","pro":"pro"}`,
+	))
+	zero := 0
+	priority := int64(10)
+	proBaseURL := "https://pro.invalid/v1"
+	require.NoError(t, h.db.Create(&model.Channel{
+		Id: smartRelayTestProChannel, Type: constant.ChannelTypeOpenAI, Key: "pro-key",
+		Status: common.ChannelStatusEnabled, Name: "pro", BaseURL: &proBaseURL,
+		Models: smartRelayTestModel, Group: "pro", AutoBan: &zero,
+	}).Error)
+	require.NoError(t, h.db.Create(&model.Ability{
+		Group: "pro", Model: smartRelayTestModel, ChannelId: smartRelayTestProChannel,
+		Enabled: true, Priority: &priority, Weight: 100,
+	}).Error)
+	h.engine.Catalogs.Invalidate()
+	h.engine.Prices.InvalidateAll()
+	catalog, err := h.engine.Catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	_, err = h.engine.Prices.Refresh(context.Background(), "default")
+	require.NoError(t, err)
+
+	contractID, _, err := service.BuildSmartContractIdentity(smartRelayTestModel, service.SmartEndpointChat)
+	require.NoError(t, err)
+	contract, exists := catalog.Contracts[contractID]
+	require.True(t, exists)
+	pool, exists := contract.Pools[smartrouter.AutomaticPoolID]
+	require.True(t, exists)
+	for _, route := range pool.Candidates {
+		require.NoError(t, h.state.RecordAttempt(context.Background(), service.SmartRouteAttemptRecord{
+			RouteID: route.RouteID, Group: route.Group, Model: smartRelayTestModel,
+			ChannelID: route.ChannelID, ContractID: contractID, Endpoint: service.SmartEndpointChat,
+			CapacityDomain: route.CapacityDomain, CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			Outcome: smartrouter.OutcomeSuccess, Admission: smartrouter.AdmissionNormal,
+		}))
+	}
+
+	h.setting.DefaultPolicy.MaxEffectiveRatioPPM = 500_000
+	ctx, _, routeRequest := h.newRequest(t, "v4-affinity-disabled-third-route-success")
+	var channels []int
+	var groups []string
+	resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+		channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+		channels = append(channels, channelID)
+		groups = append(groups, info.UsingGroup)
+		switch channelID {
+		case smartRelayTestCheapChannel:
+			return smartRelayTestError(http.StatusServiceUnavailable, types.ErrorCodeBadResponseStatusCode, 0)
+		case smartRelayTestPlusChannel:
+			return types.WithOpenAIError(types.OpenAIError{
+				Message: "The channel selected by channel affinity has been disabled, and retry was stopped by rule.",
+				Type:    "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden)
+		case smartRelayTestProChannel:
+			require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+			return nil
+		default:
+			return types.NewError(fmt.Errorf("unexpected channel %d", channelID), types.ErrorCodeGetChannelFailed)
+		}
+	})
+
+	require.Nil(t, resultErr)
+	assert.Equal(t, []int{
+		smartRelayTestCheapChannel, smartRelayTestCheapChannel,
+		smartRelayTestPlusChannel, smartRelayTestPlusChannel,
+		smartRelayTestProChannel,
+	}, channels)
+	assert.Equal(t, []string{"cheap", "cheap", "plus", "plus", "pro"}, groups)
+	reservation := h.reservation(t, "v4-affinity-disabled-third-route-success")
+	assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	assert.Equal(t, smartRelayTestProChannel, reservation.ChannelId)
+	assert.Equal(t, "pro", reservation.Group)
+	assert.Equal(t, int64(80_000), reservation.RatioPPM)
+	assert.Equal(t, 5, reservation.AttemptCount)
+}
+
+func TestRelaySmartV4UpstreamGenericForbiddenFallsThroughAndSettlesNextRoute(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 1_000)
+	ctx, _, routeRequest := h.newRequest(t, "v4-upstream-generic-forbidden-fallback")
+	var channels []int
+
+	resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+		channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+		channels = append(channels, channelID)
+		if channelID == smartRelayTestCheapChannel {
+			return types.WithOpenAIError(types.OpenAIError{
+				Message: "permission denied", Type: "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden, types.ErrOptionWithUpstreamResponseReceived())
+		}
+		require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+		return nil
+	})
+
+	require.Nil(t, resultErr)
+	assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+	reservation := h.reservation(t, "v4-upstream-generic-forbidden-fallback")
+	assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	assert.Equal(t, smartRelayTestPlusChannel, reservation.ChannelId)
+	assert.Equal(t, 3, reservation.AttemptCount)
+}
+
+func TestRelaySmartV4ImageGroupContractForbiddenFallsThroughAndSettlesNextRoute(t *testing.T) {
+	initModelListColumnNames(t)
+	configureSmartRelayTestGlobals(t)
+	h := newSmartRelayTestHarness(t, 1_000)
+	ctx, _, routeRequest := h.newRequest(t, "v4-image-group-contract-forbidden")
+	routeRequest.ReplayClass = smartrouter.ReplaySafeImage
+	var channels []int
+
+	resultErr := h.relay(ctx, routeRequest, func(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+		channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+		channels = append(channels, channelID)
+		if channelID == smartRelayTestCheapChannel {
+			return types.WithOpenAIError(types.OpenAIError{
+				Message: "Image generation is not enabled for this group",
+				Type:    "permission_denied", Code: "permission_denied",
+			}, http.StatusForbidden)
+		}
+		require.NoError(t, info.Billing.Settle(info.PriceData.QuotaToPreConsume))
+		return nil
+	})
+
+	require.Nil(t, resultErr)
+	assert.Equal(t, []int{smartRelayTestCheapChannel, smartRelayTestPlusChannel}, channels)
+	reservation := h.reservation(t, "v4-image-group-contract-forbidden")
+	assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	assert.Equal(t, smartRelayTestPlusChannel, reservation.ChannelId)
+	assert.Equal(t, "plus", reservation.Group)
+	assert.Equal(t, 2, reservation.AttemptCount)
+}

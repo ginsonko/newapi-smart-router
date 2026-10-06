@@ -1,0 +1,28 @@
+package helper
+
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestImageDimensionsWireMatrix(t *testing.T) {
+	for _, p := range common.Image2DimensionPresets() {
+		q := &types.ParameterPriceSnapshot{UpstreamModel: "gpt-image-2", Parameters: map[string]string{"resolution": p.Resolution, "size": p.Size, "count": "1"}}
+		body := map[string]any{"model": "gpt-image-2", "size": p.Size, "n": 1}
+		raw, _ := json.Marshal(body)
+		require.NoError(t, ValidateParameterImageWire(q, raw))
+		body["resolution"] = p.Resolution
+		raw, _ = json.Marshal(body)
+		require.NoError(t, ValidateParameterImageWire(q, raw))
+		body["size"] = "999x999"
+		raw, _ = json.Marshal(body)
+		require.Error(t, ValidateParameterImageWire(q, raw))
+		body["size"] = p.Size
+		body["resolution"] = "other-tier"
+		raw, _ = json.Marshal(body)
+		require.Error(t, ValidateParameterImageWire(q, raw))
+	}
+}

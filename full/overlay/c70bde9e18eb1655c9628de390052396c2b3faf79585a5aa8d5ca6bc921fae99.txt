@@ -1,0 +1,39 @@
+package service
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestVideoFailureDiagnosticPersistsAndRefundsOnce(t *testing.T) {
+	truncate(t)
+	configureTaskPollingFinancialTables(t)
+	seedUser(t, 53, 800)
+	seedTaskPollingReservation(t, "direct:reason", "reason", 53, 200, 200, model.QuotaReservationStatusSettled)
+	task := &model.Task{TaskID: "failed-diagnostic-task", Platform: constant.TaskPlatform("sora"), UserId: 53, Quota: 200, BillingReservationID: "direct:reason", Status: model.TaskStatusInProgress,
+		Properties: model.Properties{MediaMode: "videos"}, PrivateData: model.TaskPrivateData{BillingSource: model.QuotaReservationFundingWallet, BillingRequestID: "reason", Key: "private-secret"}}
+
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 53).Updates(map[string]any{"used_quota": 200, "request_count": 1}).Error)
+	reservationID := "direct:reason"
+	require.NoError(t, model.DB.Create(&model.TaskBillingReceipt{TaskRowID: task.ID, ReservationID: &reservationID, RequestID: "reason", UserID: 53, FundingSource: model.QuotaReservationFundingWallet, SubmissionQuota: 200, PreConsumedQuota: 200, AppliedQuota: 200, UsageAppliedQuota: 200, TargetQuota: 200, RequestCountApplied: true, State: model.TaskBillingReceiptTracking, Version: 1}).Error)
+	stale := *task
+	result := &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "task failed"}
+	raw := []byte(`{"status":"failed","error":{"message":"参考图片无法读取 private-secret","code":"bad_image"},"prompt":"private prompt","references":["data:image/png;base64,private"]}`)
+	for _, attempt := range []*model.Task{task, &stale} {
+		require.NoError(t, ApplyVideoTaskResult(context.Background(), &taskPollingFetchAdaptor{}, attempt, result, raw))
+		require.Equal(t, 1000, getUserQuota(t, 53))
+	}
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	require.Contains(t, task.FailReason, "参考图片无法读取")
+	require.NotContains(t, task.FailReason, "private-secret")
+	var receipt model.TaskBillingReceipt
+	require.NoError(t, model.DB.Where("task_row_id = ?", task.ID).First(&receipt).Error)
+	require.Zero(t, receipt.AppliedQuota)
+	require.EqualValues(t, model.TaskStatusFailure, task.Status)
+
+}

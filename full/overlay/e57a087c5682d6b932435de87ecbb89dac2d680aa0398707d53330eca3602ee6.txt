@@ -1,0 +1,963 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+type staticCatalogSource struct {
+	mu        sync.Mutex
+	abilities []model.Ability
+	channels  []model.Channel
+	blocks    []model.SmartRouteBlock
+	loads     int
+	err       error
+}
+
+func (source *staticCatalogSource) LoadActiveSmartRouteBlocks(_ context.Context, now time.Time) ([]model.SmartRouteBlock, error) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	result := make([]model.SmartRouteBlock, 0, len(source.blocks))
+	for _, block := range source.blocks {
+		if block.ExpiresAt == 0 || block.ExpiresAt > now.Unix() {
+			result = append(result, block)
+		}
+	}
+	return result, nil
+}
+
+func (source *staticCatalogSource) LoadEnabledRoutingState(context.Context) ([]model.Ability, []model.Channel, error) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.loads++
+	if source.err != nil {
+		return nil, nil, source.err
+	}
+	return append([]model.Ability(nil), source.abilities...), append([]model.Channel(nil), source.channels...), nil
+}
+
+func (source *staticCatalogSource) loadCount() int {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	return source.loads
+}
+
+func smartCatalogTestSetting(endpoint constant.EndpointType) smartroutersetting.Setting {
+	return smartroutersetting.Setting{
+		Enabled: true,
+		Discovery: smartroutersetting.DiscoverySetting{
+			AllowedTextEndpoints: []constant.EndpointType{endpoint},
+			ExcludeVirtualGroups: []string{"auto"},
+		},
+		CertifiedGroups: map[string]smartroutersetting.CertifiedGroupSetting{
+			"economy": {
+				Pools:      []string{"balanced-v1"},
+				AdminOrder: 10,
+			},
+			"fallback": {
+				Pools:          []string{"balanced-v1", "stable-v1"},
+				StableFallback: true,
+				AdminOrder:     20,
+			},
+		},
+		TextContracts: []smartroutersetting.TextContractSetting{
+			{Endpoint: endpoint, Capabilities: smartroutersetting.CapabilityText | smartroutersetting.CapabilityStreaming, MaxContext: 128_000},
+		},
+		ChannelProfiles: map[string]smartroutersetting.ChannelProfileSetting{},
+		DefaultPolicy: smartrouter.Policy{
+			Version:              smartrouter.PolicyVersion,
+			PolicyID:             "balanced-default-v1",
+			Enabled:              true,
+			PoolPolicy:           "balanced-v1",
+			OrderMode:            smartrouter.OrderAutoPrice,
+			MaxEffectiveRatioPPM: 100_000,
+			ExcludedGroups:       []string{},
+			ExcludedRoutes:       []string{},
+			ContractOverrides:    map[string]smartrouter.ContractOverride{},
+			HealthGuard:          true,
+			RecoveryProfile:      smartrouter.RecoveryBalanced,
+			AllowFutureGroups:    true,
+		},
+		MaxAttempts:           2,
+		CatalogRefreshSeconds: 60,
+		KillSwitchMode:        smartroutersetting.KillSwitchNormal,
+	}
+}
+
+func smartCatalogFixture(modelName string, channelType int) *staticCatalogSource {
+	priority := int64(10)
+	return &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: modelName, ChannelId: 1, Enabled: true, Priority: &priority, Weight: 50},
+			{Group: "fallback", Model: modelName, ChannelId: 2, Enabled: true, Priority: &priority, Weight: 50},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: channelType, Status: common.ChannelStatusEnabled},
+			{Id: 2, Type: channelType, Status: common.ChannelStatusEnabled},
+		},
+	}
+}
+
+func onlyContract(t *testing.T, catalog smartrouter.CertifiedRouteCatalog) smartrouter.ContractCatalog {
+	t.Helper()
+	require.Len(t, catalog.Contracts, 1)
+	for _, contract := range catalog.Contracts {
+		return contract
+	}
+	return smartrouter.ContractCatalog{}
+}
+
+func contractByEndpoint(t *testing.T, catalog smartrouter.CertifiedRouteCatalog, endpoint string) smartrouter.ContractCatalog {
+	t.Helper()
+	for _, contract := range catalog.Contracts {
+		if contract.Contract.Endpoint == endpoint {
+			return contract
+		}
+	}
+	require.Failf(t, "missing contract", "endpoint %q was not published", endpoint)
+	return smartrouter.ContractCatalog{}
+}
+
+func publishedEndpointSet(catalog smartrouter.CertifiedRouteCatalog) map[string]bool {
+	endpoints := make(map[string]bool, len(catalog.Contracts))
+	for _, contract := range catalog.Contracts {
+		endpoints[contract.Contract.Endpoint] = true
+	}
+	return endpoints
+}
+
+func TestAutomaticCatalogUsesOpenAIAdapterContractsWithoutProfile(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}
+	priority := int64(10)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{{
+			Group: "Example Discount gpt", Model: "gpt-5.6-terra", ChannelId: 36,
+			Enabled: true, Priority: &priority, Weight: 50,
+		}},
+		channels: []model.Channel{{
+			Id: 36, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled,
+		}},
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	endpoints := publishedEndpointSet(catalog)
+	assert.True(t, endpoints[SmartEndpointChat])
+	assert.True(t, endpoints[SmartEndpointCompletions])
+	assert.True(t, endpoints[SmartEndpointResponses])
+	assert.True(t, endpoints[SmartEndpointMessages])
+}
+
+func TestCacheNamespaceRevisionChangesWithCredentialGeneration(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-cache-test", constant.ChannelTypeOpenAI)
+	source.channels[0].Key = "credential-a"
+
+	first, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	firstContract := contractByEndpoint(t, first, SmartEndpointChat)
+	firstRoutes := firstContract.Pools[smartrouter.AutomaticPoolID].Candidates
+	var firstRoute smartrouter.CertifiedRoute
+	for _, route := range firstRoutes {
+		if route.ChannelID == 1 {
+			firstRoute = route
+		}
+	}
+	require.NotEmpty(t, firstRoute.CacheNamespaceRevision)
+
+	source.channels[0].Key = "credential-b"
+	second, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	secondContract := contractByEndpoint(t, second, SmartEndpointChat)
+	secondRoutes := secondContract.Pools[smartrouter.AutomaticPoolID].Candidates
+	var secondRoute smartrouter.CertifiedRoute
+	for _, route := range secondRoutes {
+		if route.ChannelID == 1 {
+			secondRoute = route
+		}
+	}
+	require.NotEmpty(t, secondRoute.CacheNamespaceRevision)
+	assert.Equal(t, firstRoute.CacheDomain, secondRoute.CacheDomain)
+	assert.NotEqual(t, firstRoute.CacheNamespaceRevision, secondRoute.CacheNamespaceRevision)
+}
+
+func TestAutomaticCatalogExplicitProfileNarrowsOpenAIAdapterContracts(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{
+		"1": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAIResponse}},
+		"2": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAIResponse}},
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(
+		context.Background(), setting, smartCatalogFixture("gpt-5.6-terra", constant.ChannelTypeOpenAI),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]bool{
+		SmartEndpointResponses:        true,
+		SmartEndpointStandaloneSearch: true,
+	}, publishedEndpointSet(catalog))
+}
+
+func TestAutomaticCatalogStandaloneSearchUsesCompatibleOpenAIAndCodexChannels(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAIResponse)
+	priority := int64(10)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "codex", Model: "gpt-5.6-sol", ChannelId: 48, Enabled: true, Priority: &priority},
+			{Group: "openai", Model: "gpt-5.6-sol", ChannelId: 1, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 48, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled},
+			{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+		},
+	}
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	contract := contractByEndpoint(t, catalog, SmartEndpointStandaloneSearch)
+	seen := map[int]bool{}
+	for _, pool := range contract.Pools {
+		require.NotEmpty(t, pool.Candidates)
+		for _, route := range pool.Candidates {
+			seen[route.ChannelID] = true
+		}
+	}
+	require.Equal(t, map[int]bool{1: true, 48: true}, seen)
+}
+
+func TestAutomaticCatalogProfileCannotWidenAnthropicAdapterToResponses(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{
+		"25": {EndpointAllow: []constant.EndpointType{
+			constant.EndpointTypeAnthropic,
+			constant.EndpointTypeOpenAI,
+			constant.EndpointTypeOpenAIResponse,
+		}},
+	}
+	priority := int64(10)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "gpt-5.6-sol", ChannelId: 50, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "gpt-5.6-sol", ChannelId: 25, Enabled: true, Priority: &priority},
+			{Group: "fallback", Model: "gpt-5.6-sol", ChannelId: 58, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 50, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 25, Type: constant.ChannelTypeAnthropic, Status: common.ChannelStatusEnabled},
+			{Id: 58, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+		},
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	channelSet := func(endpoint string) map[int]bool {
+		result := map[int]bool{}
+		for _, pool := range contractByEndpoint(t, catalog, endpoint).Pools {
+			for _, route := range pool.Candidates {
+				result[route.ChannelID] = true
+			}
+		}
+		return result
+	}
+
+	responses := channelSet(SmartEndpointResponses)
+	assert.True(t, responses[50])
+	assert.True(t, responses[58])
+	assert.False(t, responses[25])
+	assert.True(t, channelSet(SmartEndpointChat)[25])
+	assert.True(t, channelSet(SmartEndpointMessages)[25])
+}
+
+func TestAutomaticCatalogDoesNotInventResponsesForUnsupportedAdapter(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAIResponse)
+
+	_, _, err := BuildCertifiedRouteCatalog(
+		context.Background(), setting, smartCatalogFixture("claude-opus", constant.ChannelTypeAws),
+	)
+	require.ErrorIs(t, err, ErrNoCertifiedSmartRoutes)
+}
+
+func TestAutomaticCatalogCodexAdapterPublishesResponsesOnly(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(
+		context.Background(), setting, smartCatalogFixture("gpt-5.6-sol", constant.ChannelTypeCodex),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]bool{SmartEndpointResponses: true, SmartEndpointStandaloneSearch: true}, publishedEndpointSet(catalog))
+}
+
+func TestBuildCertifiedRouteCatalogPublishesExactChannelsAndMappedUpstream(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	mapping, err := common.Marshal(map[string]string{"gpt-test": "upstream-a", "upstream-a": "upstream-final"})
+	require.NoError(t, err)
+	mappingJSON := string(mapping)
+	source.channels[0].ModelMapping = &mappingJSON
+
+	catalog, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	require.NoError(t, catalog.Validate())
+	assert.Equal(t, 2, report.PublishedContracts)
+
+	contract := contractByEndpoint(t, catalog, SmartEndpointChat)
+	requestContractID, requestEndpoint, requestFingerprint, err := SmartContractIdentity("gpt-test", "/v1/chat/completions")
+	require.NoError(t, err)
+	assert.Equal(t, requestContractID, contract.Contract.ContractID)
+	assert.Equal(t, requestEndpoint, contract.Contract.Endpoint)
+	assert.Equal(t, requestFingerprint, contract.Contract.CapabilityFingerprint)
+	balanced := contract.Pools["balanced-v1"].Candidates
+	require.Len(t, balanced, 2)
+	assert.Equal(t, 1, balanced[0].ChannelID)
+	assert.Equal(t, "upstream-final", balanced[0].UpstreamModel)
+	assert.False(t, balanced[0].StableFallback)
+	assert.Equal(t, 2, balanced[1].ChannelID)
+	assert.False(t, balanced[1].StableFallback)
+	assert.Equal(t, "channel:1", balanced[0].CacheDomain)
+	assert.Equal(t, "channel:1", balanced[0].CapacityDomain)
+	assert.NotEmpty(t, balanced[0].ChannelGeneration)
+	assert.NotContains(t, balanced[0].ChannelGeneration, "upstream")
+	assert.NotEqual(t, balanced[0].RouteID, balanced[1].RouteID)
+	_, unsafePoolPublished := contract.Pools["stable-v1"]
+	assert.False(t, unsafePoolPublished, "a single-channel pool must not be exposed to smart keys")
+}
+
+func TestAutomaticCatalogKeepsCanonicalModelsIsolatedAcrossExactMappings(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	priority := int64(1)
+	mappingOne, err := common.Marshal(map[string]string{"gpt-5.6-sol": "provider-a-sol"})
+	require.NoError(t, err)
+	mappingTwo, err := common.Marshal(map[string]string{"gpt-5.6-sol": "provider-b-sol"})
+	require.NoError(t, err)
+	mappingNear, err := common.Marshal(map[string]string{"gpt-5.6-sol-preview": "provider-preview"})
+	require.NoError(t, err)
+	mappingClaude, err := common.Marshal(map[string]string{"claude-opus-4-6": "provider-claude"})
+	require.NoError(t, err)
+	mappingOneJSON := string(mappingOne)
+	mappingTwoJSON := string(mappingTwo)
+	mappingNearJSON := string(mappingNear)
+	mappingClaudeJSON := string(mappingClaude)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "gpt-5.6-sol", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "fallback", Model: "gpt-5.6-sol", ChannelId: 2, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "gpt-5.6-sol-preview", ChannelId: 3, Enabled: true, Priority: &priority},
+			{Group: "fallback", Model: "claude-opus-4-6", ChannelId: 4, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, ModelMapping: &mappingOneJSON},
+			{Id: 2, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, ModelMapping: &mappingTwoJSON},
+			{Id: 3, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, ModelMapping: &mappingNearJSON},
+			{Id: 4, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, ModelMapping: &mappingClaudeJSON},
+		},
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	contractID, _, _, err := SmartContractIdentity("gpt-5.6-sol", "/v1/chat/completions")
+	require.NoError(t, err)
+	contract, exists := catalog.Contracts[contractID]
+	require.True(t, exists)
+	candidates := contract.Pools[SmartRouteAutoDiscoveredPool].Candidates
+	require.Len(t, candidates, 2)
+	assert.ElementsMatch(t, []int{1, 2}, []int{candidates[0].ChannelID, candidates[1].ChannelID})
+	assert.ElementsMatch(t, []string{"provider-a-sol", "provider-b-sol"}, []string{candidates[0].UpstreamModel, candidates[1].UpstreamModel})
+	for _, candidate := range candidates {
+		assert.NotEqual(t, 3, candidate.ChannelID, "a near model name must remain a separate contract")
+		assert.NotEqual(t, 4, candidate.ChannelID, "a different model family must remain a separate contract")
+	}
+}
+
+func TestAutomaticCatalogNeedsNoPolicyIDPoolOrPublishingLists(t *testing.T) {
+	setting := smartroutersetting.Normalize(smartroutersetting.Setting{Enabled: true})
+	require.NoError(t, setting.Validate())
+	assert.Empty(t, setting.DefaultPolicy.PolicyID)
+	assert.Empty(t, setting.DefaultPolicy.PoolPolicy)
+
+	catalog, report, err := BuildCertifiedRouteCatalog(
+		context.Background(), setting, smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI),
+	)
+	require.NoError(t, err)
+	assert.Greater(t, report.DiscoveredRoutes, 0)
+	chat := contractByEndpoint(t, catalog, SmartEndpointChat)
+	require.Len(t, chat.Pools[SmartRouteAutoDiscoveredPool].Candidates, 2)
+}
+
+func TestChannelCredentialOrBaseURLChangeCreatesANewRouteGeneration(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	baseURL := "https://first.example/v1"
+	source.channels[0].BaseURL = &baseURL
+	source.channels[0].Key = "secret-first"
+
+	first, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	firstRoute := contractByEndpoint(t, first, SmartEndpointChat).Pools["balanced-v1"].Candidates[0]
+
+	baseURL = "https://second.example/v1"
+	source.channels[0].BaseURL = &baseURL
+	source.channels[0].Key = "secret-second"
+	second, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	secondRoute := contractByEndpoint(t, second, SmartEndpointChat).Pools["balanced-v1"].Candidates[0]
+
+	assert.NotEqual(t, firstRoute.ChannelGeneration, secondRoute.ChannelGeneration)
+	assert.NotEqual(t, firstRoute.RouteID, secondRoute.RouteID)
+	encoded, err := common.Marshal(second)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "secret-second")
+	assert.NotContains(t, string(encoded), "second.example")
+}
+
+func TestBuildCertifiedRouteCatalogPublishesSingleRouteModel(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	source.channels = source.channels[:1]
+
+	catalog, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Equal(t, 2, report.PublishedContracts)
+	assert.Equal(t, 2, report.PublishedRoutes)
+	assert.Len(t, contractByEndpoint(t, catalog, SmartEndpointChat).Pools["balanced-v1"].Candidates, 1)
+}
+
+func TestBuildCertifiedRouteCatalogIgnoresLegacyCertificationAsPublishingGate(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	economy := setting.CertifiedGroups["economy"]
+	economy.ModelDeny = []string{"gpt-test"}
+	setting.CertifiedGroups["economy"] = economy
+	fallback := setting.CertifiedGroups["fallback"]
+	fallback.ChannelAllow = []int{99}
+	setting.CertifiedGroups["fallback"] = fallback
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI))
+	require.NoError(t, err)
+	assert.Len(t, contractByEndpoint(t, catalog, SmartEndpointChat).Pools["balanced-v1"].Candidates, 2)
+}
+
+func TestAutomaticCatalogAppliesDurableBlocksAtPreciseScopes(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	source.blocks = []model.SmartRouteBlock{{
+		Id: 1, Scope: SmartRouteBlockScopeGroupModel, Group: "economy",
+		ModelPattern: "gpt-*", Source: SmartRouteBlockSourceManual,
+	}}
+
+	catalog, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Equal(t, 2, report.BlacklistedRoutes, "chat and completions routes in the blocked group are excluded")
+	chat := contractByEndpoint(t, catalog, SmartEndpointChat)
+	require.Len(t, chat.Pools["balanced-v1"].Candidates, 1)
+	assert.Equal(t, "fallback", chat.Pools["balanced-v1"].Candidates[0].Group)
+
+	// An expired manual block is no longer authoritative at the next catalog
+	// refresh and the previously excluded route is discovered again.
+	source.blocks[0].ExpiresAt = time.Now().Add(-time.Minute).Unix()
+	refreshed, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Zero(t, report.BlacklistedRoutes)
+	assert.Len(t, contractByEndpoint(t, refreshed, SmartEndpointChat).Pools["balanced-v1"].Candidates, 2)
+}
+
+func TestCatalogIgnoresLegacyAutomaticBlocksButKeepsManualAuthority(t *testing.T) {
+	source := smartCatalogFixture("gpt-5.6", constant.ChannelTypeOpenAI)
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+
+	initial, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	var routes []smartrouter.CertifiedRoute
+	var contracts []smartrouter.RouteContract
+	for _, entry := range initial.Contracts {
+		pool := entry.Pools[SmartRouteAutoDiscoveredPool]
+		for _, route := range pool.Candidates {
+			routes = append(routes, route)
+			contracts = append(contracts, entry.Contract)
+		}
+	}
+	require.NotEmpty(t, routes)
+	source.blocks = make([]model.SmartRouteBlock, 0, len(routes))
+	for index, route := range routes {
+		contract := contracts[index]
+		source.blocks = append(source.blocks, model.SmartRouteBlock{
+			Scope: SmartRouteBlockScopeRoute, RouteId: route.RouteID,
+			Group: route.Group, ChannelId: route.ChannelID,
+			ContractId: contract.ContractID, Endpoint: contract.Endpoint,
+			Source: SmartRouteBlockSourceAutoHealth, CreatedAt: 1_725_000_000, Epoch: 4,
+		})
+	}
+
+	blockedCatalog, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.NotEmpty(t, blockedCatalog.Contracts)
+	assert.Empty(t, report.BlockedRoutes)
+	assert.Zero(t, report.BlacklistedRoutes)
+
+	encoded, err := json.Marshal(report)
+	require.NoError(t, err)
+	// The report is safe to expose to the admin UI: internal route/channel
+	// identifiers are retained only in the in-process bridge used by users'
+	// redacted status endpoint.
+	for _, route := range routes {
+		assert.NotContains(t, string(encoded), route.RouteID)
+	}
+	assert.NotContains(t, string(encoded), "blocked_routes")
+}
+
+func TestAutomaticCatalogExcludesVirtualAndPublishesImageModelContracts(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	priority := int64(1)
+	source.abilities = append(source.abilities,
+		model.Ability{Group: "auto", Model: "gpt-test", ChannelId: 1, Enabled: true, Priority: &priority},
+		model.Ability{Group: "economy", Model: "gpt-image-1", ChannelId: 1, Enabled: true, Priority: &priority},
+	)
+
+	catalog, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, report.DiscoveredRoutes, 1)
+	assert.GreaterOrEqual(t, report.PublishedContracts, 2)
+	imageChatPublished := false
+	for _, contract := range catalog.Contracts {
+		if contract.Contract.CanonicalModel == "gpt-image-1" && contract.Contract.Endpoint == SmartEndpointChat {
+			imageChatPublished = true
+		}
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				assert.NotEqual(t, "auto", route.Group)
+			}
+		}
+	}
+	assert.True(t, imageChatPublished, "a model can retain a chat contract independently of its native image contract")
+}
+
+func TestAutomaticCatalogPublishesNativeImageAndVideoContracts(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeImageGeneration)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeImageGeneration, constant.EndpointTypeOpenAIVideo,
+	}
+	priority := int64(1)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "gpt-image-1", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "sora-2", ChannelId: 2, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 2, Type: constant.ChannelTypeSora, Status: common.ChannelStatusEnabled},
+		},
+	}
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	image := contractByEndpoint(t, catalog, SmartEndpointImages)
+	video := contractByEndpoint(t, catalog, SmartEndpointVideos)
+	assert.Equal(t, smartroutersetting.CapabilityImageGeneration, image.Pools["balanced-v1"].Candidates[0].Capabilities)
+	assert.Equal(t,
+		smartroutersetting.CapabilityVideoGeneration|
+			smartroutersetting.CapabilityAsyncTask|
+			smartroutersetting.CapabilityReferenceImage|
+			smartroutersetting.CapabilityReferenceVideo|
+			smartroutersetting.CapabilityReferenceAudio,
+		video.Pools["balanced-v1"].Candidates[0].Capabilities,
+	)
+}
+
+func TestUnknownVideoCapabilityContractKeepsReferencesAndOutputCountPermissive(t *testing.T) {
+	capability := mediaservice.ResolveCapabilityForRoute(
+		9, constant.ChannelTypeOpenAI, "future-video-model",
+		SmartEndpointVideos, "https://video.example",
+	)
+	contract, err := smartMediaCapabilityContract(9, "future-video-model", SmartEndpointVideos, capability)
+	require.NoError(t, err)
+	require.NotNil(t, contract)
+	assert.True(t, contract.ReferenceImage)
+	assert.True(t, contract.ReferenceVideo)
+	assert.True(t, contract.ReferenceAudio)
+	assert.Zero(t, contract.MaxImages)
+	assert.Zero(t, contract.MaxVideos)
+	assert.Zero(t, contract.MaxAudios)
+	assert.False(t, contract.OutputCount.Known)
+	assert.Empty(t, smartrouter.MatchMediaRequest(contract, &smartrouter.MediaRequestShape{
+		Kind: smartrouter.MediaKindVideo,
+		References: []smartrouter.MediaReferenceShape{
+			{Type: smartrouter.MediaKindImage, Role: "future-image-role"},
+			{Type: smartrouter.MediaKindImage, Role: "another-image-role"},
+			{Type: smartrouter.MediaKindVideo, Role: "future-video-role"},
+			{Type: smartrouter.MediaKindAudio, Role: "future-audio-role"},
+		},
+		OutputCount: 99, OutputCountKnown: true,
+	}))
+}
+
+func TestAutomaticCatalogPublishesNativeAudioContracts(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeAudioSpeech)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeAudioSpeech,
+		constant.EndpointTypeAudioTranscription,
+		constant.EndpointTypeAudioTranslation,
+	}
+	priority := int64(1)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "tts-1", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "fallback", Model: "tts-1", ChannelId: 2, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "whisper-1", ChannelId: 3, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 2, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 3, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+		},
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	speechID, _, _, err := SmartContractIdentity("tts-1", "/v1/audio/speech")
+	require.NoError(t, err)
+	speech := catalog.Contracts[speechID]
+	require.Len(t, speech.Pools[SmartRouteAutoDiscoveredPool].Candidates, 2)
+	for _, route := range speech.Pools[SmartRouteAutoDiscoveredPool].Candidates {
+		assert.NotZero(t, route.Capabilities&smartroutersetting.CapabilityAudioSpeech)
+	}
+	for _, path := range []string{"/v1/audio/transcriptions", "/v1/audio/translations"} {
+		contractID, _, _, identityErr := SmartContractIdentity("whisper-1", path)
+		require.NoError(t, identityErr)
+		contract, exists := catalog.Contracts[contractID]
+		require.True(t, exists, path)
+		routes := contract.Pools[SmartRouteAutoDiscoveredPool].Candidates
+		require.Len(t, routes, 1, path)
+		assert.NotZero(t, routes[0].Capabilities&smartroutersetting.CapabilityAudioTranscription, path)
+	}
+}
+
+func TestLegacyTextOnlyChannelProfilesDoNotSuppressMediaContracts(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{
+		"1": {EndpointAllow: []constant.EndpointType{
+			constant.EndpointTypeOpenAI,
+			constant.EndpointTypeOpenAIResponse,
+			constant.EndpointTypeAnthropic,
+		}},
+	}
+	priority := int64(1)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "gpt-image-1", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "sora-2", ChannelId: 1, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}},
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Equal(t, "gpt-image-1", contractByEndpoint(t, catalog, SmartEndpointImages).Contract.CanonicalModel)
+	assert.Equal(t, "sora-2", contractByEndpoint(t, catalog, SmartEndpointVideos).Contract.CanonicalModel)
+}
+
+func TestAutomaticCatalogMediaEndpointBlacklistWins(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeImageGeneration)
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeImageGeneration, constant.EndpointTypeOpenAIVideo,
+	}
+	priority := int64(1)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "economy", Model: "gpt-image-1", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "economy", Model: "sora-2", ChannelId: 2, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 2, Type: constant.ChannelTypeSora, Status: common.ChannelStatusEnabled},
+		},
+		blocks: []model.SmartRouteBlock{{
+			Id: 1, Scope: SmartRouteBlockScopeEndpoint,
+			Endpoint: string(constant.EndpointTypeImageGeneration), Source: SmartRouteBlockSourceManual,
+		}},
+	}
+	catalog, report, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Equal(t, 2, report.BlacklistedRoutes)
+	for _, contract := range catalog.Contracts {
+		assert.NotEqual(t, SmartEndpointImages, contract.Contract.Endpoint)
+		assert.NotEqual(t, SmartEndpointImageEdits, contract.Contract.Endpoint)
+	}
+	assert.Equal(t, "sora-2", contractByEndpoint(t, catalog, SmartEndpointVideos).Contract.CanonicalModel)
+}
+
+func TestContractIdentityDoesNotSplitOnRouteCapabilitiesOrContext(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAIResponse)
+	setting.TextContracts = []smartroutersetting.TextContractSetting{
+		{
+			Endpoint:     constant.EndpointTypeOpenAIResponse,
+			Capabilities: smartroutersetting.CapabilityText,
+			MaxContext:   64_000,
+			ChannelAllow: []int{1},
+		},
+		{
+			Endpoint:     constant.EndpointTypeOpenAIResponse,
+			Capabilities: smartroutersetting.CapabilityText | smartroutersetting.CapabilityTools,
+			MaxContext:   128_000,
+			ChannelAllow: []int{2},
+		},
+	}
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{
+		"1": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAIResponse}, Capabilities: smartroutersetting.CapabilityText, MaxContext: 64_000},
+		"2": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAIResponse}, Capabilities: smartroutersetting.CapabilityText | smartroutersetting.CapabilityTools, MaxContext: 128_000},
+	}
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeXai)
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	contract := onlyContract(t, catalog)
+	candidates := contract.Pools["balanced-v1"].Candidates
+	require.Len(t, candidates, 2)
+	assert.Equal(t, SmartEndpointResponses, contract.Contract.Endpoint)
+	assert.Equal(t, smartroutersetting.CapabilityText, candidates[0].Capabilities)
+	assert.Equal(t, 64_000, candidates[0].MaxContext)
+	assert.Equal(t, smartroutersetting.CapabilityText|smartroutersetting.CapabilityTools, candidates[1].Capabilities)
+	assert.Equal(t, 128_000, candidates[1].MaxContext)
+}
+
+func TestCatalogUsesStrictestPositiveLimitForSharedCapacityDomain(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAIResponse)
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{
+		"1": {CapacityDomain: "shared-upstream", MaxInflight: 5},
+		"2": {CapacityDomain: "shared-upstream", MaxInflight: 2},
+	}
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeXai)
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	contract := onlyContract(t, catalog)
+	for _, pool := range contract.Pools {
+		for _, route := range pool.Candidates {
+			assert.Equal(t, "shared-upstream", route.CapacityDomain)
+			assert.Equal(t, 2, route.MaxInflight)
+		}
+	}
+}
+
+func TestAdvancedCustomMustExposeTheCertifiedIncomingPath(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAIResponse)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeAdvancedCustom)
+
+	chatOnly := dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{
+		{IncomingPath: "/v1/chat/completions", UpstreamPath: "/v1/chat/completions", Converter: dto.AdvancedCustomConverterNone},
+	}}}
+	chatOnlyJSON, err := common.Marshal(chatOnly)
+	require.NoError(t, err)
+	for index := range source.channels {
+		source.channels[index].OtherSettings = string(chatOnlyJSON)
+	}
+
+	_, _, err = BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.ErrorIs(t, err, ErrNoCertifiedSmartRoutes)
+
+	responses := dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{
+		{IncomingPath: "/v1/responses", UpstreamPath: "/v1/chat/completions", Converter: dto.AdvancedCustomConverterOpenAIResponsesToOpenAIChatCompletions},
+	}}}
+	responsesJSON, err := common.Marshal(responses)
+	require.NoError(t, err)
+	for index := range source.channels {
+		source.channels[index].OtherSettings = string(responsesJSON)
+	}
+
+	catalog, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Equal(t, SmartEndpointResponses, onlyContract(t, catalog).Contract.Endpoint)
+}
+
+func TestCatalogContentVersionIsOrderIndependentAndChangesWithRouteIdentity(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+
+	first, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	source.abilities[0], source.abilities[1] = source.abilities[1], source.abilities[0]
+	source.channels[0], source.channels[1] = source.channels[1], source.channels[0]
+	second, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.Equal(t, first.Version, second.Version)
+
+	mapping := `{"gpt-test":"different-upstream"}`
+	source.channels[0].ModelMapping = &mapping
+	changed, _, err := BuildCertifiedRouteCatalog(context.Background(), setting, source)
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Version, changed.Version)
+}
+
+func TestGormCatalogSourceUsesEnabledRowsWithoutDialectSpecificJoin(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 1, Type: constant.ChannelTypeOpenAI, Key: "one", Status: common.ChannelStatusEnabled},
+		{Id: 2, Type: constant.ChannelTypeOpenAI, Key: "two", Status: common.ChannelStatusManuallyDisabled},
+	}).Error)
+	priority := int64(0)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "economy", Model: "gpt-test", ChannelId: 1, Enabled: true, Priority: &priority},
+		{Group: "economy", Model: "gpt-disabled", ChannelId: 2, Enabled: false, Priority: &priority},
+	}).Error)
+
+	abilities, channels, err := NewGormCatalogSource(db).LoadEnabledRoutingState(context.Background())
+	require.NoError(t, err)
+	require.Len(t, abilities, 1)
+	require.Len(t, channels, 1)
+	assert.Equal(t, 1, abilities[0].ChannelId)
+	assert.Equal(t, 1, channels[0].Id)
+}
+
+func TestCatalogManagerReusesContentVersionAndHonorsExplicitInvalidation(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	manager := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+
+	first, err := manager.Refresh(context.Background())
+	require.NoError(t, err)
+	second, err := manager.RefreshIfDue(context.Background())
+	require.NoError(t, err)
+	assert.Same(t, first, second)
+	assert.Equal(t, 1, source.loadCount())
+
+	manager.Invalidate()
+	third, err := manager.RefreshIfDue(context.Background())
+	require.NoError(t, err)
+	assert.Same(t, first, third)
+	assert.Equal(t, 2, source.loadCount())
+}
+
+func TestCatalogManagerRetainsLastValidatedCatalogOnTransientSourceFailure(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	manager := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+
+	first, err := manager.Refresh(context.Background())
+	require.NoError(t, err)
+	source.mu.Lock()
+	source.err = errors.New("temporary database failure")
+	source.mu.Unlock()
+	manager.Invalidate()
+	_, err = manager.Refresh(context.Background())
+	require.Error(t, err)
+
+	current, exists := manager.Current()
+	require.True(t, exists)
+	assert.Same(t, first, current)
+
+	source.mu.Lock()
+	source.err = nil
+	source.channels = nil
+	source.mu.Unlock()
+	_, err = manager.Refresh(context.Background())
+	require.ErrorIs(t, err, ErrNoCertifiedSmartRoutes)
+	_, exists = manager.Current()
+	assert.False(t, exists, "authoritative revocation must not retain the old catalog")
+
+	setting.MaxAttempts = 0
+	_, err = manager.Refresh(context.Background())
+	require.Error(t, err)
+	_, exists = manager.Current()
+	assert.False(t, exists)
+
+	setting.Enabled = false
+	_, err = manager.Refresh(context.Background())
+	require.ErrorIs(t, err, ErrSmartRouterDisabled)
+	_, exists = manager.Current()
+	assert.False(t, exists)
+}
+
+func TestCatalogManagerDropsCatalogWhenConfigurationChangesDuringSourceFailure(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	source := smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI)
+	manager := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+
+	_, err := manager.Refresh(context.Background())
+	require.NoError(t, err)
+	_, exists := manager.Current()
+	require.True(t, exists)
+
+	setting.Discovery.ExcludeVirtualGroups = append(setting.Discovery.ExcludeVirtualGroups, "economy")
+	source.mu.Lock()
+	source.err = errors.New("temporary database failure")
+	source.mu.Unlock()
+	manager.Invalidate()
+
+	_, err = manager.Refresh(context.Background())
+	require.Error(t, err)
+	_, exists = manager.Current()
+	assert.False(t, exists, "a catalog from an older admin configuration is not a valid LKG")
+}
+
+func TestGlobalSettingPublicationInvalidatesDerivedStateAndDisableStopsImmediately(t *testing.T) {
+	original := smartroutersetting.GetSmartRouterSettingSnapshot()
+	defer func() { require.NoError(t, smartroutersetting.ReplaceSmartRouterSetting(original)) }()
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	require.NoError(t, smartroutersetting.ReplaceSmartRouterSetting(setting))
+
+	catalogs := NewCatalogManager(smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI), nil)
+	defer catalogs.Close()
+	_, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	ratios := &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000, "fallback": 50_000},
+		},
+	}
+	prices := NewPriceSnapshotManager(catalogs, ratios)
+	defer prices.Close()
+	_, err = prices.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	_, exists := prices.Current("standard")
+	require.True(t, exists)
+
+	setting.DefaultForNewKeys = true
+	require.NoError(t, smartroutersetting.ReplaceSmartRouterSetting(setting))
+	assert.True(t, catalogs.dirty.Load())
+	_, exists = prices.Current("standard")
+	assert.False(t, exists)
+	_, exists = catalogs.Current()
+	assert.True(t, exists, "invalidation retains the last-known-good catalog until refresh")
+
+	setting.Enabled = false
+	setting.DefaultForNewKeys = false
+	require.NoError(t, smartroutersetting.ReplaceSmartRouterSetting(setting))
+	_, exists = catalogs.Current()
+	assert.False(t, exists)
+}

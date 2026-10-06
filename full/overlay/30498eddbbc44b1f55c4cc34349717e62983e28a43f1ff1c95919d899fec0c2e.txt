@@ -1,0 +1,1870 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	QuotaReservationFundingWallet       = "wallet"
+	QuotaReservationFundingSubscription = "subscription"
+
+	QuotaReservationStatusActive   = "active"
+	QuotaReservationStatusSettled  = "settled"
+	QuotaReservationStatusRefunded = "refunded"
+
+	// quotaReservationAccountingProjectionMarker is stored in the existing
+	// settlement_error field after the durable money settlement has also been
+	// projected to user/channel usage.  It is deliberately a marker rather
+	// than a new schema column so this hotfix remains compatible with the R55
+	// reservation table.
+	quotaReservationAccountingProjectionMarker = "accounting_projection=smart_route_committed_settlement"
+)
+
+var (
+	ErrQuotaReservationNotFound              = errors.New("quota reservation not found")
+	ErrQuotaReservationConflict              = errors.New("quota reservation identity conflict")
+	ErrQuotaReservationFinalized             = errors.New("quota reservation is already finalized")
+	ErrQuotaReservationSettlementPending     = errors.New("quota reservation settlement is pending reconciliation")
+	ErrQuotaReservationSettlementConflict    = errors.New("quota reservation was settled with a different quota")
+	ErrQuotaReservationUnknownRefundConflict = errors.New("quota reservation is not pending with unknown usage")
+	ErrQuotaReservationUsageUnavailable      = errors.New("quota reservation actual usage is unavailable")
+	ErrQuotaReservationInsufficientWallet    = errors.New("insufficient wallet quota")
+	ErrQuotaReservationInsufficientPlan      = errors.New("insufficient or inactive subscription quota")
+	ErrQuotaReservationInsufficientToken     = errors.New("insufficient token quota")
+	ErrQuotaReservationAccountingInvariant   = errors.New("quota reservation accounting invariant failed")
+	ErrQuotaReservationBatchUpdatesEnabled   = errors.New("strict quota reservations require batch quota updates to be disabled")
+	ErrQuotaReservationActiveForSubscription = errors.New("subscription has active quota reservations")
+	ErrQuotaReservationActiveForUser         = errors.New("user has active quota reservations")
+)
+
+const quotaReservationPendingWriteTimeout = 5 * time.Second
+
+// QuotaReservation is the durable idempotency and accounting record for one
+// routed request. ReservedQuota is the highest quota held before settlement;
+// FinalQuota is authoritative only after the row reaches a final status.
+type QuotaReservation struct {
+	Id                   int64  `json:"id"`
+	ReservationId        string `json:"reservation_id" gorm:"type:varchar(128);not null;uniqueIndex:idx_quota_reservation_id"`
+	RequestId            string `json:"request_id" gorm:"type:varchar(128);not null;uniqueIndex:idx_quota_reservation_request"`
+	UserId               int    `json:"user_id" gorm:"not null;index"`
+	TokenId              int    `json:"token_id" gorm:"not null;index"`
+	TokenUnlimited       bool   `json:"token_unlimited" gorm:"not null"`
+	FundingSource        string `json:"funding_source" gorm:"type:varchar(32);not null;index"`
+	UserSubscriptionId   int    `json:"user_subscription_id" gorm:"not null;index"`
+	ReservedQuota        int    `json:"reserved_quota" gorm:"type:int;not null"`
+	FinalQuota           int    `json:"final_quota" gorm:"type:int;not null"`
+	PendingFinalQuota    int    `json:"pending_final_quota" gorm:"type:int;not null"`
+	SettlementPending    bool   `json:"settlement_pending" gorm:"not null"`
+	SettlementQuotaKnown bool   `json:"settlement_quota_known" gorm:"not null"`
+	SettlementAttempts   int    `json:"settlement_attempts" gorm:"type:int;not null"`
+	SettlementError      string `json:"settlement_error" gorm:"type:text"`
+	RouteId              string `json:"route_id" gorm:"type:varchar(128);not null;index"`
+	ChannelId            int    `json:"channel_id" gorm:"not null;index"`
+	Group                string `json:"group" gorm:"type:varchar(64);not null;index"`
+	CatalogVersion       string `json:"catalog_version" gorm:"type:varchar(96);not null"`
+	PriceVersion         string `json:"price_version" gorm:"type:varchar(96);not null"`
+	RatioPPM             int64  `json:"ratio_ppm" gorm:"type:bigint;not null"`
+	QuotedQuota          int    `json:"quoted_quota" gorm:"type:int;not null"`
+	AttemptCount         int    `json:"attempt_count" gorm:"type:int;not null"`
+	Status               string `json:"status" gorm:"type:varchar(32);not null;index"`
+	CreatedAt            int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt            int64  `json:"updated_at" gorm:"type:bigint;not null;index"`
+	FinalizedAt          int64  `json:"finalized_at" gorm:"type:bigint;not null"`
+	// CommissionOperationID links a settled wallet reservation to its
+	// sidecar commission projection. Zero means not projected; -1 is a
+	// terminal, non-commissionable event (refund, subscription, or zero use).
+	// It is deliberately outside the billing state machine so the worker can
+	// retry without changing API or smart-router behavior.
+	CommissionOperationID int64 `json:"-" gorm:"type:bigint;index;not null;default:0"`
+	// Private parameter billing and pre-dispatch async recovery context.
+	// It shares this reservation's transaction and is never public.
+	ParameterCostContext *string `json:"-" gorm:"type:text"`
+}
+
+type QuotaReservationRouteQuote struct {
+	RouteId        string
+	ChannelId      int
+	Group          string
+	CatalogVersion string
+	PriceVersion   string
+	RatioPPM       int64
+	QuotedQuota    int
+}
+
+type QuotaReservationSpec struct {
+	ReservationId      string
+	RequestId          string
+	UserId             int
+	TokenId            int
+	TokenUnlimited     bool
+	FundingSource      string
+	UserSubscriptionId int
+}
+
+type QuotaReservationSubscriptionUsage struct {
+	AmountTotal int64
+	AmountUsed  int64
+}
+
+// QuotaReservationDueWindow describes one retry-backoff bucket without using
+// database-specific interval arithmetic. MaxAttempts below MinAttempts means
+// the bucket has no upper bound.
+type QuotaReservationDueWindow struct {
+	MinAttempts       int
+	MaxAttempts       int
+	UpdatedAtOrBefore int64
+}
+
+type quotaReservationCacheMutation struct {
+	walletChanged bool
+	userId        int
+	tokenChanged  bool
+	tokenKey      string
+}
+
+func (m quotaReservationCacheMutation) changed() bool {
+	return m.walletChanged || m.tokenChanged
+}
+
+type quotaReservationStore struct {
+	db          *gorm.DB
+	afterCommit func(quotaReservationCacheMutation)
+}
+
+func defaultQuotaReservationStore() quotaReservationStore {
+	return quotaReservationStore{
+		db:          DB,
+		afterCommit: invalidateQuotaReservationCaches,
+	}
+}
+
+func invalidateQuotaReservationCaches(mutation quotaReservationCacheMutation) {
+	if !common.RedisEnabled {
+		return
+	}
+	if mutation.walletChanged {
+		if err := invalidateUserCache(mutation.userId); err != nil {
+			common.SysLog("failed to invalidate user cache after quota reservation commit: " + err.Error())
+		}
+	}
+	if mutation.tokenChanged && mutation.tokenKey != "" {
+		if err := cacheDeleteToken(mutation.tokenKey); err != nil {
+			common.SysLog("failed to invalidate token cache after quota reservation commit: " + err.Error())
+		}
+	}
+}
+
+func normalizeQuotaReservationSpec(spec QuotaReservationSpec) (QuotaReservationSpec, error) {
+	spec.ReservationId = strings.TrimSpace(spec.ReservationId)
+	spec.RequestId = strings.TrimSpace(spec.RequestId)
+	spec.FundingSource = strings.TrimSpace(spec.FundingSource)
+	if spec.RequestId == "" {
+		spec.RequestId = spec.ReservationId
+	}
+	if spec.ReservationId == "" || len(spec.ReservationId) > 128 {
+		return spec, errors.New("reservationId must contain 1 to 128 bytes")
+	}
+	if spec.RequestId == "" || len(spec.RequestId) > 128 {
+		return spec, errors.New("requestId must contain 1 to 128 bytes")
+	}
+	if spec.UserId <= 0 {
+		return spec, errors.New("userId must be positive")
+	}
+	if spec.TokenId < 0 {
+		return spec, errors.New("tokenId must not be negative")
+	}
+	switch spec.FundingSource {
+	case QuotaReservationFundingWallet:
+		if spec.UserSubscriptionId != 0 {
+			return spec, errors.New("wallet reservation must not specify a subscription")
+		}
+	case QuotaReservationFundingSubscription:
+		if spec.UserSubscriptionId <= 0 {
+			return spec, errors.New("subscription reservation requires a subscription id")
+		}
+	default:
+		return spec, fmt.Errorf("unsupported funding source %q", spec.FundingSource)
+	}
+	return spec, nil
+}
+
+func validateReservationQuota(quota int) error {
+	if quota < 0 {
+		return errors.New("quota must not be negative")
+	}
+	if quota > common.MaxQuota {
+		return fmt.Errorf("quota exceeds maximum %d", common.MaxQuota)
+	}
+	return nil
+}
+
+func normalizeQuotaReservationRouteQuote(quote QuotaReservationRouteQuote) (QuotaReservationRouteQuote, error) {
+	quote.RouteId = strings.TrimSpace(quote.RouteId)
+	quote.Group = strings.TrimSpace(quote.Group)
+	quote.CatalogVersion = strings.TrimSpace(quote.CatalogVersion)
+	quote.PriceVersion = strings.TrimSpace(quote.PriceVersion)
+	if quote.RouteId == "" || len(quote.RouteId) > 128 {
+		return quote, errors.New("routeId must contain 1 to 128 bytes")
+	}
+	if quote.ChannelId <= 0 || quote.Group == "" || len(quote.Group) > 64 {
+		return quote, errors.New("route quote requires a channel and group")
+	}
+	if quote.CatalogVersion == "" || len(quote.CatalogVersion) > 96 ||
+		quote.PriceVersion == "" || len(quote.PriceVersion) > 96 {
+		return quote, errors.New("route quote requires bounded catalog and price versions")
+	}
+	if quote.RatioPPM < 0 {
+		return quote, errors.New("route quote ratio must not be negative")
+	}
+	if err := validateReservationQuota(quote.QuotedQuota); err != nil {
+		return quote, err
+	}
+	return quote, nil
+}
+
+func validateStrictQuotaReservationMode() error {
+	if common.BatchUpdateEnabled {
+		return ErrQuotaReservationBatchUpdatesEnabled
+	}
+	return nil
+}
+
+func reservationMatchesSpec(reservation *QuotaReservation, spec QuotaReservationSpec) bool {
+	return reservation.ReservationId == spec.ReservationId &&
+		reservation.RequestId == spec.RequestId &&
+		reservation.UserId == spec.UserId &&
+		reservation.TokenId == spec.TokenId &&
+		reservation.TokenUnlimited == spec.TokenUnlimited &&
+		reservation.FundingSource == spec.FundingSource &&
+		reservation.UserSubscriptionId == spec.UserSubscriptionId
+}
+
+func (store quotaReservationStore) loadReservationForUpdate(tx *gorm.DB, reservationId string) (*QuotaReservation, error) {
+	var reservation QuotaReservation
+	// Absence is the normal first step of the get-or-create path. Use Find so
+	// GORM does not emit an error-level "record not found" line for every new
+	// request while preserving the typed store error for callers.
+	query := lockForUpdate(tx).Where("reservation_id = ?", reservationId).Limit(1).Find(&reservation)
+	if query.Error != nil {
+		return nil, query.Error
+	}
+	if query.RowsAffected == 0 {
+		return nil, ErrQuotaReservationNotFound
+	}
+	return &reservation, nil
+}
+
+func (store quotaReservationStore) getOrCreateReservationTx(tx *gorm.DB, spec QuotaReservationSpec) (*QuotaReservation, bool, error) {
+	existing, err := store.loadReservationForUpdate(tx, spec.ReservationId)
+	if err == nil {
+		if !reservationMatchesSpec(existing, spec) {
+			return nil, false, ErrQuotaReservationConflict
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, ErrQuotaReservationNotFound) {
+		return nil, false, err
+	}
+	var requestConflict QuotaReservation
+	requestQuery := tx.Where("request_id = ?", spec.RequestId).Limit(1).Find(&requestConflict)
+	if requestQuery.Error != nil {
+		return nil, false, requestQuery.Error
+	}
+	if requestQuery.RowsAffected > 0 {
+		return nil, false, fmt.Errorf("%w: request id already belongs to reservation %s", ErrQuotaReservationConflict, requestConflict.ReservationId)
+	}
+
+	now := common.GetTimestamp()
+	candidate := QuotaReservation{
+		ReservationId:      spec.ReservationId,
+		RequestId:          spec.RequestId,
+		UserId:             spec.UserId,
+		TokenId:            spec.TokenId,
+		TokenUnlimited:     spec.TokenUnlimited,
+		FundingSource:      spec.FundingSource,
+		UserSubscriptionId: spec.UserSubscriptionId,
+		ReservedQuota:      0,
+		FinalQuota:         0,
+		Status:             QuotaReservationStatusActive,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		FinalizedAt:        0,
+	}
+	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&candidate)
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+
+	reservation, err := store.loadReservationForUpdate(tx, spec.ReservationId)
+	if err != nil {
+		if !errors.Is(err, ErrQuotaReservationNotFound) {
+			return nil, false, err
+		}
+		requestQuery = tx.Where("request_id = ?", spec.RequestId).First(&requestConflict)
+		if requestQuery.Error == nil {
+			return nil, false, fmt.Errorf("%w: request id already belongs to reservation %s", ErrQuotaReservationConflict, requestConflict.ReservationId)
+		}
+		if !errors.Is(requestQuery.Error, gorm.ErrRecordNotFound) {
+			return nil, false, requestQuery.Error
+		}
+		return nil, false, err
+	}
+	if !reservationMatchesSpec(reservation, spec) {
+		return nil, false, ErrQuotaReservationConflict
+	}
+	return reservation, true, nil
+}
+
+func validateReservationFundingTx(tx *gorm.DB, reservation *QuotaReservation) error {
+	switch reservation.FundingSource {
+	case QuotaReservationFundingWallet:
+		var user User
+		if err := tx.Select("id").Where("id = ?", reservation.UserId).First(&user).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrQuotaReservationInsufficientWallet
+			}
+			return err
+		}
+	case QuotaReservationFundingSubscription:
+		var subscription UserSubscription
+		if err := tx.Select("id").Where(
+			"id = ? AND user_id = ? AND status = ? AND end_time > ?",
+			reservation.UserSubscriptionId,
+			reservation.UserId,
+			"active",
+			common.GetTimestamp(),
+		).First(&subscription).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrQuotaReservationInsufficientPlan
+			}
+			return err
+		}
+	default:
+		return ErrQuotaReservationConflict
+	}
+	return nil
+}
+
+func validateReservationResourcesTx(tx *gorm.DB, reservation *QuotaReservation) error {
+	if err := validateReservationFundingTx(tx, reservation); err != nil {
+		return err
+	}
+
+	if reservation.TokenId == 0 {
+		return nil
+	}
+	var token Token
+	if err := tx.Select("id").Where(
+		"id = ? AND user_id = ? AND unlimited_quota = ?",
+		reservation.TokenId,
+		reservation.UserId,
+		reservation.TokenUnlimited,
+	).First(&token).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrQuotaReservationInsufficientToken
+		}
+		return err
+	}
+	return nil
+}
+
+func adjustReservationFundingTx(tx *gorm.DB, reservation *QuotaReservation, delta int, mutation *quotaReservationCacheMutation) error {
+	if delta == 0 {
+		return nil
+	}
+	switch reservation.FundingSource {
+	case QuotaReservationFundingWallet:
+		var result *gorm.DB
+		if delta > 0 {
+			result = tx.Model(&User{}).
+				Where("id = ? AND quota >= ?", reservation.UserId, delta).
+				Update("quota", gorm.Expr("quota - ?", delta))
+			if result.Error == nil && result.RowsAffected != 1 {
+				return ErrQuotaReservationInsufficientWallet
+			}
+		} else {
+			refund := -delta
+			// MaxQuota limits one request's charge, not a wallet's cumulative
+			// balance. Guard only the native integer boundary here.
+			maxBalance := int(^uint(0) >> 1)
+			result = tx.Unscoped().Model(&User{}).
+				Where("id = ? AND quota <= ?", reservation.UserId, maxBalance-refund).
+				Update("quota", gorm.Expr("quota + ?", refund))
+			if result.Error == nil && result.RowsAffected != 1 {
+				return ErrQuotaReservationAccountingInvariant
+			}
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		mutation.walletChanged = true
+		mutation.userId = reservation.UserId
+		return nil
+
+	case QuotaReservationFundingSubscription:
+		var result *gorm.DB
+		if delta > 0 {
+			now := common.GetTimestamp()
+			var subscription UserSubscription
+			if err := lockForUpdate(tx).
+				Where("id = ? AND user_id = ?", reservation.UserSubscriptionId, reservation.UserId).
+				First(&subscription).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrQuotaReservationInsufficientPlan
+				}
+				return err
+			}
+			if subscription.Status != "active" || subscription.EndTime <= now {
+				return ErrQuotaReservationInsufficientPlan
+			}
+			if subscription.NextResetTime > 0 && subscription.NextResetTime <= now {
+				plan, err := getSubscriptionPlanByIdTx(tx, subscription.PlanId)
+				if err != nil {
+					return err
+				}
+				if err := maybeResetUserSubscriptionWithPlanTx(tx, &subscription, plan, now); err != nil {
+					return err
+				}
+			}
+			result = tx.Model(&UserSubscription{}).
+				Where(
+					"id = ? AND user_id = ? AND status = ? AND end_time > ? AND amount_used >= 0 AND amount_used <= ? AND (amount_total = 0 OR amount_used <= amount_total - ?)",
+					reservation.UserSubscriptionId,
+					reservation.UserId,
+					"active",
+					now,
+					math.MaxInt64-int64(delta),
+					delta,
+				).
+				Update("amount_used", gorm.Expr("amount_used + ?", delta))
+			if result.Error == nil && result.RowsAffected != 1 {
+				return ErrQuotaReservationInsufficientPlan
+			}
+		} else {
+			refund := -delta
+			result = tx.Model(&UserSubscription{}).
+				Where("id = ? AND user_id = ? AND amount_used >= ?", reservation.UserSubscriptionId, reservation.UserId, refund).
+				Update("amount_used", gorm.Expr("amount_used - ?", refund))
+			if result.Error == nil && result.RowsAffected != 1 {
+				return ErrQuotaReservationAccountingInvariant
+			}
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		return nil
+	default:
+		return ErrQuotaReservationConflict
+	}
+}
+
+func adjustReservationTokenTx(tx *gorm.DB, reservation *QuotaReservation, delta int, mutation *quotaReservationCacheMutation) error {
+	if delta == 0 || reservation.TokenId == 0 || reservation.TokenUnlimited {
+		return nil
+	}
+
+	var result *gorm.DB
+	// Token remain/used values are cumulative. Only prevent native integer
+	// overflow; common.MaxQuota remains enforced by request-level validation.
+	maxBalance := int(^uint(0) >> 1)
+	if delta > 0 {
+		result = tx.Model(&Token{}).
+			Where(
+				"id = ? AND user_id = ? AND unlimited_quota = ? AND remain_quota >= ? AND used_quota <= ?",
+				reservation.TokenId,
+				reservation.UserId,
+				false,
+				delta,
+				maxBalance-delta,
+			).
+			Updates(map[string]interface{}{
+				"remain_quota":  gorm.Expr("remain_quota - ?", delta),
+				"used_quota":    gorm.Expr("used_quota + ?", delta),
+				"accessed_time": common.GetTimestamp(),
+			})
+		if result.Error == nil && result.RowsAffected != 1 {
+			return ErrQuotaReservationInsufficientToken
+		}
+	} else {
+		refund := -delta
+		result = tx.Unscoped().Model(&Token{}).
+			Where(
+				"id = ? AND user_id = ? AND used_quota >= ? AND remain_quota <= ?",
+				reservation.TokenId,
+				reservation.UserId,
+				refund,
+				maxBalance-refund,
+			).
+			Updates(map[string]interface{}{
+				"remain_quota":  gorm.Expr("remain_quota + ?", refund),
+				"used_quota":    gorm.Expr("used_quota - ?", refund),
+				"accessed_time": common.GetTimestamp(),
+			})
+		if result.Error == nil && result.RowsAffected != 1 {
+			return ErrQuotaReservationAccountingInvariant
+		}
+	}
+	if result.Error != nil {
+		return result.Error
+	}
+
+	var token Token
+	if err := tx.Unscoped().Select("key").Where("id = ?", reservation.TokenId).First(&token).Error; err != nil {
+		return err
+	}
+	mutation.tokenChanged = true
+	mutation.tokenKey = token.Key
+	return nil
+}
+
+// adjustReservationTokenFinalizationTx applies the finite-token projection
+// during settlement or refund. Wallet/subscription funding is the authoritative
+// financial ledger; missing or historically inconsistent token state must not
+// keep that money held. Real database failures still abort the transaction so
+// the worker can retry.
+func adjustReservationTokenFinalizationTx(
+	tx *gorm.DB,
+	reservation *QuotaReservation,
+	delta int,
+	mutation *quotaReservationCacheMutation,
+) (string, error) {
+	if delta == 0 || reservation.TokenId == 0 || reservation.TokenUnlimited {
+		return "", nil
+	}
+
+	var token Token
+	err := tx.Unscoped().
+		Where("id = ? AND user_id = ?", reservation.TokenId, reservation.UserId).
+		First(&token).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Sprintf("finite token %d no longer exists; main funding restored", reservation.TokenId), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if token.UnlimitedQuota {
+		return fmt.Sprintf("finite token %d became unlimited; main funding restored", reservation.TokenId), nil
+	}
+
+	maxBalance := int(^uint(0) >> 1)
+	newRemain := token.RemainQuota
+	newUsed := token.UsedQuota
+	if delta > 0 {
+		if token.RemainQuota < delta || token.UsedQuota > maxBalance-delta {
+			return fmt.Sprintf(
+				"finite token %d projection inconsistent (remain=%d used=%d debit=%d); main funding finalized",
+				reservation.TokenId,
+				token.RemainQuota,
+				token.UsedQuota,
+				delta,
+			), nil
+		}
+		newRemain -= delta
+		newUsed += delta
+	} else {
+		refund := -delta
+		if token.UsedQuota < refund || token.RemainQuota > maxBalance-refund {
+			return fmt.Sprintf(
+				"finite token %d projection inconsistent (remain=%d used=%d refund=%d); main funding restored",
+				reservation.TokenId,
+				token.RemainQuota,
+				token.UsedQuota,
+				refund,
+			), nil
+		}
+		newRemain += refund
+		newUsed -= refund
+	}
+
+	result := tx.Unscoped().Model(&Token{}).
+		Where(
+			"id = ? AND user_id = ? AND unlimited_quota = ? AND remain_quota = ? AND used_quota = ?",
+			reservation.TokenId,
+			reservation.UserId,
+			false,
+			token.RemainQuota,
+			token.UsedQuota,
+		).
+		Updates(map[string]interface{}{
+			"remain_quota":  newRemain,
+			"used_quota":    newUsed,
+			"accessed_time": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return "", result.Error
+	}
+	if result.RowsAffected != 1 {
+		return "", ErrQuotaReservationAccountingInvariant
+	}
+	mutation.tokenChanged = true
+	mutation.tokenKey = token.Key
+	return "", nil
+}
+
+func updateActiveReservationTx(tx *gorm.DB, reservation *QuotaReservation, updates map[string]interface{}) error {
+	updates["updated_at"] = common.GetTimestamp()
+	result := tx.Model(&QuotaReservation{}).
+		Where(
+			"id = ? AND status = ? AND reserved_quota = ?",
+			reservation.Id,
+			QuotaReservationStatusActive,
+			reservation.ReservedQuota,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrQuotaReservationConflict
+	}
+	return nil
+}
+
+func quotaReservationRouteQuoteUpdates(quote QuotaReservationRouteQuote) map[string]interface{} {
+	return map[string]interface{}{
+		"route_id":        quote.RouteId,
+		"channel_id":      quote.ChannelId,
+		"group":           quote.Group,
+		"catalog_version": quote.CatalogVersion,
+		"price_version":   quote.PriceVersion,
+		"ratio_ppm":       quote.RatioPPM,
+		"quoted_quota":    quote.QuotedQuota,
+		"attempt_count":   gorm.Expr("attempt_count + 1"),
+	}
+}
+
+func applyQuotaReservationRouteQuote(reservation *QuotaReservation, quote QuotaReservationRouteQuote) {
+	reservation.RouteId = quote.RouteId
+	reservation.ChannelId = quote.ChannelId
+	reservation.Group = quote.Group
+	reservation.CatalogVersion = quote.CatalogVersion
+	reservation.PriceVersion = quote.PriceVersion
+	reservation.RatioPPM = quote.RatioPPM
+	reservation.QuotedQuota = quote.QuotedQuota
+	reservation.AttemptCount++
+}
+
+func (store quotaReservationStore) reserveTo(ctx context.Context, spec QuotaReservationSpec, targetQuota int) (*QuotaReservation, error) {
+	return store.reserveToWithRouteQuote(ctx, spec, targetQuota, nil)
+}
+
+func (store quotaReservationStore) reserveToWithRouteQuote(
+	ctx context.Context,
+	spec QuotaReservationSpec,
+	targetQuota int,
+	quote *QuotaReservationRouteQuote,
+) (*QuotaReservation, error) {
+	if store.db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateStrictQuotaReservationMode(); err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeQuotaReservationSpec(spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateReservationQuota(targetQuota); err != nil {
+		return nil, err
+	}
+	var normalizedQuote *QuotaReservationRouteQuote
+	if quote != nil {
+		normalized, err := normalizeQuotaReservationRouteQuote(*quote)
+		if err != nil {
+			return nil, err
+		}
+		if normalized.QuotedQuota != targetQuota {
+			return nil, errors.New("route quote quota must equal reservation target")
+		}
+		normalizedQuote = &normalized
+	}
+
+	var result QuotaReservation
+	mutation := quotaReservationCacheMutation{}
+	err = store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, needsInitialValidation, err := store.getOrCreateReservationTx(tx, normalized)
+		if err != nil {
+			return err
+		}
+		if reservation.Status != QuotaReservationStatusActive {
+			return ErrQuotaReservationFinalized
+		}
+		if reservation.SettlementPending {
+			return ErrQuotaReservationSettlementPending
+		}
+		if needsInitialValidation || targetQuota > reservation.ReservedQuota {
+			if err := validateReservationResourcesTx(tx, reservation); err != nil {
+				return err
+			}
+		}
+		if targetQuota <= reservation.ReservedQuota && normalizedQuote == nil {
+			result = *reservation
+			return nil
+		}
+
+		updates := map[string]interface{}{}
+		if targetQuota > reservation.ReservedQuota {
+			delta := targetQuota - reservation.ReservedQuota
+			if err := adjustReservationFundingTx(tx, reservation, delta, &mutation); err != nil {
+				return err
+			}
+			if err := adjustReservationTokenTx(tx, reservation, delta, &mutation); err != nil {
+				return err
+			}
+			updates["reserved_quota"] = targetQuota
+		}
+		if normalizedQuote != nil {
+			for key, value := range quotaReservationRouteQuoteUpdates(*normalizedQuote) {
+				updates[key] = value
+			}
+		}
+		if err := updateActiveReservationTx(tx, reservation, updates); err != nil {
+			return err
+		}
+		if targetQuota > reservation.ReservedQuota {
+			reservation.ReservedQuota = targetQuota
+		}
+		if normalizedQuote != nil {
+			applyQuotaReservationRouteQuote(reservation, *normalizedQuote)
+		}
+		reservation.UpdatedAt = common.GetTimestamp()
+		result = *reservation
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if mutation.changed() && store.afterCommit != nil {
+		store.afterCommit(mutation)
+	}
+	return &result, nil
+}
+
+func (store quotaReservationStore) settle(ctx context.Context, reservationId string, actualQuota int) (*QuotaReservation, error) {
+	if store.db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateStrictQuotaReservationMode(); err != nil {
+		return nil, err
+	}
+	reservationId = strings.TrimSpace(reservationId)
+	if reservationId == "" {
+		return nil, errors.New("reservationId is empty")
+	}
+	if err := validateReservationQuota(actualQuota); err != nil {
+		return nil, err
+	}
+
+	var result QuotaReservation
+	mutation := quotaReservationCacheMutation{}
+	err := store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, err := store.loadReservationForUpdate(tx, reservationId)
+		if err != nil {
+			return err
+		}
+		switch reservation.Status {
+		case QuotaReservationStatusSettled:
+			if reservation.FinalQuota != actualQuota {
+				return ErrQuotaReservationSettlementConflict
+			}
+			result = *reservation
+			return nil
+		case QuotaReservationStatusRefunded:
+			return ErrQuotaReservationFinalized
+		case QuotaReservationStatusActive:
+		default:
+			return ErrQuotaReservationConflict
+		}
+		if reservation.SettlementPending && reservation.SettlementQuotaKnown && reservation.PendingFinalQuota != actualQuota {
+			return ErrQuotaReservationSettlementConflict
+		}
+
+		delta := actualQuota - reservation.ReservedQuota
+		if delta > 0 {
+			// Reserve/extend enforces the finite Token as an authorization limit.
+			// Finalization must not depend on that mutable projection: once exact
+			// usage exists, wallet/subscription is the authoritative money ledger.
+			if err := validateReservationFundingTx(tx, reservation); err != nil {
+				return err
+			}
+		}
+		if err := adjustReservationFundingTx(tx, reservation, delta, &mutation); err != nil {
+			return err
+		}
+		projectionWarning, err := adjustReservationTokenFinalizationTx(tx, reservation, delta, &mutation)
+		if err != nil {
+			return err
+		}
+		// R52's trusted billing boundary requires the Smart Route receipt,
+		// wallet/subscription settlement, and user/channel usage projection to
+		// commit together. R55 split the latter into relay cleanup, so normal
+		// responses without a terminal usage callback could settle money but
+		// disappear from used_quota and channel totals.
+		if strings.HasPrefix(reservation.ReservationId, "smart:") || reservation.ParameterCostContext != nil {
+			if update := tx.Model(&User{}).Where("id = ?", reservation.UserId).Updates(map[string]interface{}{
+				"used_quota":    gorm.Expr("used_quota + ?", actualQuota),
+				"request_count": gorm.Expr("request_count + 1"),
+			}); update.Error != nil {
+				return update.Error
+			} else if update.RowsAffected != 1 {
+				return fmt.Errorf("user %d not found while settling smart route usage", reservation.UserId)
+			}
+			if reservation.ChannelId > 0 && actualQuota != 0 {
+				update := tx.Model(&Channel{}).Where("id = ?", reservation.ChannelId).
+					Update("used_quota", gorm.Expr("used_quota + ?", actualQuota))
+				if update.Error != nil {
+					return update.Error
+				}
+				if update.RowsAffected != 1 {
+					projectionWarning = strings.Trim(strings.Join([]string{projectionWarning, "channel_usage_projection_missing"}, ";"), ";")
+				}
+			}
+		}
+		peakReserved := reservation.ReservedQuota
+		if actualQuota > peakReserved {
+			peakReserved = actualQuota
+		}
+		now := common.GetTimestamp()
+		settlementError := ""
+		if projectionWarning != "" {
+			settlementError = "token_projection_warning=" + projectionWarning
+			if len(settlementError) > 2048 {
+				settlementError = settlementError[:2048]
+			}
+		}
+		if strings.HasPrefix(reservation.ReservationId, "smart:") {
+			if settlementError != "" {
+				settlementError += "; "
+			}
+			settlementError += quotaReservationAccountingProjectionMarker
+		}
+		if err := updateActiveReservationTx(tx, reservation, map[string]interface{}{
+			"reserved_quota":         peakReserved,
+			"final_quota":            actualQuota,
+			"pending_final_quota":    actualQuota,
+			"settlement_pending":     false,
+			"settlement_quota_known": true,
+			"settlement_error":       settlementError,
+			"status":                 QuotaReservationStatusSettled,
+			"finalized_at":           now,
+		}); err != nil {
+			return err
+		}
+		reservation.ReservedQuota = peakReserved
+		reservation.FinalQuota = actualQuota
+		reservation.PendingFinalQuota = actualQuota
+		reservation.SettlementPending = false
+		reservation.SettlementQuotaKnown = true
+		reservation.SettlementError = settlementError
+		reservation.Status = QuotaReservationStatusSettled
+		reservation.FinalizedAt = now
+		reservation.UpdatedAt = now
+		if err := enqueueParameterReservationTerminalTx(tx, reservation); err != nil {
+			return err
+		}
+		result = *reservation
+		return nil
+	})
+	if err != nil {
+		if shouldMarkQuotaReservationSettlementPending(err) {
+			if pendingErr := store.markSettlementPending(ctx, reservationId, actualQuota, err); pendingErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("persist settlement pending state: %w", pendingErr))
+			}
+		}
+		return nil, err
+	}
+	if mutation.changed() && store.afterCommit != nil {
+		store.afterCommit(mutation)
+	}
+	return &result, nil
+}
+
+// ApplySmartRouteCommittedAccountingProjection atomically projects a settled
+// smart-route reservation to the user and channel usage counters.  The
+// reservation row is the durable idempotency fence: repeated recovery,
+// worker, or request cleanup calls observe the marker and do not increment
+// counters again.  Wallet/subscription money is intentionally not touched;
+// Settle has already applied that authoritative ledger change.
+func ApplySmartRouteCommittedAccountingProjection(
+	ctx context.Context,
+	reservationID string,
+) (*QuotaReservation, bool, error) {
+	if DB == nil {
+		return nil, false, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateStrictQuotaReservationMode(); err != nil {
+		return nil, false, err
+	}
+	reservationID = strings.TrimSpace(reservationID)
+	if reservationID == "" {
+		return nil, false, errors.New("reservationId is empty")
+	}
+
+	var result QuotaReservation
+	applied := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, err := defaultQuotaReservationStore().loadReservationForUpdate(tx, reservationID)
+		if err != nil {
+			return err
+		}
+		if reservation.Status != QuotaReservationStatusSettled {
+			return fmt.Errorf("smart route accounting projection requires settled reservation, got %s", reservation.Status)
+		}
+		if strings.Contains(reservation.SettlementError, quotaReservationAccountingProjectionMarker) {
+			result = *reservation
+			return nil
+		}
+
+		// Keep request_count semantics aligned with the normal text/audio
+		// consume path even when the final quota is zero.
+		if update := tx.Model(&User{}).Where("id = ?", reservation.UserId).Updates(map[string]interface{}{
+			"used_quota":    gorm.Expr("used_quota + ?", reservation.FinalQuota),
+			"request_count": gorm.Expr("request_count + 1"),
+		}); update.Error != nil {
+			return update.Error
+		} else if update.RowsAffected != 1 {
+			return fmt.Errorf("user %d not found while projecting smart route accounting", reservation.UserId)
+		}
+		if reservation.ChannelId > 0 && reservation.FinalQuota != 0 {
+			if update := tx.Model(&Channel{}).Where("id = ?", reservation.ChannelId).
+				Update("used_quota", gorm.Expr("used_quota + ?", reservation.FinalQuota)); update.Error != nil {
+				return update.Error
+			} else if update.RowsAffected != 1 {
+				return fmt.Errorf("channel %d not found while projecting smart route accounting", reservation.ChannelId)
+			}
+		}
+
+		settlementError := reservation.SettlementError
+		if strings.TrimSpace(settlementError) != "" {
+			settlementError += "; "
+		}
+		settlementError += quotaReservationAccountingProjectionMarker
+		if len(settlementError) > 2048 {
+			// Preserve the marker even when an adaptor warning already consumed
+			// the field's bound.
+			prefixLen := 2048 - len(quotaReservationAccountingProjectionMarker) - 2
+			if prefixLen < 0 {
+				prefixLen = 0
+			}
+			settlementError = settlementError[:prefixLen] + "; " + quotaReservationAccountingProjectionMarker
+		}
+		if update := tx.Model(&QuotaReservation{}).Where("id = ? AND status = ?", reservation.Id, QuotaReservationStatusSettled).
+			Updates(map[string]interface{}{"settlement_error": settlementError, "updated_at": common.GetTimestamp()}); update.Error != nil {
+			return update.Error
+		} else if update.RowsAffected != 1 {
+			return ErrQuotaReservationConflict
+		}
+		reservation.SettlementError = settlementError
+		reservation.UpdatedAt = common.GetTimestamp()
+		result = *reservation
+		applied = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return &result, applied, nil
+}
+
+// MarkSmartRouteCommittedAccountingProjection marks a settled reservation as
+// projected without changing counters. It is used when the normal usage path
+// already wrote a positive consume log before a retry/recovery worker runs.
+func MarkSmartRouteCommittedAccountingProjection(ctx context.Context, reservationID string) error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reservationID = strings.TrimSpace(reservationID)
+	if reservationID == "" {
+		return errors.New("reservationId is empty")
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, err := defaultQuotaReservationStore().loadReservationForUpdate(tx, reservationID)
+		if err != nil {
+			return err
+		}
+		if reservation.Status != QuotaReservationStatusSettled {
+			return fmt.Errorf("smart route accounting projection requires settled reservation, got %s", reservation.Status)
+		}
+		if strings.Contains(reservation.SettlementError, quotaReservationAccountingProjectionMarker) {
+			return nil
+		}
+		settlementError := reservation.SettlementError
+		if strings.TrimSpace(settlementError) != "" {
+			settlementError += "; "
+		}
+		settlementError += quotaReservationAccountingProjectionMarker
+		if len(settlementError) > 2048 {
+			prefixLen := 2048 - len(quotaReservationAccountingProjectionMarker) - 2
+			if prefixLen < 0 {
+				prefixLen = 0
+			}
+			settlementError = settlementError[:prefixLen] + "; " + quotaReservationAccountingProjectionMarker
+		}
+		return tx.Model(&QuotaReservation{}).Where("id = ? AND status = ?", reservation.Id, QuotaReservationStatusSettled).
+			Update("settlement_error", settlementError).Error
+	})
+}
+
+func shouldMarkQuotaReservationSettlementPending(err error) bool {
+	return err != nil &&
+		!errors.Is(err, ErrQuotaReservationNotFound) &&
+		!errors.Is(err, ErrQuotaReservationFinalized) &&
+		!errors.Is(err, ErrQuotaReservationSettlementPending) &&
+		!errors.Is(err, ErrQuotaReservationSettlementConflict) &&
+		!errors.Is(err, ErrQuotaReservationBatchUpdatesEnabled)
+}
+
+func shouldMarkUnknownRefundRetry(err error) bool {
+	return err != nil &&
+		!errors.Is(err, ErrQuotaReservationNotFound) &&
+		!errors.Is(err, ErrQuotaReservationFinalized) &&
+		!errors.Is(err, ErrQuotaReservationUnknownRefundConflict) &&
+		!errors.Is(err, ErrQuotaReservationConflict) &&
+		!errors.Is(err, ErrQuotaReservationBatchUpdatesEnabled)
+}
+
+func (store quotaReservationStore) markSettlementPending(ctx context.Context, reservationId string, actualQuota int, settleErr error) error {
+	if store.db == nil || settleErr == nil {
+		return nil
+	}
+	message := settleErr.Error()
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pendingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaReservationPendingWriteTimeout)
+	defer cancel()
+	result := store.db.WithContext(pendingCtx).Model(&QuotaReservation{}).
+		Where(
+			"reservation_id = ? AND status = ? AND (settlement_pending = ? OR settlement_quota_known = ? OR pending_final_quota = ?)",
+			reservationId,
+			QuotaReservationStatusActive,
+			false,
+			false,
+			actualQuota,
+		).
+		Updates(map[string]interface{}{
+			"pending_final_quota":    actualQuota,
+			"settlement_pending":     true,
+			"settlement_quota_known": true,
+			"settlement_attempts":    gorm.Expr("settlement_attempts + 1"),
+			"settlement_error":       message,
+			"updated_at":             common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+
+	var reservation QuotaReservation
+	if err := store.db.WithContext(pendingCtx).
+		Select("status", "settlement_pending", "settlement_quota_known", "pending_final_quota").
+		Where("reservation_id = ?", reservationId).
+		First(&reservation).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrQuotaReservationNotFound
+		}
+		return err
+	}
+	if reservation.Status != QuotaReservationStatusActive {
+		return nil
+	}
+	if reservation.SettlementPending && reservation.SettlementQuotaKnown && reservation.PendingFinalQuota != actualQuota {
+		return ErrQuotaReservationSettlementConflict
+	}
+	return ErrQuotaReservationConflict
+}
+
+func (store quotaReservationStore) markUnknownRefundRetry(
+	ctx context.Context,
+	reservationId string,
+	refundErr error,
+	previousError string,
+) error {
+	if store.db == nil || refundErr == nil {
+		return nil
+	}
+	message := "automatic unknown-usage refund failed: " + refundErr.Error()
+	if previous := strings.TrimSpace(previousError); previous != "" {
+		message += "; prior_error=" + previous
+	}
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pendingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaReservationPendingWriteTimeout)
+	defer cancel()
+	result := store.db.WithContext(pendingCtx).Model(&QuotaReservation{}).
+		Where(
+			"reservation_id = ? AND status = ? AND settlement_pending = ? AND settlement_quota_known = ?",
+			reservationId,
+			QuotaReservationStatusActive,
+			true,
+			false,
+		).
+		Updates(map[string]interface{}{
+			"settlement_attempts": gorm.Expr("settlement_attempts + 1"),
+			"settlement_error":    message,
+			"updated_at":          common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+
+	var reservation QuotaReservation
+	if err := store.db.WithContext(pendingCtx).
+		Select("status", "settlement_pending", "settlement_quota_known").
+		Where("reservation_id = ?", reservationId).
+		First(&reservation).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrQuotaReservationNotFound
+		}
+		return err
+	}
+	if reservation.Status != QuotaReservationStatusActive {
+		return nil
+	}
+	return ErrQuotaReservationUnknownRefundConflict
+}
+
+func (store quotaReservationStore) holdForReconciliation(
+	ctx context.Context,
+	reservationId string,
+	reason string,
+) (*QuotaReservation, error) {
+	if store.db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateStrictQuotaReservationMode(); err != nil {
+		return nil, err
+	}
+	reservationId = strings.TrimSpace(reservationId)
+	reason = strings.TrimSpace(reason)
+	if reservationId == "" {
+		return nil, errors.New("reservationId is empty")
+	}
+	if reason == "" {
+		return nil, errors.New("reconciliation reason is empty")
+	}
+	if len(reason) > 2048 {
+		reason = reason[:2048]
+	}
+
+	var result QuotaReservation
+	err := store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, err := store.loadReservationForUpdate(tx, reservationId)
+		if err != nil {
+			return err
+		}
+		switch reservation.Status {
+		case QuotaReservationStatusSettled:
+			result = *reservation
+			return nil
+		case QuotaReservationStatusRefunded:
+			return ErrQuotaReservationFinalized
+		case QuotaReservationStatusActive:
+		default:
+			return ErrQuotaReservationConflict
+		}
+		if reservation.SettlementPending {
+			result = *reservation
+			return nil
+		}
+		if err := updateActiveReservationTx(tx, reservation, map[string]interface{}{
+			"pending_final_quota":    0,
+			"settlement_pending":     true,
+			"settlement_quota_known": false,
+			"settlement_attempts":    gorm.Expr("settlement_attempts + 1"),
+			"settlement_error":       reason,
+		}); err != nil {
+			return err
+		}
+		reservation.PendingFinalQuota = 0
+		reservation.SettlementPending = true
+		reservation.SettlementQuotaKnown = false
+		reservation.SettlementAttempts++
+		reservation.SettlementError = reason
+		reservation.UpdatedAt = common.GetTimestamp()
+		result = *reservation
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (store quotaReservationStore) markManualReview(
+	ctx context.Context,
+	reservationId string,
+	reason string,
+) (*QuotaReservation, error) {
+	if store.db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reservationId = strings.TrimSpace(reservationId)
+	reason = strings.TrimSpace(reason)
+	if reservationId == "" {
+		return nil, errors.New("reservationId is empty")
+	}
+	if reason == "" {
+		return nil, errors.New("manual review reason is empty")
+	}
+	if len(reason) > 2048 {
+		reason = reason[:2048]
+	}
+
+	var result QuotaReservation
+	err := store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, err := store.loadReservationForUpdate(tx, reservationId)
+		if err != nil {
+			return err
+		}
+		if reservation.Status != QuotaReservationStatusActive {
+			result = *reservation
+			return nil
+		}
+		if !reservation.SettlementPending || !reservation.SettlementQuotaKnown {
+			result = *reservation
+			return nil
+		}
+		if err := updateActiveReservationTx(tx, reservation, map[string]interface{}{
+			"settlement_quota_known": false,
+			"settlement_error":       reason,
+		}); err != nil {
+			return err
+		}
+		reservation.SettlementQuotaKnown = false
+		reservation.SettlementError = reason
+		reservation.UpdatedAt = common.GetTimestamp()
+		result = *reservation
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (store quotaReservationStore) refund(ctx context.Context, reservationId string) (*QuotaReservation, error) {
+	return store.refundWithPolicy(ctx, reservationId, false)
+}
+
+func (store quotaReservationStore) refundUnknownPending(ctx context.Context, reservationId string) (*QuotaReservation, error) {
+	return store.refundWithPolicy(ctx, reservationId, true)
+}
+
+func (store quotaReservationStore) refundWithPolicy(
+	ctx context.Context,
+	reservationId string,
+	requireUnknownPending bool,
+) (*QuotaReservation, error) {
+	if store.db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateStrictQuotaReservationMode(); err != nil {
+		return nil, err
+	}
+	reservationId = strings.TrimSpace(reservationId)
+	if reservationId == "" {
+		return nil, errors.New("reservationId is empty")
+	}
+
+	var result QuotaReservation
+	mutation := quotaReservationCacheMutation{}
+	previousSettlementError := ""
+	err := store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reservation, err := store.loadReservationForUpdate(tx, reservationId)
+		if err != nil {
+			return err
+		}
+		switch reservation.Status {
+		case QuotaReservationStatusRefunded:
+			result = *reservation
+			return nil
+		case QuotaReservationStatusSettled:
+			return ErrQuotaReservationFinalized
+		case QuotaReservationStatusActive:
+		default:
+			return ErrQuotaReservationConflict
+		}
+		if requireUnknownPending {
+			if !reservation.SettlementPending || reservation.SettlementQuotaKnown {
+				return ErrQuotaReservationUnknownRefundConflict
+			}
+			previousSettlementError = reservation.SettlementError
+		} else if reservation.SettlementPending {
+			return ErrQuotaReservationSettlementPending
+		}
+
+		projectionWarning := ""
+		if reservation.ReservedQuota > 0 {
+			if err := adjustReservationFundingTx(tx, reservation, -reservation.ReservedQuota, &mutation); err != nil {
+				return err
+			}
+			projectionWarning, err = adjustReservationTokenFinalizationTx(
+				tx,
+				reservation,
+				-reservation.ReservedQuota,
+				&mutation,
+			)
+			if err != nil {
+				return err
+			}
+		}
+		now := common.GetTimestamp()
+		settlementError := ""
+		if requireUnknownPending {
+			settlementError = "customer-first automatic refund: exact usage unavailable"
+			if previous := strings.TrimSpace(reservation.SettlementError); previous != "" {
+				settlementError += "; prior_error=" + previous
+			}
+			if len(settlementError) > 2048 {
+				settlementError = settlementError[:2048]
+			}
+		}
+		if projectionWarning != "" {
+			if settlementError != "" {
+				settlementError += "; "
+			}
+			settlementError += "token_projection_warning=" + projectionWarning
+			if len(settlementError) > 2048 {
+				settlementError = settlementError[:2048]
+			}
+		}
+		updates := map[string]interface{}{
+			"final_quota":            0,
+			"pending_final_quota":    0,
+			"settlement_pending":     false,
+			"settlement_quota_known": false,
+			"settlement_error":       settlementError,
+			"status":                 QuotaReservationStatusRefunded,
+			"finalized_at":           now,
+		}
+		if requireUnknownPending {
+			updates["updated_at"] = now
+			updateResult := tx.Model(&QuotaReservation{}).
+				Where(
+					"id = ? AND status = ? AND reserved_quota = ? AND settlement_pending = ? AND settlement_quota_known = ?",
+					reservation.Id,
+					QuotaReservationStatusActive,
+					reservation.ReservedQuota,
+					true,
+					false,
+				).
+				Updates(updates)
+			if updateResult.Error != nil {
+				return updateResult.Error
+			}
+			if updateResult.RowsAffected != 1 {
+				return ErrQuotaReservationConflict
+			}
+		} else if err := updateActiveReservationTx(tx, reservation, updates); err != nil {
+			return err
+		}
+		reservation.FinalQuota = 0
+		reservation.PendingFinalQuota = 0
+		reservation.SettlementPending = false
+		reservation.SettlementQuotaKnown = false
+		reservation.SettlementError = settlementError
+		reservation.Status = QuotaReservationStatusRefunded
+		reservation.FinalizedAt = now
+		reservation.UpdatedAt = now
+		if err := enqueueParameterReservationTerminalTx(tx, reservation); err != nil {
+			return err
+		}
+		result = *reservation
+		return nil
+	})
+	if err != nil {
+		if requireUnknownPending && shouldMarkUnknownRefundRetry(err) {
+			if pendingErr := store.markUnknownRefundRetry(ctx, reservationId, err, previousSettlementError); pendingErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("persist unknown refund retry state: %w", pendingErr))
+			}
+		}
+		if !requireUnknownPending && shouldMarkQuotaReservationSettlementPending(err) {
+			refundErr := fmt.Errorf("refund failed before finalization: %w", err)
+			pendingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaReservationPendingWriteTimeout)
+			defer cancel()
+			if _, pendingErr := store.holdForReconciliation(pendingCtx, reservationId, refundErr.Error()); pendingErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("persist refund pending state: %w", pendingErr))
+			}
+		}
+		return nil, err
+	}
+	if mutation.changed() && store.afterCommit != nil {
+		store.afterCommit(mutation)
+	}
+	return &result, nil
+}
+
+func (store quotaReservationStore) heartbeat(ctx context.Context, reservationId string) (bool, error) {
+	if store.db == nil {
+		return false, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reservationId = strings.TrimSpace(reservationId)
+	if reservationId == "" {
+		return false, errors.New("reservationId is empty")
+	}
+
+	result := store.db.WithContext(ctx).Model(&QuotaReservation{}).
+		Where(
+			"reservation_id = ? AND status = ? AND settlement_pending = ?",
+			reservationId,
+			QuotaReservationStatusActive,
+			false,
+		).
+		Update("updated_at", common.GetTimestamp())
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected == 1 {
+		return true, nil
+	}
+
+	// MySQL may report zero affected rows when a heartbeat lands in the same
+	// timestamp second. Re-read lifecycle state before stopping the loop.
+	var activeCount int64
+	if err := store.db.WithContext(ctx).Model(&QuotaReservation{}).
+		Where(
+			"reservation_id = ? AND status = ? AND settlement_pending = ?",
+			reservationId,
+			QuotaReservationStatusActive,
+			false,
+		).
+		Count(&activeCount).Error; err != nil {
+		return false, err
+	}
+	return activeCount == 1, nil
+}
+
+func (store quotaReservationStore) markStaleForReview(
+	ctx context.Context,
+	updatedBefore int64,
+	limit int,
+	reason string,
+) (int, error) {
+	if store.db == nil {
+		return 0, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return 0, errors.New("stale reservation review reason is empty")
+	}
+	if len(reason) > 2048 {
+		reason = reason[:2048]
+	}
+
+	reservationIds := make([]string, 0, limit)
+	if err := store.db.WithContext(ctx).
+		Model(&QuotaReservation{}).
+		Where(
+			"status = ? AND settlement_pending = ? AND updated_at <= ?",
+			QuotaReservationStatusActive,
+			false,
+			updatedBefore,
+		).
+		Order("updated_at asc").
+		Order("id asc").
+		Limit(limit).
+		Pluck("reservation_id", &reservationIds).Error; err != nil {
+		return 0, err
+	}
+
+	marked := 0
+	for _, reservationId := range reservationIds {
+		didMark := false
+		err := store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			reservation, err := store.loadReservationForUpdate(tx, reservationId)
+			if err != nil {
+				if errors.Is(err, ErrQuotaReservationNotFound) {
+					return nil
+				}
+				return err
+			}
+			if reservation.Status != QuotaReservationStatusActive ||
+				reservation.SettlementPending || reservation.UpdatedAt > updatedBefore {
+				return nil
+			}
+			updates := map[string]interface{}{
+				"pending_final_quota":    0,
+				"settlement_pending":     true,
+				"settlement_quota_known": false,
+				"settlement_attempts":    gorm.Expr("settlement_attempts + 1"),
+				"settlement_error":       reason,
+				"updated_at":             common.GetTimestamp(),
+			}
+			updateResult := tx.Model(&QuotaReservation{}).
+				Where(
+					"id = ? AND status = ? AND reserved_quota = ? AND settlement_pending = ? AND updated_at <= ?",
+					reservation.Id,
+					QuotaReservationStatusActive,
+					reservation.ReservedQuota,
+					false,
+					updatedBefore,
+				).
+				Updates(updates)
+			if updateResult.Error != nil {
+				return updateResult.Error
+			}
+			if updateResult.RowsAffected != 1 {
+				return nil
+			}
+			didMark = true
+			return nil
+		})
+		if err != nil {
+			return marked, err
+		}
+		if didMark {
+			marked++
+		}
+	}
+	return marked, nil
+}
+
+func (store quotaReservationStore) recordRouteQuote(
+	ctx context.Context,
+	reservationId string,
+	quote QuotaReservationRouteQuote,
+) (*QuotaReservation, error) {
+	if store.db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateStrictQuotaReservationMode(); err != nil {
+		return nil, err
+	}
+	reservationId = strings.TrimSpace(reservationId)
+	if reservationId == "" {
+		return nil, errors.New("reservationId is empty")
+	}
+	normalized, err := normalizeQuotaReservationRouteQuote(quote)
+	if err != nil {
+		return nil, err
+	}
+	updates := map[string]interface{}{
+		"route_id":        normalized.RouteId,
+		"channel_id":      normalized.ChannelId,
+		"group":           normalized.Group,
+		"catalog_version": normalized.CatalogVersion,
+		"price_version":   normalized.PriceVersion,
+		"ratio_ppm":       normalized.RatioPPM,
+		"quoted_quota":    normalized.QuotedQuota,
+		"attempt_count":   gorm.Expr("attempt_count + 1"),
+		"updated_at":      common.GetTimestamp(),
+	}
+	result := store.db.WithContext(ctx).Model(&QuotaReservation{}).
+		Where(
+			"reservation_id = ? AND status = ? AND settlement_pending = ?",
+			reservationId,
+			QuotaReservationStatusActive,
+			false,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected != 1 {
+		var reservation QuotaReservation
+		if err := store.db.WithContext(ctx).
+			Select("status", "settlement_pending").
+			Where("reservation_id = ?", reservationId).
+			First(&reservation).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrQuotaReservationNotFound
+			}
+			return nil, err
+		}
+		if reservation.Status == QuotaReservationStatusActive && reservation.SettlementPending {
+			return nil, ErrQuotaReservationSettlementPending
+		}
+		return nil, ErrQuotaReservationFinalized
+	}
+	return GetQuotaReservation(ctx, reservationId)
+}
+
+func ReserveQuotaTo(ctx context.Context, spec QuotaReservationSpec, targetQuota int) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().reserveTo(ctx, spec, targetQuota)
+}
+
+func ReserveQuotaToWithRouteQuote(
+	ctx context.Context,
+	spec QuotaReservationSpec,
+	targetQuota int,
+	quote QuotaReservationRouteQuote,
+) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().reserveToWithRouteQuote(ctx, spec, targetQuota, &quote)
+}
+
+func SettleQuotaReservation(ctx context.Context, reservationId string, actualQuota int) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().settle(ctx, reservationId, actualQuota)
+}
+
+func RefundQuotaReservation(ctx context.Context, reservationId string) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().refund(ctx, reservationId)
+}
+
+// HeartbeatQuotaReservation refreshes liveness only while a reservation is an
+// active foreground hold. Terminal and reconciliation-pending rows are never
+// changed and return active=false.
+func HeartbeatQuotaReservation(ctx context.Context, reservationId string) (active bool, err error) {
+	return defaultQuotaReservationStore().heartbeat(ctx, reservationId)
+}
+
+// RefundUnknownPendingQuotaReservation resolves only an active reservation
+// whose exact usage is unavailable. Funding, limited-token quota and terminal
+// state move together, and replaying an already-refunded row is a no-op.
+func RefundUnknownPendingQuotaReservation(ctx context.Context, reservationId string) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().refundUnknownPending(ctx, reservationId)
+}
+
+// MarkStaleQuotaReservationsForReview moves abandoned active holds into the
+// unknown-usage queue, where the reconciliation worker refunds them.
+func MarkStaleQuotaReservationsForReview(
+	ctx context.Context,
+	updatedBefore int64,
+	limit int,
+	reason string,
+) (int, error) {
+	return defaultQuotaReservationStore().markStaleForReview(ctx, updatedBefore, limit, reason)
+}
+
+func HoldQuotaReservationForReconciliation(
+	ctx context.Context,
+	reservationId string,
+	reason string,
+) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().holdForReconciliation(ctx, reservationId, reason)
+}
+
+// MarkQuotaReservationForManualReview stops automatic retries while retaining
+// the held quota and the evidence needed for an operator decision.
+func MarkQuotaReservationForManualReview(
+	ctx context.Context,
+	reservationId string,
+	reason string,
+) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().markManualReview(ctx, reservationId, reason)
+}
+
+func RecordQuotaReservationRouteQuote(
+	ctx context.Context,
+	reservationId string,
+	quote QuotaReservationRouteQuote,
+) (*QuotaReservation, error) {
+	return defaultQuotaReservationStore().recordRouteQuote(ctx, reservationId, quote)
+}
+
+func GetQuotaReservation(ctx context.Context, reservationId string) (*QuotaReservation, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var reservation QuotaReservation
+	err := DB.WithContext(ctx).Where("reservation_id = ?", strings.TrimSpace(reservationId)).First(&reservation).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrQuotaReservationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &reservation, nil
+}
+
+// ListPendingQuotaReservations returns active reconciliation rows. quotaKnown
+// may be nil to include both classes, true for retryable exact quotas, or false
+// for unknown usage that must be refunded automatically.
+func ListPendingQuotaReservations(
+	ctx context.Context,
+	quotaKnown *bool,
+	offset int,
+	limit int,
+) ([]*QuotaReservation, int64, error) {
+	if DB == nil {
+		return nil, 0, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+
+	query := DB.WithContext(ctx).
+		Model(&QuotaReservation{}).
+		Where("status = ? AND settlement_pending = ?", QuotaReservationStatusActive, true)
+	if quotaKnown != nil {
+		query = query.Where("settlement_quota_known = ?", *quotaKnown)
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	reservations := make([]*QuotaReservation, 0)
+	if err := query.
+		Order("updated_at asc").
+		Order("id asc").
+		Offset(offset).
+		Limit(limit).
+		Find(&reservations).Error; err != nil {
+		return nil, 0, err
+	}
+	return reservations, total, nil
+}
+
+// ListDueKnownQuotaReservations selects retryable reservations directly by
+// their backoff buckets. This prevents a large deferred bucket at the front of
+// the queue from starving newer rows that are already due.
+func ListDueKnownQuotaReservations(
+	ctx context.Context,
+	windows []QuotaReservationDueWindow,
+	limit int,
+) ([]*QuotaReservation, int64, error) {
+	if DB == nil {
+		return nil, 0, errors.New("database is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	if len(windows) == 0 {
+		return []*QuotaReservation{}, 0, nil
+	}
+
+	var dueScope *gorm.DB
+	for _, window := range windows {
+		if window.MinAttempts < 0 {
+			return nil, 0, errors.New("quota reservation due window attempts must not be negative")
+		}
+		var scope *gorm.DB
+		if window.MaxAttempts >= window.MinAttempts {
+			scope = DB.Where(
+				"settlement_attempts >= ? AND settlement_attempts <= ? AND updated_at <= ?",
+				window.MinAttempts,
+				window.MaxAttempts,
+				window.UpdatedAtOrBefore,
+			)
+		} else {
+			scope = DB.Where(
+				"settlement_attempts >= ? AND updated_at <= ?",
+				window.MinAttempts,
+				window.UpdatedAtOrBefore,
+			)
+		}
+		if dueScope == nil {
+			dueScope = scope
+		} else {
+			dueScope = dueScope.Or(scope)
+		}
+	}
+
+	query := DB.WithContext(ctx).
+		Model(&QuotaReservation{}).
+		Where(
+			"status = ? AND settlement_pending = ? AND settlement_quota_known = ?",
+			QuotaReservationStatusActive,
+			true,
+			true,
+		).
+		Where(dueScope)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	reservations := make([]*QuotaReservation, 0, limit)
+	if err := query.
+		Order("updated_at asc").
+		Order("id asc").
+		Limit(limit).
+		Find(&reservations).Error; err != nil {
+		return nil, 0, err
+	}
+	return reservations, total, nil
+}
+
+func GetQuotaReservationSubscriptionUsage(
+	ctx context.Context,
+	userId int,
+	userSubscriptionId int,
+) (*QuotaReservationSubscriptionUsage, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if userId <= 0 || userSubscriptionId <= 0 {
+		return nil, errors.New("invalid subscription usage identity")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var subscription UserSubscription
+	if err := DB.WithContext(ctx).
+		Select("amount_total", "amount_used").
+		Where("id = ? AND user_id = ?", userSubscriptionId, userId).
+		First(&subscription).Error; err != nil {
+		return nil, err
+	}
+	return &QuotaReservationSubscriptionUsage{
+		AmountTotal: subscription.AmountTotal,
+		AmountUsed:  subscription.AmountUsed,
+	}, nil
+}

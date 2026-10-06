@@ -1,0 +1,1466 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+const (
+	CommissionAdjustmentAdd      = "add"
+	CommissionAdjustmentSubtract = "subtract"
+	CommissionAdjustmentSet      = "set"
+	OrdinaryQuotaOverride        = "override"
+)
+
+type OrdinaryQuotaAdjustmentResult struct {
+	UserID                   int   `json:"user_id"`
+	PreviousTotalQuota       int64 `json:"previous_total_quota"`
+	TotalQuota               int64 `json:"total_quota"`
+	PreviousOrdinaryQuota    int64 `json:"previous_ordinary_quota"`
+	OrdinaryQuota            int64 `json:"ordinary_quota"`
+	CommissionAvailableQuota int64 `json:"commission_available_quota"`
+	LegacyTotalOverride      bool  `json:"legacy_total_override"`
+}
+
+// Administrative wallet adjustments are bounded by the wallet representation,
+// not the per-request usage limit. The transaction checks overflow and funds.
+func AdjustOrdinaryUserQuota(userID int, mode string, value int64, legacyTotalOverride bool) (*OrdinaryQuotaAdjustmentResult, error) {
+	mode = strings.TrimSpace(mode)
+	if userID <= 0 || value < 0 ||
+		(mode != CommissionAdjustmentAdd && mode != CommissionAdjustmentSubtract && mode != OrdinaryQuotaOverride) ||
+		(mode != OrdinaryQuotaOverride && value == 0) {
+		return nil, ErrCommissionInvalidInput
+	}
+
+	var output OrdinaryQuotaAdjustmentResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		output, err = adjustOrdinaryUserQuotaTx(tx, userID, mode, value, legacyTotalOverride)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := invalidateUserCache(userID); err != nil {
+		common.SysLog("failed to invalidate ordinary quota adjustment cache: " + err.Error())
+	}
+	return &output, nil
+}
+
+// AdjustOrdinaryUserQuotaTx applies the same ordinary-wallet mutation inside
+// a caller-owned transaction. It is used when a durable operation state and
+// the balance change must commit atomically.
+func AdjustOrdinaryUserQuotaTx(tx *gorm.DB, userID int, mode string, value int64, legacyTotalOverride bool) (*OrdinaryQuotaAdjustmentResult, error) {
+	result, err := adjustOrdinaryUserQuotaTx(tx, userID, strings.TrimSpace(mode), value, legacyTotalOverride)
+	return &result, err
+}
+
+func adjustOrdinaryUserQuotaTx(tx *gorm.DB, userID int, mode string, value int64, legacyTotalOverride bool) (OrdinaryQuotaAdjustmentResult, error) {
+	if tx == nil || userID <= 0 || value < 0 ||
+		(mode != CommissionAdjustmentAdd && mode != CommissionAdjustmentSubtract && mode != OrdinaryQuotaOverride) ||
+		(mode != OrdinaryQuotaOverride && value == 0) {
+		return OrdinaryQuotaAdjustmentResult{}, ErrCommissionInvalidInput
+	}
+	var user User
+	if err := lockForUpdate(tx.Unscoped()).Where("id = ?", userID).First(&user).Error; err != nil {
+		return OrdinaryQuotaAdjustmentResult{}, err
+	}
+	account := CommissionAccountV1{UserID: userID}
+	if err := lockForUpdate(tx).Where("user_id = ?", userID).First(&account).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return OrdinaryQuotaAdjustmentResult{}, err
+		}
+		account = CommissionAccountV1{UserID: userID}
+	}
+	previousOrdinary := int64(user.Quota)
+	if err := validateCommissionAccount(&account, previousOrdinary); err != nil {
+		return OrdinaryQuotaAdjustmentResult{}, err
+	}
+	nextOrdinary := previousOrdinary
+	switch mode {
+	case CommissionAdjustmentAdd:
+		var err error
+		nextOrdinary, err = commissionSafeAdd(previousOrdinary, value)
+		if err != nil {
+			return OrdinaryQuotaAdjustmentResult{}, err
+		}
+	case CommissionAdjustmentSubtract:
+		if value > previousOrdinary {
+			return OrdinaryQuotaAdjustmentResult{}, ErrCommissionInsufficientOrdinary
+		}
+		nextOrdinary = previousOrdinary - value
+	case OrdinaryQuotaOverride:
+		nextOrdinary = value
+	}
+	if nextOrdinary < 0 && mode == CommissionAdjustmentAdd && previousOrdinary < nextOrdinary {
+		updated := tx.Unscoped().Model(&User{}).Where("id = ? AND quota = ?", user.Id, previousOrdinary).Update("quota", nextOrdinary)
+		if updated.Error != nil {
+			return OrdinaryQuotaAdjustmentResult{}, updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return OrdinaryQuotaAdjustmentResult{}, ErrCommissionVersionConflict
+		}
+		return OrdinaryQuotaAdjustmentResult{UserID: userID, PreviousTotalQuota: previousOrdinary, TotalQuota: nextOrdinary,
+			PreviousOrdinaryQuota: previousOrdinary, OrdinaryQuota: nextOrdinary, CommissionAvailableQuota: account.AvailableQuota}, nil
+	}
+	if _, err := commissionCheckedWalletBalance(nextOrdinary); err != nil {
+		return OrdinaryQuotaAdjustmentResult{}, err
+	}
+	if nextOrdinary != previousOrdinary {
+		if err := persistCommissionUserQuotaTx(tx, &user, previousOrdinary, nextOrdinary); err != nil {
+			return OrdinaryQuotaAdjustmentResult{}, err
+		}
+	}
+	if err := validateCommissionAccount(&account, nextOrdinary); err != nil {
+		return OrdinaryQuotaAdjustmentResult{}, err
+	}
+	// Keep the legacy marker's historical response semantics.  This helper is
+	// also used by Bot financial transactions, but the public field is an
+	// compatibility marker rather than an echo of the caller's implementation
+	// flag.
+	return OrdinaryQuotaAdjustmentResult{UserID: userID, PreviousTotalQuota: previousOrdinary, TotalQuota: nextOrdinary,
+		PreviousOrdinaryQuota: previousOrdinary, OrdinaryQuota: nextOrdinary,
+		CommissionAvailableQuota: account.AvailableQuota, LegacyTotalOverride: false}, nil
+}
+
+type CommissionTierView struct {
+	ThresholdQuota int64 `json:"threshold_quota"`
+	RateBps        int64 `json:"rate_bps"`
+}
+
+type CommissionSummary struct {
+	UserID                       int                  `json:"user_id"`
+	InviterID                    int                  `json:"inviter_id"`
+	TotalAvailableQuota          int64                `json:"total_available_quota"`
+	OrdinaryAvailableQuota       int64                `json:"ordinary_available_quota"`
+	CommissionAvailableQuota     int64                `json:"commission_available_quota"`
+	CommissionUsageReservedQuota int64                `json:"commission_usage_reserved_quota"`
+	WithdrawalHeldQuota          int64                `json:"withdrawal_held_quota"`
+	DebtQuota                    int64                `json:"debt_quota"`
+	PendingCapacityQuota         int64                `json:"pending_capacity_quota"`
+	GrossLifetimeEligibleQuota   int64                `json:"gross_lifetime_eligible_quota"`
+	LifetimeEarnedQuota          int64                `json:"lifetime_earned_quota"`
+	LifetimeSpentQuota           int64                `json:"lifetime_spent_quota"`
+	LifetimeWithdrawalPaidQuota  int64                `json:"lifetime_withdrawal_paid_quota"`
+	AccountVersion               int64                `json:"account_version"`
+	ProfileStatus                string               `json:"profile_status"`
+	ProgramID                    int64                `json:"program_id"`
+	ProgramName                  string               `json:"program_name"`
+	CurrentRateBps               int64                `json:"current_rate_bps"`
+	NextThresholdQuota           *int64               `json:"next_threshold_quota"`
+	Tiers                        []CommissionTierView `json:"tiers"`
+	InvitationCode               string               `json:"invitation_code"`
+	InvitedUsers                 int64                `json:"invited_users"`
+	ActiveInvitedUsers           int64                `json:"active_invited_users"`
+	Mode                         string               `json:"mode"`
+	SpendPriority                string               `json:"spend_priority"`
+}
+
+type CommissionInviteeRow struct {
+	UserID    int   `json:"user_id"`
+	CreatedAt int64 `json:"created_at"`
+}
+
+type CommissionAccountRow struct {
+	CommissionAccountV1
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	UserStatus  int    `json:"user_status"`
+	UserQuota   int64  `json:"user_quota"`
+}
+
+type CommissionProfileRow struct {
+	CommissionProfileV1
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	ProgramName string `json:"program_name"`
+}
+
+// CommissionCostExportEvent is the stable, redacted contract consumed by
+// operating-ledger integrations. AmountQuota is signed: awards are positive
+// costs and linked award reversals are negative costs.
+type CommissionCostExportEvent struct {
+	SchemaVersion     string `json:"schema_version"`
+	ID                int64  `json:"id"`
+	EventUUID         string `json:"event_uuid"`
+	EventType         string `json:"event_type"`
+	AmountQuota       int64  `json:"amount_quota"`
+	BeneficiaryUserID int    `json:"beneficiary_user_id"`
+	ConsumerUserID    int    `json:"consumer_user_id"`
+	OperationPublicID string `json:"operation_public_id"`
+	OperationSource   string `json:"operation_source"`
+	SourceStableID    string `json:"source_stable_id"`
+	RelatedEventUUID  string `json:"related_event_uuid,omitempty"`
+	CreatedAt         int64  `json:"created_at"`
+}
+
+type CommissionAdjustmentSpec struct {
+	UserID          int
+	Mode            string
+	ValueQuota      int64
+	ExpectedVersion int64
+	ActorUserID     int
+	ReasonCode      string
+	IdempotencyKey  string
+}
+
+type CommissionAdjustmentResult struct {
+	Account                 CommissionAccountV1 `json:"account"`
+	UserQuota               int64               `json:"user_quota"`
+	OrdinaryAvailableQuota  int64               `json:"ordinary_available_quota"`
+	RequestedQuota          int64               `json:"requested_quota"`
+	EffectiveAvailableDelta int64               `json:"effective_available_delta"`
+	DebtDelta               int64               `json:"debt_delta"`
+	PendingCapacityDelta    int64               `json:"pending_capacity_delta"`
+	Replayed                bool                `json:"replayed"`
+}
+
+type CommissionTransferSpec struct {
+	UserID          int
+	AmountQuota     int64
+	ExpectedVersion int64
+	IdempotencyKey  string
+}
+
+type CommissionTransferResult struct {
+	Account              CommissionAccountV1 `json:"account"`
+	TransferredQuota     int64               `json:"transferred_quota"`
+	OrdinaryBalanceQuota int64               `json:"ordinary_balance_quota"`
+	Replayed             bool                `json:"replayed"`
+}
+
+type CommissionWithdrawalCreateSpec struct {
+	UserID          int
+	AmountQuota     int64
+	ExpectedVersion int64
+	MaskedContact   string
+	IdempotencyKey  string
+}
+
+type CommissionWithdrawalActionSpec struct {
+	WithdrawalPublicID string
+	Action             string
+	ExpectedVersion    int64
+	ActorUserID        int
+	ActorIsRoot        bool
+	ActorIsOwner       bool
+	ReasonCode         string
+	MaskedReference    string
+	IdempotencyKey     string
+}
+
+func GetCommissionSummary(userID int) (*CommissionSummary, error) {
+	if userID <= 0 {
+		return nil, ErrCommissionInvalidInput
+	}
+	var user User
+	if err := DB.Unscoped().Where("id = ?", userID).First(&user).Error; err != nil {
+		return nil, err
+	}
+	account := CommissionAccountV1{UserID: userID}
+	if err := DB.Where("user_id = ?", userID).First(&account).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	if account.ID != 0 {
+		if err := validateCommissionAccount(&account, int64(user.Quota)); err != nil {
+			return nil, err
+		}
+	}
+	totalAvailable, err := commissionSafeAdd(int64(user.Quota), account.AvailableQuota)
+	if err != nil {
+		return nil, err
+	}
+	summary := &CommissionSummary{
+		UserID: userID, InviterID: user.InviterId, TotalAvailableQuota: totalAvailable,
+		OrdinaryAvailableQuota:       int64(user.Quota),
+		CommissionAvailableQuota:     account.AvailableQuota,
+		CommissionUsageReservedQuota: account.UsageReservedQuota,
+		WithdrawalHeldQuota:          account.WithdrawalHeldQuota, DebtQuota: account.DebtQuota,
+		PendingCapacityQuota:        account.PendingCapacityQuota,
+		GrossLifetimeEligibleQuota:  account.GrossLifetimeEligibleQuota,
+		LifetimeEarnedQuota:         account.LifetimeEarnedQuota,
+		LifetimeSpentQuota:          account.LifetimeSpentQuota,
+		LifetimeWithdrawalPaidQuota: account.LifetimeWithdrawalPaidQuota,
+		AccountVersion:              account.Version, InvitationCode: user.AffCode,
+		Tiers: []CommissionTierView{},
+	}
+	settings, err := GetCommissionSettings()
+	if err != nil {
+		return nil, err
+	}
+	summary.Mode = CommissionModeDark
+	summary.SpendPriority = CommissionOrdinaryFirst
+	if err := DB.Unscoped().Model(&User{}).Where("inviter_id = ?", userID).Count(&summary.InvitedUsers).Error; err != nil {
+		return nil, err
+	}
+	if err := DB.Model(&User{}).Where("inviter_id = ? AND status = ?", userID, common.UserStatusEnabled).
+		Count(&summary.ActiveInvitedUsers).Error; err != nil {
+		return nil, err
+	}
+	if settings.CurrentProgramID > 0 {
+		var program CommissionProgramV1
+		if err := DB.Where("id = ? AND status = ?", settings.CurrentProgramID, CommissionProgramPublished).First(&program).Error; err == nil {
+			summary.ProfileStatus = "universal"
+			summary.ProgramID = program.ID
+			summary.ProgramName = program.Name
+			summary.Mode = CommissionModeActive
+			tiers, _, parseErr := normalizeCommissionTierJSON(program.TiersJSON)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			for _, tier := range tiers {
+				summary.Tiers = append(summary.Tiers, CommissionTierView{ThresholdQuota: tier.ThresholdQuota, RateBps: tier.RateBps})
+				if tier.ThresholdQuota <= account.GrossLifetimeEligibleQuota {
+					summary.CurrentRateBps = tier.RateBps
+				} else if summary.NextThresholdQuota == nil {
+					next := tier.ThresholdQuota
+					summary.NextThresholdQuota = &next
+				}
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+	return summary, nil
+}
+
+func ListCommissionInvitees(inviterID, offset, limit int) ([]CommissionInviteeRow, int64, error) {
+	if inviterID <= 0 || offset < 0 || limit <= 0 || limit > 100 {
+		return nil, 0, ErrCommissionInvalidInput
+	}
+	query := DB.Model(&User{}).Where("inviter_id = ?", inviterID)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	rows := make([]CommissionInviteeRow, 0)
+	if err := query.Select("id AS user_id, created_at").Order("id DESC").
+		Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	return rows, total, nil
+}
+
+func ListCommissionLedger(userID, offset, limit int) ([]CommissionLedgerV1, int64, error) {
+	if userID <= 0 || offset < 0 || limit <= 0 || limit > 100 {
+		return nil, 0, ErrCommissionInvalidInput
+	}
+	query := DB.Model(&CommissionLedgerV1{}).
+		Joins("JOIN commission_accounts ON commission_accounts.id = commission_ledger.account_id").
+		Where("commission_accounts.user_id = ?", userID)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	rows := make([]CommissionLedgerV1, 0)
+	if err := query.Select("commission_ledger.*").Order("commission_ledger.id DESC").
+		Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	return rows, total, nil
+}
+
+func CreateCommissionProgram(name string, tiers []CommissionTierView, actorUserID int) (*CommissionProgramV1, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 128 || !utf8.ValidString(name) || actorUserID <= 0 {
+		return nil, false, ErrCommissionInvalidInput
+	}
+	raw, err := common.Marshal(tiers)
+	if err != nil {
+		return nil, false, err
+	}
+	_, canonical, err := normalizeCommissionTierJSON(string(raw))
+	if err != nil {
+		return nil, false, err
+	}
+	contentHash := commissionHash("r29-program-v1", canonical)
+	var existing CommissionProgramV1
+	if err := DB.Where("content_sha256 = ?", contentHash).First(&existing).Error; err == nil {
+		return &existing, true, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, err
+	}
+	now := time.Now().UnixMilli()
+	program := &CommissionProgramV1{PublicID: commissionPublicID("ccp"), Name: name, TiersJSON: canonical,
+		ContentSHA256: contentHash, Status: CommissionProgramDraft, CreatedBy: actorUserID, Version: 1,
+		CreatedAt: now, UpdatedAt: now}
+	if err := DB.Create(program).Error; err != nil {
+		if findErr := DB.Where("content_sha256 = ?", contentHash).First(&existing).Error; findErr == nil {
+			return &existing, true, nil
+		}
+		return nil, false, err
+	}
+	return program, false, nil
+}
+
+func ListCommissionPrograms(offset, limit int) ([]CommissionProgramV1, int64, error) {
+	if offset < 0 || limit <= 0 || limit > 100 {
+		return nil, 0, ErrCommissionInvalidInput
+	}
+	var total int64
+	if err := DB.Model(&CommissionProgramV1{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	programs := make([]CommissionProgramV1, 0)
+	if err := DB.Order("id DESC").Offset(offset).Limit(limit).Find(&programs).Error; err != nil {
+		return nil, 0, err
+	}
+	return programs, total, nil
+}
+
+func PublishCommissionProgram(publicID string, expectedVersion int64, actorUserID int) (*CommissionProgramV1, error) {
+	publicID = strings.TrimSpace(publicID)
+	if publicID == "" || expectedVersion <= 0 || actorUserID <= 0 {
+		return nil, ErrCommissionInvalidInput
+	}
+	var result CommissionProgramV1
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var program CommissionProgramV1
+		if err := lockForUpdate(tx).Where("public_id = ?", publicID).First(&program).Error; err != nil {
+			return err
+		}
+		if program.Version == expectedVersion+1 && program.Status == CommissionProgramPublished {
+			result = program
+			return nil
+		}
+		if program.Version != expectedVersion || program.Status != CommissionProgramDraft {
+			return ErrCommissionVersionConflict
+		}
+		if _, canonical, err := normalizeCommissionTierJSON(program.TiersJSON); err != nil || commissionHash("r29-program-v1", canonical) != program.ContentSHA256 {
+			if err != nil {
+				return err
+			}
+			return ErrCommissionInvariant
+		}
+		now := time.Now().UnixMilli()
+		updated := tx.Model(&CommissionProgramV1{}).Where("id = ? AND version = ?", program.ID, expectedVersion).
+			Updates(map[string]interface{}{"status": CommissionProgramPublished, "published_by": actorUserID,
+				"published_at": now, "version": expectedVersion + 1, "updated_at": now})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrCommissionVersionConflict
+		}
+		var settings CommissionSettingsV1
+		if err := lockForUpdate(tx).First(&settings, 1).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&CommissionSettingsV1{}).Where("id = ? AND version = ?", settings.ID, settings.Version).
+			Updates(map[string]interface{}{"current_program_id": program.ID, "version": settings.Version + 1, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		program.Status = CommissionProgramPublished
+		program.PublishedBy = actorUserID
+		program.PublishedAt = now
+		program.Version++
+		program.UpdatedAt = now
+		result = program
+		return nil
+	})
+	return &result, err
+}
+
+func UpdateCommissionSettings(expectedVersion int64, mode, priority string, actorUserID int) (*CommissionSettingsV1, error) {
+	mode = strings.TrimSpace(mode)
+	priority = strings.TrimSpace(priority)
+	if expectedVersion <= 0 || actorUserID <= 0 || !validCommissionMode(mode) || !validCommissionSpendPriority(priority) {
+		return nil, ErrCommissionInvalidInput
+	}
+	var result CommissionSettingsV1
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var settings CommissionSettingsV1
+		if err := lockForUpdate(tx).First(&settings, 1).Error; err != nil {
+			return err
+		}
+		if settings.Version == expectedVersion+1 && settings.Mode == mode && settings.SpendPriority == priority {
+			result = settings
+			return nil
+		}
+		if settings.Version != expectedVersion || !validCommissionModeTransition(settings.Mode, mode) {
+			return ErrCommissionVersionConflict
+		}
+		if mode == CommissionModeActive {
+			if settings.CurrentProgramID <= 0 {
+				return ErrCommissionInvalidInput
+			}
+			var count int64
+			if err := tx.Model(&CommissionProgramV1{}).Where("id = ? AND status = ?", settings.CurrentProgramID, CommissionProgramPublished).
+				Count(&count).Error; err != nil {
+				return err
+			}
+			if count != 1 {
+				return ErrCommissionInvalidInput
+			}
+		}
+		now := time.Now().UnixMilli()
+		updates := map[string]interface{}{"mode": mode, "spend_priority": priority,
+			"version": settings.Version + 1, "updated_at": now}
+		if settings.Mode == CommissionModeDark && mode == CommissionModeCapture {
+			updates["capture_epoch"] = settings.CaptureEpoch + 1
+		}
+		if settings.Mode == CommissionModeCapture && mode == CommissionModeActive {
+			updates["accrual_epoch"] = common.GetTimestamp()
+		}
+		updated := tx.Model(&CommissionSettingsV1{}).Where("id = ? AND version = ?", settings.ID, settings.Version).Updates(updates)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrCommissionVersionConflict
+		}
+		if err := tx.First(&result, settings.ID).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	return &result, err
+}
+
+func validCommissionModeTransition(from, to string) bool {
+	if from == to {
+		return true
+	}
+	switch from {
+	case CommissionModeDark:
+		return to == CommissionModeCapture
+	case CommissionModeCapture:
+		return to == CommissionModeActive || to == CommissionModeSuspended
+	case CommissionModeActive:
+		return to == CommissionModeSuspended
+	case CommissionModeSuspended:
+		return to == CommissionModeActive || to == CommissionModeCapture
+	default:
+		return false
+	}
+}
+
+func UpsertCommissionProfile(userID int, programPublicID, status string, expectedVersion int64) (*CommissionProfileV1, error) {
+	status = strings.TrimSpace(status)
+	if userID <= 0 || (status != CommissionProfileEnabled && status != CommissionProfilePaused) {
+		return nil, ErrCommissionInvalidInput
+	}
+	var result CommissionProfileV1
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ?", userID).First(&user).Error; err != nil {
+			return err
+		}
+		if status == CommissionProfileEnabled && (user.DeletedAt.Valid || user.Status != common.UserStatusEnabled) {
+			return ErrCommissionInvalidInput
+		}
+		var program CommissionProgramV1
+		if err := tx.Where("public_id = ? AND status = ?", strings.TrimSpace(programPublicID), CommissionProgramPublished).
+			First(&program).Error; err != nil {
+			return err
+		}
+		var profile CommissionProfileV1
+		err := lockForUpdate(tx).Where("user_id = ?", userID).First(&profile).Error
+		now := time.Now().UnixMilli()
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if expectedVersion != 0 {
+				return ErrCommissionVersionConflict
+			}
+			profile = CommissionProfileV1{PublicID: commissionPublicID("ccf"), UserID: userID, Status: status,
+				ProgramID: program.ID, Version: 1, CreatedAt: now, UpdatedAt: now}
+			if err := tx.Create(&profile).Error; err != nil {
+				return err
+			}
+			result = profile
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if profile.Version == expectedVersion+1 && profile.Status == status && profile.ProgramID == program.ID {
+			result = profile
+			return nil
+		}
+		if profile.Version != expectedVersion {
+			return ErrCommissionVersionConflict
+		}
+		updated := tx.Model(&CommissionProfileV1{}).Where("id = ? AND version = ?", profile.ID, profile.Version).
+			Updates(map[string]interface{}{"status": status, "program_id": program.ID,
+				"version": profile.Version + 1, "updated_at": now})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrCommissionVersionConflict
+		}
+		profile.Status = status
+		profile.ProgramID = program.ID
+		profile.Version++
+		profile.UpdatedAt = now
+		result = profile
+		return nil
+	})
+	return &result, err
+}
+
+func ListCommissionAccounts(offset, limit int, ranking bool) ([]CommissionAccountRow, int64, error) {
+	if offset < 0 || limit <= 0 || limit > 100 {
+		return nil, 0, ErrCommissionInvalidInput
+	}
+	var total int64
+	if err := DB.Model(&CommissionAccountV1{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	order := "commission_accounts.id DESC"
+	if ranking {
+		order = "commission_accounts.lifetime_earned_quota DESC, commission_accounts.id ASC"
+	}
+	rows := make([]CommissionAccountRow, 0)
+	err := DB.Table("commission_accounts").Select("commission_accounts.*, users.username, users.display_name, users.status AS user_status, users.quota AS user_quota").
+		Joins("JOIN users ON users.id = commission_accounts.user_id").Order(order).Offset(offset).Limit(limit).Scan(&rows).Error
+	return rows, total, err
+}
+
+func ListCommissionProfiles(offset, limit int) ([]CommissionProfileRow, int64, error) {
+	if offset < 0 || limit <= 0 || limit > 100 {
+		return nil, 0, ErrCommissionInvalidInput
+	}
+	var total int64
+	if err := DB.Model(&CommissionProfileV1{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	rows := make([]CommissionProfileRow, 0)
+	err := DB.Table("commission_profiles").
+		Select("commission_profiles.*, users.username, users.display_name, commission_programs.name AS program_name").
+		Joins("JOIN users ON users.id = commission_profiles.user_id").
+		Joins("JOIN commission_programs ON commission_programs.id = commission_profiles.program_id").
+		Order("commission_profiles.id DESC").Offset(offset).Limit(limit).Scan(&rows).Error
+	return rows, total, err
+}
+
+func ListCommissionLedgerSince(afterID int64, limit int) ([]CommissionLedgerV1, error) {
+	if afterID < 0 || limit <= 0 || limit > 500 {
+		return nil, ErrCommissionInvalidInput
+	}
+	rows := make([]CommissionLedgerV1, 0)
+	if err := DB.Where("id > ?", afterID).Order("id ASC").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func ListCommissionCostEventsSince(afterID int64, limit int) ([]CommissionCostExportEvent, error) {
+	if afterID < 0 || limit <= 0 || limit > 500 {
+		return nil, ErrCommissionInvalidInput
+	}
+	type costRow struct {
+		ID                   int64
+		EventUUID            string
+		EventType            string
+		AvailableDelta       int64
+		PendingCapacityDelta int64
+		DebtDelta            int64
+		BeneficiaryUserID    int
+		ConsumerUserID       int
+		OperationPublicID    string
+		OperationSource      string
+		SourceStableID       string
+		RelatedEventUUID     string
+		CreatedAt            int64
+	}
+	var rows []costRow
+	if err := DB.Table("commission_ledger AS ledger").
+		Select(`ledger.id, ledger.event_uuid, ledger.event_type, ledger.available_delta,
+			ledger.pending_capacity_delta, ledger.debt_delta,
+			accounts.user_id AS beneficiary_user_id, ledger.consumer_user_id,
+			operations.public_id AS operation_public_id, operations.source AS operation_source,
+			operations.source_stable_id, COALESCE(related.event_uuid, '') AS related_event_uuid,
+			ledger.created_at`).
+		Joins("JOIN commission_accounts AS accounts ON accounts.id = ledger.account_id").
+		Joins("JOIN commission_operations AS operations ON operations.id = ledger.operation_id").
+		Joins("LEFT JOIN commission_ledger AS related ON related.id = ledger.related_event_id").
+		Where("ledger.id > ? AND ledger.event_type IN ?", afterID,
+			[]string{"commission_awarded", "commission_award_reversed"}).
+		Order("ledger.id ASC").Limit(limit).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make([]CommissionCostExportEvent, 0, len(rows))
+	for _, row := range rows {
+		amount, err := commissionSafeAdd(row.AvailableDelta, row.PendingCapacityDelta)
+		if err != nil {
+			return nil, ErrCommissionInvariant
+		}
+		amount, err = commissionSafeAdd(amount, -row.DebtDelta)
+		if err != nil {
+			return nil, ErrCommissionInvariant
+		}
+		if row.EventType == "commission_awarded" && amount < 0 ||
+			row.EventType == "commission_award_reversed" && amount > 0 {
+			return nil, ErrCommissionInvariant
+		}
+		result = append(result, CommissionCostExportEvent{
+			SchemaVersion: "r29-commission-cost-v1", ID: row.ID, EventUUID: row.EventUUID,
+			EventType: row.EventType, AmountQuota: amount, BeneficiaryUserID: row.BeneficiaryUserID,
+			ConsumerUserID: row.ConsumerUserID, OperationPublicID: row.OperationPublicID,
+			OperationSource: row.OperationSource, SourceStableID: row.SourceStableID,
+			RelatedEventUUID: row.RelatedEventUUID, CreatedAt: row.CreatedAt,
+		})
+	}
+	return result, nil
+}
+
+func PreviewCommissionAdjustment(spec CommissionAdjustmentSpec) (*CommissionAdjustmentResult, error) {
+	return calculateCommissionAdjustment(nil, spec, true)
+}
+
+func ApplyCommissionAdjustment(spec CommissionAdjustmentSpec) (*CommissionAdjustmentResult, error) {
+	return calculateCommissionAdjustment(DB, spec, false)
+}
+
+func TransferCommissionToBalance(spec CommissionTransferSpec) (*CommissionTransferResult, error) {
+	key := strings.TrimSpace(spec.IdempotencyKey)
+	if spec.UserID <= 0 || spec.AmountQuota <= 0 || spec.ExpectedVersion <= 0 || key == "" || len(key) > 128 {
+		return nil, ErrCommissionInvalidInput
+	}
+	requestHash := commissionHash("r29-transfer-request-v1", strconv.Itoa(spec.UserID),
+		strconv.FormatInt(spec.AmountQuota, 10), strconv.FormatInt(spec.ExpectedVersion, 10))
+	eventKey := "commission-transfer:" + strconv.Itoa(spec.UserID) + ":" + key
+	var output CommissionTransferResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var prior CommissionLedgerV1
+		if err := tx.Where("event_key_hash = ?", commissionHash("r29-ledger-v1", eventKey)).First(&prior).Error; err == nil {
+			if prior.RequestHash != requestHash {
+				return ErrCommissionIdempotencyConflict
+			}
+			users, err := loadCommissionUsersForUpdateTx(tx, spec.UserID)
+			if err != nil {
+				return err
+			}
+			account, err := loadCommissionAccountForUpdateTx(tx, spec.UserID)
+			if err != nil {
+				return err
+			}
+			output = CommissionTransferResult{Account: *account, TransferredQuota: spec.AmountQuota,
+				OrdinaryBalanceQuota: int64(users[spec.UserID].Quota), Replayed: true}
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		users, err := loadCommissionUsersForUpdateTx(tx, spec.UserID)
+		if err != nil {
+			return err
+		}
+		user := users[spec.UserID]
+		if user.DeletedAt.Valid || user.Status != common.UserStatusEnabled {
+			return ErrCommissionInvalidInput
+		}
+		account, err := loadCommissionAccountForUpdateTx(tx, spec.UserID)
+		if err != nil {
+			return err
+		}
+		if account.Version != spec.ExpectedVersion {
+			return ErrCommissionVersionConflict
+		}
+		if account.AvailableQuota < spec.AmountQuota {
+			return ErrCommissionInsufficientAvailable
+		}
+		nextOrdinary, err := commissionSafeAdd(int64(user.Quota), spec.AmountQuota)
+		if err != nil {
+			return err
+		}
+
+		oldQuota := int64(user.Quota)
+		oldAccount := *account
+		account.AvailableQuota -= spec.AmountQuota
+		account.LifetimeSpentQuota, err = commissionSafeAdd(account.LifetimeSpentQuota, spec.AmountQuota)
+		if err != nil {
+			return err
+		}
+		if err := persistCommissionUserQuotaTx(tx, user, oldQuota, nextOrdinary); err != nil {
+			return err
+		}
+		if err := persistCommissionAccountTx(tx, account, oldAccount.Version); err != nil {
+			return err
+		}
+		if _, err := appendCommissionLedgerTx(tx, commissionLedgerMutation{
+			EventKey: eventKey, EventType: "commission_transferred_to_balance", Account: account,
+			AvailableDelta: -spec.AmountQuota, UserQuotaDelta: spec.AmountQuota,
+			UserQuotaAfter: nextOrdinary, ActorUserID: spec.UserID,
+			ReasonCode: "user_transfer_to_balance", RequestHash: requestHash,
+		}); err != nil {
+			return err
+		}
+		output = CommissionTransferResult{Account: *account, TransferredQuota: spec.AmountQuota,
+			OrdinaryBalanceQuota: nextOrdinary}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !output.Replayed {
+		if err := invalidateUserCache(spec.UserID); err != nil {
+			common.SysLog("failed to invalidate commission transfer cache: " + err.Error())
+		}
+	}
+	return &output, nil
+}
+
+func calculateCommissionAdjustment(db *gorm.DB, spec CommissionAdjustmentSpec, preview bool) (*CommissionAdjustmentResult, error) {
+	if err := validateCommissionAdjustmentSpec(spec, preview); err != nil {
+		return nil, err
+	}
+	var output CommissionAdjustmentResult
+	run := func(tx *gorm.DB) error {
+		requestHash := commissionHash("r29-adjust-request-v1", strconv.Itoa(spec.UserID), spec.Mode,
+			strconv.FormatInt(spec.ValueQuota, 10), strconv.FormatInt(spec.ExpectedVersion, 10), strings.TrimSpace(spec.ReasonCode))
+		eventKey := "admin-adjust:" + strconv.Itoa(spec.UserID) + ":" + strings.TrimSpace(spec.IdempotencyKey)
+		if !preview {
+			var prior CommissionLedgerV1
+			err := tx.Where("event_key_hash = ?", commissionHash("r29-ledger-v1", eventKey)).First(&prior).Error
+			if err == nil {
+				if prior.RequestHash != requestHash {
+					return ErrCommissionIdempotencyConflict
+				}
+				users, err := loadCommissionUsersForUpdateTx(tx, spec.UserID)
+				if err != nil {
+					return err
+				}
+				account, err := loadCommissionAccountForUpdateTx(tx, spec.UserID)
+				if err != nil {
+					return err
+				}
+				output = commissionAdjustmentResult(account, users[spec.UserID], spec.ValueQuota, 0, 0, 0, true)
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		var user User
+		query := tx.Unscoped().Where("id = ?", spec.UserID)
+		if !preview {
+			query = lockForUpdate(query)
+		}
+		if err := query.First(&user).Error; err != nil {
+			return err
+		}
+		account := CommissionAccountV1{UserID: spec.UserID}
+		accountCreated := false
+		accountQuery := tx.Where("user_id = ?", spec.UserID)
+		if !preview {
+			accountQuery = lockForUpdate(accountQuery)
+		}
+		if err := accountQuery.First(&account).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if preview {
+				account = CommissionAccountV1{UserID: spec.UserID, Version: 0}
+			} else {
+				if spec.ExpectedVersion != 0 {
+					return ErrCommissionVersionConflict
+				}
+				created, err := loadCommissionAccountForUpdateTx(tx, spec.UserID)
+				if err != nil {
+					return err
+				}
+				account = *created
+				accountCreated = true
+			}
+		}
+		if !accountCreated && account.Version != spec.ExpectedVersion {
+			return ErrCommissionVersionConflict
+		}
+		if err := validateCommissionAccount(&account, int64(user.Quota)); err != nil {
+			return err
+		}
+		oldAccount := account
+		manualDelta, err := applyCommissionAdjustmentLocked(&account, &user, spec.Mode, spec.ValueQuota)
+		if err != nil {
+			return err
+		}
+		account.NetManualAdjustmentQuota, err = commissionSafeAdd(oldAccount.NetManualAdjustmentQuota, manualDelta)
+		if err != nil {
+			return err
+		}
+		if preview {
+			output = commissionAdjustmentResult(&account, &user, spec.ValueQuota,
+				account.AvailableQuota-oldAccount.AvailableQuota, account.DebtQuota-oldAccount.DebtQuota,
+				account.PendingCapacityQuota-oldAccount.PendingCapacityQuota, false)
+			return nil
+		}
+		if err := persistCommissionAccountTx(tx, &account, oldAccount.Version); err != nil {
+			return err
+		}
+		if _, err := appendCommissionLedgerTx(tx, commissionLedgerMutation{
+			EventKey: eventKey, EventType: "commission_adjustment_" + spec.Mode, Account: &account,
+			AvailableDelta:       account.AvailableQuota - oldAccount.AvailableQuota,
+			DebtDelta:            account.DebtQuota - oldAccount.DebtQuota,
+			PendingCapacityDelta: account.PendingCapacityQuota - oldAccount.PendingCapacityQuota,
+			UserQuotaDelta:       0, UserQuotaAfter: int64(user.Quota),
+			ActorUserID: spec.ActorUserID, ReasonCode: strings.TrimSpace(spec.ReasonCode), RequestHash: requestHash,
+		}); err != nil {
+			return err
+		}
+		output = commissionAdjustmentResult(&account, &user, spec.ValueQuota,
+			account.AvailableQuota-oldAccount.AvailableQuota, account.DebtQuota-oldAccount.DebtQuota,
+			account.PendingCapacityQuota-oldAccount.PendingCapacityQuota, false)
+		return nil
+	}
+	if preview {
+		if err := run(DB); err != nil {
+			return nil, err
+		}
+		return &output, nil
+	}
+	if err := db.Transaction(run); err != nil {
+		return nil, err
+	}
+	if err := invalidateUserCache(spec.UserID); err != nil {
+		common.SysLog("failed to invalidate commission adjustment cache: " + err.Error())
+	}
+	return &output, nil
+}
+
+func validateCommissionAdjustmentSpec(spec CommissionAdjustmentSpec, preview bool) error {
+	if spec.UserID <= 0 || spec.ActorUserID <= 0 || spec.ExpectedVersion < 0 || spec.ValueQuota < 0 ||
+		(spec.Mode != CommissionAdjustmentAdd && spec.Mode != CommissionAdjustmentSubtract && spec.Mode != CommissionAdjustmentSet) {
+		return ErrCommissionInvalidInput
+	}
+	if spec.Mode != CommissionAdjustmentSet && spec.ValueQuota == 0 {
+		return ErrCommissionInvalidInput
+	}
+	if !preview && (strings.TrimSpace(spec.IdempotencyKey) == "" || len(spec.IdempotencyKey) > 128 ||
+		strings.TrimSpace(spec.ReasonCode) == "" || len(spec.ReasonCode) > 64) {
+		return ErrCommissionInvalidInput
+	}
+	return nil
+}
+
+func applyCommissionAdjustmentLocked(account *CommissionAccountV1, user *User, mode string, value int64) (int64, error) {
+	beforeAvailable := account.AvailableQuota
+	switch mode {
+	case CommissionAdjustmentAdd:
+		if _, err := applyCommissionCreditLocked(account, user, value); err != nil {
+			return 0, err
+		}
+		return value, nil
+	case CommissionAdjustmentSubtract:
+		if value > account.AvailableQuota {
+			return 0, ErrCommissionInsufficientAvailable
+		}
+		account.AvailableQuota -= value
+		return -value, validateCommissionAccount(account, int64(user.Quota))
+	case CommissionAdjustmentSet:
+		if value < beforeAvailable {
+			delta := beforeAvailable - value
+			account.AvailableQuota -= delta
+			return -delta, validateCommissionAccount(account, int64(user.Quota))
+		}
+		if value == beforeAvailable {
+			return 0, nil
+		}
+		required := value - beforeAvailable
+		if account.DebtQuota > math.MaxInt64-required {
+			return 0, ErrCommissionInvariant
+		}
+		required += account.DebtQuota
+		if _, err := applyCommissionCreditLocked(account, user, required); err != nil {
+			return 0, err
+		}
+		if account.AvailableQuota != value {
+			return 0, ErrCommissionInvalidInput
+		}
+		return required, nil
+	default:
+		return 0, ErrCommissionInvalidInput
+	}
+}
+
+func commissionAdjustmentResult(account *CommissionAccountV1, user *User, requested, availableDelta, debtDelta, pendingDelta int64, replayed bool) CommissionAdjustmentResult {
+	return CommissionAdjustmentResult{Account: *account, UserQuota: int64(user.Quota),
+		OrdinaryAvailableQuota: int64(user.Quota), RequestedQuota: requested,
+		EffectiveAvailableDelta: availableDelta, DebtDelta: debtDelta, PendingCapacityDelta: pendingDelta, Replayed: replayed}
+}
+
+func CreateCommissionWithdrawal(spec CommissionWithdrawalCreateSpec) (*CommissionWithdrawalV1, bool, error) {
+	contact := strings.TrimSpace(spec.MaskedContact)
+	key := strings.TrimSpace(spec.IdempotencyKey)
+	if spec.UserID <= 0 || spec.AmountQuota <= 0 || spec.ExpectedVersion <= 0 || key == "" || len(key) > 128 ||
+		len(contact) > 128 || !utf8.ValidString(contact) || containsLongDigitRun(contact, 7) {
+		return nil, false, ErrCommissionInvalidInput
+	}
+	keyHash := commissionHash("r29-withdrawal-key-v1", strconv.Itoa(spec.UserID), key)
+	requestHash := commissionHash("r29-withdrawal-request-v1", strconv.Itoa(spec.UserID), strconv.FormatInt(spec.AmountQuota, 10), contact)
+	var result CommissionWithdrawalV1
+	replayed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var prior CommissionWithdrawalV1
+		if err := tx.Where("idempotency_key_hash = ?", keyHash).First(&prior).Error; err == nil {
+			if prior.RequestHash != requestHash {
+				return ErrCommissionIdempotencyConflict
+			}
+			result = prior
+			replayed = true
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		users, err := loadCommissionUsersForUpdateTx(tx, spec.UserID)
+		if err != nil {
+			return err
+		}
+		user := users[spec.UserID]
+		if user.Status != common.UserStatusEnabled || user.DeletedAt.Valid {
+			return ErrCommissionInvalidInput
+		}
+		account, err := loadCommissionAccountForUpdateTx(tx, spec.UserID)
+		if err != nil {
+			return err
+		}
+		if account.Version != spec.ExpectedVersion {
+			return ErrCommissionVersionConflict
+		}
+		if err := validateCommissionWithdrawalHeldTx(tx, account); err != nil {
+			return err
+		}
+		if account.AvailableQuota > math.MaxInt64-account.PendingCapacityQuota ||
+			account.AvailableQuota+account.PendingCapacityQuota < spec.AmountQuota {
+			return ErrCommissionInsufficientAvailable
+		}
+		oldAccount := *account
+		oldQuota := int64(user.Quota)
+		fromAvailable := minInt64(account.AvailableQuota, spec.AmountQuota)
+		fromPending := spec.AmountQuota - fromAvailable
+		account.AvailableQuota -= fromAvailable
+		account.PendingCapacityQuota -= fromPending
+		account.WithdrawalHeldQuota += spec.AmountQuota
+		user.Quota -= int(fromAvailable)
+		if err := validateCommissionAccount(account, int64(user.Quota)); err != nil {
+			return err
+		}
+		if err := persistCommissionUserQuotaTx(tx, user, oldQuota, int64(user.Quota)); err != nil {
+			return err
+		}
+		if err := persistCommissionAccountTx(tx, account, oldAccount.Version); err != nil {
+			return err
+		}
+		now := time.Now().UnixMilli()
+		withdrawal := CommissionWithdrawalV1{PublicID: commissionPublicID("ccw"), UserID: spec.UserID,
+			AmountQuota: spec.AmountQuota, Status: CommissionWithdrawalStatusSubmitted, RequestHash: requestHash,
+			IdempotencyKeyHash: keyHash, Version: 1, MaskedContact: contact, SubmittedAt: now,
+			CreatedAt: now, UpdatedAt: now}
+		if err := tx.Create(&withdrawal).Error; err != nil {
+			return err
+		}
+		if _, err := appendCommissionLedgerTx(tx, commissionLedgerMutation{EventKey: "withdrawal-submit:" + key,
+			EventType: "withdrawal_submitted", WithdrawalID: withdrawal.ID, Account: account,
+			AvailableDelta: -fromAvailable, WithdrawalHeldDelta: spec.AmountQuota,
+			PendingCapacityDelta: -fromPending, UserQuotaDelta: -fromAvailable, UserQuotaAfter: int64(user.Quota),
+			ActorUserID: spec.UserID, ReasonCode: "user_withdrawal", RequestHash: requestHash}); err != nil {
+			return err
+		}
+		if err := validateCommissionWithdrawalHeldTx(tx, account); err != nil {
+			return err
+		}
+		result = withdrawal
+		return nil
+	})
+	if err == nil && !replayed {
+		_ = invalidateUserCache(spec.UserID)
+	}
+	return &result, replayed, err
+}
+
+func ApplyCommissionWithdrawalAction(spec CommissionWithdrawalActionSpec) (*CommissionWithdrawalV1, bool, error) {
+	publicID := strings.TrimSpace(spec.WithdrawalPublicID)
+	action := strings.TrimSpace(spec.Action)
+	key := strings.TrimSpace(spec.IdempotencyKey)
+	reason := strings.TrimSpace(spec.ReasonCode)
+	reference := strings.TrimSpace(spec.MaskedReference)
+	if publicID == "" || spec.ExpectedVersion <= 0 || spec.ActorUserID <= 0 || key == "" || len(key) > 128 ||
+		len(reason) > 64 || len(reference) > 128 || containsLongDigitRun(reference, 7) {
+		return nil, false, ErrCommissionInvalidInput
+	}
+	requestHash := commissionHash("r29-withdrawal-action-v1", publicID, action,
+		strconv.FormatInt(spec.ExpectedVersion, 10), reason, reference, strconv.Itoa(spec.ActorUserID))
+	eventKey := "withdrawal-action:" + publicID + ":" + key
+	var result CommissionWithdrawalV1
+	replayed := false
+	var invalidateUserID int
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var prior CommissionLedgerV1
+		if err := tx.Where("event_key_hash = ?", commissionHash("r29-ledger-v1", eventKey)).First(&prior).Error; err == nil {
+			if prior.RequestHash != requestHash {
+				return ErrCommissionIdempotencyConflict
+			}
+			if err := tx.Where("public_id = ?", publicID).First(&result).Error; err != nil {
+				return err
+			}
+			replayed = true
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		var withdrawal CommissionWithdrawalV1
+		if err := lockForUpdate(tx).Where("public_id = ?", publicID).First(&withdrawal).Error; err != nil {
+			return err
+		}
+		invalidateUserID = withdrawal.UserID
+		if spec.ActorIsOwner && spec.ActorUserID != withdrawal.UserID {
+			return ErrCommissionInvalidInput
+		}
+		if withdrawal.Version != spec.ExpectedVersion {
+			return ErrCommissionVersionConflict
+		}
+		users, err := loadCommissionUsersForUpdateTx(tx, withdrawal.UserID)
+		if err != nil {
+			return err
+		}
+		user := users[withdrawal.UserID]
+		account, err := loadCommissionAccountForUpdateTx(tx, withdrawal.UserID)
+		if err != nil {
+			return err
+		}
+		if err := validateCommissionWithdrawalHeldTx(tx, account); err != nil {
+			return err
+		}
+		oldAccount := *account
+		oldQuota := int64(user.Quota)
+		fromStatus := withdrawal.Status
+		now := time.Now().UnixMilli()
+		toStatus, accountChanged, err := applyWithdrawalTransitionLocked(&withdrawal, account, user, spec, now)
+		if err != nil {
+			return err
+		}
+		if accountChanged {
+			if err := persistCommissionUserQuotaTx(tx, user, oldQuota, int64(user.Quota)); err != nil {
+				return err
+			}
+			if err := persistCommissionAccountTx(tx, account, oldAccount.Version); err != nil {
+				return err
+			}
+		}
+		updates := map[string]interface{}{"status": toStatus, "version": withdrawal.Version + 1,
+			"updated_at": now, "actor_user_id": spec.ActorUserID}
+		for key, value := range withdrawalTransitionFields(withdrawal, toStatus) {
+			updates[key] = value
+		}
+		updated := tx.Model(&CommissionWithdrawalV1{}).Where("id = ? AND version = ?", withdrawal.ID, withdrawal.Version).Updates(updates)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrCommissionVersionConflict
+		}
+		withdrawal.Status = toStatus
+		withdrawal.Version++
+		withdrawal.UpdatedAt = now
+		withdrawal.ActorUserID = spec.ActorUserID
+		if _, err := appendCommissionLedgerTx(tx, commissionLedgerMutation{EventKey: eventKey,
+			EventType: "withdrawal_" + toStatus, WithdrawalID: withdrawal.ID, Account: account,
+			AvailableDelta:       account.AvailableQuota - oldAccount.AvailableQuota,
+			WithdrawalHeldDelta:  account.WithdrawalHeldQuota - oldAccount.WithdrawalHeldQuota,
+			DebtDelta:            account.DebtQuota - oldAccount.DebtQuota,
+			PendingCapacityDelta: account.PendingCapacityQuota - oldAccount.PendingCapacityQuota,
+			UserQuotaDelta:       int64(user.Quota) - oldQuota, UserQuotaAfter: int64(user.Quota),
+			ActorUserID: spec.ActorUserID, ReasonCode: reason, RequestHash: requestHash}); err != nil {
+			return err
+		}
+		if err := validateCommissionWithdrawalHeldTx(tx, account); err != nil {
+			return err
+		}
+		_ = fromStatus
+		result = withdrawal
+		return nil
+	})
+	if err == nil && invalidateUserID > 0 && !replayed {
+		_ = invalidateUserCache(invalidateUserID)
+	}
+	return &result, replayed, err
+}
+
+func applyWithdrawalTransitionLocked(withdrawal *CommissionWithdrawalV1, account *CommissionAccountV1, user *User,
+	spec CommissionWithdrawalActionSpec, now int64) (string, bool, error) {
+	action := strings.TrimSpace(spec.Action)
+	switch action {
+	case CommissionWithdrawalStatusApproved:
+		if !spec.ActorIsRoot || (withdrawal.Status != CommissionWithdrawalStatusSubmitted && withdrawal.Status != CommissionWithdrawalStatusReviewRequired) {
+			return "", false, ErrCommissionWithdrawalTransition
+		}
+		if withdrawal.Status == CommissionWithdrawalStatusReviewRequired {
+			if account.DebtQuota != 0 || (withdrawal.ReviewFromStatus != CommissionWithdrawalStatusSubmitted && withdrawal.ReviewFromStatus != CommissionWithdrawalStatusApproved) {
+				return "", false, ErrCommissionWithdrawalTransition
+			}
+		}
+		withdrawal.ApprovedAt = now
+		return CommissionWithdrawalStatusApproved, false, nil
+	case CommissionWithdrawalStatusPaid:
+		if !spec.ActorIsRoot || withdrawal.Status != CommissionWithdrawalStatusApproved || account.DebtQuota != 0 ||
+			account.WithdrawalHeldQuota < withdrawal.AmountQuota {
+			return "", false, ErrCommissionWithdrawalTransition
+		}
+		account.WithdrawalHeldQuota -= withdrawal.AmountQuota
+		account.LifetimeWithdrawalPaidQuota += withdrawal.AmountQuota
+		withdrawal.PaidAt = now
+		withdrawal.MaskedPaymentReference = strings.TrimSpace(spec.MaskedReference)
+		return CommissionWithdrawalStatusPaid, true, nil
+	case CommissionWithdrawalStatusRejected, CommissionWithdrawalStatusCanceled:
+		ownerCancel := action == CommissionWithdrawalStatusCanceled && spec.ActorIsOwner &&
+			(withdrawal.Status == CommissionWithdrawalStatusSubmitted ||
+				(withdrawal.Status == CommissionWithdrawalStatusReviewRequired && withdrawal.ReviewFromStatus == CommissionWithdrawalStatusSubmitted))
+		rootAction := spec.ActorIsRoot && (withdrawal.Status == CommissionWithdrawalStatusSubmitted ||
+			withdrawal.Status == CommissionWithdrawalStatusApproved || withdrawal.Status == CommissionWithdrawalStatusReviewRequired)
+		if !ownerCancel && !rootAction {
+			return "", false, ErrCommissionWithdrawalTransition
+		}
+		if account.WithdrawalHeldQuota < withdrawal.AmountQuota {
+			return "", false, ErrCommissionWithdrawalConservation
+		}
+		account.WithdrawalHeldQuota -= withdrawal.AmountQuota
+		if _, err := applyCommissionCreditLocked(account, user, withdrawal.AmountQuota); err != nil {
+			return "", false, err
+		}
+		if action == CommissionWithdrawalStatusRejected {
+			withdrawal.RejectedAt = now
+		} else {
+			withdrawal.CanceledAt = now
+		}
+		return action, true, nil
+	case CommissionWithdrawalStatusReviewRequired:
+		if !spec.ActorIsRoot || (withdrawal.Status != CommissionWithdrawalStatusSubmitted && withdrawal.Status != CommissionWithdrawalStatusApproved) ||
+			strings.TrimSpace(spec.ReasonCode) == "" {
+			return "", false, ErrCommissionWithdrawalTransition
+		}
+		withdrawal.ReviewFromStatus = withdrawal.Status
+		withdrawal.ReviewReasonCode = strings.TrimSpace(spec.ReasonCode)
+		withdrawal.ReviewEnteredVersion = withdrawal.Version + 1
+		withdrawal.ReviewEnteredAt = now
+		return CommissionWithdrawalStatusReviewRequired, false, nil
+	default:
+		return "", false, ErrCommissionWithdrawalTransition
+	}
+}
+
+func withdrawalTransitionFields(withdrawal CommissionWithdrawalV1, status string) map[string]interface{} {
+	fields := map[string]interface{}{}
+	switch status {
+	case CommissionWithdrawalStatusApproved:
+		fields["approved_at"] = withdrawal.ApprovedAt
+	case CommissionWithdrawalStatusPaid:
+		fields["paid_at"] = withdrawal.PaidAt
+		fields["masked_payment_reference"] = withdrawal.MaskedPaymentReference
+	case CommissionWithdrawalStatusRejected:
+		fields["rejected_at"] = withdrawal.RejectedAt
+	case CommissionWithdrawalStatusCanceled:
+		fields["canceled_at"] = withdrawal.CanceledAt
+	case CommissionWithdrawalStatusReviewRequired:
+		fields["review_from_status"] = withdrawal.ReviewFromStatus
+		fields["review_reason_code"] = withdrawal.ReviewReasonCode
+		fields["review_entered_version"] = withdrawal.ReviewEnteredVersion
+		fields["review_entered_at"] = withdrawal.ReviewEnteredAt
+	}
+	return fields
+}
+
+func validateCommissionWithdrawalHeldTx(tx *gorm.DB, account *CommissionAccountV1) error {
+	if account == nil {
+		return ErrCommissionInvariant
+	}
+	var expected int64
+	if err := tx.Model(&CommissionWithdrawalV1{}).Where("user_id = ? AND status IN ?", account.UserID,
+		[]string{CommissionWithdrawalStatusSubmitted, CommissionWithdrawalStatusApproved, CommissionWithdrawalStatusReviewRequired}).
+		Select("COALESCE(SUM(amount_quota), 0)").Scan(&expected).Error; err != nil {
+		return err
+	}
+	if expected != account.WithdrawalHeldQuota {
+		return ErrCommissionWithdrawalConservation
+	}
+	return nil
+}
+
+func ListCommissionWithdrawals(userID, offset, limit int) ([]CommissionWithdrawalV1, int64, error) {
+	if userID < 0 || offset < 0 || limit <= 0 || limit > 100 {
+		return nil, 0, ErrCommissionInvalidInput
+	}
+	query := DB.Model(&CommissionWithdrawalV1{})
+	if userID > 0 {
+		query = query.Where("user_id = ?", userID)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	rows := make([]CommissionWithdrawalV1, 0)
+	if err := query.Order("id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	return rows, total, nil
+}
+
+func CommissionUserDeletionBlockedTx(tx *gorm.DB, userID int) error {
+	if tx == nil || userID <= 0 {
+		return ErrCommissionInvalidInput
+	}
+	var inviterReferences int64
+	if err := tx.Unscoped().Model(&User{}).Where("inviter_id = ?", userID).Count(&inviterReferences).Error; err != nil {
+		return err
+	}
+	if inviterReferences > 0 {
+		return ErrCommissionInviterReferenced
+	}
+	checks := []struct {
+		model interface{}
+		where string
+		args  []interface{}
+	}{
+		{&CommissionProfileV1{}, "user_id = ?", []interface{}{userID}},
+		{&CommissionAccountV1{}, "user_id = ?", []interface{}{userID}},
+		{&CommissionOperationV1{}, "consumer_user_id = ? OR beneficiary_user_id = ?", []interface{}{userID, userID}},
+		{&CommissionWithdrawalV1{}, "user_id = ?", []interface{}{userID}},
+		{&CommissionLedgerV1{}, "consumer_user_id = ? OR actor_user_id = ?", []interface{}{userID, userID}},
+	}
+	for _, check := range checks {
+		if !tx.Migrator().HasTable(check.model) {
+			continue
+		}
+		var count int64
+		if err := tx.Model(check.model).Where(check.where, check.args...).Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrCommissionInviterReferenced
+		}
+	}
+	return nil
+}
+
+func PauseCommissionProfileTx(tx *gorm.DB, userID int) error {
+	if tx == nil || userID <= 0 || !tx.Migrator().HasTable(&CommissionProfileV1{}) {
+		return nil
+	}
+	return tx.Model(&CommissionProfileV1{}).Where("user_id = ? AND status = ?", userID, CommissionProfileEnabled).
+		Updates(map[string]interface{}{"status": CommissionProfilePaused, "version": gorm.Expr("version + 1"),
+			"updated_at": time.Now().UnixMilli()}).Error
+}
+
+func BindCommissionInviterTx(tx *gorm.DB, user *User, inviterID int) error {
+	if tx == nil || user == nil || inviterID < 0 {
+		return ErrCommissionInvalidInput
+	}
+	if inviterID == 0 {
+		if user.InviterId < 0 {
+			return ErrCommissionInvalidInput
+		}
+		return nil
+	}
+	if user.InviterId > 0 {
+		if user.InviterId == inviterID {
+			return nil
+		}
+		return ErrCommissionInvalidInput
+	}
+	if user.Id > 0 && user.Id == inviterID {
+		return ErrCommissionInvalidInput
+	}
+	var inviter User
+	if err := lockForUpdate(tx).Where("id = ? AND status = ?", inviterID, common.UserStatusEnabled).First(&inviter).Error; err != nil {
+		return err
+	}
+	if inviter.DeletedAt.Valid {
+		return ErrCommissionInvalidInput
+	}
+	visited := map[int]struct{}{}
+	current := inviter
+	for current.Id > 0 {
+		if user.Id > 0 && current.Id == user.Id {
+			return ErrCommissionInvalidInput
+		}
+		if _, exists := visited[current.Id]; exists {
+			return ErrCommissionInvalidInput
+		}
+		visited[current.Id] = struct{}{}
+		if current.InviterId <= 0 {
+			break
+		}
+		nextInviterID := current.InviterId
+		current = User{}
+		if err := tx.Unscoped().Select("id", "inviter_id").Where("id = ?", nextInviterID).First(&current).Error; err != nil {
+			return err
+		}
+	}
+	user.InviterId = inviterID
+	return nil
+}
+
+func containsLongDigitRun(value string, threshold int) bool {
+	run := 0
+	for _, char := range value {
+		if char >= '0' && char <= '9' {
+			run++
+			if run >= threshold {
+				return true
+			}
+		} else {
+			run = 0
+		}
+	}
+	return false
+}
+
+func NormalizeCommissionTiers(tiers []CommissionTierView) ([]CommissionTierView, string, error) {
+	raw, err := common.Marshal(tiers)
+	if err != nil {
+		return nil, "", err
+	}
+	parsed, canonical, err := normalizeCommissionTierJSON(string(raw))
+	if err != nil {
+		return nil, "", err
+	}
+	result := make([]CommissionTierView, 0, len(parsed))
+	for _, tier := range parsed {
+		result = append(result, CommissionTierView{ThresholdQuota: tier.ThresholdQuota, RateBps: tier.RateBps})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ThresholdQuota < result[j].ThresholdQuota })
+	return result, canonical, nil
+}
+
+func CommissionReadiness() (map[string]interface{}, error) {
+	settings, err := GetCommissionSettings()
+	if err != nil {
+		return nil, err
+	}
+	var nonterminalOperations int64
+	if err := DB.Model(&CommissionOperationV1{}).Where("financial_status = ?", CommissionFinancialReserved).
+		Count(&nonterminalOperations).Error; err != nil {
+		return nil, err
+	}
+	var pendingWithdrawals int64
+	if err := DB.Model(&CommissionWithdrawalV1{}).Where("status IN ?", []string{
+		CommissionWithdrawalStatusSubmitted, CommissionWithdrawalStatusApproved, CommissionWithdrawalStatusReviewRequired,
+	}).Count(&pendingWithdrawals).Error; err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"schema_version":         settings.SchemaVersion,
+		"mode":                   settings.Mode,
+		"spend_priority":         settings.SpendPriority,
+		"runtime_role":           CommissionRuntimeRole(),
+		"current_program_id":     settings.CurrentProgramID,
+		"nonterminal_operations": nonterminalOperations,
+		"pending_withdrawals":    pendingWithdrawals,
+		"schema_ready":           true,
+	}, nil
+}
+
+func ensureCommissionQuotaFits(value int64) error {
+	if value < int64(common.MinQuota) || value > int64(common.MaxQuota) {
+		return fmt.Errorf("%w: quota %d is outside the shared int32 range", ErrCommissionInvalidInput, value)
+	}
+	return nil
+}

@@ -1,0 +1,427 @@
+package sora
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/gabriel-vasile/mimetype"
+	"github.com/gin-gonic/gin"
+)
+
+// encodedImageBody owns only a disk spool, not a second in-memory copy of the
+// base64 payload. Closing is safe both before dispatch and from http.Transport.
+type encodedImageBody struct {
+	file        *os.File
+	reservation *mediaservice.RequestSpoolReservation
+	ctx         context.Context
+	size        int64
+	maxBytes    int64
+	once        sync.Once
+}
+
+func (body *encodedImageBody) Read(p []byte) (int, error) { return body.file.Read(p) }
+func (body *encodedImageBody) Write(p []byte) (int, error) {
+	if err := body.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if body.maxBytes > 0 && int64(len(p)) > body.maxBytes-body.size {
+		return 0, fmt.Errorf("完整请求超过配置的 %d 字节上限", body.maxBytes)
+	}
+	if err := body.reservation.GrowTo(body.size + int64(len(p))); err != nil {
+		return 0, err
+	}
+	n, err := body.file.Write(p)
+	body.size += int64(n)
+	return n, err
+}
+func (body *encodedImageBody) Close() error {
+	var err error
+	body.once.Do(func() { err = body.file.Close(); _ = os.Remove(body.file.Name()); body.reservation.Release() })
+	return err
+}
+
+type inlineImageSource struct {
+	reference relaycommon.MediaReference
+	file      *multipart.FileHeader
+}
+
+func buildInlineImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request relaycommon.TaskSubmitReq, capability mediaservice.Capability) (io.Reader, error) {
+	fields := make(map[string]interface{})
+	contentType := c.GetHeader("Content-Type")
+	var files []*multipart.FileHeader
+	if strings.HasPrefix(contentType, "application/json") {
+		storage, err := common.GetBodyStorage(c)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = storage.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		if err = common.DecodeJson(storage, &fields); err != nil {
+			return nil, err
+		}
+	} else if strings.HasPrefix(contentType, "multipart/form-data") {
+		form, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			return nil, err
+		}
+		for name, values := range form.Value {
+			if len(values) > 0 {
+				fields[name] = values[0]
+			}
+		}
+		// OpenAI multipart has one input_reference; accept repeated files in
+		// their multipart order without silently ignoring additional images.
+		for name, values := range form.File {
+			if name != "input_reference" {
+				return nil, fmt.Errorf("use input_reference for multipart image files")
+			}
+			files = append(files, values...)
+		}
+	} else {
+		return nil, fmt.Errorf("inline image contracts require JSON or multipart/form-data")
+	}
+	for _, name := range []string{"referenceImages", "referenceVideos", "referenceAudios", "reference_image_urls", "reference_videos", "reference_audios"} {
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("use references or images instead of %s", name)
+		}
+	}
+	if metadata, ok := fields["metadata"].(map[string]interface{}); ok {
+		for _, name := range []string{"image", "images", "input_reference", "references", "referenceImages", "referenceVideos", "referenceAudios", "video_b64s", "audio_b64s"} {
+			if _, exists := metadata[name]; exists {
+				return nil, fmt.Errorf("reference inputs must be top-level fields, not metadata.%s", name)
+			}
+		}
+	}
+	// Native arrays have already passed NormalizeTaskMediaReferences. Verify
+	// their correspondence before removing aliases from the provider payload.
+	for field, kind := range map[string]string{"images": "image", "video_b64s": "video", "audio_b64s": "audio"} {
+		if raw, present := fields[field]; present {
+			if field == "images" && len(request.References) == 0 {
+				continue
+			}
+			values, ok := raw.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("%s 必须为素材数组", field)
+			}
+			refs := request.ReferenceURLs(kind)
+			if len(values) != len(refs) {
+				return nil, fmt.Errorf("%s 尚未规范化或与 references 冲突", field)
+			}
+			for i, raw := range values {
+				value, ok := raw.(string)
+				if !ok {
+					return nil, fmt.Errorf("%s 必须包含 Base64 字符串", field)
+				}
+				value = strings.TrimSpace(value)
+				_, payload, hasData := strings.Cut(refs[i], ";base64,")
+				if value != refs[i] && (!hasData || value != payload) {
+					return nil, fmt.Errorf("%s 与已验证素材冲突", field)
+				}
+			}
+			delete(fields, field)
+		}
+	}
+	if len(files) > 0 && (len(request.References) > 0 || len(request.Images) > 0 || request.InputReference != "" || request.Image != "") {
+		return nil, fmt.Errorf("use one image input form; multipart files conflict with image references")
+	}
+	sources := make([]inlineImageSource, 0)
+	if len(request.References) > 0 {
+		for _, reference := range request.References {
+			sources = append(sources, inlineImageSource{reference: reference})
+		}
+	} else if len(files) > 0 {
+		for _, file := range files {
+			reference := relaycommon.MediaReference{Type: "image", Role: "reference", SizeBytes: file.Size, MetadataTrusted: true}
+			sources = append(sources, inlineImageSource{reference: reference, file: file})
+		}
+	} else {
+		images := request.Images
+		if len(images) == 0 && request.InputReference != "" {
+			images = []string{request.InputReference}
+		}
+		if len(images) == 0 && request.Image != "" {
+			images = []string{request.Image}
+		}
+		for _, image := range images {
+			reference := relaycommon.MediaReference{Type: "image", Role: "reference", ResolvedURL: strings.TrimSpace(image)}
+			sources = append(sources, inlineImageSource{reference: reference})
+		}
+	}
+	descriptors := make([]mediaservice.ReferenceDescriptor, 0, len(sources))
+	request.References = nil
+	for _, source := range sources {
+		reference := source.reference
+		descriptors = append(descriptors, mediaservice.ReferenceDescriptor{Type: reference.Type, Role: reference.Role, SizeBytes: reference.SizeBytes, MetadataTrusted: reference.MetadataTrusted})
+		request.References = append(request.References, reference)
+	}
+	if err := capability.Validate(descriptors); err != nil {
+		return nil, err
+	}
+	if err := applyManagedCapabilityPayload(fields, request, capability); err != nil {
+		return nil, err
+	}
+	fields["model"] = info.UpstreamModelName
+	if err := relaycommon.ValidateParameterVideoWire(info.PriceData.ParameterPricing, fields, capability); err != nil {
+		return nil, err
+	}
+	for kind, field := range capability.ReferenceFields {
+		if capability.ReferenceEncoding[kind] == "data_url" {
+			delete(fields, field)
+		}
+	}
+	encoded, err := common.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+	if len(sources) == 0 {
+		if capability.MaxRequestBytes > 0 && int64(len(encoded)) > capability.MaxRequestBytes {
+			return nil, fmt.Errorf("完整请求超过配置的字节上限")
+		}
+		c.Request.Header.Set("Content-Type", "application/json")
+		return bytes.NewReader(encoded), nil
+	}
+	directory, err := mediaservice.RequestSpoolDirectory()
+	if err != nil {
+		return nil, err
+	}
+	maxBytes := mediasetting.Get().MaxRequestBytes
+	if capability.MaxRequestBytes > 0 {
+		maxBytes = min(maxBytes, capability.MaxRequestBytes)
+	}
+	reservation, err := mediaservice.BeginRequestSpoolReservation(maxBytes, 0)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.CreateTemp(directory, "inline-image-request-*")
+	if err != nil {
+		reservation.Release()
+		return nil, err
+	}
+	body := &encodedImageBody{file: file, reservation: reservation, ctx: c.Request.Context(), maxBytes: maxBytes}
+	ready := false
+	defer func() {
+		if !ready {
+			_ = body.Close()
+		}
+	}()
+	if _, err = body.Write(encoded[:len(encoded)-1]); err != nil {
+		return nil, err
+	}
+	for _, kind := range []string{"image", "video", "audio"} {
+		typed := make([]inlineImageSource, 0)
+		for _, source := range sources {
+			if source.reference.Type == kind {
+				typed = append(typed, source)
+			}
+		}
+		if len(typed) == 0 || capability.ReferenceEncoding[kind] != "data_url" {
+			continue
+		}
+		maxFile, maxRemote, maxTotal, mimes := inlineMediaLimits(capability, kind)
+		if maxFile <= 0 || maxRemote <= 0 || maxTotal <= 0 || len(mimes) == 0 {
+			return nil, fmt.Errorf("%s 内联素材必须配置大小及类型限制", kind)
+		}
+		fieldName, marshalErr := common.Marshal(capability.ReferenceFields[kind])
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		if _, err = fmt.Fprintf(body, ",%s:[", fieldName); err != nil {
+			return nil, err
+		}
+		var totalBytes int64
+		for index, source := range typed {
+			if index > 0 {
+				if _, err = io.WriteString(body, ","); err != nil {
+					return nil, err
+				}
+			}
+			limit := min(maxFile, maxTotal-totalBytes)
+			if limit <= 0 {
+				return nil, fmt.Errorf("%s 素材超过配置的合计字节上限", kind)
+			}
+			reader, sourceLimit, openErr := openInlineImage(c.Request.Context(), info.UserId, source, capability, limit)
+			if openErr != nil {
+				return nil, fmt.Errorf("%s 素材 %d: %w", kind, index+1, openErr)
+			}
+			n, encodeErr := writeInlineImage(body, reader, sourceLimit, mimes)
+			_ = reader.Close()
+			if encodeErr != nil {
+				return nil, fmt.Errorf("%s 素材 %d: %w", kind, index+1, encodeErr)
+			}
+			totalBytes += n
+		}
+		if _, err = io.WriteString(body, "]"); err != nil {
+			return nil, err
+		}
+	}
+	if _, err = io.WriteString(body, "}"); err != nil {
+		return nil, err
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	c.Request.Header.Set("Content-Type", "application/json")
+	ready = true
+	return body, nil
+}
+
+func openInlineImage(ctx context.Context, userID int, source inlineImageSource, capability mediaservice.Capability, limit int64) (io.ReadCloser, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	if source.file != nil {
+		if source.file.Size > limit {
+			return nil, 0, fmt.Errorf("file exceeds the configured image byte limit")
+		}
+		reader, err := source.file.Open()
+		return reader, limit, err
+	}
+	reference := source.reference
+	kind := reference.Type
+	if kind == "" {
+		kind = "image"
+	}
+	_, maxRemote, _, mimes := inlineMediaLimits(capability, kind)
+	ownedRemote := false
+	if reference.FileID != "" {
+		blob, _, err := model.GetMediaBlobByAssetID(userID, reference.FileID, false)
+		if err != nil {
+			blob, err = model.GetMediaBlobForUser(userID, reference.FileID)
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("file_id is unavailable for this user")
+		}
+		if blob.Status != model.MediaBlobStatusReady || blob.SizeBytes > limit || !strings.HasPrefix(blob.MimeType, kind+"/") {
+			return nil, 0, fmt.Errorf("file_id is not a ready image within the configured byte limit")
+		}
+		if blob.StorageBackend == model.MediaStorageBackendLocal {
+			path, err := mediaservice.ResolveObjectPath(blob.ObjectKey)
+			if err != nil {
+				return nil, 0, err
+			}
+			file, err := os.Open(path)
+			return file, limit, err
+		}
+		// Read the stored, ownership-checked origin, avoiding a signed self-fetch.
+		// Keep SSRF/redirect validation, but apply uploaded-image byte limits.
+		ownedRemote = true
+		reference.ResolvedURL = strings.TrimSpace(blob.PrivateSource)
+		if reference.ResolvedURL == "" {
+			return nil, 0, fmt.Errorf("remote file_id has no readable source")
+		}
+	}
+	value := strings.TrimSpace(reference.SourceURL())
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		if !ownedRemote {
+			limit = min(limit, maxRemote)
+		}
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Host == "" || parsed.User != nil {
+			return nil, 0, fmt.Errorf("image URL must be an absolute HTTP(S) URL without credentials")
+		}
+		if err = service.ValidateSSRFProtectedFetchURL(value); err != nil {
+			return nil, 0, fmt.Errorf("image URL is not allowed by the fetch policy")
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, value, nil)
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid image URL")
+		}
+		client := service.GetSSRFProtectedHTTPClient()
+		if client == nil {
+			return nil, 0, fmt.Errorf("image fetch client is unavailable")
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, 0, fmt.Errorf("image download failed")
+		}
+		if response.StatusCode != http.StatusOK || response.ContentLength > limit {
+			_ = response.Body.Close()
+			return nil, 0, fmt.Errorf("image download returned status %d or exceeds the %d byte limit", response.StatusCode, limit)
+		}
+		return response.Body, limit, nil
+	}
+	if strings.HasPrefix(value, "data:") {
+		header, payload, found := strings.Cut(value, ",")
+		if !found || !strings.HasSuffix(header, ";base64") {
+			return nil, 0, fmt.Errorf("image data URL must use base64 encoding")
+		}
+		mimeType := strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64")
+		if !allowedImageMIME(mimeType, mimes) {
+			return nil, 0, fmt.Errorf("image data URL has an unsupported MIME type")
+		}
+		value = payload
+	}
+	if value == "" {
+		return nil, 0, fmt.Errorf("image reference is empty")
+	}
+	return io.NopCloser(base64.NewDecoder(base64.StdEncoding, strings.NewReader(value))), limit, nil
+}
+
+func allowedImageMIME(value string, allowed []string) bool {
+	for _, mimeType := range allowed {
+		if value == mimeType {
+			return true
+		}
+	}
+	return false
+}
+
+// Decode means base64 decoding, not allocating the decompressed pixel bitmap.
+// Byte limits are checked even when Content-Length or client MIME is false.
+func writeInlineImage(writer io.Writer, reader io.Reader, limit int64, allowed []string) (int64, error) {
+	buffered := bufio.NewReader(io.LimitReader(reader, limit+1))
+	prefix, peekErr := buffered.Peek(3072)
+	if peekErr != nil && peekErr != io.EOF && peekErr != bufio.ErrBufferFull {
+		return 0, fmt.Errorf("invalid image data")
+	}
+	mimeType := mimetype.Detect(prefix).String()
+	if !allowedImageMIME(mimeType, allowed) {
+		return 0, fmt.Errorf("素材内容不符合此模型支持的文件格式")
+	}
+	if _, err := fmt.Fprintf(writer, "\"data:%s;base64,", mimeType); err != nil {
+		return 0, err
+	}
+	encoder := base64.NewEncoder(base64.StdEncoding, writer)
+	written, err := io.Copy(encoder, buffered)
+	if err != nil {
+		return written, fmt.Errorf("image data could not be encoded: %w", err)
+	}
+	if written > limit {
+		return written, fmt.Errorf("image exceeds the configured %d byte limit", limit)
+	}
+	if err := encoder.Close(); err != nil {
+		return written, err
+	}
+	_, err = io.WriteString(writer, "\"")
+	return written, err
+}
+
+func inlineMediaLimits(c mediaservice.Capability, kind string) (int64, int64, int64, []string) {
+	switch kind {
+	case "image":
+		return c.MaxImageBytes, c.MaxRemoteImageBytes, c.MaxTotalImageBytes, c.ImageMIMETypes
+	case "video":
+		return c.MaxVideoBytes, c.MaxRemoteVideoBytes, c.MaxTotalVideoBytes, c.VideoMIMETypes
+	case "audio":
+		return c.MaxAudioBytes, c.MaxRemoteAudioBytes, c.MaxTotalAudioBytes, c.AudioMIMETypes
+	default:
+		return 0, 0, 0, nil
+	}
+}

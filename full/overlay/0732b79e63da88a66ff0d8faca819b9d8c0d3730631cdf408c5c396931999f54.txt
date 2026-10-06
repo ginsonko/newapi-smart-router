@@ -1,0 +1,1148 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+
+export type SmartRouterOrderMode = 'auto_price' | 'manual'
+export type SmartRouterStrategy =
+  | 'price'
+  | 'stability'
+  | 'latency'
+  | 'balanced'
+  | 'custom_weighted'
+  | 'manual'
+export type SmartRouterQueueMode = 'no_queue' | 'short_wait'
+export type SmartRouterKillSwitchMode = 'normal' | 'fallback_only'
+export type SmartRouterEndpoint =
+  | 'openai'
+  | 'openai-response'
+  | 'anthropic'
+  | 'image-generation'
+  | 'openai-video'
+
+export type SmartRouterPrimaryState =
+  | 'needs_review'
+  | 'unavailable'
+  | 'unknown'
+  | 'probing'
+  | 'recovering'
+  | 'degraded_usable'
+  | 'healthy'
+  | 'pending_sample'
+  | 'telemetry_unavailable'
+
+export type SmartRouterEvidenceFreshness = 'none' | 'fresh' | 'recent' | 'stale'
+
+export type SmartRouterEvidenceConfidence = 'none' | 'low' | 'medium' | 'high'
+
+export type SmartRouterAffinityMode = 'fixed_premium' | 'economic_break_even'
+
+export type SmartRouterCompressionThreshold = {
+  model: string
+  tokens: number
+}
+
+export type SmartRouterCacheEconomyStatus = {
+  feature_version: string
+  champion_version: string
+  challenger_version: string
+  learning_enabled: boolean
+  queue_depth: number
+  queue_capacity: number
+  profiles: number
+  profiles_with_cost_evidence: number
+  profiles_with_context_evidence: number
+  drifted_profiles: number
+  processed: number
+  fallback_decisions: number
+  keep_decisions: number
+  switch_decisions: number
+  dropped: number
+  duplicates: number
+  persistence_errors: number
+  worker_errors: number
+  prediction_samples: number
+  mean_prediction_error_ppm: number
+  identifiable_counterfactuals: number
+  unidentified_counterfactuals: number
+  redis_backoff_until_ms: number
+  last_update_ms: number
+}
+
+export type SmartRouterCacheEconomyStatusResponse = {
+  success: boolean
+  message?: string
+  data?: SmartRouterCacheEconomyStatus
+}
+
+export type SmartRouterActualInputCostStatus = {
+  feature_version: string
+  estimator_version?: string
+  learning_enabled: boolean
+  evidence_ready?: boolean
+  queue_depth: number
+  queue_capacity: number
+  profiles: number
+  processed: number
+  dropped: number
+  duplicates: number
+  persistence_errors: number
+  worker_errors: number
+  last_update_ms: number
+}
+
+export type SmartRouterContractOverride = {
+  pool_policy?: string
+  order_mode?: SmartRouterOrderMode
+  manual_route_order?: string[]
+}
+
+export type SmartRouterPolicy = {
+  version: number
+  enabled: boolean
+  strategy: SmartRouterStrategy
+  excluded_groups: string[]
+  allow_future_groups: boolean
+  manual_group_order: string[]
+  max_attempts: number
+  failure_threshold: number
+  max_effective_ratio_ppm: number
+  health_guard: boolean
+  actual_input_cost_ranking?: boolean
+  recovery_profile: 'fast' | 'balanced' | 'stable'
+  affinity_enabled: boolean
+  affinity_mode: SmartRouterAffinityMode
+  affinity_max_premium_percent: number
+  affinity_ttl_seconds: number
+  compression_thresholds: SmartRouterCompressionThreshold[]
+  ttft_policy: {
+    enabled: boolean
+    metric?: '' | 'p95'
+    target_ms: number
+    hard_max_ms: number
+    min_samples: number
+  }
+  queue_policy: {
+    mode: SmartRouterQueueMode
+    max_wait_ms: number
+    min_saving_percent: number
+  }
+  balanced_weights: {
+    stability: number
+    price: number
+    ttft: number
+  }
+  custom_weights: {
+    cache: number
+    cost: number
+    ttft: number
+    stability: number
+  }
+  /** Legacy v3 fields are accepted so existing smart keys remain editable. */
+  policy_id?: string
+  pool_policy?: string
+  order_mode?: SmartRouterOrderMode
+  excluded_routes?: string[]
+  contract_overrides?: Record<string, SmartRouterContractOverride>
+  allow_future_certified_routes?: boolean
+}
+
+export type SmartRouterCertifiedGroup = {
+  pools: string[]
+  stable_fallback: boolean
+  model_allow?: string[]
+  model_deny?: string[]
+  channel_allow?: number[]
+  admin_order?: number
+}
+
+export type SmartRouterTextContract = {
+  endpoint: SmartRouterEndpoint
+  capabilities: number
+  max_context: number
+  model_allow?: string[]
+  model_deny?: string[]
+  channel_allow?: number[]
+}
+
+export type SmartRouterChannelProfile = {
+  endpoint_allow?: SmartRouterEndpoint[]
+  capabilities?: number
+  max_context?: number
+  cache_domain?: string
+  capacity_domain?: string
+  failure_domain?: string
+  max_inflight?: number
+}
+
+export type SmartRouterSetting = {
+  enabled: boolean
+  default_for_new_keys: boolean
+  discovery?: {
+    allowed_text_endpoints: SmartRouterEndpoint[]
+    exclude_virtual_groups: string[]
+  }
+  channel_profiles?: Record<string, SmartRouterChannelProfile>
+  default_policy: SmartRouterPolicy
+  default_max_effective_ratio_ppm?: number
+  absolute_max_effective_ratio_ppm?: number
+  attempt_limit_enabled?: boolean
+  recovery_fallback_enabled?: boolean | null
+  max_attempts: number
+  max_failure_threshold?: number
+  hard_failure_window_seconds?: number
+  catalog_refresh_seconds: number
+  probe_initial_backoff_seconds?: number
+  probe_max_backoff_seconds?: number
+  max_probe_failures?: number
+  max_outage_seconds?: number
+  probe_budget_per_minute?: number
+  probe_max_concurrency?: number
+  probe_timeout_seconds?: number
+  probe_completion_grace_seconds?: number
+  probe_scan_interval_ms?: number
+  probe_queue_capacity?: number
+  probe_lease_ttl_seconds?: number
+  recovery_fast_interval_seconds?: number
+  recovery_fast_window_seconds?: number
+  recovery_sweep_interval_seconds?: number
+  recovery_slow_backoff_seconds?: number[]
+  recovery_canary_initial_traffic_ppm?: number
+  recovery_canary_healthy_samples?: number
+  recovery_canary_fast_history_samples?: number
+  recovery_canary_fast_reliability_ppm?: number
+  recovery_coverage_target?: number
+  recovery_backup_evidence_ttl_seconds?: number
+  cold_start_wave_batch_size?: number
+  cold_start_wave_max_concurrency?: number
+  cold_start_probe_budget_per_minute?: number
+  cold_start_wait_ms?: number
+  cold_start_poll_interval_ms?: number
+  background_probe_enabled?: boolean
+  max_queue_wait_ms?: number
+  kill_switch_mode: SmartRouterKillSwitchMode
+  /** Read-only compatibility with the v3 control plane. */
+  certified_groups?: Record<string, SmartRouterCertifiedGroup>
+  text_contracts?: SmartRouterTextContract[]
+}
+
+export type SmartRouterCatalogRejection = {
+  group?: string
+  model?: string
+  channel_id?: number
+  endpoint?: string
+  reason: string
+}
+
+export type SmartRouterCatalogReport = {
+  discovered_models?: number
+  discovered_routes?: number
+  discovered_groups?: number
+  blacklisted_routes?: number
+  missing_ratio_routes?: number
+  incompatible_endpoint_routes?: number
+  quarantined_routes?: number
+  updated_at?: number
+  ability_count?: number
+  enabled_channels?: number
+  published_routes?: number
+  published_contracts?: number
+  omitted_contracts?: number
+  rejections?: SmartRouterCatalogRejection[]
+}
+
+export type SmartRouterOptions = {
+  enabled: boolean
+  default_for_new_keys: boolean
+  default_policy: SmartRouterPolicy
+  catalog_ready: boolean
+  catalog_version: string
+  catalog_updated_at?: number
+  model_count: number
+  route_count?: number
+  attempt_limit_enabled?: boolean
+  max_attempts?: number
+  max_failure_threshold?: number
+  default_max_effective_ratio_ppm?: number
+  absolute_max_effective_ratio_ppm?: number
+  max_queue_wait_ms?: number
+  groups: SmartRouterGroupOption[]
+}
+
+export type SmartRouterGroupOption = {
+  group: string
+  description?: string
+  effective_ratio_ppm: number
+  supported_model_count?: number
+  healthy_route_count?: number
+  route_count?: number
+  health_status?:
+    | 'healthy'
+    | 'degraded'
+    | 'unknown'
+    | 'unavailable'
+    | 'quarantined'
+  stable_fallback?: boolean
+  admin_order?: number
+  recent_cache_rate_ppm?: number
+  actual_input_cost_model_count?: number
+  actual_input_cost_samples?: number
+  actual_input_cost_last_observed_at_ms?: number
+  actual_input_cost_historical_samples?: number
+  actual_input_cost_confidence_ppm?: number
+  actual_input_cost_estimator_version?: string
+  historical_cache_rate_ppm?: number | null
+}
+
+export type SmartRouterBlockScope =
+  | 'group'
+  | 'model'
+  | 'channel'
+  | 'group_model'
+  | 'channel_model'
+  | 'endpoint'
+  | 'route'
+
+export type SmartRouterBlock = {
+  id: number
+  scope: SmartRouterBlockScope
+  group?: string
+  model_pattern?: string
+  channel_id?: number
+  contract_id?: string
+  endpoint?: string
+  route_id?: string
+  reason: string
+  expires_at?: number
+  created_at?: number
+  updated_at?: number
+  created_by?: number
+  source: 'manual' | 'auto_health' | 'model_404' | string
+  epoch?: number
+}
+
+export type SmartRouterBlockInput = Omit<
+  SmartRouterBlock,
+  'id' | 'created_at' | 'created_by' | 'source' | 'epoch'
+>
+
+export type SmartRouterBlocksResponse = {
+  success: boolean
+  message?: string
+  data?: SmartRouterBlock[] | { items: SmartRouterBlock[]; total: number }
+}
+
+export type SmartRouterHealthRoute = {
+  route_id: string
+  model?: string
+  group?: string
+  channel_id?: number
+  contract_id?: string
+  endpoint?: string
+  primary_state?: SmartRouterPrimaryState | string
+  health_state?: SmartRouterPrimaryState | string
+  probe_state?: string
+  constraint_labels?: string[]
+  status?: string
+  phase?: string
+  epoch?: number
+  consecutive_hard_failures?: number
+  successes?: number
+  failures?: number
+  success_rate?: number | null
+  real_successes?: number
+  real_failures?: number
+  probe_successes?: number
+  last_outcome?: string
+  last_http_status?: number
+  last_error?: string
+  first_failure_at_ms?: number
+  last_failure_at_ms?: number
+  last_success_at_ms?: number
+  last_updated_ms?: number
+  /** Optional recovery telemetry added by newer smart-router workers. */
+  last_probe_at_ms?: number
+  last_probe_started_at_ms?: number
+  last_probe_completed_at_ms?: number
+  last_probe_outcome?: string
+  last_probe_http_status?: number
+  last_probe_error?: string
+  probe_failures?: number
+  next_probe_at_ms?: number
+  sample_due_at_ms?: number
+  stable_since_ms?: number
+  failure_window_until_ms?: number
+  capacity_until_ms?: number
+  credential_until_ms?: number
+  capacity_limited?: boolean
+  ttft_p95_ms?: number
+  ttft_samples?: number
+  quarantined?: boolean
+  quarantined_at_ms?: number
+  requires_admin_review?: boolean
+  probe_overdue?: boolean
+  natural_traffic_only?: boolean
+  supports_synthetic_probe?: boolean
+  sanitized_error?: string
+  effective_ratio_ppm?: number
+  price_known?: boolean
+  model_price_known?: boolean
+  price?: SmartRouterRoutePrice
+  recent_cache_rate_ppm?: number
+  estimated_input_cost_ppm?: number
+  estimated_input_usd_per_million?: number
+  actual_input_cost_source?: 'observed' | 'pooled_prior' | string
+  actual_input_cost_samples?: number
+  actual_input_cost_last_observed_at_ms?: number
+  actual_input_cost_historical_samples?: number
+  actual_input_cost_confidence_ppm?: number
+  actual_input_cost_estimator_version?: string
+  historical_cache_rate_ppm?: number | null
+}
+
+export type SmartRouterHealthSummary = Partial<
+  Record<
+    | SmartRouterPrimaryState
+    | 'total'
+    | 'degraded'
+    | 'recovering'
+    | 'review'
+    | 'probe_overdue'
+    | 'natural_traffic_only',
+    number
+  >
+>
+
+export type SmartRouterHealthResponse = {
+  success: boolean
+  message?: string
+  data?:
+    | SmartRouterHealthRoute[]
+    | {
+        items: SmartRouterHealthRoute[]
+        total?: number
+        page?: number
+        page_size?: number
+        summary?: SmartRouterHealthSummary
+        updated_at_ms?: number
+        snapshot_version?: string
+        stale?: boolean
+        shared_state_backend?: string
+        background_probe_available?: boolean
+        background_probe_enabled?: boolean
+        snapshot?: {
+          id?: string
+          generated_at_ms?: number
+          age_ms?: number
+          stale?: boolean
+          stale_after_ms?: number
+          catalog_version?: string
+          price_version?: string
+          state_version?: string
+        }
+        pagination?: {
+          page?: number
+          page_size?: number
+          total?: number
+          total_pages?: number
+        }
+        probe_worker?: {
+          heartbeat_at_ms: number
+          queued: number
+          running: number
+          limit: number
+          budget_per_minute: number
+          succeeded: number
+          failed: number
+          deferred: number
+          dropped: number
+          last_defer_reason?: string
+          last_ttfe_ms?: number
+          last_ttft_ms?: number
+          last_run_at_ms: number
+          online?: boolean
+          waiting_for_budget?: number
+          queue_capacity?: number
+        }
+        actual_input_cost_status?: SmartRouterActualInputCostStatus
+      }
+}
+
+export type SmartRouterHealthActionResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    status:
+      | 'scheduled'
+      | 'reset'
+      | 'queued'
+      | 'duplicate'
+      | 'already_queued'
+      | 'already_healthy'
+      | 'already_running'
+      | 'cooldown'
+      | 'not_due'
+      | 'waiting_for_budget'
+      | 'natural_traffic_only'
+      | 'healthy'
+      | 'requires_reset'
+      | 'queue_full'
+      | 'worker_unavailable'
+      | 'not_found'
+      | 'unsupported'
+      | string
+    disposition?: string
+    mode?: string
+    operation_id?: string
+    route_id: string
+    epoch?: number
+    phase?: string
+    next_probe_at_ms?: number
+    sample_due_at_ms?: number
+    probe_capability?: string
+    worker_available?: boolean
+    retry_after_ms?: number
+    state?: unknown
+  }
+}
+
+export type SmartRouterBulkRecoveryResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    status:
+      | 'queued'
+      | 'partially_queued'
+      | 'already_queued'
+      | 'already_scheduled'
+      | 'nothing_to_requeue'
+      | 'queue_full'
+      | 'recovery_disabled'
+      | 'catalog_unavailable'
+      | 'worker_unavailable'
+      | 'timeout'
+      | 'canceled'
+      | 'failed'
+      | string
+    complete?: boolean
+    contracts?: number
+    physical_routes?: number
+    queued?: number
+    already_queued?: number
+    queue_full?: number
+    accepted?: number
+    manual_blacklists_preserved?: boolean
+  }
+}
+
+export type SmartRouterResetAllAutomaticHealthResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    reset: number
+    failed: number
+    physical_routes?: number
+    automatic_only?: boolean
+    manual_health_preserved?: boolean
+  }
+}
+
+/**
+ * User-safe route status. The server deliberately exposes group/model health
+ * here instead of channel IDs, route IDs, credentials, or raw upstream
+ * errors. All fields are optional so the page remains compatible while the
+ * observability contract is rolled out across blue/green instances.
+ */
+export type SmartRouterRoutePrice = {
+  billing_mode: string
+  billing_unit: string
+  fixed_duration_seconds?: number
+  comparison_class?: string
+  actual_input_comparison_class?: string
+  score_ppm?: number
+  static_comparable: boolean
+  cache_pricing_known?: boolean
+  cache_read_ratio_ppm?: number
+  cache_creation_5m_ratio_ppm?: number
+  cache_creation_1h_ratio_ppm?: number
+  scope?: string
+  revision?: string
+  incomparable_reason?: string
+}
+
+export type SmartRouterRankingCost = {
+  ranking_cost_basis?:
+    | 'recent_actual_input_cost'
+    | 'static_price'
+    | 'manual_order'
+    | string
+  ranking_cost_source?:
+    | 'observed'
+    | 'pooled_prior'
+    | 'optimistic_unobserved'
+    | 'unobservable_static'
+    | 'static_fallback'
+    | 'not_applicable'
+    | string
+  ranking_cost_used?: boolean
+  ranking_cost_comparison?:
+    | 'unknown'
+    | 'cheaper'
+    | 'equal'
+    | 'more_expensive'
+    | 'incomparable'
+    | string
+  routing_cache_weight_ppm?: number | null
+  predicted_input_cost_ppm?: number | null
+  predicted_input_usd_per_million?: number | null
+  recent_cache_rate_ppm?: number | null
+  estimated_input_cost_ppm?: number | null
+  estimated_input_usd_per_million?: number | null
+  actual_input_cost_samples?: number
+  actual_input_cost_last_observed_at_ms?: number
+  actual_input_cost_historical_samples?: number
+  actual_input_cost_confidence_ppm?: number
+  actual_input_cost_estimator_version?: string
+  historical_cache_rate_ppm?: number | null
+}
+
+export type SmartRouterStatusItem = SmartRouterRankingCost & {
+  detail_id?: string
+  contract_id?: string
+  model?: string
+  endpoint?: SmartRouterEndpoint | string
+  group: string
+  effective_ratio_ppm?: number
+  price_known?: boolean
+  model_price_known?: boolean
+  price?: SmartRouterRoutePrice
+  price_comparison?:
+    | 'unknown'
+    | 'cheaper'
+    | 'equal'
+    | 'more_expensive'
+    | 'incomparable'
+    | string
+  price_comparison_reason?: string
+  primary_state?: SmartRouterPrimaryState | string
+  constraint_labels?: string[]
+  /** Canonical health status returned by the user-safe status endpoint. */
+  status?: string
+  health_status?: string
+  phase?: string
+  success_rate?: number | null
+  ttft_p95_ms?: number
+  ttft_samples?: number
+  recent_ttft_average_ms?: number
+  recent_ttft_samples?: number
+  recent_ttft_source?: string
+  recent_ttft_confidence_ppm?: number
+  historical_ttft_samples?: number
+  recent_usage_count?: number
+  recent_stability_rate?: number | null
+  recent_stability_samples?: number
+  recent_stability_source?: string
+  stability_confidence_ppm?: number
+  historical_stability_samples?: number
+  recent_metrics_observed_at_ms?: number
+  successes?: number
+  failures?: number
+  real_successes?: number
+  real_failures?: number
+  probe_successes?: number
+  last_observed_at_ms?: number
+  last_real_success_at_ms?: number
+  last_probe_at_ms?: number
+  last_probe_outcome?: string
+  probe_failures?: number
+  next_probe_at_ms?: number
+  sample_due_at_ms?: number
+  stable_since_ms?: number
+  quarantined_at_ms?: number
+  requires_admin_review?: boolean
+  capacity_limited?: boolean
+  credential_blocked?: boolean
+  quarantined?: boolean
+  selected?: boolean
+  selection_rank?: number
+  selection_reason?: string
+  skipped_reason?: string
+  decision_reason_code?: string
+  evidence_freshness?: SmartRouterEvidenceFreshness
+  evidence_confidence?: SmartRouterEvidenceConfidence
+  mixed_evidence?: boolean
+  in_key_scope?: boolean
+  automatically_rejoins?: boolean
+  next_action?: string
+  next_action_actor?: string
+  natural_traffic_only?: boolean
+  availability?: string
+  decision?: string
+  dispatch_eligibility?:
+    | 'eligible'
+    | 'conditional'
+    | 'safe_last_resort'
+    | 'ineligible'
+    | string
+  dispatch_reason?: string
+  reason_code?: string
+  secondary_reason_codes?: string[]
+  admission?: string
+  cheaper_than_preference?: boolean
+  evidence?: {
+    success_rate?: number | null
+    total_successes?: number
+    total_hard_failures?: number
+    real_successes?: number
+    real_hard_failures?: number
+    probe_successes?: number
+    total_probe_failures?: number
+    current_probe_failures?: number
+    reliability_ppm?: number
+    sample_count?: number
+    freshness?: SmartRouterEvidenceFreshness
+    confidence?: SmartRouterEvidenceConfidence
+    historical?: boolean
+    last_observed_at_ms?: number
+    last_real_success_at_ms?: number
+    last_real_failure_at_ms?: number
+    last_probe_at_ms?: number
+    last_probe_started_at_ms?: number
+    last_probe_completed_at_ms?: number
+    last_probe_outcome?: string
+  }
+  recovery?: {
+    probe_state?: string
+    next_action?: string
+    next_action_actor?: string
+    next_action_at_ms?: number
+    automatic_candidate_reentry?:
+      | boolean
+      | 'yes'
+      | 'no'
+      | 'conditional'
+      | 'not_needed'
+    can_become_preferred_after_entry?:
+      | boolean
+      | 'yes'
+      | 'no'
+      | 'conditional'
+      | 'not_applicable'
+    requires_admin_review?: boolean
+  }
+  constraints?: {
+    group_authorized?: boolean
+    group_selected?: boolean
+    within_key_price_limit?: boolean
+    endpoint_supported?: boolean
+    capabilities_supported?: boolean
+    context_supported?: boolean
+    ttft_acceptable?: boolean
+  }
+}
+
+export type SmartRouterStatusSummary = Partial<
+  Record<
+    | 'models'
+    | 'contracts'
+    | 'with_preference'
+    | 'cheaper_unavailable'
+    | 'recovering'
+    | 'needs_attention'
+    | 'healthy'
+    | 'pending_sample',
+    number
+  >
+>
+
+export type SmartRouterStatusCoverageCandidate = SmartRouterRankingCost & {
+  position: number
+  group: string
+  effective_ratio_ppm: number
+  price?: SmartRouterRoutePrice
+  admission?: string
+  selected?: boolean
+}
+
+export type SmartRouterStatusCoverage = {
+  target: number
+  candidate_routes: number
+  distinct_failure_domains: number
+  missing: number
+  complete: boolean
+  candidates: SmartRouterStatusCoverageCandidate[]
+}
+
+export type SmartRouterStatusResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    schema_version?: number
+    kind?: 'preference_snapshot' | string
+    token_id?: number
+    model?: string
+    contract_id?: string
+    endpoint?: string
+    strategy?: SmartRouterStrategy
+    recovery_profile?: 'fast' | 'balanced' | 'stable'
+    effective_max_ratio_ppm?: number
+    effective_policy?: {
+      strategy?: SmartRouterStrategy
+      recovery_profile?: 'fast' | 'balanced' | 'stable'
+      max_effective_ratio_ppm?: number
+      failure_threshold?: number
+      attempt_limit_enabled?: boolean
+      max_attempts?: number
+      queue_mode?: SmartRouterQueueMode | string
+      ttft_enabled?: boolean
+      affinity_enabled?: boolean
+      actual_input_cost_ranking?: boolean
+      actual_input_cost_snapshot_ready?: boolean
+    }
+    preference?:
+      | null
+      | (SmartRouterRankingCost & {
+          group?: string
+          effective_ratio_ppm?: number
+          price_known?: boolean
+          price?: SmartRouterRoutePrice
+          admission?: string
+          decision_reason?: string
+          plan_kind?: string
+        })
+    coverage?: SmartRouterStatusCoverage
+    updated_at_ms?: number
+    fact_snapshot_version?: string
+    snapshot_version?: string
+    stale?: boolean
+    catalog_version?: string
+    price_version?: string
+    background_probe_available?: boolean
+    background_probe_enabled?: boolean
+    summary?: SmartRouterStatusSummary
+    total?: number
+    page?: number
+    page_size?: number
+    assumptions?:
+      | string[]
+      | {
+          preference_snapshot?: boolean
+          basic_request_profile?: boolean
+          no_session_affinity?: boolean
+          no_previous_attempts?: boolean
+          capacity_point_in_time?: boolean
+          endpoint_inferred?: boolean
+          replay_class?: string
+          required_capabilities?: number
+          estimated_context?: number
+          deadline_budget_ms?: number
+        }
+    plan_error_code?: string
+    items: SmartRouterStatusItem[]
+  }
+}
+
+export type SmartRouterStatusModelIndexItem = {
+  model: string
+  display_name?: string
+  family?: string
+  modality?: 'text' | 'image' | 'video' | 'audio' | 'other' | string
+  search_aliases?: string[]
+  recent_usage_count?: number
+  /** Stable, privacy-safe hash of the canonical model + incoming contract. */
+  contract_id?: string
+  /** V4.3 emits one exact model + endpoint contract per item. */
+  endpoint?: string
+  primary_state?: SmartRouterPrimaryState | string
+  group_count?: number
+  in_scope_group_count?: number
+  available_groups?: number
+  degraded_groups?: number
+  recovering_groups?: number
+  needs_review_groups?: number
+  pending_sample_groups?: number
+  /** Compatibility summary: lowest Key admission-ceiling ratio, not model price. */
+  lowest_ratio_ppm?: number
+  lowest_ratio_known?: boolean
+  /** Compatibility summary: lowest eligible Key ceiling, not model price. */
+  lowest_eligible_ratio_ppm?: number
+  lowest_eligible_known?: boolean
+  has_available_candidate?: boolean
+  has_conditional_candidate?: boolean
+  dispatch_eligible_groups?: number
+  conditional_groups?: number
+  /** Optional safe extension used by the group filter. */
+  groups?: string[]
+  /** Compatibility with early V4.3 index drafts. */
+  endpoints?: string[]
+  contracts?: Array<{
+    contract_id?: string
+    endpoint: string
+    groups?: string[]
+    primary_state?: SmartRouterPrimaryState | string
+    preferred_group?: string
+    preferred_ratio_ppm?: number
+    cheaper_unavailable?: number
+    requires_attention?: boolean
+    last_observed_at_ms?: number
+  }>
+  preferred_group?: string
+  preferred_ratio_ppm?: number
+  cheaper_unavailable?: number
+  requires_attention?: boolean
+  last_observed_at_ms?: number
+}
+
+export type SmartRouterStatusModelsResponse = {
+  success: boolean
+  message?: string
+  data?:
+    | SmartRouterStatusModelIndexItem[]
+    | {
+        schema_version?: number
+        kind?: 'model_endpoint_index' | string
+        token_id?: number
+        items: SmartRouterStatusModelIndexItem[]
+        total?: number
+        page?: number
+        page_size?: number
+        updated_at_ms?: number
+        fact_snapshot_version?: string
+        snapshot_version?: string
+        catalog_version?: string
+        price_version?: string
+        background_probe_available?: boolean
+        background_probe_enabled?: boolean
+      }
+}
+
+export type RouteAnalyticsCoverage = {
+  coverage_start_ms?: number
+  coverage_end_ms?: number
+  freshness_at_ms?: number
+  partial: boolean
+  missing_reason?:
+    | 'no_samples'
+    | 'backfill_in_progress'
+    | 'source_lag'
+    | 'source_unavailable'
+    | 'partial_backfill'
+    | 'partial_coverage'
+    | string
+}
+
+export type RouteAnalyticsPoint = {
+  bucket_start_ms: number
+  bucket_end_ms: number
+  has_samples: boolean
+  logical_requests: number
+  final_successes: number
+  first_hit_successes: number
+  retry_recoveries: number
+  confirmed_failures: number
+  final_availability_rate_ppm: number | null
+  first_hit_success_rate_ppm: number | null
+  cache_read_tokens: number
+  total_input_tokens: number
+  cache_rate_ppm: number | null
+  ttft_average_ms: number | null
+  ttft_p50_ms: number | null
+  ttft_p95_ms: number | null
+  ttft_samples: number
+  ttft_percentile_capped: boolean
+  predicted_input_cost_ppm: number | null
+  predicted_input_tokens: number
+  health_available_events: number
+  health_unknown_events: number
+  health_unavailable_events: number
+  probe_successes: number
+  probe_failures: number
+  distinct_price_revision_count: number
+  updated_at_ms?: number
+}
+
+export type RouteAnalyticsDetailResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    schema_version: number
+    detail_id: string
+    model: string
+    endpoint: string
+    group_name: string
+    group_ratio_ppm: number
+    current_state?: string
+    dispatch_eligibility?: string
+    current_price?: SmartRouterRoutePrice
+    current_data_available: boolean
+    range: '1h' | '24h' | '3d'
+    point_width_ms: number
+    coverage: RouteAnalyticsCoverage
+    summary: RouteAnalyticsPoint & {
+      coverage_points: number
+      total_points: number
+    }
+    points: RouteAnalyticsPoint[]
+    data_source: string
+    metric_contract: string
+  }
+}
+
+export type KeyUsageAnalyticsPoint = {
+  bucket_start_ms: number
+  bucket_end_ms: number
+  has_samples: boolean
+  logical_requests: number
+  successes: number
+  failures: number
+  success_rate_ppm: number | null
+  positive_quota: number
+  refund_quota: number
+  net_quota: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_rate_ppm: number | null
+  ttft_average_ms: number | null
+  ttft_p50_ms: number | null
+  ttft_p95_ms: number | null
+  ttft_samples: number
+  ttft_percentile_capped: boolean
+  net_quota_per_100m_input: number | null
+  updated_at_ms?: number
+}
+
+export type KeyUsageAnalyticsResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    schema_version: number
+    token_id: number
+    range: '1h' | '1d' | '7d'
+    model_filter?: string
+    point_width_ms: number
+    coverage: RouteAnalyticsCoverage
+    summary: KeyUsageAnalyticsPoint
+    points: KeyUsageAnalyticsPoint[]
+    models: Array<{
+      model: string
+      endpoint?: string
+      summary: KeyUsageAnalyticsPoint
+    }>
+    groups?: Array<{
+      group: string
+      endpoint?: string
+      summary: KeyUsageAnalyticsPoint
+    }>
+    data_source: string
+  }
+}
+
+export type SmartRouterOptionsResponse = {
+  success: boolean
+  message?: string
+  data: SmartRouterOptions
+}
+
+export type SmartRouterConfigResponse = {
+  success: boolean
+  message?: string
+  data: {
+    setting: SmartRouterSetting
+    catalog_report?: SmartRouterCatalogReport
+    catalog_version?: string
+    catalog_ready: boolean
+    catalog_error?: string
+  }
+}
+
+export type UpdateSmartRouterConfigResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    setting?: SmartRouterSetting
+    catalog_report?: SmartRouterCatalogReport
+    catalog_version?: string
+    catalog_ready?: boolean
+    catalog_error?: string
+  }
+}
+
+export type SmartRouterReconciliationUsage = 'unknown' | 'known' | 'all'
+
+export type SmartRouterReconciliation = {
+  id: number
+  reservation_id: string
+  request_id: string
+  user_id: number
+  token_id: number
+  token_unlimited: boolean
+  funding_source: string
+  user_subscription_id: number
+  reserved_quota: number
+  final_quota: number
+  pending_final_quota: number
+  settlement_pending: boolean
+  settlement_quota_known: boolean
+  settlement_attempts: number
+  settlement_error: string
+  route_id: string
+  channel_id: number
+  group: string
+  catalog_version: string
+  price_version: string
+  ratio_ppm: number
+  quoted_quota: number
+  attempt_count: number
+  status: string
+  created_at: number
+  updated_at: number
+  finalized_at: number
+}
+
+export type SmartRouterReconciliationPage = {
+  page: number
+  page_size: number
+  total: number
+  items: SmartRouterReconciliation[]
+}
+
+export type SmartRouterReconciliationListResponse = {
+  success: boolean
+  message?: string
+  data?: SmartRouterReconciliationPage
+}
+
+export type SmartRouterReconciliationRun = {
+  scanned: number
+  due: number
+  settled: number
+  deferred: number
+  failed: number
+}
+
+export type SmartRouterReconciliationRetryResponse = {
+  success: boolean
+  message?: string
+  data?: SmartRouterReconciliationRun
+}
+
+export type SmartRouterReconciliationSettleResponse = {
+  success: boolean
+  message?: string
+  data?: SmartRouterReconciliation
+}

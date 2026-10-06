@@ -1,0 +1,129 @@
+package service
+
+import (
+	"context"
+	"testing"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newImageCurrentPolicySession(test *testing.T) *SmartRoutingSession {
+	test.Helper()
+	session, _ := managerTestSession(test, &managerOrderingStateStore{})
+	test.Cleanup(session.engine.Prices.Close)
+	test.Cleanup(session.engine.Catalogs.Close)
+	catalog, found := session.engine.Catalogs.Current()
+	require.True(test, found)
+	entry := catalog.Contracts[session.request.ContractID]
+	delete(catalog.Contracts, session.request.ContractID)
+	contractID, fingerprint, err := BuildSmartContractIdentity("gpt-test", SmartEndpointImages)
+	require.NoError(test, err)
+	entry.Contract.ContractID, entry.Contract.Endpoint, entry.Contract.CapabilityFingerprint = contractID, SmartEndpointImages, fingerprint
+	pool := entry.Pools["balanced-v1"]
+	for index := range pool.Candidates {
+		pool.Candidates[index].Capabilities = SmartCapabilityImageGeneration
+	}
+	entry.Pools["balanced-v1"] = pool
+	catalog.Contracts[contractID] = entry
+	session.engine.Catalogs.current.Store(catalog)
+	session.request.ContractID, session.request.Endpoint, session.request.CapabilityFingerprint = contractID, SmartEndpointImages, fingerprint
+	session.request.RequiredCapabilities, session.request.ReplayClass = SmartCapabilityImageGeneration, smartrouter.ReplaySafeImage
+	return session
+}
+
+func TestImageCurrentPolicyRestrictsResumedCandidates(test *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		restrict  func(*smartrouter.Policy, string)
+		wantRoute string
+	}{
+		{name: "unchanged_policy", restrict: func(*smartrouter.Policy, string) {}, wantRoute: "fallback"},
+		{name: "excluded_group", restrict: func(policy *smartrouter.Policy, _ string) { policy.ExcludedGroups = []string{"fallback"} }},
+		{name: "excluded_route", restrict: func(policy *smartrouter.Policy, _ string) { policy.ExcludedRoutes = []string{"fallback"} }},
+		{name: "fixed_group_scope", restrict: func(policy *smartrouter.Policy, _ string) {
+			policy.AllowFutureGroups, policy.AllowFutureCertifiedRoutes = false, false
+			policy.ManualGroupOrder = []string{"economy"}
+		}},
+		{name: "manual_contract_scope", restrict: func(policy *smartrouter.Policy, contractID string) {
+			policy.AllowFutureGroups, policy.AllowFutureCertifiedRoutes = false, false
+			policy.ManualGroupOrder = []string{"economy", "fallback"}
+			policy.ContractOverrides = map[string]smartrouter.ContractOverride{contractID: {
+				OrderMode: smartrouter.OrderManual, ManualRouteOrder: []string{"cheap"},
+			}}
+		}},
+		{name: "lower_price_ceiling", restrict: func(policy *smartrouter.Policy, _ string) { policy.MaxEffectiveRatioPPM = 30_000 }},
+	} {
+		test.Run(testCase.name, func(test *testing.T) {
+			session := newImageCurrentPolicySession(test)
+			current := session.policy
+			testCase.restrict(&current, session.request.ContractID)
+			session.ResumeImageAttempts([]int{1}, []string{"economy", "fallback"})
+			session.RestrictImageCurrentPolicy(current)
+			handle, err := session.Next(context.Background())
+			if testCase.wantRoute == "" {
+				require.ErrorIs(test, err, smartrouter.ErrNoCandidate)
+				assert.Nil(test, handle)
+				return
+			}
+			require.NoError(test, err)
+			require.NotNil(test, handle)
+			defer handle.stopAndRelease()
+			assert.Equal(test, testCase.wantRoute, handle.Route.RouteID)
+		})
+	}
+}
+
+func TestImageCurrentPolicyInheritedCeilingOnlyTightens(test *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		frozen      int64
+		current     int64
+		wantCeiling int64
+		wantRoute   string
+	}{
+		{name: "zero_inherits_site_limit", frozen: 50_000, current: 0, wantCeiling: 30_000, wantRoute: "cheap"},
+		{name: "inherited_limit_keeps_stricter_frozen_limit", frozen: 10_000, current: 0, wantCeiling: 10_000},
+		{name: "higher_current_limit_cannot_expand_frozen_limit", frozen: 10_000, current: 50_000, wantCeiling: 10_000},
+	} {
+		test.Run(testCase.name, func(test *testing.T) {
+			session := newImageCurrentPolicySession(test)
+			setting := session.engine.Settings()
+			setting.DefaultMaxEffectiveRatioPPM, setting.AbsoluteMaxEffectiveRatioPPM = 30_000, 100_000
+			session.engine.Settings = func() smartroutersetting.Setting { return setting }
+			session.policy.MaxEffectiveRatioPPM = testCase.frozen
+			current := session.policy
+			current.MaxEffectiveRatioPPM = testCase.current
+			session.RestrictImageCurrentPolicy(current)
+			assert.Equal(test, testCase.wantCeiling, session.policy.MaxEffectiveRatioPPM)
+			handle, err := session.Next(context.Background())
+			if testCase.wantRoute == "" {
+				require.ErrorIs(test, err, smartrouter.ErrNoCandidate)
+				assert.Nil(test, handle)
+				return
+			}
+			require.NoError(test, err)
+			defer handle.stopAndRelease()
+			assert.Equal(test, testCase.wantRoute, handle.Route.RouteID)
+		})
+	}
+}
+
+func TestImageCurrentPolicyRecheckedBeforeNextAttempt(test *testing.T) {
+	session := newImageCurrentPolicySession(test)
+	current := session.policy
+	session.RestrictImageCurrentPolicy(current)
+	first, err := session.Next(context.Background())
+	require.NoError(test, err)
+	require.Equal(test, "cheap", first.Route.RouteID)
+	session.RecordAttempt(context.Background(), first, SmartRouteOutcome{
+		Outcome: smartrouter.OutcomeInfrastructure, RouteFailure: true, RetryNextRoute: true,
+	}, 0, 0, false)
+	current.ExcludedRoutes = []string{"fallback"}
+	session.RestrictImageCurrentPolicy(current)
+	next, err := session.Next(context.Background())
+	require.ErrorIs(test, err, smartrouter.ErrNoCandidate)
+	assert.Nil(test, next)
+}

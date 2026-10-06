@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  defaultLeaderboardPreferencesV3,
+  leaderboardPreferencesStorageKeyV3,
+  normalizeLeaderboardPreferencesV3,
+  rememberLeaderboardContractV3,
+} from './leaderboard-preferences.ts'
+
+describe('leaderboard preferences v3', () => {
+  test('defaults to Codex Responses and real cost', () => {
+    assert.deepEqual(defaultLeaderboardPreferencesV3(), {
+      version: 3,
+      model: 'gpt-5.6-sol',
+      endpoint: 'openai-responses-v1',
+      metric: 'cost',
+      favoriteContracts: [],
+      recentContracts: [],
+      weightPanelOpen: false,
+      routeRange: '1h',
+      keyRange: '1h',
+      keyModel: '',
+    })
+  })
+
+  test('isolates persisted state by user id without storing a key string', () => {
+    assert.equal(
+      leaderboardPreferencesStorageKeyV3(7),
+      'smart-router-leaderboard-preferences-v3:7'
+    )
+    assert.notEqual(
+      leaderboardPreferencesStorageKeyV3(7),
+      leaderboardPreferencesStorageKeyV3(8)
+    )
+  })
+
+  test('normalizes invalid values and bounds recent history', () => {
+    const normalized = normalizeLeaderboardPreferencesV3({
+      metric: 'invalid',
+      routeRange: '30d',
+      keyRange: '30d',
+      favoriteContracts: ['a', 'a', 3],
+      recentContracts: Array.from({ length: 20 }, (_, index) => `${index}`),
+      keyTokenId: -1,
+    })
+    assert.equal(normalized.metric, 'cost')
+    assert.equal(normalized.routeRange, '1h')
+    assert.equal(normalized.keyRange, '1h')
+    assert.deepEqual(normalized.favoriteContracts, ['a'])
+    assert.equal(normalized.recentContracts.length, 8)
+    assert.equal(normalized.keyTokenId, undefined)
+  })
+
+  test('moves the latest contract to the front without duplicates', () => {
+    const next = rememberLeaderboardContractV3(
+      {
+        ...defaultLeaderboardPreferencesV3(),
+        recentContracts: ['a', 'b', 'c'],
+      },
+      'b'
+    )
+    assert.deepEqual(next.recentContracts, ['b', 'a', 'c'])
+  })
+})

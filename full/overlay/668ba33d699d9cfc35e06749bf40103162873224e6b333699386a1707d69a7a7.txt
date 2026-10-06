@@ -1,0 +1,923 @@
+package media
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+)
+
+type ArtifactCandidate struct {
+	Source   string
+	Type     string
+	Role     string
+	MimeType string
+	Filename string
+	Identity string
+	Metadata map[string]any
+}
+
+type PublicArtifact struct {
+	ID              string  `json:"id"`
+	Type            string  `json:"type"`
+	Role            string  `json:"role"`
+	Index           int     `json:"index"`
+	Status          string  `json:"status"`
+	MimeType        string  `json:"mime_type,omitempty"`
+	Filename        string  `json:"filename,omitempty"`
+	SizeBytes       int64   `json:"size_bytes,omitempty"`
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
+	Width           int     `json:"width,omitempty"`
+	Height          int     `json:"height,omitempty"`
+	HasAudio        bool    `json:"has_audio,omitempty"`
+	ContentURL      string  `json:"content_url"`
+	DownloadURL     string  `json:"download_url"`
+}
+
+func RedactProviderResponse(body []byte) []byte {
+	var payload map[string]any
+	if err := common.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	redactInlineMediaValue(payload)
+	redacted, err := common.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return redacted
+}
+
+func redactInlineMediaValue(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			lower := strings.ToLower(key)
+			if text, ok := child.(string); ok && (strings.Contains(lower, "base64") || strings.Contains(lower, "b64") || strings.HasPrefix(text, "data:")) {
+				typed[key] = truncateInlineMedia(text)
+				continue
+			}
+			redactInlineMediaValue(child)
+		}
+	case []any:
+		for _, child := range typed {
+			redactInlineMediaValue(child)
+		}
+	}
+}
+
+func truncateInlineMedia(value string) string {
+	const maxKeep = 256
+	if len(value) <= maxKeep {
+		return value
+	}
+	return value[:maxKeep] + "..."
+}
+
+func EnsureTaskArtifacts(task *model.Task) ([]model.TaskArtifact, error) {
+	return EnsureTaskArtifactsFromRaw(context.Background(), task, nil)
+}
+
+// EnsureTaskArtifactsFromRaw merges the original provider response, the
+// redacted task snapshot, and the compatibility result URL. Every discovered
+// output is upserted independently so a later poll can add missing siblings
+// without duplicating artifacts already archived by another worker.
+func EnsureTaskArtifactsFromRaw(ctx context.Context, task *model.Task, raw []byte) ([]model.TaskArtifact, error) {
+	if task == nil || task.UserId <= 0 || task.TaskID == "" {
+		return nil, fmt.Errorf("invalid media task")
+	}
+	candidates := mergeArtifactCandidates(
+		ExtractArtifactCandidates(raw),
+		ExtractArtifactCandidates(task.Data),
+	)
+	if task.Properties.MediaMode == "videos" {
+		// A provider response can contain a compatibility URL rewritten with the
+		// local task ID while private_data already contains the real provider ID.
+		// Never attempt that URL: it is a local proxy address, not a provider
+		// artifact, and repeatedly produces 401/99% finalization stalls.
+		if upstreamID := strings.TrimSpace(task.GetUpstreamTaskID()); upstreamID != "" && upstreamID != task.TaskID {
+			filtered := candidates[:0]
+			localMarker := "/v1/videos/" + task.TaskID + "/"
+			for _, candidate := range candidates {
+				if strings.Contains(candidate.Source, localMarker) && IsVideoTaskContentURL(candidate.Source) {
+					continue
+				}
+				filtered = append(filtered, candidate)
+			}
+			candidates = filtered
+		}
+		completedURL := ExtractPrimaryVideoURLForTask(task, raw)
+		if completedURL == "" {
+			completedURL = ExtractPrimaryVideoURLForTask(task, task.Data)
+		}
+		if completedURL != "" {
+			// content and download are alternate deliveries of one video. Keep
+			// the selected endpoint, not two assets for one provider output.
+			filtered := candidates[:0]
+			selected, _ := url.Parse(completedURL)
+			for _, candidate := range candidates {
+				current, _ := url.Parse(candidate.Source)
+				if candidate.Type == "video" && IsVideoTaskContentURL(candidate.Source) &&
+					IsVideoTaskContentURL(completedURL) && current != nil && selected != nil &&
+					strings.EqualFold(current.Scheme, selected.Scheme) && strings.EqualFold(current.Host, selected.Host) &&
+					strings.TrimSuffix(strings.TrimSuffix(current.Path, "/content"), "/download") == strings.TrimSuffix(strings.TrimSuffix(selected.Path, "/content"), "/download") {
+					continue
+				}
+				filtered = append(filtered, candidate)
+			}
+			candidates = filtered
+			candidates = prependUniqueCandidate(candidates,
+				candidateFromSource(completedURL, "video", "primary", "task.completed_url"))
+		}
+		candidates = preferConcreteVideoCandidates(candidates)
+	}
+	archivedArtifactsLoaded := false
+	var archivedArtifacts []model.TaskArtifact
+	loadArchivedArtifacts := func() ([]model.TaskArtifact, error) {
+		if archivedArtifactsLoaded {
+			return archivedArtifacts, nil
+		}
+		existingArtifacts, err := model.ListTaskArtifacts(task.UserId, task.TaskID)
+		if err != nil {
+			return nil, err
+		}
+		archivedArtifacts = existingArtifacts
+		archivedArtifactsLoaded = true
+		return archivedArtifacts, nil
+	}
+	checkArchivedVideo := func() (bool, error) {
+		existingArtifacts, err := loadArchivedArtifacts()
+		if err != nil {
+			return false, err
+		}
+		for _, artifact := range existingArtifacts {
+			if artifact.Type == "video" {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	resultURL := strings.TrimSpace(task.GetResultURL())
+	if resultURL != "" {
+		resultURL = normalizeTaskProxySource(resultURL, task.TaskID)
+		isCompatibilityResult := strings.HasPrefix(resultURL, "task://") || IsVideoTaskContentURL(resultURL)
+		hasProviderVideo := false
+		hasArchivedVideo := false
+		for _, candidate := range candidates {
+			if candidate.Type == "video" {
+				hasProviderVideo = true
+				break
+			}
+		}
+		if isCompatibilityResult && !hasProviderVideo {
+			var err error
+			hasArchivedVideo, err = checkArchivedVideo()
+			if err != nil {
+				return nil, fmt.Errorf("list existing task artifacts before compatibility fallback: %w", err)
+			}
+		}
+		// A task:// source is the compatibility proxy for the provider's primary
+		// video, not an additional output. Keep it only when the provider payload
+		// and durable task state do not already contain a concrete video artifact.
+		if !isCompatibilityResult || (!hasProviderVideo && !hasArchivedVideo) {
+			candidates = prependUniqueCandidate(candidates, candidateFromSource(resultURL, "video", "primary", "task.result_url"))
+		}
+	}
+	if len(candidates) == 0 && task.Status == model.TaskStatusSuccess {
+		hasArchivedVideo, err := checkArchivedVideo()
+		if err != nil {
+			return nil, fmt.Errorf("list existing task artifacts before terminal fallback: %w", err)
+		}
+		if !hasArchivedVideo {
+			candidates = append(candidates, ArtifactCandidate{
+				Source: "task://" + task.TaskID, Type: "video", Role: "primary",
+				MimeType: "video/mp4", Filename: task.TaskID + ".mp4",
+				Identity: "task-proxy:" + task.TaskID,
+			})
+		}
+	}
+	if len(candidates) == 0 {
+		existingArtifacts, err := loadArchivedArtifacts()
+		if err != nil {
+			return nil, fmt.Errorf("list existing task artifacts without new candidates: %w", err)
+		}
+		return existingArtifacts, nil
+	}
+	user, _ := model.GetUserById(task.UserId, false)
+	username := task.Username
+	if user != nil {
+		username = user.Username
+	}
+	archiveErrors := make([]error, 0)
+	for index, candidate := range candidates {
+		role := candidate.Role
+		if role == "" {
+			role = "secondary"
+		}
+		if index == 0 && candidate.Type == "video" {
+			role = "primary"
+		}
+		metadata, _ := common.Marshal(candidate.Metadata)
+		saveErr := saveTaskArtifactCandidate(ctx, task, username, candidate, role, index, metadata)
+		if saveErr != nil {
+			archiveErrors = append(archiveErrors, fmt.Errorf("archive media output %d: %w", index+1, saveErr))
+		}
+	}
+	artifacts, listErr := model.ListTaskArtifacts(task.UserId, task.TaskID)
+	if listErr != nil {
+		archiveErrors = append(archiveErrors, fmt.Errorf("list archived media outputs: %w", listErr))
+	}
+	return artifacts, errors.Join(archiveErrors...)
+}
+
+// ExtractPrimaryVideoURL reads only well-known completion fields. The caller
+// supplies the video-task context, so a signed URL does not need a file suffix
+// to be recognized as the primary video.
+func ExtractPrimaryVideoURL(raw []byte) string {
+	return extractPrimaryVideoURL(raw, func(source string) string { return primaryVideoSource(source) })
+}
+
+func extractPrimaryVideoURL(raw []byte, resolve func(string) string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var value any
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	// Providers commonly return both an authenticated task-content endpoint and
+	// a short-lived direct media URL. Search the entire completion envelope for
+	// a concrete output before accepting the compatibility task endpoint, so
+	// wrapper field order cannot turn a downloadable result into a 0 B proxy.
+	if concrete := extractPrimaryVideoURLValue(value, 0, false, resolve); concrete != "" {
+		return concrete
+	}
+	return extractPrimaryVideoURLValue(value, 0, true, resolve)
+}
+
+func extractPrimaryVideoURLValue(value any, depth int, allowTaskContent bool, resolve func(string) string) string {
+	if depth > 6 {
+		return ""
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"download_url", "video_url", "videoUrl", "result_url", "resultUrl", "url", "content_url", "download", "content"} {
+			if candidate := primaryVideoSourceForPass(mapValueFold(typed, key), allowTaskContent, resolve); candidate != "" {
+				return candidate
+			}
+		}
+		if metadata, ok := mapValueFold(typed, "metadata").(map[string]any); ok {
+			if candidate := primaryVideoSourceForPass(mapValueFold(metadata, "url"), allowTaskContent, resolve); candidate != "" {
+				return candidate
+			}
+			if candidate := primaryVideoSourceForPass(mapValueFold(metadata, "video_url"), allowTaskContent, resolve); candidate != "" {
+				return candidate
+			}
+		}
+		for _, key := range []string{"data", "result", "response", "output", "urls"} {
+			if nested := mapValueFold(typed, key); nested != nil {
+				if candidate := extractPrimaryVideoURLValue(nested, depth+1, allowTaskContent, resolve); candidate != "" {
+					return candidate
+				}
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if candidate := extractPrimaryVideoURLValue(item, depth+1, allowTaskContent, resolve); candidate != "" {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func primaryVideoSourceForPass(value any, allowTaskContent bool, resolve func(string) string) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	source := resolve(text)
+	if source == "" {
+		return ""
+	}
+	isTaskContent := IsVideoTaskContentURL(source)
+	if isTaskContent != allowTaskContent {
+		return ""
+	}
+	return source
+}
+
+// IsVideoTaskContentURL identifies the standardized authenticated compatibility
+// endpoint without depending on a provider hostname or task-id format.
+func IsVideoTaskContentURL(source string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(source))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	for index := 0; index+3 < len(parts); index++ {
+		if parts[index] == "v1" && parts[index+1] == "videos" &&
+			strings.TrimSpace(parts[index+2]) != "" && (parts[index+3] == "content" || parts[index+3] == "download") &&
+			index+4 == len(parts) {
+			return true
+		}
+	}
+	return false
+}
+
+func preferConcreteVideoCandidates(candidates []ArtifactCandidate) []ArtifactCandidate {
+	hasConcreteVideo := false
+	for _, candidate := range candidates {
+		if candidate.Type == "video" && !IsVideoTaskContentURL(candidate.Source) &&
+			!strings.HasPrefix(candidate.Source, "task://") {
+			hasConcreteVideo = true
+			break
+		}
+	}
+	if !hasConcreteVideo {
+		return candidates
+	}
+	filtered := make([]ArtifactCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Type == "video" &&
+			(IsVideoTaskContentURL(candidate.Source) || strings.HasPrefix(candidate.Source, "task://")) {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func mapValueFold(values map[string]any, wanted string) any {
+	for key, value := range values {
+		if strings.EqualFold(key, wanted) {
+			return value
+		}
+	}
+	return nil
+}
+
+func primaryVideoSource(value any) string {
+	source, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	source = strings.TrimSpace(source)
+	if strings.HasPrefix(strings.ToLower(source), "data:video/") {
+		return source
+	}
+	parsed, err := url.Parse(source)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return ""
+	}
+	return source
+}
+
+func saveTaskArtifactCandidate(ctx context.Context, task *model.Task, username string, candidate ArtifactCandidate, role string, position int, metadata []byte) error {
+	if strings.HasPrefix(candidate.Source, "data:") {
+		return saveInlineTaskArtifact(ctx, task, username, candidate, role, position, metadata)
+	}
+	if candidate.Type == "video" && IsVideoTaskContentURL(candidate.Source) {
+		// Reuse the original asset link when a former task:// placeholder now
+		// has a concrete frozen provider endpoint. Never reset actual retries.
+		if snapshot, err := model.GetTaskDeliverySnapshot(task.ID); err == nil {
+			upstreamID := strings.TrimSpace(task.PrivateData.UpstreamTaskID)
+			if upstreamID == "" {
+				upstreamID = strings.TrimSpace(snapshot.UpstreamTaskID)
+			}
+			if source, valid := ResolveVideoTaskContentURL(candidate.Source, snapshot.UpstreamBaseURL, upstreamID); valid {
+				reused, err := model.RecoverTaskProxyArtifact(task, source, candidate.Identity)
+				if err != nil || reused {
+					return err
+				}
+			}
+		}
+	}
+	_, _, err := SaveRemoteArtifact(RemoteArtifactInput{
+		UserID: task.UserId, Username: username, TaskRowID: task.ID, TaskPublicID: task.TaskID,
+		ChannelID: task.ChannelId, Model: task.Properties.OriginModelName, Group: task.Group,
+		SourceURL: candidate.Source, ProviderOutputIdentity: candidate.Identity,
+		Type: candidate.Type, Role: role, Position: position, MimeType: candidate.MimeType,
+		Filename: candidate.Filename, Metadata: metadata,
+	})
+	return err
+}
+
+func saveInlineTaskArtifact(ctx context.Context, task *model.Task, username string, candidate ArtifactCandidate, role string, position int, metadata []byte) error {
+	var existing model.TaskArtifact
+	lookup := model.DB.Where("task_row_id = ? AND provider_output_identity = ?", task.ID, candidate.Identity).Limit(1).Find(&existing)
+	if lookup.Error != nil {
+		return lookup.Error
+	}
+	if lookup.RowsAffected > 0 {
+		return nil
+	}
+	mimeType, reader, sizeHint, err := openDataURL(candidate.Source)
+	if err != nil {
+		return err
+	}
+	blob, err := SaveUpload(ctx, UploadInput{
+		UserID: task.UserId, Username: username, Filename: candidate.Filename,
+		Purpose: "generated", Role: role, Reader: reader, SizeHint: sizeHint,
+		TTLHours: mediasetting.Get().AssetTTLHours, SourceKind: "provider_inline",
+		TaskPublicID: task.TaskID, ChannelID: task.ChannelId,
+		Model: task.Properties.OriginModelName, Group: task.Group, Metadata: metadata,
+		DeclaredMimeType: mimeType,
+	})
+	if err != nil {
+		return err
+	}
+	assetID, err := NewPublicID("asset_")
+	if err != nil {
+		_ = DeleteBlob(blob.PublicID, "inline-artifact-id-failure", true)
+		return err
+	}
+	artifact := &model.TaskArtifact{
+		PublicAssetID: assetID, TaskRowID: task.ID, TaskPublicID: task.TaskID,
+		MediaBlobID: blob.ID, UserID: task.UserId, ChannelID: task.ChannelId,
+		ProviderOutputIdentity: candidate.Identity, Type: candidate.Type, Role: role,
+		Position: position, Status: "ready", MimeType: blob.MimeType,
+		Filename: blob.Filename, SizeBytes: blob.SizeBytes, Metadata: metadata,
+		ExpiresAt: blob.ExpiresAt,
+	}
+	err = model.DB.Create(artifact).Error
+	if err == nil {
+		return nil
+	}
+	var winner model.TaskArtifact
+	winnerLookup := model.DB.Where("task_row_id = ? AND provider_output_identity = ?", task.ID, candidate.Identity).Limit(1).Find(&winner)
+	if winnerLookup.Error == nil && winnerLookup.RowsAffected > 0 {
+		_ = DeleteBlob(blob.PublicID, "inline-artifact-duplicate", true)
+		return nil
+	}
+	_ = DeleteBlob(blob.PublicID, "inline-artifact-create-failure", true)
+	return err
+}
+
+func openDataURL(source string) (string, io.Reader, int64, error) {
+	comma := strings.IndexByte(source, ',')
+	if comma < 0 {
+		return "", nil, 0, fmt.Errorf("invalid inline media data")
+	}
+	header := source[:comma]
+	if !strings.HasPrefix(header, "data:") || !strings.Contains(header, ";base64") {
+		return "", nil, 0, fmt.Errorf("unsupported inline media data")
+	}
+	mimeType := strings.TrimPrefix(strings.SplitN(header, ";", 2)[0], "data:")
+	encoded := source[comma+1:]
+	encoding := base64.StdEncoding
+	if len(encoded)%4 != 0 {
+		encoding = base64.RawStdEncoding
+	}
+	sizeHint := int64(encoding.DecodedLen(len(encoded)))
+	return mimeType, base64.NewDecoder(encoding, strings.NewReader(encoded)), sizeHint, nil
+}
+
+func ExtractArtifactCandidates(raw []byte) []ArtifactCandidate {
+	if len(raw) == 0 {
+		return nil
+	}
+	result := make([]ArtifactCandidate, 0)
+	seen := make(map[string]struct{})
+	var value any
+	if err := common.Unmarshal(raw, &value); err == nil {
+		walkArtifactValue(value, nil, "", &result, seen, 0)
+		return result
+	}
+	for len(raw) > 0 {
+		line := raw
+		if newline := bytes.IndexByte(raw, '\n'); newline >= 0 {
+			line = raw[:newline]
+			raw = raw[newline+1:]
+		} else {
+			raw = nil
+		}
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		line = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if bytes.Equal(line, []byte("[DONE]")) || len(line) == 0 {
+			continue
+		}
+		var event any
+		if common.Unmarshal(line, &event) != nil || isPartialMediaEvent(event) {
+			continue
+		}
+		walkArtifactValue(event, []string{"event"}, "", &result, seen, 0)
+	}
+	return result
+}
+
+func isPartialMediaEvent(value any) bool {
+	event, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	typeName, _ := event["type"].(string)
+	return strings.Contains(strings.ToLower(typeName), "partial")
+}
+
+func mergeArtifactCandidates(groups ...[]ArtifactCandidate) []ArtifactCandidate {
+	merged := make([]ArtifactCandidate, 0)
+	seen := make(map[string]struct{})
+	for _, group := range groups {
+		for _, candidate := range group {
+			key := candidate.Type + "\n" + artifactIdentitySource(candidate.Source)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, candidate)
+		}
+	}
+	return merged
+}
+
+func normalizeTaskProxySource(source, taskID string) string {
+	if strings.HasPrefix(source, "task://") {
+		return source
+	}
+	if taskID != "" && strings.Contains(source, "/v1/videos/"+taskID+"/content") {
+		return "task://" + taskID
+	}
+	return source
+}
+
+func walkArtifactValue(value any, path []string, parentKey string, result *[]ArtifactCandidate, seen map[string]struct{}, depth int) {
+	if depth > 12 {
+		return
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if isInternalArtifactContainerKey(key) {
+				continue
+			}
+			walkArtifactValue(typed[key], append(path, key), key, result, seen, depth+1)
+		}
+	case []any:
+		for index, item := range typed {
+			walkArtifactValue(item, append(path, strconv.Itoa(index)), parentKey, result, seen, depth+1)
+		}
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return
+		}
+		if looksLikeNestedJSON(parentKey, trimmed) {
+			var nested any
+			if common.Unmarshal([]byte(trimmed), &nested) == nil {
+				walkArtifactValue(nested, append(path, "json"), parentKey, result, seen, depth+1)
+			}
+		}
+		candidate, ok := candidateForJSONValue(parentKey, strings.Join(path, "."), trimmed)
+		if !ok {
+			return
+		}
+		key := candidate.Type + "\n" + artifactIdentitySource(candidate.Source)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		*result = append(*result, candidate)
+	}
+}
+
+func isInternalArtifactContainerKey(key string) bool {
+	return strings.EqualFold(strings.TrimSpace(key), "_raw_stream")
+}
+
+func looksLikeNestedJSON(key, value string) bool {
+	lowerKey := strings.ToLower(key)
+	if !strings.Contains(lowerKey, "data") && !strings.Contains(lowerKey, "result") && !strings.Contains(lowerKey, "output") {
+		return false
+	}
+	return strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[")
+}
+
+func candidateForJSONValue(key, path, value string) (ArtifactCandidate, bool) {
+	lowerKey := strings.ToLower(key)
+	if strings.HasPrefix(value, "data:") {
+		// RedactProviderResponse deliberately appends an impossible Base64
+		// suffix. The full provider response has already been archived before
+		// this snapshot is inspected, so the redacted copy is not an output.
+		if strings.HasSuffix(value, "...") {
+			return ArtifactCandidate{}, false
+		}
+		mimeType := strings.TrimPrefix(strings.SplitN(value, ";", 2)[0], "data:")
+		mediaType := mediaTypeForMIME(mimeType)
+		if mediaType == "other" {
+			return ArtifactCandidate{}, false
+		}
+		return buildCandidate(value, mediaType, roleForKey(lowerKey), mimeType, path), true
+	}
+	if looksLikeMediaBase64(lowerKey, path, value) {
+		mediaType := typeForKeyAndURL(lowerKey+" "+strings.ToLower(path), "")
+		if mediaType == "" {
+			mediaType = "image"
+		}
+		mimeType := mimeForURL("", mediaType)
+		return buildCandidate("data:"+mimeType+";base64,"+value, mediaType, roleForKey(lowerKey), mimeType, path), true
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "task") {
+		return ArtifactCandidate{}, false
+	}
+	mediaType := typeForKeyAndURL(lowerKey, parsed.Path)
+	if mediaType == "" {
+		return ArtifactCandidate{}, false
+	}
+	return buildCandidate(value, mediaType, roleForKey(lowerKey), mimeForURL(parsed.Path, mediaType), path), true
+}
+func looksLikeBase64Payload(value string) bool {
+	if len(value) < 4 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') ||
+			char == '+' || char == '/' || char == '=' || char == '-' || char == '_' || char == '\r' || char == '\n' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func looksLikeMediaBase64(key, path, value string) bool {
+	marker := strings.ToLower(key + " " + path)
+	if !strings.Contains(marker, "b64") && !strings.Contains(marker, "base64") && !strings.Contains(marker, "bytesbase64encoded") {
+		return false
+	}
+	if len(value) < 32 || !looksLikeBase64Payload(value) {
+		return false
+	}
+	return true
+}
+
+func candidateFromSource(source, defaultType, role, identity string) ArtifactCandidate {
+	parsed, _ := url.Parse(source)
+	mediaType := typeForKeyAndURL(defaultType, parsed.Path)
+	if mediaType == "" {
+		mediaType = defaultType
+	}
+	candidate := buildCandidate(source, mediaType, role, mimeForURL(parsed.Path, mediaType), identity)
+	if identity != "" {
+		candidate.Identity = identity
+	}
+	return candidate
+}
+
+func buildCandidate(source, mediaType, role, mimeType, path string) ArtifactCandidate {
+	parsed, _ := url.Parse(source)
+	filename := filepath.Base(parsed.Path)
+	if filename == "." || filename == "/" || filename == "" {
+		filename = "result" + extensionForMediaType(mediaType)
+	} else if safeExtension(filename, "") == "" {
+		// mime.ExtensionsByType is platform-dependent (video/mp4 may become
+		// .m4v on Windows). Artifact contracts use one stable public extension.
+		filename += extensionForMediaType(mediaType)
+	}
+	digest := sha256.Sum256([]byte(mediaType + "\n" + artifactIdentitySource(source)))
+	return ArtifactCandidate{
+		Source: source, Type: mediaType, Role: role, MimeType: mimeType,
+		Filename: normalizeMediaFilename(filename, mimeType, mediaType),
+		Identity: "output_sha256_" + hex.EncodeToString(digest[:]),
+		Metadata: map[string]any{"source_path": path},
+	}
+}
+
+func prependUniqueCandidate(candidates []ArtifactCandidate, candidate ArtifactCandidate) []ArtifactCandidate {
+	for index := range candidates {
+		if candidates[index].Type == candidate.Type && artifactIdentitySource(candidates[index].Source) == artifactIdentitySource(candidate.Source) {
+			candidates[index].Role = "primary"
+			if index == 0 {
+				return candidates
+			}
+			return append([]ArtifactCandidate{candidates[index]}, append(candidates[:index], candidates[index+1:]...)...)
+		}
+	}
+	return append([]ArtifactCandidate{candidate}, candidates...)
+}
+
+// artifactIdentitySource removes rotating delivery credentials from HTTP URLs
+// while preserving the original source for the actual download. Query strings
+// and fragments on provider asset URLs are commonly short-lived signatures;
+// treating them as identity would duplicate the same output after every poll.
+func artifactIdentitySource(source string) string {
+	parsed, err := url.Parse(source)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return source
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func typeForKeyAndURL(key, path string) string {
+	lower := strings.ToLower(key + " " + path)
+	switch {
+	case strings.Contains(lower, "video"), hasAnySuffix(lower, ".mp4", ".webm", ".mov", ".mkv", ".m3u8"):
+		return "video"
+	case strings.Contains(lower, "audio"), strings.Contains(lower, "sound"), hasAnySuffix(lower, ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"):
+		return "audio"
+	case strings.Contains(lower, "image"), strings.Contains(lower, "cover"), strings.Contains(lower, "thumbnail"), hasAnySuffix(lower, ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"):
+		return "image"
+	case strings.Contains(lower, "subtitle"), hasAnySuffix(lower, ".srt", ".vtt"):
+		return "subtitle"
+	default:
+		return ""
+	}
+}
+
+func roleForKey(key string) string {
+	switch {
+	case strings.Contains(key, "cover") || strings.Contains(key, "thumbnail"):
+		return "thumbnail"
+	case strings.Contains(key, "subtitle"):
+		return "subtitle"
+	case strings.Contains(key, "audio") || strings.Contains(key, "sound"):
+		return "audio_track"
+	default:
+		return "secondary"
+	}
+}
+
+func mimeForURL(path, mediaType string) string {
+	extension := strings.ToLower(filepath.Ext(path))
+	switch extension {
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".m4a":
+		return "audio/mp4"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".vtt":
+		return "text/vtt"
+	case ".srt":
+		return "application/x-subrip"
+	}
+	switch mediaType {
+	case "video":
+		return "video/mp4"
+	case "audio":
+		return "audio/mpeg"
+	case "image":
+		return "image/png"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func extensionForMediaType(mediaType string) string {
+	switch mediaType {
+	case "video":
+		return ".mp4"
+	case "audio":
+		return ".mp3"
+	case "image":
+		return ".png"
+	case "subtitle":
+		return ".vtt"
+	default:
+		return ".bin"
+	}
+}
+
+func hasAnySuffix(value string, suffixes ...string) bool {
+	for _, suffix := range suffixes {
+		if strings.Contains(value, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func PublicArtifacts(artifacts []model.TaskArtifact, admin bool) []PublicArtifact {
+	concreteTypes := make(map[string]struct{})
+	for _, artifact := range artifacts {
+		if artifact.Status != "ready" || strings.TrimSpace(artifact.PublicAssetID) == "" {
+			continue
+		}
+		if !isCompatibilityTaskArtifact(artifact) {
+			concreteTypes[artifact.Type] = struct{}{}
+		}
+	}
+	result := make([]PublicArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact.Status != "ready" || strings.TrimSpace(artifact.PublicAssetID) == "" {
+			continue
+		}
+		if isCompatibilityTaskArtifact(artifact) {
+			if _, hasConcreteOutput := concreteTypes[artifact.Type]; hasConcreteOutput {
+				continue
+			}
+		}
+		result = append(result, PublicArtifactFromModel(artifact, admin))
+	}
+	return result
+}
+
+func isCompatibilityTaskArtifact(artifact model.TaskArtifact) bool {
+	identity := strings.TrimSpace(artifact.ProviderOutputIdentity)
+	return identity == "task.result_url" || strings.HasPrefix(identity, "task-proxy:")
+}
+
+func PublicArtifactFromModel(artifact model.TaskArtifact, admin bool) PublicArtifact {
+	contentURL, downloadURL := PublicMediaURLs(artifact.PublicAssetID, admin)
+	return PublicArtifact{
+		ID: artifact.PublicAssetID, Type: artifact.Type, Role: artifact.Role, Index: artifact.Position,
+		Status: artifact.Status, MimeType: artifact.MimeType, Filename: artifact.Filename,
+		SizeBytes: artifact.SizeBytes, DurationSeconds: artifact.DurationSeconds,
+		Width: artifact.Width, Height: artifact.Height, HasAudio: artifact.HasAudio,
+		ContentURL: contentURL, DownloadURL: downloadURL,
+	}
+}
+
+// PublicMediaURLs returns short-lived signed URLs for preview, playback, open,
+// and download. Browser media elements and new tabs cannot attach the console
+// session headers, so exposing an unsigned content URL creates a broken link.
+func PublicMediaURLs(publicID string, admin bool) (string, string) {
+	audience := "user"
+	ttl := mediasetting.Get().SignedURLTTLSeconds
+	if admin {
+		audience = "admin"
+		ttl = mediasetting.Get().AdminPreviewTTLSeconds
+	}
+	expires := time.Now().Add(time.Duration(ttl) * time.Second).Unix()
+	base := strings.TrimRight(system_setting.ServerAddress, "/")
+	contentURL := fmt.Sprintf("%s/v1/assets/%s/content", base, url.PathEscape(publicID))
+	signature := common.GenerateMediaSignature(publicID, expires, audience)
+	deliveryURL := fmt.Sprintf("%s?expires=%d&audience=%s&signature=%s", contentURL, expires, audience, signature)
+	return deliveryURL, deliveryURL
+}
+
+func DecorateOpenAIVideoResponse(raw []byte, task *model.Task) ([]byte, error) {
+	if task.Status == model.TaskStatusFailure {
+		return FailedVideoResponse(task)
+	}
+	var response map[string]any
+	if err := common.Unmarshal(raw, &response); err != nil {
+		return raw, err
+	}
+	if task.Status == model.TaskStatusFinalizing {
+		response["status"] = "in_progress"
+		response["progress"] = 99
+		response["completed_at"] = nil
+		response["delivery_status"] = "finalizing"
+		response["upstream_status"] = "completed"
+		for _, key := range []string{"url", "content_url", "download_url", "video_url", "result_url", "urls", "content", "download"} {
+			delete(response, key)
+		}
+		response["artifacts"] = []PublicArtifact{}
+		return common.Marshal(response)
+	}
+	if task.Status == model.TaskStatusSuccess {
+		if _, err := EnsureTaskArtifacts(task); err != nil {
+			return raw, err
+		}
+	}
+	artifacts, err := ListDeliverableTaskArtifacts(task.UserId, task.TaskID)
+	if err != nil {
+		return raw, err
+	}
+	public := PublicArtifacts(artifacts, false)
+	response["artifacts"] = public
+	if len(public) > 0 {
+		response["url"] = public[0].ContentURL
+		response["content_url"] = public[0].ContentURL
+	}
+	return common.Marshal(response)
+}

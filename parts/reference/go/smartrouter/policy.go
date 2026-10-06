@@ -20,11 +20,12 @@ const (
 type Strategy string
 
 const (
-	StrategyPrice     Strategy = "price"
-	StrategyStability Strategy = "stability"
-	StrategyLatency   Strategy = "latency"
-	StrategyBalanced  Strategy = "balanced"
-	StrategyManual    Strategy = "manual"
+	StrategyPrice          Strategy = "price"
+	StrategyStability      Strategy = "stability"
+	StrategyLatency        Strategy = "latency"
+	StrategyBalanced       Strategy = "balanced"
+	StrategyCustomWeighted Strategy = "custom_weighted"
+	StrategyManual         Strategy = "manual"
 )
 
 type OrderMode string
@@ -88,6 +89,7 @@ type Policy struct {
 	TTFTPolicy           TTFTPolicy                  `json:"ttft_policy"`
 	QueuePolicy          QueuePolicy                 `json:"queue_policy"`
 	BalancedWeights      BalancedWeights             `json:"balanced_weights,omitempty"`
+	CustomWeights        CustomWeights               `json:"custom_weights,omitempty"`
 	// Nil means the field was absent in a legacy policy and therefore keeps the
 	// reviewed default-on behavior. An explicit false is the only opt-out.
 	ActualInputCostRanking     *bool                       `json:"actual_input_cost_ranking,omitempty"`
@@ -130,8 +132,19 @@ type BalancedWeights struct {
 	TTFT      int `json:"ttft"`
 }
 
+type CustomWeights struct {
+	Cache     int `json:"cache"`
+	Cost      int `json:"cost"`
+	TTFT      int `json:"ttft"`
+	Stability int `json:"stability"`
+}
+
 func DefaultBalancedWeights() BalancedWeights {
 	return BalancedWeights{Stability: 45, Price: 40, TTFT: 15}
+}
+
+func DefaultCustomWeights() CustomWeights {
+	return CustomWeights{Cache: 25, Cost: 25, TTFT: 25, Stability: 25}
 }
 
 // NormalizePolicy returns a canonical deep copy suitable for hashing or
@@ -151,6 +164,9 @@ func NormalizePolicy(policy Policy) Policy {
 	}
 	if policy.BalancedWeights == (BalancedWeights{}) {
 		policy.BalancedWeights = DefaultBalancedWeights()
+	}
+	if policy.CustomWeights == (CustomWeights{}) {
+		policy.CustomWeights = DefaultCustomWeights()
 	}
 	if policy.RecoveryProfile == "" {
 		policy.RecoveryProfile = RecoveryBalanced
@@ -274,6 +290,9 @@ func (policy Policy) Validate() error {
 		return errors.New("smartrouter: failure_threshold must be positive when specified")
 	}
 	if err := policy.BalancedWeights.validate(strategy); err != nil {
+		return err
+	}
+	if err := policy.CustomWeights.validate(strategy); err != nil {
 		return err
 	}
 	if policy.AffinityMaxPremiumPercent < 0 || policy.AffinityMaxPremiumPercent > 1000 || policy.AffinityTTLSeconds < 0 {
@@ -415,6 +434,13 @@ func (policy Policy) EffectiveBalancedWeights() BalancedWeights {
 	return policy.BalancedWeights
 }
 
+func (policy Policy) EffectiveCustomWeights() CustomWeights {
+	if policy.CustomWeights == (CustomWeights{}) {
+		return DefaultCustomWeights()
+	}
+	return policy.CustomWeights
+}
+
 func strategyFromOrderMode(mode OrderMode) Strategy {
 	if mode == OrderManual {
 		return StrategyManual
@@ -431,7 +457,7 @@ func orderModeFromStrategy(strategy Strategy) OrderMode {
 
 func validStrategy(strategy Strategy) bool {
 	switch strategy {
-	case StrategyPrice, StrategyStability, StrategyLatency, StrategyBalanced, StrategyManual:
+	case StrategyPrice, StrategyStability, StrategyLatency, StrategyBalanced, StrategyCustomWeighted, StrategyManual:
 		return true
 	default:
 		return false
@@ -451,6 +477,19 @@ func (weights BalancedWeights) validate(strategy Strategy) error {
 	}
 	if weights.Stability+weights.Price+weights.TTFT != 100 {
 		return errors.New("smartrouter: balanced weights must total 100")
+	}
+	return nil
+}
+
+func (weights CustomWeights) validate(strategy Strategy) error {
+	if weights == (CustomWeights{}) && strategy != StrategyCustomWeighted {
+		return nil
+	}
+	if weights.Cache < 0 || weights.Cost < 0 || weights.TTFT < 0 || weights.Stability < 0 {
+		return errors.New("smartrouter: custom weights cannot be negative")
+	}
+	if weights.Cache+weights.Cost+weights.TTFT+weights.Stability != 100 {
+		return errors.New("smartrouter: custom weights must total 100")
 	}
 	return nil
 }

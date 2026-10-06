@@ -1,0 +1,345 @@
+package smart_router_setting
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	settingconfig "github.com/QuantumNous/new-api/setting/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func validSetting() Setting {
+	return Setting{
+		Enabled: true,
+		CertifiedGroups: map[string]CertifiedGroupSetting{
+			"economy": {
+				Pools:        []string{"balanced-v1"},
+				ModelAllow:   []string{"gpt-*"},
+				ChannelAllow: []int{2, 1},
+			},
+			"fallback": {
+				Pools:          []string{"balanced-v1", "stable-v1"},
+				StableFallback: true,
+			},
+		},
+		TextContracts: []TextContractSetting{
+			{
+				Endpoint:     constant.EndpointTypeOpenAIResponse,
+				Capabilities: CapabilityText | CapabilityStreaming | CapabilityTools,
+				MaxContext:   128_000,
+			},
+		},
+		ChannelProfiles: map[string]ChannelProfileSetting{
+			"2": {EndpointAllow: []constant.EndpointType{constant.EndpointTypeOpenAIResponse}},
+		},
+		DefaultPolicy: smartrouter.Policy{
+			Version:              smartrouter.PolicyVersion,
+			PolicyID:             "balanced-default-v1",
+			Enabled:              true,
+			PoolPolicy:           "balanced-v1",
+			OrderMode:            smartrouter.OrderAutoPrice,
+			MaxEffectiveRatioPPM: 100_000,
+			ExcludedGroups:       []string{},
+			ExcludedRoutes:       []string{},
+			ContractOverrides:    map[string]smartrouter.ContractOverride{},
+			HealthGuard:          true,
+			RecoveryProfile:      smartrouter.RecoveryBalanced,
+			AllowFutureGroups:    true,
+		},
+		MaxAttempts:           2,
+		CatalogRefreshSeconds: 60,
+		KillSwitchMode:        KillSwitchNormal,
+	}
+}
+
+func TestDefaultSmartRouterSettingIsDisabledAndUnopinionated(t *testing.T) {
+	setting := GetSmartRouterSettingSnapshot()
+
+	assert.False(t, setting.Enabled)
+	assert.False(t, setting.DefaultForNewKeys)
+	assert.False(t, setting.AttemptLimitEnabled)
+	assert.Empty(t, setting.CertifiedGroups)
+	assert.Empty(t, setting.TextContracts)
+	assert.Empty(t, setting.DefaultPolicy.PoolPolicy)
+	require.NoError(t, setting.Validate())
+}
+
+func TestAttemptLimitDefaultsOffAndPreservesExplicitEnable(t *testing.T) {
+	var legacy Setting
+	require.NoError(t, common.UnmarshalJsonStr(`{"enabled":false}`, &legacy))
+	assert.False(t, Normalize(legacy).AttemptLimitEnabled)
+
+	setting := validSetting()
+	setting.AttemptLimitEnabled = true
+	require.NoError(t, setting.Validate())
+	assert.True(t, Normalize(setting).AttemptLimitEnabled)
+}
+
+func TestDefaultForNewKeysCannotBypassDisabledControlPlane(t *testing.T) {
+	setting := GetSmartRouterSettingSnapshot()
+	setting.DefaultForNewKeys = true
+
+	err := setting.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires enabled=true")
+}
+
+func TestBackgroundProbesRemainEnabledAfterValidationAndNormalization(t *testing.T) {
+	setting := validSetting()
+	setting.BackgroundProbeEnabled = true
+	require.NoError(t, setting.Validate())
+	normalized := Normalize(setting)
+	assert.True(t, normalized.BackgroundProbeEnabled)
+	assert.Equal(t, DefaultProbeTimeoutSeconds, normalized.ProbeTimeoutSeconds)
+	assert.Equal(t, 5_000, normalized.ProbeScanIntervalMS)
+	assert.Equal(t, 60, normalized.ProbeInitialBackoffSeconds)
+	assert.Equal(t, 60, normalized.ProbeMaxBackoffSeconds)
+	assert.Equal(t, DefaultColdStartWaveBatchSize, normalized.ColdStartWaveBatchSize)
+	assert.Equal(t, DefaultColdStartWaveMaxConcurrency, normalized.ColdStartWaveMaxConcurrency)
+	assert.Equal(t, DefaultColdStartProbeBudgetPerMinute, normalized.ColdStartProbeBudgetPerMinute)
+	assert.Equal(t, DefaultColdStartWaitMS, normalized.ColdStartWaitMS)
+	assert.Equal(t, DefaultColdStartPollIntervalMS, normalized.ColdStartPollIntervalMS)
+	assert.Greater(t, normalized.EffectiveProbeLeaseTTLSeconds(), normalized.ProbeTimeoutSeconds)
+}
+
+func TestRecoveryBackoffNeverEmitsLegacyLongTiers(t *testing.T) {
+	setting := validSetting()
+	setting.RecoverySlowBackoffSeconds = []int{300, 900, 3600}
+
+	normalized := Normalize(setting)
+	require.Equal(t, []int{MaximumRecoveryProbeBackoffSeconds}, normalized.RecoverySlowBackoffSeconds)
+	require.NoError(t, normalized.Validate())
+	for _, delay := range normalized.RecoverySlowBackoffSeconds {
+		assert.LessOrEqual(t, delay, MaximumRecoveryProbeBackoffSeconds)
+	}
+}
+
+func TestLegacyV4TextOnlyConfigurationMigratesToBackgroundMediaDiscovery(t *testing.T) {
+	setting := validSetting()
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+	}
+	setting.BackgroundProbeEnabled = false
+	setting.ProbeTimeoutSeconds = 0
+	setting.ProbeCompletionGraceSeconds = 0
+
+	normalized := Normalize(setting)
+
+	assert.True(t, normalized.BackgroundProbeEnabled)
+	assert.Contains(t, normalized.Discovery.AllowedTextEndpoints, constant.EndpointTypeImageGeneration)
+	assert.Contains(t, normalized.Discovery.AllowedTextEndpoints, constant.EndpointTypeOpenAIVideo)
+	assert.Contains(t, normalized.Discovery.AllowedTextEndpoints, constant.EndpointTypeAudioSpeech)
+	assert.Contains(t, normalized.Discovery.AllowedTextEndpoints, constant.EndpointTypeAudioTranscription)
+	assert.Contains(t, normalized.Discovery.AllowedTextEndpoints, constant.EndpointTypeAudioTranslation)
+}
+
+func TestCurrentConfigurationCanExplicitlyDisableBackgroundProbes(t *testing.T) {
+	setting := validSetting()
+	setting.ProbeTimeoutSeconds = 45
+	setting.ProbeCompletionGraceSeconds = 15
+	setting.BackgroundProbeEnabled = false
+
+	normalized := Normalize(setting)
+
+	assert.False(t, normalized.BackgroundProbeEnabled)
+}
+
+func TestDefaultV4ConfigurationCanBeEnabledWithoutLegacyPublishingLists(t *testing.T) {
+	setting := GetSmartRouterSettingSnapshot()
+	setting.Enabled = true
+	setting.DefaultForNewKeys = true
+	setting.CertifiedGroups = nil
+	setting.TextContracts = nil
+
+	require.NoError(t, setting.Validate())
+	assert.Equal(t, smartrouter.PolicyVersion, setting.DefaultPolicy.Version)
+	assert.Equal(t, smartrouter.StrategyPrice, setting.DefaultPolicy.Strategy)
+	assert.Empty(t, setting.DefaultPolicy.PoolPolicy)
+	assert.Empty(t, setting.DefaultPolicy.PolicyID)
+}
+
+func TestEnabledSmartRouterBoundsShortWaitAndRejectsBatchAccounting(t *testing.T) {
+	setting := validSetting()
+	setting.DefaultPolicy.QueuePolicy = smartrouter.QueuePolicy{
+		Mode: smartrouter.QueueModeShortWait, MaxWaitMS: 500, MinSavingPercent: 20,
+	}
+	require.NoError(t, setting.Validate())
+	setting.MaxQueueWaitMS = 200
+	require.ErrorContains(t, setting.Validate(), "exceeds max_queue_wait_ms")
+
+	setting.MaxQueueWaitMS = 1000
+	setting.DefaultPolicy.QueuePolicy = smartrouter.QueuePolicy{Mode: smartrouter.QueueModeNoQueue}
+	originalBatch := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = true
+	t.Cleanup(func() { common.BatchUpdateEnabled = originalBatch })
+	require.ErrorContains(t, setting.Validate(), "BATCH_UPDATE_ENABLED=false")
+}
+
+func TestEnabledSettingDoesNotRequireLegacyCertificationOrStableFallback(t *testing.T) {
+	setting := validSetting()
+	setting.CertifiedGroups = nil
+	setting.TextContracts = nil
+
+	require.NoError(t, setting.Validate())
+	normalized := Normalize(setting)
+	assert.Equal(t, []string{"auto"}, normalized.Discovery.ExcludeVirtualGroups)
+	assert.Equal(t, DefaultMaxEffectiveRatioPPM, normalized.DefaultMaxEffectiveRatioPPM)
+}
+
+func TestNormalizeProducesCanonicalIndependentCopy(t *testing.T) {
+	setting := validSetting()
+	rule := setting.CertifiedGroups["economy"]
+	rule.Pools = []string{" balanced-v1 ", "balanced-v1"}
+	rule.ChannelAllow = []int{2, 1, 2}
+	setting.CertifiedGroups["economy"] = rule
+
+	normalized := Normalize(setting)
+	normalizedRule := normalized.CertifiedGroups["economy"]
+	assert.Equal(t, []string{"balanced-v1"}, normalizedRule.Pools)
+	assert.Equal(t, []int{1, 2}, normalizedRule.ChannelAllow)
+
+	normalizedRule.Pools[0] = "changed"
+	assert.Equal(t, " balanced-v1 ", setting.CertifiedGroups["economy"].Pools[0])
+}
+
+func TestSettingAcceptsMediaEndpointsAndRejectsUnknownEndpoint(t *testing.T) {
+	for _, endpoint := range []constant.EndpointType{
+		constant.EndpointTypeImageGeneration,
+		constant.EndpointTypeOpenAIVideo,
+		constant.EndpointTypeAudioSpeech,
+		constant.EndpointTypeAudioTranscription,
+		constant.EndpointTypeAudioTranslation,
+	} {
+		t.Run(string(endpoint), func(t *testing.T) {
+			setting := validSetting()
+			setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{endpoint}
+			require.NoError(t, setting.Validate())
+		})
+	}
+	setting := validSetting()
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{constant.EndpointTypeGemini}
+	require.Error(t, setting.Validate())
+}
+
+func TestLegacyV3JSONReceivesV4DiscoveryAndSafetyDefaults(t *testing.T) {
+	legacy := validSetting()
+	legacy.Discovery = DiscoverySetting{}
+	legacy.DefaultMaxEffectiveRatioPPM = 0
+	legacy.AbsoluteMaxEffectiveRatioPPM = 0
+	legacy.MaxFailureThreshold = 0
+	legacy.HardFailureWindowSeconds = 0
+	legacy.ProbeInitialBackoffSeconds = 0
+	legacy.ProbeMaxBackoffSeconds = 0
+	legacy.MaxProbeFailures = 0
+	legacy.MaxOutageSeconds = 0
+	legacy.ProbeBudgetPerMinute = 0
+	legacy.ProbeMaxConcurrency = 0
+	legacy.ProbeLeaseTTLSeconds = 0
+	legacy.ColdStartWaveBatchSize = 0
+	legacy.ColdStartWaveMaxConcurrency = 0
+	legacy.ColdStartProbeBudgetPerMinute = 0
+	legacy.ColdStartWaitMS = 0
+	legacy.ColdStartPollIntervalMS = 0
+	legacy.MaxQueueWaitMS = 0
+
+	payload, err := common.Marshal(legacy)
+	require.NoError(t, err)
+	var decoded Setting
+	require.NoError(t, common.Unmarshal(payload, &decoded))
+	normalized := Normalize(decoded)
+	require.NoError(t, normalized.Validate())
+	assert.ElementsMatch(t, []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+		constant.EndpointTypeAnthropic,
+		constant.EndpointTypeImageGeneration,
+		constant.EndpointTypeOpenAIVideo,
+		constant.EndpointTypeAudioSpeech,
+		constant.EndpointTypeAudioTranscription,
+		constant.EndpointTypeAudioTranslation,
+	}, normalized.Discovery.AllowedTextEndpoints)
+	assert.Equal(t, []string{"auto"}, normalized.Discovery.ExcludeVirtualGroups)
+	assert.Equal(t, DefaultMaxEffectiveRatioPPM, normalized.DefaultMaxEffectiveRatioPPM)
+	assert.Equal(t, AbsoluteMaxEffectiveRatioPPM, normalized.AbsoluteMaxEffectiveRatioPPM)
+	assert.Equal(t, DefaultMaxProbeFailures, normalized.MaxProbeFailures)
+	assert.Equal(t, DefaultColdStartWaveBatchSize, normalized.ColdStartWaveBatchSize)
+	assert.Equal(t, DefaultColdStartWaitMS, normalized.ColdStartWaitMS)
+}
+
+func TestColdStartWaveAndWaitLimitsAreValidated(t *testing.T) {
+	setting := validSetting()
+	setting.ColdStartWaveBatchSize = 2
+	setting.ColdStartWaveMaxConcurrency = 3
+	require.ErrorContains(t, setting.Validate(), "cold-start wave limits")
+
+	setting.ColdStartWaveMaxConcurrency = 2
+	setting.ColdStartWaitMS = 100
+	setting.ColdStartPollIntervalMS = 200
+	require.ErrorContains(t, setting.Validate(), "cold-start wait limits")
+}
+
+func TestCloneDoesNotShareNestedPolicyOrCertificationState(t *testing.T) {
+	original := validSetting()
+	cloned := Clone(original)
+
+	cloned.DefaultPolicy.ExcludedGroups = append(cloned.DefaultPolicy.ExcludedGroups, "changed")
+	rule := cloned.CertifiedGroups["economy"]
+	rule.ChannelAllow[0] = 99
+	cloned.CertifiedGroups["economy"] = rule
+	cloned.TextContracts[0].ModelAllow = append(cloned.TextContracts[0].ModelAllow, "changed")
+
+	assert.Empty(t, original.DefaultPolicy.ExcludedGroups)
+	assert.Equal(t, []int{2, 1}, original.CertifiedGroups["economy"].ChannelAllow)
+	assert.Empty(t, original.TextContracts[0].ModelAllow)
+}
+
+func TestLegacyPublishingListsNeverBlockV4Configuration(t *testing.T) {
+	setting := validSetting()
+	setting.CertifiedGroups[" economy "] = setting.CertifiedGroups["economy"]
+	setting.CertifiedGroups["broken"] = CertifiedGroupSetting{}
+	setting.TextContracts = append(setting.TextContracts, TextContractSetting{Endpoint: "unsupported"})
+
+	err := setting.Validate()
+	require.NoError(t, err)
+}
+
+func TestSettingRejectsNegativeChannelCapacityLimit(t *testing.T) {
+	setting := validSetting()
+	setting.ChannelProfiles["2"] = ChannelProfileSetting{MaxInflight: -1}
+
+	err := setting.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_inflight cannot be negative")
+}
+
+func TestRegisteredConfigurationPublishesOneAtomicSnapshotAndNotifies(t *testing.T) {
+	original := GetSmartRouterSettingSnapshot()
+	t.Cleanup(func() { require.NoError(t, ReplaceSmartRouterSetting(original)) })
+
+	notifications := 0
+	unsubscribe := SubscribeSmartRouterSettingChanges(func() { notifications++ })
+	t.Cleanup(unsubscribe)
+	next := validSetting()
+	next.DefaultForNewKeys = true
+	payload, err := common.Marshal(next)
+	require.NoError(t, err)
+
+	registered := settingconfig.GlobalConfig.Get(ConfigName)
+	require.NotNil(t, registered)
+	require.NoError(t, settingconfig.UpdateConfigFromMap(registered, map[string]string{"config": string(payload)}))
+
+	snapshot := GetSmartRouterSettingSnapshot()
+	assert.True(t, snapshot.Enabled)
+	assert.True(t, snapshot.DefaultForNewKeys)
+	assert.Equal(t, "balanced-v1", snapshot.DefaultPolicy.PoolPolicy)
+	assert.Equal(t, 1, notifications)
+
+	snapshot.CertifiedGroups["changed"] = CertifiedGroupSetting{Pools: []string{"changed"}}
+	_, exists := GetSmartRouterSettingSnapshot().CertifiedGroups["changed"]
+	assert.False(t, exists)
+}

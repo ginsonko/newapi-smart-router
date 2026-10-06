@@ -1,0 +1,73 @@
+package media
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestHistoryRepairDefaultsToDryRunAndRecoversOnlyReadableSources(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-history-repair?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.MediaBlob{}, &model.Task{}, &model.TaskArtifact{}))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.Enabled = true
+	nextSetting.RemoteMaterializeEnabled = true
+	nextSetting.StoragePath = t.TempDir()
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+	require.NoError(t, EnsureStorage())
+
+	legacyDir := filepath.Join(nextSetting.StoragePath, "old-objects", "nested")
+	require.NoError(t, os.MkdirAll(legacyDir, 0o750))
+	legacyPath := filepath.Join(legacyDir, "asset-recover.png")
+	require.NoError(t, os.WriteFile(legacyPath, []byte("recoverable"), 0o600))
+	assets := []*model.MediaBlob{
+		{PublicID: "asset-recover", UserID: 1, StorageBackend: model.MediaStorageBackendLocal,
+			ObjectKey: "objects/missing/asset-recover.png", SizeBytes: int64(len("recoverable")),
+			Status: model.MediaBlobStatusReady},
+		{PublicID: "asset-remote", UserID: 1, StorageBackend: model.MediaStorageBackendRemote,
+			PrivateSource: "https://cdn.example.test/asset.png", Status: model.MediaBlobStatusReady,
+			MaterializeStatus: model.MediaMaterializeAbandoned},
+		{PublicID: "asset-lost", UserID: 1, StorageBackend: model.MediaStorageBackendLocal,
+			ObjectKey: "objects/missing/asset-lost.png", SizeBytes: 10, Status: model.MediaBlobStatusReady},
+	}
+	require.NoError(t, db.Create(&assets).Error)
+
+	report, err := RunHistoryRepair(context.Background(), true, 100)
+	require.NoError(t, err)
+	assert.True(t, report.DryRun)
+	assert.Equal(t, 1, report.RecoveredLocal)
+	assert.Equal(t, 1, report.QueuedMaterialize)
+	assert.Equal(t, 1, report.MarkedUnavailable)
+	var unchanged model.MediaBlob
+	require.NoError(t, db.Where("public_id = ?", "asset-remote").First(&unchanged).Error)
+	assert.Equal(t, model.MediaMaterializeAbandoned, unchanged.MaterializeStatus)
+
+	report, err = RunHistoryRepair(context.Background(), false, 100)
+	require.NoError(t, err)
+	assert.False(t, report.DryRun)
+	var recovered model.MediaBlob
+	require.NoError(t, db.Where("public_id = ?", "asset-recover").First(&recovered).Error)
+	assert.Equal(t, model.MediaMaterializeComplete, recovered.MaterializeStatus)
+	assert.Equal(t, "old-objects/nested/asset-recover.png", recovered.ObjectKey)
+	var queued model.MediaBlob
+	require.NoError(t, db.Where("public_id = ?", "asset-remote").First(&queued).Error)
+	assert.Equal(t, model.MediaMaterializePending, queued.MaterializeStatus)
+	var lost model.MediaBlob
+	require.NoError(t, db.Where("public_id = ?", "asset-lost").First(&lost).Error)
+	assert.Equal(t, model.MediaMaterializePermanentlyUnavailable, lost.MaterializeStatus)
+}

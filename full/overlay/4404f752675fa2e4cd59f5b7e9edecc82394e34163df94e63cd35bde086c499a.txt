@@ -1,0 +1,308 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+const (
+	TenantCostDownstreamActive   = "active"
+	TenantCostDownstreamDisabled = "disabled"
+)
+
+// TenantCostDownstream is non-secret metadata for one downstream consumer of
+// Gateway's procurement facts. Endpoint credentials stay in deployment-owned
+// secret configuration and are never persisted in this table.
+type TenantCostDownstream struct {
+	TenantID    string `json:"tenant_id" gorm:"primaryKey;type:varchar(64)"`
+	DisplayName string `json:"display_name" gorm:"type:varchar(128);not null"`
+	ConfigKey   string `json:"config_key" gorm:"type:varchar(64);not null;index;uniqueIndex:idx_tenant_cost_downstream_config_key"`
+	Status      string `json:"status" gorm:"type:varchar(24);index;not null"`
+	CreatedAt   int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt   int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostDownstream) TableName() string { return "tenant_cost_downstreams" }
+
+func defaultTenantCostDownstream() TenantCostDownstream {
+	return TenantCostDownstream{
+		TenantID: DefaultTenantCostTenantID, DisplayName: "Downstream",
+		ConfigKey: "downstream", Status: TenantCostDownstreamActive,
+	}
+}
+
+func validTenantCostDownstreamStatus(value string) bool {
+	switch strings.TrimSpace(value) {
+	case TenantCostDownstreamActive, TenantCostDownstreamDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
+func validTenantCostConfigKey(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 || value != strings.ToLower(value) {
+		return false
+	}
+	for index, r := range value {
+		isLetter := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		if !isLetter && !isDigit && r != '_' {
+			return false
+		}
+		if (index == 0 || index == len(value)-1) && r == '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// DefaultTenantCostConfigKey derives a deployment-friendly environment-key
+// suffix from a tenant ID. Explicit config keys are never silently rewritten;
+// this helper is only the UI/default path when the operator leaves it blank.
+func DefaultTenantCostConfigKey(tenantID string) string {
+	value := strings.ToLower(strings.TrimSpace(tenantID))
+	var builder strings.Builder
+	lastUnderscore := false
+	for _, r := range value {
+		isLetter := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		if isLetter || isDigit {
+			builder.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			builder.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(builder.String(), "_")
+}
+
+// IsValidTenantCostTenantID is syntax-only. Authorization is supplied by a
+// registered downstream and a binding/reporting token; this helper must not
+// hard-code a finite list of future downstreams.
+func IsValidTenantCostTenantID(value string) bool {
+	return validTenantCostPublicIdentifier(strings.TrimSpace(value), 64)
+}
+
+// RequireRegisteredTenantCostDownstream is the shared scope guard for data
+// and control-plane operations. Syntax-valid IDs that are not registered are
+// still denied; this prevents a caller from manufacturing a tenant namespace
+// merely by supplying a new string.
+func RequireRegisteredTenantCostDownstream(tenantID string) (*TenantCostDownstream, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if !IsValidTenantCostTenantID(tenantID) || DB == nil {
+		return nil, ErrTenantCostScope
+	}
+	row, err := GetTenantCostDownstream(tenantID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrTenantCostScope
+	}
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// RequireActiveTenantCostDownstream is used when a new credential or a
+// reporting token would otherwise become usable. Existing immutable facts may
+// still be read after a downstream is disabled, but no new traffic is allowed.
+func RequireActiveTenantCostDownstream(tenantID string) (*TenantCostDownstream, error) {
+	row, err := RequireRegisteredTenantCostDownstream(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil || strings.TrimSpace(row.Status) != TenantCostDownstreamActive ||
+		!validTenantCostConfigKey(row.ConfigKey) {
+		return nil, ErrTenantCostScope
+	}
+	return row, nil
+}
+
+func requireTenantCostDownstreamTx(tx *gorm.DB, tenantID string, active bool) (*TenantCostDownstream, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tx == nil || !IsValidTenantCostTenantID(tenantID) {
+		return nil, ErrTenantCostScope
+	}
+	var row TenantCostDownstream
+	if err := lockForUpdate(tx).Where("tenant_id = ?", tenantID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostScope
+		}
+		return nil, err
+	}
+	if active && strings.TrimSpace(row.Status) != TenantCostDownstreamActive {
+		return nil, ErrTenantCostScope
+	}
+	return &row, nil
+}
+
+func validateTenantCostDownstream(row *TenantCostDownstream) error {
+	if row == nil || !IsValidTenantCostTenantID(row.TenantID) ||
+		strings.TrimSpace(row.DisplayName) == "" || len([]rune(strings.TrimSpace(row.DisplayName))) > 128 ||
+		strings.Contains(strings.ToLower(row.DisplayName), "sk-") || strings.Contains(row.DisplayName, "://") ||
+		!validTenantCostConfigKey(strings.TrimSpace(row.ConfigKey)) || !validTenantCostDownstreamStatus(row.Status) {
+		return ErrTenantCostInvalidInput
+	}
+	return nil
+}
+
+// EnsureDefaultTenantCostDownstream is idempotent and only fills the default
+// seed. It never re-enables an operator-disabled row.
+func EnsureDefaultTenantCostDownstream() error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	seed := defaultTenantCostDownstream()
+	var existing TenantCostDownstream
+	err := DB.Where("tenant_id = ?", seed.TenantID).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		now := common.GetTimestamp()
+		seed.CreatedAt, seed.UpdatedAt = now, now
+		return DB.Create(&seed).Error
+	}
+	if err != nil {
+		return err
+	}
+	if existing.DisplayName == "" || existing.ConfigKey == "" {
+		existing.DisplayName, existing.ConfigKey = seed.DisplayName, seed.ConfigKey
+		existing.UpdatedAt = common.GetTimestamp()
+		return DB.Save(&existing).Error
+	}
+	return nil
+}
+
+func UpsertTenantCostDownstream(row *TenantCostDownstream) error {
+	if err := validateTenantCostDownstream(row); err != nil {
+		return err
+	}
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	now := common.GetTimestamp()
+	row.TenantID = strings.TrimSpace(row.TenantID)
+	row.DisplayName = strings.TrimSpace(row.DisplayName)
+	row.ConfigKey = strings.TrimSpace(row.ConfigKey)
+	if row.CreatedAt == 0 {
+		row.CreatedAt = now
+	}
+	row.UpdatedAt = now
+	return DB.Transaction(func(tx *gorm.DB) error {
+		return upsertTenantCostDownstreamTx(tx, row)
+	})
+}
+
+func upsertTenantCostDownstreamTx(tx *gorm.DB, row *TenantCostDownstream) error {
+	if tx == nil || row == nil {
+		return ErrTenantCostInvalidInput
+	}
+	var existing TenantCostDownstream
+	err := lockForUpdate(tx).Where("tenant_id = ?", row.TenantID).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		var collision TenantCostDownstream
+		if err := tx.Where("config_key = ? AND tenant_id <> ?", row.ConfigKey, row.TenantID).First(&collision).Error; err == nil {
+			return ErrTenantCostConflict
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		return tx.Create(row).Error
+	}
+	if err != nil {
+		return err
+	}
+	var collision TenantCostDownstream
+	if err := tx.Where("config_key = ? AND tenant_id <> ?", row.ConfigKey, row.TenantID).First(&collision).Error; err == nil {
+		return ErrTenantCostConflict
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	// Existing-row upserts are metadata-only. Preserve the operator-selected
+	// state while the row is locked; changing status is intentionally reserved
+	// for SetTenantCostDownstreamStatus, so a caller cannot silently re-enable a
+	// disabled downstream by posting its metadata with status=active.
+	row.CreatedAt, row.TenantID = existing.CreatedAt, existing.TenantID
+	row.Status = existing.Status
+	return tx.Save(row).Error
+}
+
+// UpsertTenantCostDownstreamWithAudit makes the root registration operation
+// atomic: metadata and its audit record either commit together or neither is
+// visible. Existing non-root provisioning callers can keep using the
+// unaudited compatibility wrapper above.
+func UpsertTenantCostDownstreamWithAudit(row *TenantCostDownstream, actorUserID int) error {
+	if err := validateTenantCostDownstream(row); err != nil {
+		return err
+	}
+	if actorUserID <= 0 || DB == nil {
+		return ErrTenantCostInvalidInput
+	}
+	now := common.GetTimestamp()
+	row.TenantID = strings.TrimSpace(row.TenantID)
+	row.DisplayName = strings.TrimSpace(row.DisplayName)
+	row.ConfigKey = strings.TrimSpace(row.ConfigKey)
+	if row.CreatedAt == 0 {
+		row.CreatedAt = now
+	}
+	row.UpdatedAt = now
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := upsertTenantCostDownstreamTx(tx, row); err != nil {
+			return err
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, row.TenantID, actorUserID,
+			"downstream_upserted", row.TenantID, "metadata updated", now)
+	})
+}
+
+func GetTenantCostDownstream(tenantID string) (*TenantCostDownstream, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if !IsValidTenantCostTenantID(tenantID) || DB == nil {
+		return nil, ErrTenantCostScope
+	}
+	var row TenantCostDownstream
+	if err := DB.Where("tenant_id = ?", tenantID).First(&row).Error; err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+func ListTenantCostDownstreams(limit int) ([]TenantCostDownstream, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []TenantCostDownstream
+	err := DB.Order("tenant_id asc").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func SetTenantCostDownstreamStatus(tenantID, status string, actorUserID int) error {
+	tenantID, status = strings.TrimSpace(tenantID), strings.TrimSpace(status)
+	if !IsValidTenantCostTenantID(tenantID) || !validTenantCostDownstreamStatus(status) || actorUserID <= 0 || DB == nil {
+		return ErrTenantCostInvalidInput
+	}
+	now := common.GetTimestamp()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var row TenantCostDownstream
+		if err := lockForUpdate(tx).Where("tenant_id = ?", tenantID).First(&row).Error; err != nil {
+			return err
+		}
+		if row.Status == status {
+			return nil
+		}
+		if err := tx.Model(&TenantCostDownstream{}).Where("tenant_id = ?", tenantID).Updates(map[string]interface{}{"status": status, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		return tx.Create(&TenantCostAuditEvent{TenantID: tenantID, ActorUserID: actorUserID,
+			Action: "downstream_status_changed", SubjectID: tenantID,
+			Details: fmt.Sprintf("status=%s", status), CreatedAt: now}).Error
+	})
+}

@@ -1,0 +1,56 @@
+package openai
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestOrdinaryResponsesTerminalDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, event string
+		failed      bool
+	}{
+		{"failed", `{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","type":"server_error","message":"Our servers are currently overloaded. Please try again later."}}}`, true},
+		{"error", `{"type":"error","error":{"code":"rate_limit_exceeded","message":"Upstream rate limit exceeded, please retry later"}}`, true},
+		{"completed", `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":4,"total_tokens":11}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Set(common.RequestIdKey, "terminal-diagnostics")
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"}, IsStream: true, RelayFormat: types.RelayFormatOpenAI}
+			resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: " + tc.event + "\n\n"))}
+			usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			if tc.failed {
+				require.NotNil(t, apiErr)
+				require.Nil(t, usage)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+			} else {
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+			}
+			assert.Contains(t, recorder.Body.String(), tc.event)
+			assert.Equal(t, tc.failed, ResponsesTerminalError(c) != nil)
+			assert.Equal(t, tc.failed, info.StreamStatus.HasErrors())
+			assert.Equal(t, !tc.failed, SmartResponsesCompletedSeen(c))
+			if tc.failed {
+				assert.Contains(t, info.StreamStatus.Errors[0].Message, "code=")
+			} else {
+				assert.Equal(t, 11, usage.TotalTokens)
+			}
+			ResetSmartResponsesAttemptState(c)
+			assert.Nil(t, ResponsesTerminalError(c), "attempt reset must discard the previous route failure")
+		})
+	}
+}

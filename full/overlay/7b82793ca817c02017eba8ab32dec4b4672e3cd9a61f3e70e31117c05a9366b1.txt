@@ -1,0 +1,107 @@
+package media
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestRunCleanupProtectsRetainedReviewedAndActivelyLeasedAssets(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-cleanup-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.TaskArtifact{}, &model.MediaModerationEvent{},
+		&model.MediaCleanupRun{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.CleanupBatchSize = 100
+	nextSetting.EvidenceRetentionDays = 180
+	nextSetting.ReservedFreeBytes = 1 << 50
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	now := time.Now().Unix()
+	assets := []model.MediaBlob{
+		{PublicID: "ordinary-expired", UserID: 1, StorageBackend: model.MediaStorageBackendRemote, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved, ExpiresAt: now - 60},
+		{PublicID: "administrator-hold", UserID: 1, StorageBackend: model.MediaStorageBackendRemote, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved, AdminHold: true, ExpiresAt: now - 60},
+		{PublicID: "active-reader", UserID: 1, StorageBackend: model.MediaStorageBackendRemote, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved, AccessLeaseCount: 1, AccessLeaseUntil: now + 60, ExpiresAt: now - 60},
+		{PublicID: "review-evidence", UserID: 1, StorageBackend: model.MediaStorageBackendRemote, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationViolation, ExpiresAt: now - 60},
+	}
+	require.NoError(t, db.Create(&assets).Error)
+	require.NoError(t, db.Create(&model.MediaModerationEvent{
+		MediaBlobID: assets[3].ID, PublicAssetID: assets[3].PublicID, UserID: assets[3].UserID,
+		Action: "violation", PreviousStatus: model.MediaModerationUnreviewed,
+		NewStatus: model.MediaModerationViolation, CreatedAt: now,
+	}).Error)
+
+	summary, err := RunCleanup(context.Background(), "contract-test", 0, false)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, 1, summary.DeletedCount, "only the ordinary expired asset may be reclaimed")
+
+	for _, publicID := range []string{"administrator-hold", "active-reader", "review-evidence"} {
+		var stored model.MediaBlob
+		require.NoError(t, db.Where("public_id = ?", publicID).First(&stored).Error)
+		assert.Zero(t, stored.DeletedAt, "%s must remain available while protected", publicID)
+		assert.Equal(t, model.MediaBlobStatusReady, stored.Status)
+	}
+	var ordinary model.MediaBlob
+	require.NoError(t, db.Where("public_id = ?", "ordinary-expired").First(&ordinary).Error)
+	assert.NotZero(t, ordinary.DeletedAt)
+	assert.Equal(t, model.MediaBlobStatusDeleted, ordinary.Status)
+}
+
+func TestScheduledCleanupNeverDeletesExpiredUserAssets(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-scheduled-cleanup-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.TaskArtifact{}, &model.MediaModerationEvent{},
+		&model.MediaCleanupRun{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.CleanupBatchSize = 100
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	expired := model.MediaBlob{
+		PublicID: "scheduled-expired", UserID: 1,
+		StorageBackend: model.MediaStorageBackendRemote,
+		PrivateSource:  "https://provider.example.test/result.png",
+		Status:         model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved,
+		ExpiresAt: time.Now().Add(-time.Hour).Unix(), SizeBytes: 128,
+	}
+	require.NoError(t, db.Create(&expired).Error)
+
+	summary, err := RunCleanup(context.Background(), "scheduled", 0, false)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Zero(t, summary.ExaminedCount)
+	assert.Zero(t, summary.DeletedCount)
+	assert.Zero(t, summary.FreedBytes)
+
+	var stored model.MediaBlob
+	require.NoError(t, db.Where("id = ?", expired.ID).First(&stored).Error)
+	assert.Zero(t, stored.DeletedAt)
+	assert.Equal(t, model.MediaBlobStatusReady, stored.Status)
+	assert.Equal(t, expired.PrivateSource, stored.PrivateSource)
+}

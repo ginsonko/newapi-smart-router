@@ -1,0 +1,97 @@
+package sora
+
+import (
+	"context"
+	"encoding/base64"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/stretchr/testify/require"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestInlineOwnedRemoteUsesUploadLimitAndOrigin(t *testing.T) {
+	_, cap := prepareInlineTest(t)
+	data := inlineTestImage(t, 12)
+	cap.MaxRemoteImageBytes = 1
+	fetch := system_setting.GetFetchSetting()
+	previous := *fetch
+	fetch.EnableSSRFProtection = false
+	service.InitHttpClient()
+	t.Cleanup(func() { *fetch = previous; service.InitHttpClient() })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Empty(t, r.Header.Get("Authorization"))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	blob := model.MediaBlob{PublicID: "file_remote", UserID: 1, StorageBackend: model.MediaStorageBackendRemote, PrivateSource: server.URL + "/image", Status: model.MediaBlobStatusReady, MimeType: "image/png", SizeBytes: int64(len(data))}
+	require.NoError(t, model.DB.Create(&blob).Error)
+	source := inlineImageSource{reference: relaycommon.MediaReference{Type: "image", FileID: blob.PublicID, ResolvedURL: "https://self.invalid/signed"}}
+	reader, limit, err := openInlineImage(context.Background(), 1, source, cap, cap.MaxImageBytes)
+	require.NoError(t, err)
+	defer reader.Close()
+	require.Equal(t, cap.MaxImageBytes, limit)
+	actual, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, data, actual)
+	_, _, err = openInlineImage(context.Background(), 2, source, cap, cap.MaxImageBytes)
+	require.Error(t, err)
+	_, _, err = openInlineImage(context.Background(), 1, inlineImageSource{reference: relaycommon.MediaReference{Type: "image", URL: server.URL + "/image"}}, cap, cap.MaxImageBytes)
+	require.Error(t, err)
+}
+
+func TestInlineHTTP2EarlyResponseKeepsBodyUntilTransportFinishes(t *testing.T) {
+	_, cap := prepareInlineTest(t)
+	c := inlineContext(t, `{}`)
+	data := inlineTestImage(t, 12)
+	// Large enough that HTTP/2 flow control must wait for the server to read.
+	data = append(data, []byte(strings.Repeat("x", 2<<20))...)
+	// Use the real spool writer and transport, retaining the handle during upload.
+	request := relaycommon.TaskSubmitReq{Images: []string{base64.StdEncoding.EncodeToString(data)}, Seconds: "5", Duration: 5, Resolution: "720p"}
+	body, err := buildInlineImageRequest(c, inlineInfo(), request, cap)
+	require.NoError(t, err)
+	spool := body.(*encodedImageBody)
+	allowRead := make(chan struct{})
+	received := make(chan int64, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-allowRead
+		n, _ := io.Copy(io.Discard, r.Body)
+		received <- n
+		_, _ = w.Write([]byte(`{"id":"accepted"}`))
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	service.InitHttpClient()
+	client := service.GetHttpClient()
+	old := *client
+	*client = *server.Client()
+	defer func() { *client = old }()
+	info := inlineInfo()
+	info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+	adaptor := &TaskAdaptor{baseURL: server.URL}
+	response, err := adaptor.DoRequest(c, info, body)
+	require.NoError(t, err)
+	_, err = os.Stat(spool.file.Name())
+	require.NoError(t, err)
+	close(allowRead)
+	select {
+	case n := <-received:
+		require.Equal(t, spool.size, n)
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload stalled")
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	require.Eventually(t, func() bool { _, e := os.Stat(spool.file.Name()); return os.IsNotExist(e) }, time.Second, 10*time.Millisecond)
+}

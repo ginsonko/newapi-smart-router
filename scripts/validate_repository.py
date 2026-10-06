@@ -14,9 +14,9 @@ import jsonschema
 import yaml
 
 
-RELEASE_VERSION = "v0.3.0-alpha.1"
-BRIDGE_PROTOCOL = "bridge-spi-v1alpha3"
-EXPECTED_CORE_FILE_COUNT = 20
+from build_release import RELEASE_VERSION
+BRIDGE_PROTOCOL = "bridge-spi-v1alpha4"
+EXPECTED_CORE_FILE_COUNT = 29
 README_BASELINE_LINES = 2372
 README_BASELINE_SHA256 = "6eaae6be969cc543f08215d7a87774c3c20c113b067bd07dda8827b4b61d118b"
 
@@ -31,6 +31,9 @@ def sha256_file(path: Path) -> str:
 
 def normalized_readme_prefix(path: Path) -> tuple[int, str]:
     normalized = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    marker = b"<!-- historical-manual-start -->\n"
+    if marker in normalized:
+        normalized = normalized.split(marker, 1)[1]
     lines = normalized.splitlines(keepends=True)
     prefix = b"".join(lines[:README_BASELINE_LINES])
     return len(lines), hashlib.sha256(prefix).hexdigest()
@@ -81,8 +84,8 @@ class RepositoryValidator:
         parts_manifest = yaml.safe_load((self.root / "parts" / "manifest" / "PARTS-MANIFEST.yaml").read_text(encoding="utf-8"))
         capability_matrix = yaml.safe_load((self.root / "parts" / "manifest" / "capability-matrix.yaml").read_text(encoding="utf-8"))
         self.check("v0_3_parts_versions", (
-            parts_manifest.get("manifest_version") == "3.0.0-alpha.1"
-            and capability_matrix.get("matrix_version") == "3.0.0-alpha.1"
+            parts_manifest.get("manifest_version") == "4.0.0-alpha.1"
+            and capability_matrix.get("matrix_version") == "4.0.0-alpha.1"
         ), {"parts": parts_manifest.get("manifest_version"), "matrix": capability_matrix.get("matrix_version")})
         route_price_schema = parsed[self.root / "parts" / "spec" / "route-price.schema.json"]
         route_price_validator = jsonschema.Draft202012Validator(route_price_schema)
@@ -185,12 +188,19 @@ class RepositoryValidator:
             "AGPL-3.0-only", "does not grant", "QuantumNous New API", "not a license grant",
         )), "COMMERCIAL-LICENSE.md")
         self.check("public_history_gate_closed", "public repository is not rebuilt from clean upstream history" not in matrix, "capability matrix")
-        self.check("bridge_protocol_v1alpha3", (
+        self.check("bridge_protocol_current", (
             f'ProtocolVersion = "{BRIDGE_PROTOCOL}"' in bridge_source
             and bridge_manifest.get("bridge_protocol") == BRIDGE_PROTOCOL
             and "HOOK-PRICE-001" in bridge_manifest.get("required_hooks", [])
             and "multimodal_models_discovery" in bridge_manifest.get("observed_r52_capabilities", [])
         ), bridge_manifest.get("bridge_protocol"))
+
+        integration_example = json.loads((self.root / "integration/integration-manifest.example.json").read_text(encoding="utf-8"))
+        self.check("current_integration_metadata", (
+            integration_example.get("release") == RELEASE_VERSION
+            and integration_example.get("bridge_protocol") == BRIDGE_PROTOCOL
+            and {item["hook_id"] for item in integration_example.get("hooks", [])} == set(bridge_manifest["required_hooks"])
+        ), "current release/protocol and complete required hooks")
 
         line_count, prefix_digest = normalized_readme_prefix(self.root / "README.md")
         self.check("readme_v0_2_strict_prefix_preserved", (
@@ -219,12 +229,30 @@ class RepositoryValidator:
             sha256_file(core_vectors) == sha256_file(parts_vectors)
         ), {"core": sha256_file(core_vectors), "parts": sha256_file(parts_vectors)})
 
+    def validate_full_overlay(self) -> None:
+        from build_v04 import safe_member
+        manifest = json.loads((self.root / "full/reference-v0.4.json").read_text(encoding="utf-8"))
+        self.check("full_overlay_version", manifest.get("schema_version") == "full-reference-overlay-v2" and manifest.get("release") == RELEASE_VERSION)
+        files = manifest["files"]
+        paths = [entry["path"] for entry in files]
+        self.check("full_overlay_unique_paths", len(paths) == len(set(paths)) and len(paths) > 1000)
+        for value in [*paths, *manifest["remove"]]:
+            safe_member(value)
+        failures = []
+        expected = {entry["path"]: entry["sha256"] for entry in files}
+        for entry in manifest["overlay"]:
+            path = self.root / "full/overlay" / safe_member(entry["blob"])
+            if not path.is_file() or sha256_file(path) != entry["sha256"] or expected.get(entry["path"]) != entry["sha256"]:
+                failures.append(entry["path"])
+        self.check("full_overlay_pinned_hashes", not failures and bool(manifest["overlay"]), failures)
+
     def run(self) -> dict:
         self.validate_structure()
         self.validate_structured_files()
         self.validate_markdown()
         self.validate_public_contract()
         self.validate_core_mirrors()
+        self.validate_full_overlay()
         return {
             "schema_version": "repository-validation-v1",
             "status": "PUBLIC_REPOSITORY_READY",

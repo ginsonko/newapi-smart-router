@@ -1,0 +1,807 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/service"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+type imageRouteReconcileFixture struct {
+	database *gorm.DB
+	job      *model.ImageRouteJob
+	root     *model.Task
+	child    *model.Task
+	receipt  *model.TaskBillingReceipt
+}
+
+type imageRouteAccountingSnapshot struct {
+	User         model.User
+	Token        model.Token
+	Channels     []model.Channel
+	Receipts     []model.TaskBillingReceipt
+	Reservations []model.QuotaReservation
+	Logs         []model.Log
+}
+
+func newImageRouteJobFixture(test *testing.T) *imageRouteReconcileFixture {
+	test.Helper()
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousMemory, previousBatch := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled
+	previousSetting := smartroutersetting.GetSmartRouterSettingSnapshot()
+	previousMediaSetting := mediasetting.Get()
+	previousGinMode := gin.Mode()
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(test, err)
+	connection, err := database.DB()
+	require.NoError(test, err)
+	connection.SetMaxOpenConns(1)
+	model.DB, model.LOG_DB = database, database
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled = false, false, false
+	gin.SetMode(gin.TestMode)
+	disabledSetting := smartroutersetting.Clone(previousSetting)
+	disabledSetting.Enabled, disabledSetting.BackgroundProbeEnabled = false, false
+	require.NoError(test, smartroutersetting.ReplaceSmartRouterSetting(disabledSetting))
+	test.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousMainType, previousLogType)
+		common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled = previousRedis, previousMemory, previousBatch
+		gin.SetMode(previousGinMode)
+		require.NoError(test, smartroutersetting.ReplaceSmartRouterSetting(previousSetting))
+		require.NoError(test, mediasetting.Replace(previousMediaSetting))
+		require.NoError(test, connection.Close())
+	})
+	require.NoError(test, database.AutoMigrate(
+		&model.Task{}, &model.ImageRouteJob{}, &model.TaskBillingReceipt{},
+		&model.User{}, &model.Token{}, &model.Channel{}, &model.QuotaReservation{}, &model.Log{},
+		&model.MediaBlob{}, &model.TaskArtifact{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+	mediaSetting := previousMediaSetting
+	mediaSetting.StoragePath = test.TempDir()
+	mediaSetting.ReservedFreeBytes = 1
+	require.NoError(test, mediasetting.Replace(mediaSetting))
+	user := &model.User{Id: 701, Username: "image-route-reconcile", Status: common.UserStatusDisabled,
+		Group: "default", Quota: 900, UsedQuota: 100, RequestCount: 1, AffCode: "image-route-reconcile"}
+	user.SetSetting(dto.UserSetting{QuotaWarningThreshold: 1})
+	token := &model.Token{Id: 702, UserId: user.Id, Key: "local-image-route-test", Status: common.TokenStatusEnabled,
+		ExpiredTime: -1, RemainQuota: 900, UsedQuota: 100, Group: "auto"}
+	channel := &model.Channel{Id: 703, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled,
+		Name: "local-image-route", UsedQuota: 100}
+	require.NoError(test, database.Create(user).Error)
+	require.NoError(test, database.Create(token).Error)
+	require.NoError(test, database.Create(channel).Error)
+	bodyPath := filepath.Join(test.TempDir(), "request.json")
+	require.NoError(test, os.WriteFile(bodyPath, []byte(`{"model":"gpt-image-2","prompt":"local fixture","n":1}`), 0600))
+	job := &model.ImageRouteJob{
+		PublicTaskID: "image-route-root", UserID: user.Id, TokenID: token.Id,
+		RequestPath: "/v1/images/generations", ContentType: "application/json", BodyPath: bodyPath,
+		PolicyJSON: `{"version":4,"enabled":true}`, FrozenGroupsJSON: `["default"]`,
+		ResponseFormat: "url", NoRetention: true, ClientIP: "127.0.0.1",
+	}
+	root := &model.Task{Group: "default", Properties: model.Properties{MediaMode: "images", OriginModelName: "gpt-image-2"}}
+	require.NoError(test, model.CreateImageRouteJob(job, root))
+	imageRouteDispatches.Lock()
+	_, alreadyRunning := imageRouteDispatches.active[job.ID]
+	imageRouteDispatches.active[job.ID] = struct{}{}
+	imageRouteDispatches.Unlock()
+	require.False(test, alreadyRunning)
+	test.Cleanup(func() {
+		imageRouteDispatches.Lock()
+		delete(imageRouteDispatches.active, job.ID)
+		imageRouteDispatches.Unlock()
+	})
+	return &imageRouteReconcileFixture{database: database, job: job, root: root}
+}
+
+func newImageRouteReconcileFixture(test *testing.T) *imageRouteReconcileFixture {
+	test.Helper()
+	fixture := newImageRouteJobFixture(test)
+	database, job, root := fixture.database, fixture.job, fixture.root
+	_, won, err := model.ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(test, err)
+	require.True(test, won)
+	require.NoError(test, model.RecordImageRouteJobChannel(job.ID, 703))
+	reservationID := "image-route-child-reservation"
+	child := &model.Task{
+		TaskID: "image-route-child", UserId: job.UserID, ChannelId: 703, Platform: constant.TaskPlatformOpenAIImage,
+		Status: model.TaskStatusFailure, Quota: 0, FailReason: "provider explicitly failed", Data: []byte(`{}`),
+		BillingReservationID: reservationID, Properties: root.Properties,
+		PrivateData: model.TaskPrivateData{TokenId: job.TokenID, BillingRequestID: "image-route-child-request",
+			ImageTask: &model.ImageTaskContext{RetryableFailure: true, RouteJobID: job.ID, ResponseFormat: "url", NoRetention: true, Count: 1}},
+	}
+	require.NoError(test, database.Create(child).Error)
+	require.NoError(test, model.BindImageRouteJobTask(job.ID, child.TaskID))
+	reservation := &model.QuotaReservation{
+		ReservationId: reservationID, RequestId: child.PrivateData.BillingRequestID, UserId: job.UserID, TokenId: job.TokenID,
+		ChannelId: child.ChannelId, FundingSource: model.QuotaReservationFundingWallet, Status: model.QuotaReservationStatusActive,
+		ReservedQuota: 100, AttemptCount: 1,
+	}
+	require.NoError(test, database.Create(reservation).Error)
+	receipt := &model.TaskBillingReceipt{
+		TaskRowID: child.ID, ReservationID: &reservationID, RequestID: reservation.RequestId,
+		UserID: job.UserID, TokenID: job.TokenID, ChannelID: child.ChannelId, FundingSource: model.QuotaReservationFundingWallet,
+		SubmissionQuota: 100, PreConsumedQuota: 100, AppliedQuota: 100, UsageAppliedQuota: 100,
+		State: model.TaskBillingReceiptTerminalPending, TerminalTargetStatus: model.TaskStatusFailure,
+		TargetQuota: 0, RequestCountApplied: true, Version: 3,
+	}
+	require.NoError(test, database.Create(receipt).Error)
+	fixture.child, fixture.receipt = child, receipt
+	fixture.job = fixture.loadJob(test)
+	return fixture
+}
+
+func (fixture *imageRouteReconcileFixture) loadJob(test *testing.T) *model.ImageRouteJob {
+	test.Helper()
+	job, found, err := model.GetImageRouteJob(fixture.job.PublicTaskID, fixture.job.UserID)
+	require.NoError(test, err)
+	require.True(test, found)
+	return job
+}
+
+func (fixture *imageRouteReconcileFixture) loadRoot(test *testing.T) *model.Task {
+	test.Helper()
+	root, found, err := model.GetByTaskId(fixture.job.UserID, fixture.job.PublicTaskID)
+	require.NoError(test, err)
+	require.True(test, found)
+	return root
+}
+
+func (fixture *imageRouteReconcileFixture) accounting(test *testing.T) imageRouteAccountingSnapshot {
+	test.Helper()
+	var snapshot imageRouteAccountingSnapshot
+	require.NoError(test, fixture.database.First(&snapshot.User, fixture.job.UserID).Error)
+	require.NoError(test, fixture.database.First(&snapshot.Token, fixture.job.TokenID).Error)
+	require.NoError(test, fixture.database.Order("id").Find(&snapshot.Channels).Error)
+	require.NoError(test, fixture.database.Order("id").Find(&snapshot.Receipts).Error)
+	require.NoError(test, fixture.database.Order("id").Find(&snapshot.Reservations).Error)
+	require.NoError(test, fixture.database.Order("id").Find(&snapshot.Logs).Error)
+	return snapshot
+}
+
+func (fixture *imageRouteReconcileFixture) observeJobTransitions(test *testing.T) *[]string {
+	test.Helper()
+	transitions := []string{}
+	err := fixture.database.Callback().Update().After("gorm:update").Register("observe_image_route_state", func(transaction *gorm.DB) {
+		if transaction.Error != nil || transaction.RowsAffected != 1 || transaction.Statement.Schema == nil || transaction.Statement.Schema.Table != "image_route_jobs" {
+			return
+		}
+		updates, ok := transaction.Statement.Dest.(map[string]interface{})
+		if !ok {
+			return
+		}
+		if state, ok := updates["state"].(string); ok {
+			transitions = append(transitions, state)
+		}
+	})
+	require.NoError(test, err)
+	return &transitions
+}
+
+func TestReconcileImageRouteJobRefundMustBeAppliedAndZero(test *testing.T) {
+	cases := []struct {
+		name          string
+		state         string
+		targetQuota   int
+		appliedQuota  int
+		usageQuota    int
+		childQuota    int
+		targetStatus  model.TaskStatus
+		removeReceipt bool
+	}{
+		{name: "refund_pending", state: model.TaskBillingReceiptTerminalPending, appliedQuota: 100, usageQuota: 100},
+		{name: "pending_even_when_all_amounts_are_zero", state: model.TaskBillingReceiptTerminalPending},
+		{name: "submission_pending", state: model.TaskBillingReceiptSubmissionPending},
+		{name: "tracking", state: model.TaskBillingReceiptTracking},
+		{name: "manual_review", state: model.TaskBillingReceiptReview},
+		{name: "missing_receipt", removeReceipt: true},
+		{name: "applied_nonzero_target", state: model.TaskBillingReceiptApplied, targetQuota: 1},
+		{name: "applied_nonzero_funding", state: model.TaskBillingReceiptApplied, appliedQuota: 1},
+		{name: "applied_nonzero_usage", state: model.TaskBillingReceiptApplied, usageQuota: 1},
+		{name: "applied_nonzero_child", state: model.TaskBillingReceiptApplied, childQuota: 1},
+		{name: "applied_wrong_terminal_target", state: model.TaskBillingReceiptApplied, targetStatus: model.TaskStatusSuccess},
+	}
+	for _, testCase := range cases {
+		test.Run(testCase.name, func(test *testing.T) {
+			fixture := newImageRouteReconcileFixture(test)
+			if testCase.targetStatus == "" {
+				testCase.targetStatus = model.TaskStatusFailure
+			}
+			fixture.receipt.State, fixture.receipt.TerminalTargetStatus = testCase.state, testCase.targetStatus
+			fixture.receipt.TargetQuota, fixture.receipt.AppliedQuota, fixture.receipt.UsageAppliedQuota = testCase.targetQuota, testCase.appliedQuota, testCase.usageQuota
+			require.NoError(test, fixture.database.Save(fixture.receipt).Error)
+			if testCase.removeReceipt {
+				require.NoError(test, fixture.database.Delete(fixture.receipt).Error)
+			}
+			require.NoError(test, fixture.database.Model(fixture.child).Update("quota", testCase.childQuota).Error)
+			before := fixture.accounting(test)
+			transitions := fixture.observeJobTransitions(test)
+			reconcileImageRouteJob(context.Background(), fixture.job)
+			reconcileImageRouteJob(context.Background(), fixture.loadJob(test))
+			assert.Equal(test, fixture.job, fixture.loadJob(test))
+			assert.Empty(test, *transitions)
+			assert.EqualValues(test, model.TaskStatusSubmitted, fixture.loadRoot(test).Status)
+			assert.Equal(test, before, fixture.accounting(test))
+			assert.FileExists(test, fixture.job.BodyPath)
+		})
+	}
+}
+
+func TestReconcileImageRouteJobNonRetryableFailureStopsAfterRefund(test *testing.T) {
+	for _, missingImageContext := range []bool{false, true} {
+		test.Run(fmt.Sprintf("missing_image_context_%t", missingImageContext), func(test *testing.T) {
+			fixture := newImageRouteReconcileFixture(test)
+			_, err := model.ApplyTaskBillingTerminal(fixture.child.ID)
+			require.NoError(test, err)
+			fixture.child.PrivateData.ImageTask.RetryableFailure = false
+			if missingImageContext {
+				fixture.child.PrivateData.ImageTask = nil
+			}
+			require.NoError(test, fixture.database.Model(fixture.child).Update("private_data", fixture.child.PrivateData).Error)
+			before := fixture.accounting(test)
+			transitions := fixture.observeJobTransitions(test)
+			reconcileImageRouteJob(context.Background(), fixture.job)
+			completed := fixture.loadJob(test)
+			assert.Equal(test, model.ImageRouteJobFailed, completed.State)
+			assert.Equal(test, fixture.child.FailReason, completed.LastError)
+			assert.Equal(test, fixture.child.TaskID, completed.CurrentTaskID)
+			assert.Equal(test, []string{model.ImageRouteJobFailed}, *transitions)
+			root := fixture.loadRoot(test)
+			assert.EqualValues(test, model.TaskStatusFailure, root.Status)
+			assert.Zero(test, root.Quota)
+			reconcileImageRouteJob(context.Background(), fixture.job)
+			reconcileImageRouteJob(context.Background(), completed)
+			assert.Equal(test, completed, fixture.loadJob(test))
+			assert.Equal(test, before, fixture.accounting(test))
+		})
+	}
+}
+
+func TestReconcileImageRouteJobRefundThenResumeOnlyOnce(test *testing.T) {
+	fixture := newImageRouteReconcileFixture(test)
+	beforeRefund := fixture.accounting(test)
+	transitions := fixture.observeJobTransitions(test)
+	reconcileImageRouteJob(context.Background(), fixture.job)
+	assert.Empty(test, *transitions)
+	assert.Equal(test, fixture.job, fixture.loadJob(test))
+	assert.Equal(test, beforeRefund, fixture.accounting(test))
+	refunded, err := model.ApplyTaskBillingTerminal(fixture.child.ID)
+	require.NoError(test, err)
+	require.Equal(test, model.TaskBillingReceiptApplied, refunded.State)
+	require.Zero(test, refunded.TargetQuota)
+	require.Zero(test, refunded.AppliedQuota)
+	require.Zero(test, refunded.UsageAppliedQuota)
+	afterRefund := fixture.accounting(test)
+	assert.Equal(test, 1000, afterRefund.User.Quota)
+	assert.Zero(test, afterRefund.User.UsedQuota)
+	assert.Equal(test, 1, afterRefund.User.RequestCount)
+	assert.Equal(test, 1000, afterRefund.Token.RemainQuota)
+	assert.Zero(test, afterRefund.Token.UsedQuota)
+	require.Len(test, afterRefund.Channels, 1)
+	assert.Zero(test, afterRefund.Channels[0].UsedQuota)
+	reconcileImageRouteJob(context.Background(), fixture.loadJob(test))
+	ready := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobReady, ready.State)
+	assert.Empty(test, ready.CurrentTaskID)
+	assert.Equal(test, []string{model.ImageRouteJobReady}, *transitions)
+	assert.Equal(test, afterRefund, fixture.accounting(test))
+	reconcileImageRouteJob(context.Background(), fixture.job)
+	reconcileImageRouteJob(context.Background(), ready)
+	assert.Equal(test, ready, fixture.loadJob(test))
+	executeImageRouteJob(context.Background(), ready)
+	completed := fixture.loadJob(test)
+	assert.Equal(test, []string{model.ImageRouteJobReady, model.ImageRouteJobDispatching, model.ImageRouteJobFailed}, *transitions)
+	assert.Equal(test, model.ImageRouteJobFailed, completed.State)
+	assert.Contains(test, completed.LastError, "账户已不可用")
+	assert.Empty(test, completed.CurrentTaskID)
+	assert.Equal(test, fixture.job.AttemptedChannelsJSON, completed.AttemptedChannelsJSON)
+	assert.Greater(test, completed.Version, fixture.job.Version)
+	assert.EqualValues(test, model.TaskStatusFailure, fixture.loadRoot(test).Status)
+	assert.Equal(test, afterRefund, fixture.accounting(test))
+	reconcileImageRouteJob(context.Background(), fixture.job)
+	reconcileImageRouteJob(context.Background(), completed)
+	_, err = model.ApplyTaskBillingTerminal(fixture.child.ID)
+	require.NoError(test, err)
+	assert.Equal(test, completed, fixture.loadJob(test))
+	assert.Len(test, *transitions, 3)
+	assert.Equal(test, afterRefund, fixture.accounting(test))
+	var taskCount int64
+	require.NoError(test, fixture.database.Model(&model.Task{}).Count(&taskCount).Error)
+	assert.EqualValues(test, 2, taskCount)
+}
+
+func TestReconcileImageRouteJobSuccessDeliveredUnderRootID(test *testing.T) {
+	fixture := newImageRouteReconcileFixture(test)
+	fixture.child.Status, fixture.child.FailReason = model.TaskStatusSuccess, ""
+	fixture.child.Quota = 100
+	fixture.child.Data = []byte(`{"created":123,"data":[{"url":"http://127.0.0.1:1/result.png"}]}`)
+	require.NoError(test, fixture.database.Save(fixture.child).Error)
+	fixture.receipt.TerminalTargetStatus = model.TaskStatusSuccess
+	fixture.receipt.TargetQuota = 100
+	require.NoError(test, fixture.database.Save(fixture.receipt).Error)
+	_, err := model.ApplyTaskBillingTerminal(fixture.child.ID)
+	require.NoError(test, err)
+	before := fixture.accounting(test)
+	transitions := fixture.observeJobTransitions(test)
+	reconcileImageRouteJob(context.Background(), fixture.job)
+	completed := fixture.loadJob(test)
+	assert.Equal(test, model.ImageRouteJobSucceeded, completed.State)
+	assert.Equal(test, fixture.child.TaskID, completed.CurrentTaskID)
+	assert.Equal(test, []string{model.ImageRouteJobSucceeded}, *transitions)
+	root := fixture.loadRoot(test)
+	assert.Equal(test, fixture.root.ID, root.ID)
+	assert.Equal(test, fixture.job.PublicTaskID, root.TaskID)
+	assert.EqualValues(test, model.TaskStatusSuccess, root.Status)
+	assert.Equal(test, "100%", root.Progress)
+	assert.Zero(test, root.Quota)
+	assert.JSONEq(test, string(fixture.child.Data), string(root.Data))
+	response, err := imageRouteJobResponse(completed)
+	require.NoError(test, err)
+	var delivered dto.ImageResponse
+	require.NoError(test, common.Unmarshal(response, &delivered))
+	assert.EqualValues(test, 123, delivered.Created)
+	require.Len(test, delivered.Data, 1)
+	assert.Equal(test, "http://127.0.0.1:1/result.png", delivered.Data[0].Url)
+	assert.Empty(test, delivered.Data[0].B64Json)
+	for _, testCase := range []struct {
+		name string
+		user int
+		code int
+	}{
+		{name: "owner", user: fixture.job.UserID, code: http.StatusOK},
+		{name: "another_user", user: fixture.job.UserID + 1, code: http.StatusNotFound},
+	} {
+		test.Run(testCase.name, func(test *testing.T) {
+			recorder := httptest.NewRecorder()
+			requestContext, _ := gin.CreateTestContext(recorder)
+			requestContext.Request = httptest.NewRequest(http.MethodGet, "/v1/images/generations/"+fixture.job.PublicTaskID, nil)
+			requestContext.Params = gin.Params{{Key: "task_id", Value: fixture.job.PublicTaskID}}
+			requestContext.Set("id", testCase.user)
+			GetImageTask(requestContext)
+			require.Equal(test, testCase.code, recorder.Code, recorder.Body.String())
+			if testCase.code == http.StatusOK {
+				var payload map[string]interface{}
+				require.NoError(test, common.Unmarshal(recorder.Body.Bytes(), &payload))
+				assert.Equal(test, fixture.job.PublicTaskID, payload["id"])
+				assert.Equal(test, fixture.job.PublicTaskID, payload["task_id"])
+				assert.Equal(test, "completed", payload["status"])
+				assert.NotEmpty(test, payload["data"])
+				assert.NotContains(test, recorder.Body.String(), fixture.child.TaskID)
+			} else {
+				assert.NotContains(test, recorder.Body.String(), "result.png")
+			}
+		})
+	}
+	reconcileImageRouteJob(context.Background(), fixture.job)
+	reconcileImageRouteJob(context.Background(), completed)
+	assert.Equal(test, completed, fixture.loadJob(test))
+	assert.Equal(test, root, fixture.loadRoot(test))
+	assert.Equal(test, before, fixture.accounting(test))
+	assert.Len(test, *transitions, 1)
+}
+
+func TestReconcileImageRouteJobUnknownAndUnfinishedNeverResume(test *testing.T) {
+	for _, status := range []model.TaskStatus{model.TaskStatusUnknown, model.TaskStatusSubmitted, model.TaskStatusInProgress, model.TaskStatusFinalizing} {
+		test.Run(string(status), func(test *testing.T) {
+			fixture := newImageRouteReconcileFixture(test)
+			_, err := model.ApplyTaskBillingTerminal(fixture.child.ID)
+			require.NoError(test, err)
+			require.NoError(test, fixture.database.Model(fixture.child).Update("status", status).Error)
+			before := fixture.accounting(test)
+			transitions := fixture.observeJobTransitions(test)
+			reconcileImageRouteJob(context.Background(), fixture.job)
+			reconcileImageRouteJob(context.Background(), fixture.loadJob(test))
+			assert.Empty(test, *transitions)
+			assert.Equal(test, fixture.job, fixture.loadJob(test))
+			assert.EqualValues(test, model.TaskStatusSubmitted, fixture.loadRoot(test).Status)
+			assert.Equal(test, before, fixture.accounting(test))
+			assert.FileExists(test, fixture.job.BodyPath)
+		})
+	}
+}
+
+func TestReconcileImageRouteJobMissingOrForeignChildNeverResume(test *testing.T) {
+	for _, missing := range []bool{false, true} {
+		test.Run(fmt.Sprintf("missing_%t", missing), func(test *testing.T) {
+			fixture := newImageRouteReconcileFixture(test)
+			if missing {
+				require.NoError(test, fixture.database.Delete(fixture.child).Error)
+			} else {
+				require.NoError(test, fixture.database.Model(fixture.child).Update("user_id", fixture.job.UserID+1).Error)
+			}
+			before := fixture.accounting(test)
+			reconcileImageRouteJob(context.Background(), fixture.job)
+			assert.Equal(test, fixture.job, fixture.loadJob(test))
+			assert.EqualValues(test, model.TaskStatusSubmitted, fixture.loadRoot(test).Status)
+			assert.Equal(test, before, fixture.accounting(test))
+		})
+	}
+}
+
+type imageRouteLocalOnlyTransport struct {
+	baseURL   string
+	transport http.RoundTripper
+	blocked   atomic.Int64
+}
+
+func (transport *imageRouteLocalOnlyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Scheme+"://"+request.URL.Host != transport.baseURL {
+		transport.blocked.Add(1)
+		return nil, fmt.Errorf("image route test refuses non-fixture URL: %s", request.URL.Redacted())
+	}
+	return transport.transport.RoundTrip(request)
+}
+
+func newImageRouteLocalUpstreamFixture(test *testing.T, handler func(*imageRouteReconcileFixture) http.Handler) (*imageRouteReconcileFixture, *httptest.Server, *imageRouteLocalOnlyTransport) {
+	test.Helper()
+	previousDB := model.DB
+	initModelListColumnNames(test)
+	model.DB = previousDB
+	fixture := newImageRouteJobFixture(test)
+	database := fixture.database
+	require.NoError(test, database.AutoMigrate(
+		&model.Ability{}, &model.SmartRouteBlock{}, &model.TaskDeliverySnapshot{}, &model.TaskMediaInput{},
+		&model.ModelCapabilityCatalogHead{}, &model.ModelCapabilityBundleRecord{},
+		&model.UserSubscription{}, &model.SubscriptionPlan{},
+	))
+	previousRatios := ratio_setting.GroupRatio2JSONString()
+	previousOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	previousUsableGroups := rootsetting.UserUsableGroups2JSONString()
+	previousGroupPrices := billing_setting.GetGroupModelPricingJSONString()
+	previousParameterPrices := billing_setting.GetParameterPricingJSONString()
+	previousCountToken, previousErrorLog := constant.CountToken, constant.ErrorLogEnabled
+	constant.CountToken, constant.ErrorLogEnabled = false, false
+	test.Cleanup(func() {
+		constant.CountToken, constant.ErrorLogEnabled = previousCountToken, previousErrorLog
+		require.NoError(test, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+		require.NoError(test, ratio_setting.UpdateGroupGroupRatioByJSONString(previousOverrides))
+		require.NoError(test, ratio_setting.UpdateModelPriceByJSONString(previousPrices))
+		require.NoError(test, rootsetting.UpdateUserUsableGroupsByJSONString(previousUsableGroups))
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(previousGroupPrices)
+		require.NoError(test, err)
+		_, _, err = billing_setting.UpdateParameterPricingFromJSONString(previousParameterPrices)
+		require.NoError(test, err)
+	})
+	require.NoError(test, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"cheap":0.02,"plus":0.04}`))
+	require.NoError(test, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+	require.NoError(test, ratio_setting.UpdateModelPriceByJSONString(`{"gpt-image-2":0.01}`))
+	require.NoError(test, rootsetting.UpdateUserUsableGroupsByJSONString(`{"default":"default","cheap":"cheap","plus":"plus"}`))
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{"schema_version":1,"groups":{}}`)
+	require.NoError(test, err)
+	_, _, err = billing_setting.UpdateParameterPricingFromJSONString(`{"schema_version":1,"rules":[]}`)
+	require.NoError(test, err)
+	setting := smartRelayTestSetting()
+	setting.Discovery.AllowedTextEndpoints = []constant.EndpointType{constant.EndpointTypeImageGeneration}
+	setting.TextContracts = []smartroutersetting.TextContractSetting{{Endpoint: constant.EndpointTypeImageGeneration,
+		Capabilities: service.SmartCapabilityImageGeneration, MaxContext: 128_000, ModelAllow: []string{"gpt-image-2"}}}
+	setting.CertifiedGroups = map[string]smartroutersetting.CertifiedGroupSetting{
+		"cheap": {Pools: []string{smartrouter.AutomaticPoolID}, AdminOrder: 1},
+		"plus":  {Pools: []string{smartrouter.AutomaticPoolID}, AdminOrder: 2},
+	}
+	setting.ChannelProfiles = map[string]smartroutersetting.ChannelProfileSetting{}
+	setting.BackgroundProbeEnabled = false
+	setting = smartroutersetting.Normalize(setting)
+	policyJSON, err := common.Marshal(setting.DefaultPolicy)
+	require.NoError(test, err)
+	require.NoError(test, database.Model(&model.User{}).Where("id = ?", fixture.job.UserID).
+		Updates(map[string]interface{}{"status": common.UserStatusEnabled, "quota": 1000, "used_quota": 0, "request_count": 0}).Error)
+	require.NoError(test, database.Model(&model.Token{}).Where("id = ?", fixture.job.TokenID).
+		Updates(map[string]interface{}{"remain_quota": 1000, "used_quota": 0, "routing_policy": string(policyJSON)}).Error)
+	require.NoError(test, database.Model(fixture.job).
+		Updates(map[string]interface{}{"policy_json": string(policyJSON), "frozen_groups_json": `["cheap","plus"]`}).Error)
+	fixture.job = fixture.loadJob(test)
+	provider := httptest.NewServer(handler(fixture))
+	test.Cleanup(provider.Close)
+	if service.GetHttpClient() == nil {
+		service.InitHttpClient()
+	}
+	client := service.GetHttpClient()
+	previousClient := *client
+	localTransport := &http.Transport{Proxy: nil}
+	guard := &imageRouteLocalOnlyTransport{baseURL: provider.URL, transport: localTransport}
+	*client = http.Client{Transport: guard, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	test.Cleanup(func() {
+		*client = previousClient
+		localTransport.CloseIdleConnections()
+	})
+	for index, group := range []string{"cheap", "plus"} {
+		channel := model.Channel{Id: 703 + index, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled,
+			Name: "local-" + group, Models: "gpt-image-2", Group: group, BaseURL: &provider.URL, AutoBan: common.GetPointer(0)}
+		channel.Key = []string{"local-channel-a", "local-channel-b"}[index]
+		channel.SetOtherSettings(dto.ChannelOtherSettings{ImageAdapter: &dto.ImageAdapterConfig{Protocol: "generation_references", Async: true}})
+		require.NoError(test, database.Save(&channel).Error)
+		require.NoError(test, database.Create(&model.Ability{Group: group, Model: "gpt-image-2", ChannelId: channel.Id,
+			Enabled: true, Priority: common.GetPointer(int64(10)), Weight: 100}).Error)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	require.NoError(test, err)
+	previousState := engine.State
+	state, err := service.NewMemorySmartRouteStateStore(service.DefaultSmartRouteStateConfig())
+	require.NoError(test, err)
+	engine.State = state
+	test.Cleanup(func() {
+		engine.State = previousState
+		engine.Catalogs.Invalidate()
+		engine.Prices.InvalidateAll()
+	})
+	require.NoError(test, smartroutersetting.ReplaceSmartRouterSetting(setting))
+	catalog, err := engine.Catalogs.Refresh(context.Background())
+	require.NoError(test, err)
+	contractID, _, err := service.BuildSmartContractIdentity("gpt-image-2", service.SmartEndpointImages)
+	require.NoError(test, err)
+	contract, found := catalog.Contracts[contractID]
+	require.True(test, found)
+	require.Len(test, contract.Pools[smartrouter.AutomaticPoolID].Candidates, 2)
+	_, err = engine.Prices.Refresh(context.Background(), "default")
+	require.NoError(test, err)
+	return fixture, provider, guard
+}
+
+func TestReconcileImageRouteJobExecuteAsyncFailureRefundThenFallbackSuccess(test *testing.T) {
+	var postsA, postsB, pollsA, pollsB atomic.Int64
+	var providerURL string
+	fixture, provider, guard := newImageRouteLocalUpstreamFixture(test, func(fixture *imageRouteReconcileFixture) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			switch request.Method + " " + request.URL.Path {
+			case "POST /v1/images/generations":
+				var payload map[string]interface{}
+				if !assert.NoError(test, common.DecodeJson(request.Body, &payload)) {
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				assert.Equal(test, "gpt-image-2", payload["model"])
+				assert.Equal(test, "local fixture", payload["prompt"])
+				assert.Equal(test, "url", payload["response_format"])
+				assert.Equal(test, false, payload["stream"])
+				switch request.Header.Get("Authorization") {
+				case "Bearer local-channel-a":
+					postsA.Add(1)
+					writer.WriteHeader(http.StatusAccepted)
+					_, _ = writer.Write([]byte(`{"task_id":"provider-a","status":"pending","data":[]}`))
+				case "Bearer local-channel-b":
+					postsB.Add(1)
+					var failedReceipt model.TaskBillingReceipt
+					assert.NoError(test, fixture.database.Where("channel_id = ?", 703).First(&failedReceipt).Error)
+					assert.Equal(test, model.TaskBillingReceiptApplied, failedReceipt.State)
+					assert.Zero(test, failedReceipt.AppliedQuota)
+					assert.Zero(test, failedReceipt.UsageAppliedQuota)
+					assert.Zero(test, failedReceipt.TargetQuota)
+					writer.WriteHeader(http.StatusAccepted)
+					_, _ = writer.Write([]byte(`{"task_id":"provider-b","status":"pending","data":[]}`))
+				default:
+					test.Errorf("unexpected local upstream credential")
+					writer.WriteHeader(http.StatusUnauthorized)
+				}
+			case "GET /v1/images/generations/provider-a":
+				pollsA.Add(1)
+				_, _ = writer.Write([]byte(`{"task_id":"provider-a","status":"failed","message":"local provider A failed"}`))
+			case "GET /v1/images/generations/provider-b":
+				pollsB.Add(1)
+				_, _ = fmt.Fprintf(writer, `{"task_id":"provider-b","status":"completed","created":123,"data":[{"url":%q}]}`, providerURL+"/result.png")
+			default:
+				test.Errorf("unexpected local upstream request %s %s", request.Method, request.URL.Path)
+				writer.WriteHeader(http.StatusNotFound)
+			}
+		})
+	})
+	providerURL = provider.URL
+	transitions := fixture.observeJobTransitions(test)
+	executeImageRouteJob(context.Background(), fixture.job)
+	waitingA := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobWaiting, waitingA.State, waitingA.LastError)
+	require.EqualValues(test, 1, postsA.Load())
+	require.Zero(test, postsB.Load())
+	childA, found, err := model.GetByTaskId(fixture.job.UserID, waitingA.CurrentTaskID)
+	require.NoError(test, err)
+	require.True(test, found)
+	require.Equal(test, "provider-a", childA.PrivateData.UpstreamTaskID)
+	receiptA, err := model.GetTaskBillingReceipt(childA.ID)
+	require.NoError(test, err)
+	require.Equal(test, model.TaskBillingReceiptTracking, receiptA.State)
+	require.Equal(test, 100, receiptA.AppliedQuota)
+	assert.Equal(test, 900, fixture.accounting(test).User.Quota)
+	reconcileImageRouteJob(context.Background(), waitingA)
+	assert.Equal(test, waitingA, fixture.loadJob(test))
+	require.NoError(test, service.PollImageTask(context.Background(), childA))
+	receiptA, err = model.GetTaskBillingReceipt(childA.ID)
+	require.NoError(test, err)
+	require.EqualValues(test, model.TaskStatusFailure, childA.Status)
+	require.True(test, childA.PrivateData.ImageTask.RetryableFailure)
+	require.Equal(test, model.TaskBillingReceiptApplied, receiptA.State)
+	require.Zero(test, receiptA.AppliedQuota)
+	require.Zero(test, receiptA.UsageAppliedQuota)
+	require.Zero(test, receiptA.TargetQuota)
+	afterRefund := fixture.accounting(test)
+	require.Equal(test, 1000, afterRefund.User.Quota)
+	require.Equal(test, 1000, afterRefund.Token.RemainQuota)
+	require.Len(test, afterRefund.Reservations, 1)
+	assert.Equal(test, model.QuotaReservationStatusSettled, afterRefund.Reservations[0].Status)
+	assert.Zero(test, afterRefund.Reservations[0].FinalQuota)
+	var refundLogs []model.Log
+	require.NoError(test, fixture.database.Where("type = ?", model.LogTypeRefund).Find(&refundLogs).Error)
+	require.Len(test, refundLogs, 1)
+	assert.Equal(test, 100, refundLogs[0].Quota)
+	assert.Equal(test, childA.ChannelId, refundLogs[0].ChannelId)
+	assert.Contains(test, refundLogs[0].Other, childA.TaskID)
+	reconcileImageRouteJob(context.Background(), waitingA)
+	readyB := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobReady, readyB.State)
+	require.Equal(test, "[703]", readyB.AttemptedChannelsJSON)
+	executeImageRouteJob(context.Background(), readyB)
+	waitingB := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobWaiting, waitingB.State, waitingB.LastError)
+	require.NotEqual(test, waitingA.CurrentTaskID, waitingB.CurrentTaskID)
+	require.EqualValues(test, 1, postsA.Load())
+	require.EqualValues(test, 1, postsB.Load())
+	childB, found, err := model.GetByTaskId(fixture.job.UserID, waitingB.CurrentTaskID)
+	require.NoError(test, err)
+	require.True(test, found)
+	require.Equal(test, "provider-b", childB.PrivateData.UpstreamTaskID)
+	require.Equal(test, 704, childB.ChannelId)
+	require.NoError(test, service.PollImageTask(context.Background(), childB))
+	require.EqualValues(test, model.TaskStatusSuccess, childB.Status)
+	reconcileImageRouteJob(context.Background(), waitingB)
+	completed := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobSucceeded, completed.State, completed.LastError)
+	root := fixture.loadRoot(test)
+	assert.Equal(test, fixture.job.PublicTaskID, root.TaskID)
+	assert.EqualValues(test, model.TaskStatusSuccess, root.Status)
+	assert.Zero(test, root.Quota)
+	assert.Contains(test, string(root.Data), provider.URL+"/result.png")
+	afterSuccess := fixture.accounting(test)
+	require.Len(test, afterSuccess.Receipts, 2)
+	assert.Equal(test, model.TaskBillingReceiptApplied, afterSuccess.Receipts[1].State)
+	assert.Equal(test, 200, afterSuccess.Receipts[1].AppliedQuota)
+	assert.Equal(test, 800, afterSuccess.User.Quota)
+	assert.Equal(test, 200, afterSuccess.User.UsedQuota)
+	assert.Equal(test, 2, afterSuccess.User.RequestCount)
+	assert.Equal(test, 800, afterSuccess.Token.RemainQuota)
+	assert.Equal(test, 200, afterSuccess.Token.UsedQuota)
+	require.Len(test, afterSuccess.Reservations, 2)
+	assert.NotEqual(test, afterSuccess.Reservations[0].RequestId, afterSuccess.Reservations[1].RequestId)
+	assert.Equal(test, 200, afterSuccess.Reservations[1].FinalQuota)
+	assert.Zero(test, afterSuccess.Channels[0].UsedQuota)
+	assert.EqualValues(test, 200, afterSuccess.Channels[1].UsedQuota)
+	assert.Equal(test, "[703,704]", completed.AttemptedChannelsJSON)
+	assert.Equal(test, []string{model.ImageRouteJobDispatching, model.ImageRouteJobWaiting, model.ImageRouteJobReady,
+		model.ImageRouteJobDispatching, model.ImageRouteJobWaiting, model.ImageRouteJobSucceeded}, *transitions)
+	transitionCount := len(*transitions)
+	for _, stale := range []*model.ImageRouteJob{fixture.job, waitingA, readyB, waitingB, completed} {
+		reconcileImageRouteJob(context.Background(), stale)
+		executeImageRouteJob(context.Background(), stale)
+	}
+	require.NoError(test, service.PollImageTask(context.Background(), childA))
+	require.NoError(test, service.PollImageTask(context.Background(), childB))
+	assert.Equal(test, completed, fixture.loadJob(test))
+	assert.Equal(test, afterSuccess, fixture.accounting(test))
+	assert.Len(test, *transitions, transitionCount)
+	assert.EqualValues(test, 1, postsA.Load())
+	assert.EqualValues(test, 1, postsB.Load())
+	assert.EqualValues(test, 1, pollsA.Load())
+	assert.EqualValues(test, 1, pollsB.Load())
+	assert.Zero(test, guard.blocked.Load())
+	response, err := imageRouteJobResponse(completed)
+	require.NoError(test, err)
+	assert.Contains(test, string(response), provider.URL+"/result.png")
+	assert.NotContains(test, string(response), "provider-b")
+}
+
+func TestReconcileImageRouteJobSyncDeliverySurvivesPostResponseLookupFailure(test *testing.T) {
+	const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=="
+	wireResponse := fmt.Sprintf(`{"created":123,"data":[{"b64_json":%q}]}`, pngBase64)
+	var posts, lookupFailures atomic.Int64
+	fixture, _, guard := newImageRouteLocalUpstreamFixture(test, func(fixture *imageRouteReconcileFixture) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			assert.Equal(test, http.MethodPost, request.Method)
+			assert.Equal(test, "/v1/images/generations", request.URL.Path)
+			assert.Equal(test, "Bearer local-channel-a", request.Header.Get("Authorization"))
+			var beforeSend model.ImageRouteJob
+			if assert.NoError(test, fixture.database.First(&beforeSend, fixture.job.ID).Error) {
+				assert.Equal(test, model.ImageRouteJobDispatching, beforeSend.State)
+				assert.NotEmpty(test, beforeSend.ResultReservation)
+				assert.Equal(test, ".json", filepath.Ext(beforeSend.ResultPath))
+				assert.NoFileExists(test, beforeSend.ResultPath)
+			}
+			posts.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(wireResponse))
+		})
+	})
+	var channels []model.Channel
+	require.NoError(test, fixture.database.Order("id").Find(&channels).Error)
+	for index := range channels {
+		channels[index].SetOtherSettings(dto.ChannelOtherSettings{ImageAdapter: &dto.ImageAdapterConfig{Protocol: "generation_references"}})
+		require.NoError(test, fixture.database.Save(&channels[index]).Error)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	require.NoError(test, err)
+	engine.Catalogs.Invalidate()
+	engine.Prices.InvalidateAll()
+	_, err = engine.Catalogs.Refresh(context.Background())
+	require.NoError(test, err)
+	injected := errors.New("local test: job lookup unavailable after synchronized delivery")
+	require.NoError(test, fixture.database.Callback().Query().After("gorm:query").Register("fail_image_route_lookup_after_delivery", func(transaction *gorm.DB) {
+		job, ok := transaction.Statement.Dest.(*model.ImageRouteJob)
+		if !ok || transaction.Error != nil || job.ID != fixture.job.ID || posts.Load() != 1 || lookupFailures.Load() != 0 {
+			return
+		}
+		if _, err := os.Stat(job.ResultPath); err == nil && lookupFailures.CompareAndSwap(0, 1) {
+			transaction.AddError(injected)
+		}
+	}))
+	test.Cleanup(func() {
+		require.NoError(test, fixture.database.Callback().Query().Remove("fail_image_route_lookup_after_delivery"))
+	})
+	transitions := fixture.observeJobTransitions(test)
+	executeImageRouteJob(context.Background(), fixture.job)
+	require.EqualValues(test, 1, posts.Load())
+	require.EqualValues(test, 1, lookupFailures.Load())
+	pending := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobDispatching, pending.State)
+	require.Empty(test, pending.CurrentTaskID)
+	require.Equal(test, ".json", filepath.Ext(pending.ResultPath))
+	require.FileExists(test, pending.ResultPath)
+	assert.NoFileExists(test, pending.ResultPath[:len(pending.ResultPath)-len(".json")])
+	raw, err := os.ReadFile(pending.ResultPath)
+	require.NoError(test, err)
+	assert.JSONEq(test, wireResponse, string(raw))
+	assert.EqualValues(test, model.TaskStatusSubmitted, fixture.loadRoot(test).Status)
+	var reservation model.MediaStorageReservation
+	require.NoError(test, fixture.database.Where("token = ?", pending.ResultReservation).First(&reservation).Error)
+	assert.GreaterOrEqual(test, reservation.Bytes, int64(len(raw)))
+	afterPost := fixture.accounting(test)
+	assert.Equal(test, 900, afterPost.User.Quota)
+	assert.Equal(test, 900, afterPost.Token.RemainQuota)
+	reconcileImageRouteDeliveries(context.Background())
+	completed := fixture.loadJob(test)
+	require.Equal(test, model.ImageRouteJobSucceeded, completed.State)
+	assert.Equal(test, pending.ResultPath, completed.ResultPath)
+	root := fixture.loadRoot(test)
+	assert.Equal(test, fixture.job.PublicTaskID, root.TaskID)
+	assert.EqualValues(test, model.TaskStatusSuccess, root.Status)
+	assert.Zero(test, root.Quota)
+	assert.NotContains(test, string(root.Data), pngBase64)
+	delivered, err := imageRouteJobResponse(completed)
+	require.NoError(test, err)
+	assert.JSONEq(test, wireResponse, string(delivered))
+	for replay := 0; replay < 3; replay++ {
+		reconcileImageRouteDeliveries(context.Background())
+		reconcileImageRouteJob(context.Background(), pending)
+		executeImageRouteJob(context.Background(), fixture.job)
+		executeImageRouteJob(context.Background(), pending)
+	}
+	assert.Equal(test, completed, fixture.loadJob(test))
+	assert.Equal(test, afterPost, fixture.accounting(test))
+	assert.Equal(test, []string{model.ImageRouteJobDispatching, model.ImageRouteJobSucceeded}, *transitions)
+	assert.EqualValues(test, 1, posts.Load())
+	assert.EqualValues(test, 1, lookupFailures.Load())
+	assert.Zero(test, guard.blocked.Load())
+	assert.FileExists(test, completed.ResultPath)
+}

@@ -1,0 +1,31 @@
+package claude
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNativeClaudeRequestPreservesToolImageAndCacheBlocks(t *testing.T) {
+	input := `{"model":"claude-test","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_a","name":"read_file","input":{"path":"a"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":[{"type":"text","text":"view","cache_control":{"type":"ephemeral"}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]}]}]}`
+	var request dto.ClaudeRequest
+	require.NoError(t, json.Unmarshal([]byte(input), &request))
+	converted, err := (&Adaptor{}).ConvertClaudeRequest(nil, &relaycommon.RelayInfo{}, &request)
+	require.NoError(t, err)
+	require.Same(t, &request, converted)
+	serialized, err := json.Marshal(converted)
+	require.NoError(t, err)
+	var output map[string]any
+	require.NoError(t, json.Unmarshal(serialized, &output))
+	messages := output["messages"].([]any)
+	toolUse := messages[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	require.Equal(t, "call_a", toolUse["id"])
+	result := messages[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+	require.Equal(t, "call_a", result["tool_use_id"])
+	blocks := result["content"].([]any)
+	require.Equal(t, "ephemeral", blocks[0].(map[string]any)["cache_control"].(map[string]any)["type"])
+	require.Equal(t, "QUJD", blocks[1].(map[string]any)["source"].(map[string]any)["data"])
+}

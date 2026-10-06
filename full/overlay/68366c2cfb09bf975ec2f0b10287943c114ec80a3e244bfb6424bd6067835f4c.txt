@@ -1,0 +1,164 @@
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import type { TFunction } from 'i18next'
+
+import type { ApiKey } from '../types'
+import {
+  buildSmartRouterPolicyFromForm,
+  buildRememberedSmartRouterPolicy,
+  getApiKeyFormSchema,
+  getApiKeyFormDefaultValues,
+  transformApiKeyToFormDefaults,
+  transformFormDataToPayload,
+} from './api-key-form'
+
+describe('per-key smart routing memory', () => {
+  const schema = getApiKeyFormSchema(((key: string) => key) as TFunction)
+  const initial = getApiKeyFormDefaultValues({
+    useSmartRouting: true,
+    smartGroups: ['standard', 'premium'],
+  })
+  initial.smart_policy.selected_groups = ['premium']
+  initial.smart_policy.allow_future_groups = false
+  const policy = buildSmartRouterPolicyFromForm(initial, [
+    'standard',
+    'premium',
+  ])
+  const serialized = JSON.stringify(policy)
+
+  test('an incomplete smart draft never blocks saving a fixed group or erases saved memory', () => {
+    const fixed = {
+      ...initial,
+      name: 'fixed',
+      routing_mode: 'fixed' as const,
+      group: 'standard',
+      unlimited_quota: true,
+      smart_policy: {
+        ...initial.smart_policy,
+        selected_groups: [],
+        manual_group_order: [],
+        allow_future_groups: false,
+      },
+    }
+    assert.equal(schema.safeParse(fixed).success, true)
+    assert.equal(
+      schema.safeParse({ ...fixed, routing_mode: 'smart' }).success,
+      false
+    )
+    const memory = buildRememberedSmartRouterPolicy(
+      fixed,
+      ['standard', 'premium'],
+      schema
+    )
+    assert.equal(memory, undefined)
+    const payload = transformFormDataToPayload(fixed, '', memory)
+    assert.equal(Object.hasOwn(payload, 'routing_policy_memory'), false)
+    assert.equal(payload.routing_policy, '')
+  })
+
+  test('fixed save preserves memory separately from active policy', () => {
+    const fixed = {
+      ...initial,
+      routing_mode: 'fixed' as const,
+      group: 'standard',
+    }
+    const payload = transformFormDataToPayload(fixed, '', serialized)
+    assert.equal(payload.routing_policy, '')
+    assert.equal(payload.routing_policy_memory, serialized)
+    const reloaded = transformApiKeyToFormDefaults(
+      { ...payload, id: 1 } as ApiKey,
+      undefined,
+      ['standard', 'premium', 'new-group']
+    )
+    assert.equal(reloaded.routing_mode, 'fixed')
+    assert.deepEqual(reloaded.smart_policy.selected_groups, ['premium'])
+    assert.equal(reloaded.smart_policy.allow_future_groups, false)
+    reloaded.routing_mode = 'smart'
+    const restored = buildSmartRouterPolicyFromForm(reloaded, [
+      'standard',
+      'premium',
+      'new-group',
+    ])
+    assert.deepEqual(restored.manual_group_order, ['premium'])
+    assert.equal(restored.allow_future_groups, false)
+    assert.equal(
+      transformFormDataToPayload(reloaded, JSON.stringify(restored)).group,
+      'auto'
+    )
+  })
+
+  test('legacy auto stays fixed while remembered settings are available', () => {
+    const form = transformApiKeyToFormDefaults(
+      {
+        id: 2,
+        group: 'auto',
+        routing_policy: '',
+        routing_policy_memory: serialized,
+        cross_group_retry: true,
+      } as ApiKey,
+      undefined,
+      ['standard', 'premium']
+    )
+    assert.equal(form.routing_mode, 'fixed')
+    assert.deepEqual(form.smart_policy.selected_groups, ['premium'])
+    assert.equal(transformFormDataToPayload(form).routing_policy, '')
+    assert.equal(transformFormDataToPayload(form).cross_group_retry, true)
+  })
+
+  test('revoked group and an explicit empty subset never expand to all', () => {
+    const revoked = transformApiKeyToFormDefaults(
+      {
+        id: 3,
+        group: 'standard',
+        routing_policy: '',
+        routing_policy_memory: serialized,
+      } as ApiKey,
+      undefined,
+      ['standard', 'new-group']
+    )
+    assert.deepEqual(revoked.smart_policy.selected_groups, [])
+    const empty = transformApiKeyToFormDefaults(
+      {
+        id: 3,
+        group: 'standard',
+        routing_policy: '',
+        routing_policy_memory: JSON.stringify({
+          ...policy,
+          manual_group_order: [],
+          excluded_groups: [],
+        }),
+      } as ApiKey,
+      undefined,
+      ['standard', 'new-group']
+    )
+    assert.deepEqual(empty.smart_policy.selected_groups, [])
+  })
+
+  test('cancelled or failed edits do not mutate source rows or other keys', () => {
+    const row = {
+      id: 4,
+      group: 'standard',
+      routing_policy: '',
+      routing_policy_memory: serialized,
+    } as ApiKey
+    const first = transformApiKeyToFormDefaults(row, undefined, [
+      'standard',
+      'premium',
+    ])
+    first.smart_policy.selected_groups = ['standard']
+    first.smart_policy.allow_future_groups = true
+    assert.equal(row.routing_policy_memory, serialized)
+    const reopened = transformApiKeyToFormDefaults(row, undefined, [
+      'standard',
+      'premium',
+    ])
+    assert.deepEqual(reopened.smart_policy.selected_groups, ['premium'])
+    const other = transformApiKeyToFormDefaults(
+      { id: 5, group: 'standard', routing_policy: '' } as ApiKey,
+      undefined,
+      ['standard']
+    )
+    assert.deepEqual(other.smart_policy.selected_groups, ['standard'])
+  })
+})

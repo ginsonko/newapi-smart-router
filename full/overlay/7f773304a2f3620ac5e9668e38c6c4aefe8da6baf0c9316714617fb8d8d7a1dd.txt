@@ -1,0 +1,168 @@
+package controller
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestPerfMetricsPrivacy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousUsable, previousRatios := setting.UserUsableGroups2JSONString(), ratio_setting.GroupRatio2JSONString()
+	special := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	previousSpecial := special.ReadAll()
+	database, err := gorm.Open(sqlite.Open("file:perf-privacy?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, common.RedisEnabled = database, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.SetLogDatabaseType(previousLogType)
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousUsable))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+		special.Replace(previousSpecial)
+		connection, err := database.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.PerfMetric{}))
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"public":"Public","retired":"Retired"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"public":1,"friends":1,"private":1,"auto":1}`))
+	special.Replace(map[string]map[string]string{
+		"friends": {"+:friends": "Friends"},
+		"admin":   {"+:private": "Private", "+:friends": "Friends"},
+	})
+	for _, user := range []model.User{
+		{Id: 1, Username: "ordinary", AffCode: "perf-1", Group: "public", Role: common.RoleCommonUser, Status: common.UserStatusEnabled},
+		{Id: 2, Username: "friend", AffCode: "perf-2", Group: "friends", Role: common.RoleCommonUser, Status: common.UserStatusEnabled},
+		{Id: 3, Username: "owner", AffCode: "perf-3", Group: "admin", Role: common.RoleRootUser, Status: common.UserStatusEnabled},
+	} {
+		require.NoError(t, database.Create(&user).Error)
+	}
+	timestamp := time.Now().Add(-time.Hour).Unix()
+	for _, metric := range []model.PerfMetric{
+		{ModelName: "privacy-shared", Group: "public", BucketTs: timestamp, RequestCount: 2, SuccessCount: 2, TotalLatencyMs: 2000, TtftSumMs: 100, TtftCount: 2},
+		{ModelName: "privacy-shared", Group: "friends", BucketTs: timestamp, RequestCount: 1, SuccessCount: 1, TotalLatencyMs: 6000},
+		{ModelName: "privacy-shared", Group: "private", BucketTs: timestamp, RequestCount: 1, SuccessCount: 0, TotalLatencyMs: 9000},
+		{ModelName: "privacy-shared", Group: "retired", BucketTs: timestamp, RequestCount: 1, TotalLatencyMs: 99000},
+		{ModelName: "privacy-private-only", Group: "private", BucketTs: timestamp, RequestCount: 1, TotalLatencyMs: 88000},
+		{ModelName: "privacy-auto", Group: "auto", BucketTs: timestamp, RequestCount: 1, TotalLatencyMs: 77000},
+	} {
+		require.NoError(t, database.Create(&metric).Error)
+	}
+	perfmetrics.Record(perfmetrics.Sample{Model: "privacy-hot-only", Group: "private", LatencyMs: 12345, Success: true})
+	request := func(identity any, path string, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(response)
+		context.Request = httptest.NewRequest(http.MethodGet, path, nil)
+		context.Set("group", "admin")
+		context.Set("role", common.RoleRootUser)
+		if identity != nil {
+			context.Set("id", identity)
+		}
+		handler(context)
+		return response
+	}
+	for _, testCase := range []struct {
+		name     string
+		identity any
+		groups   []string
+	}{
+		{name: "anonymous", groups: []string{"public"}},
+		{name: "ordinary-stale-admin-context", identity: 1, groups: []string{"public"}},
+		{name: "friends", identity: 2, groups: []string{"friends", "public"}},
+		{name: "owner", identity: 3, groups: []string{"friends", "private", "public"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := request(testCase.identity, "/api/perf-metrics?model=privacy-shared", GetPerfMetrics)
+			require.Equal(t, http.StatusOK, response.Code)
+			assert.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+			assert.Contains(t, response.Header().Values("Vary"), "Cookie, Authorization, New-Api-User")
+			var payload struct {
+				Success bool                    `json:"success"`
+				Data    perfmetrics.QueryResult `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+			require.True(t, payload.Success)
+			groups := make([]string, 0, len(payload.Data.Groups))
+			for _, group := range payload.Data.Groups {
+				groups = append(groups, group.Group)
+				assert.NotEmpty(t, group.Series)
+			}
+			assert.Equal(t, testCase.groups, groups)
+			if testCase.identity != 3 {
+				assert.Equal(t, http.StatusForbidden, request(testCase.identity, "/api/perf-metrics?model=privacy-shared&group=private", GetPerfMetrics).Code)
+			}
+		})
+	}
+	for _, identity := range []any{nil, 1} {
+		response := request(identity, "/api/perf-metrics/summary?group=private", GetPerfMetricsSummary)
+		require.Equal(t, http.StatusOK, response.Code)
+		var payload struct {
+			Data perfmetrics.SummaryAllResult `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+		require.Len(t, payload.Data.Models, 1)
+		assert.Equal(t, "privacy-shared", payload.Data.Models[0].ModelName)
+		assert.EqualValues(t, 1000, payload.Data.Models[0].AvgLatencyMs)
+		assert.EqualValues(t, 100, payload.Data.Models[0].SuccessRate)
+		assert.Equal(t, []float64{100}, payload.Data.Models[0].RecentSuccessRates)
+		response = request(identity, "/api/perf-metrics?model=privacy-hot-only", GetPerfMetrics)
+		assert.NotContains(t, response.Body.String(), `"group":"private"`)
+	}
+	ownerSummary := request(3, "/api/perf-metrics/summary", GetPerfMetricsSummary)
+	assert.Contains(t, ownerSummary.Body.String(), "privacy-hot-only")
+	assert.Contains(t, ownerSummary.Body.String(), "privacy-private-only")
+	assert.NotContains(t, ownerSummary.Body.String(), "privacy-auto")
+	for _, group := range []string{"admin", "public"} {
+		require.NoError(t, database.Model(&model.User{}).Where("id = ?", 1).Update("group", group).Error)
+		response := request(1, "/api/perf-metrics?model=privacy-shared", GetPerfMetrics)
+		assert.Equal(t, group == "admin", containsPrivatePerfGroup(response.Body.Bytes()))
+	}
+	require.NoError(t, database.Model(&model.User{}).Where("id = ?", 1).Update("status", common.UserStatusDisabled).Error)
+	assert.Equal(t, http.StatusForbidden, request(1, "/api/perf-metrics/summary", GetPerfMetricsSummary).Code)
+	assert.Equal(t, http.StatusUnauthorized, request("3", "/api/perf-metrics/summary", GetPerfMetricsSummary).Code)
+	assert.Equal(t, http.StatusServiceUnavailable, request(9999, "/api/perf-metrics/summary", GetPerfMetricsSummary).Code)
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{}`))
+	response := request(nil, "/api/perf-metrics/summary", GetPerfMetricsSummary)
+	assert.JSONEq(t, `{"success":true,"data":{"models":[]}}`, response.Body.String())
+	response = request(nil, "/api/perf-metrics?model=privacy-shared", GetPerfMetrics)
+	var empty struct {
+		Data perfmetrics.QueryResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &empty))
+	assert.Empty(t, empty.Data.Groups)
+	assert.Equal(t, http.StatusForbidden, request(nil, "/api/perf-metrics?model=privacy-shared&group=missing", GetPerfMetrics).Code)
+}
+
+func containsPrivatePerfGroup(body []byte) bool {
+	var payload struct {
+		Data perfmetrics.QueryResult `json:"data"`
+	}
+	if err := common.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	for _, group := range payload.Data.Groups {
+		if group.Group == "private" {
+			return true
+		}
+	}
+	return false
+}

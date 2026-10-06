@@ -1,0 +1,524 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/relay"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+func relaySmartImage(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	baseInfo *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	policy smartrouter.Policy,
+) *types.NewAPIError {
+	if baseInfo == nil {
+		return types.NewError(errors.New("smart router image relay info is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	routeRequest, err := service.BuildSmartRouteRequest(
+		c, baseInfo.OriginModelName, smartMediaEstimatedContext(promptTokens, meta),
+	)
+	if err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	if routeRequest.ReplayClass != smartrouter.ReplaySafeImage {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("smart router image endpoint has invalid replay contract %s", routeRequest.ReplayClass),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if c.GetInt64(service.ImageRouteJobContextKey) == 0 {
+		return startSmartImageJob(c, baseInfo, policy, routeRequest)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	return relaySmartWithEngine(
+		c, relayFormat, baseInfo, promptTokens, meta, policy, routeRequest, engine, dispatchSmartImageRelay,
+	)
+}
+
+func dispatchSmartImageRelay(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+	result := relay.ImageHelper(c, info)
+	if result != nil && !service.IsSmartMediaRoutePreparationFailure(result) {
+		status := result.GetOriginalStatusCode()
+		if status >= 500 || status == http.StatusRequestTimeout || status == http.StatusConflict {
+			result = service.MarkSmartMediaSubmissionAmbiguous(result)
+		}
+	}
+	result = classifySmartSynchronousMediaResult(c, info, result, "image")
+	if result != nil && service.ClassifySmartMediaAttempt(result) == service.SmartMediaAttemptAcceptanceUnknown {
+		c.Set("image_attempt_uncertain", true)
+	}
+	return result
+}
+
+func relaySmartAudio(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	baseInfo *relaycommon.RelayInfo,
+	promptTokens int,
+	meta *types.TokenCountMeta,
+	policy smartrouter.Policy,
+) *types.NewAPIError {
+	if baseInfo == nil {
+		return types.NewError(errors.New("smart router audio relay info is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	routeRequest, err := service.BuildSmartRouteRequest(
+		c, baseInfo.OriginModelName, smartMediaEstimatedContext(promptTokens, meta),
+	)
+	if err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	if routeRequest.ReplayClass != smartrouter.ReplaySafeAudio {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("smart router audio endpoint has invalid replay contract %s", routeRequest.ReplayClass),
+			types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		return smartRouteControllerError(err)
+	}
+	return relaySmartWithEngine(
+		c, relayFormat, baseInfo, promptTokens, meta, policy, routeRequest, engine, dispatchSmartAudioRelay,
+	)
+}
+
+func dispatchSmartAudioRelay(c *gin.Context, _ types.RelayFormat, info *relaycommon.RelayInfo) *types.NewAPIError {
+	return classifySmartSynchronousMediaResult(c, info, relay.AudioHelper(c, info), "audio")
+}
+
+func smartMediaEstimatedContext(promptTokens int, meta *types.TokenCountMeta) int {
+	if promptTokens < 0 {
+		return 0
+	}
+	estimated := promptTokens
+	if meta == nil || meta.MaxTokens <= 0 {
+		return estimated
+	}
+	maxInt := int(^uint(0) >> 1)
+	if estimated > maxInt-meta.MaxTokens {
+		return maxInt
+	}
+	return estimated + meta.MaxTokens
+}
+
+func classifySmartSynchronousMediaResult(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	apiErr *types.NewAPIError,
+	kind string,
+) *types.NewAPIError {
+	disposition := service.ClassifySmartMediaAttempt(apiErr)
+	if disposition != service.SmartMediaAttemptAcceptanceUnknown {
+		if disposition == service.SmartMediaAttemptNotAccepted && service.IsSmartMediaRoutePreparationFailure(apiErr) {
+			return service.MarkSmartMediaRouteNotAccepted(apiErr)
+		}
+		return apiErr
+	}
+	if info != nil && info.Billing != nil {
+		info.Billing.Refund(c)
+	}
+	return service.MarkSmartMediaSubmissionAmbiguous(apiErr)
+}
+
+func relaySmartVideo(c *gin.Context, baseInfo *relaycommon.RelayInfo, policy smartrouter.Policy) *dto.TaskError {
+	if baseInfo == nil {
+		return service.TaskErrorWrapperLocal(errors.New("smart router video relay info is nil"), "invalid_request", http.StatusBadRequest)
+	}
+	routeRequest, err := service.BuildSmartRouteRequest(c, baseInfo.OriginModelName, 0)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if routeRequest.ReplayClass != smartrouter.ReplaySafeVideo {
+		return service.TaskErrorWrapperLocal(
+			fmt.Errorf("smart router video endpoint has invalid replay contract %s", routeRequest.ReplayClass),
+			"invalid_request", http.StatusBadRequest,
+		)
+	}
+	engine, err := service.GetDefaultSmartRouterEngine()
+	if err != nil {
+		return taskErrorFromSmartAPI(smartRouteControllerError(err), false)
+	}
+	session, err := engine.NewSession(c.Request.Context(), baseInfo.TokenId, baseInfo.UserGroup, routeRequest, policy)
+	if err != nil {
+		return taskErrorFromSmartAPI(smartRouteControllerError(err), false)
+	}
+	policy = session.ResolvedPolicy()
+
+	responseHeaders := c.Writer.Header().Clone()
+	requestHeaders := c.Request.Header.Clone()
+	publicTaskID := strings.TrimSpace(baseInfo.PublicTaskID)
+	if publicTaskID == "" {
+		publicTaskID = model.GenerateTaskID()
+	}
+	var billing *service.SmartRouteBillingSession
+	var lastRetryableTaskErr *dto.TaskError
+	var lastRetryableAPIErr *types.NewAPIError
+	completed := false
+	attemptNumber := 0
+	eligibleCandidateCount := 0
+	defer func() {
+		if !completed && billing != nil && billing.NeedsRefund() {
+			billing.Refund(c)
+		}
+	}()
+
+	for {
+		handle, planErr := session.Next(c.Request.Context())
+		if planErr != nil {
+			if lastRetryableTaskErr != nil && lastRetryableAPIErr != nil && c.Request.Context().Err() == nil {
+				finalErr := smartRouteExhaustedAPIErrorWithCandidates(
+					lastRetryableAPIErr,
+					attemptNumber,
+					eligibleCandidateCount,
+					service.ClassifySmartRouteOutcome(lastRetryableAPIErr, nil).ErrorSummary,
+					c.GetString(common.RequestIdKey),
+				)
+				recordChannelErrorLog(c, finalErr)
+				return taskErrorFromSmartAPI(finalErr, false)
+			}
+			return taskErrorFromSmartAPI(smartRouteControllerError(planErr), false)
+		}
+		attemptNumber++
+		if len(handle.Plan.Candidates) > eligibleCandidateCount {
+			eligibleCandidateCount = len(handle.Plan.Candidates)
+		}
+		channel, channelErr := loadCurrentSmartRouteChannel(handle.Route, baseInfo.OriginModelName)
+		if channelErr != nil {
+			engine.Catalogs.Invalidate()
+			engine.Prices.InvalidateAll()
+			outcome := service.ClassifySmartRouteOutcome(channelErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(channelErr), false)
+			if session.CanTryNextMedia(outcome, c.Writer.Written(), service.SmartMediaAttemptNotAccepted) {
+				lastRetryableAPIErr = channelErr
+				lastRetryableTaskErr = taskErrorFromSmartAPI(channelErr, false)
+				continue
+			}
+			recordChannelErrorLog(c, channelErr)
+			return taskErrorFromSmartAPI(channelErr, false)
+		}
+
+		routerSetting := smartroutersetting.Normalize(engine.Settings())
+		effectiveMaxRatioPPM := policy.MaxEffectiveRatioPPM
+		if effectiveMaxRatioPPM == 0 {
+			effectiveMaxRatioPPM = routerSetting.DefaultMaxEffectiveRatioPPM
+		}
+		if effectiveMaxRatioPPM > routerSetting.AbsoluteMaxEffectiveRatioPPM {
+			effectiveMaxRatioPPM = routerSetting.AbsoluteMaxEffectiveRatioPPM
+		}
+		if handle.Plan.RatioPPM > effectiveMaxRatioPPM {
+			priceErr := types.NewErrorWithStatusCode(
+				fmt.Errorf("smart router group %s exceeds this key's current price limit", handle.Plan.Group),
+				types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+			)
+			outcome := service.SmartRouteOutcome{
+				Outcome: smartrouter.OutcomeUserRejected, FailureScope: service.SmartFailureUser,
+				RouteFailure: true, RetryNextRoute: true,
+			}
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(priceErr), false)
+			if session.CanTryNextMedia(outcome, c.Writer.Written(), service.SmartMediaAttemptNotAccepted) {
+				lastRetryableAPIErr = priceErr
+				lastRetryableTaskErr = taskErrorFromSmartAPI(priceErr, false)
+				continue
+			}
+			recordChannelErrorLog(c, priceErr)
+			return taskErrorFromSmartAPI(priceErr, false)
+		}
+
+		restoreHTTPHeader(c.Writer.Header(), responseHeaders)
+		c.Request.Header = requestHeaders.Clone()
+		resetSmartChannelContext(c)
+		common.SetContextKey(c, constant.ContextKeyAutoGroup, handle.Plan.Group)
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, handle.Plan.Group)
+		if setupErr := middleware.SetupContextForSelectedChannel(c, channel, baseInfo.OriginModelName); setupErr != nil {
+			outcome := service.ClassifySmartRouteOutcome(setupErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(setupErr), false)
+			if session.CanTryNextMedia(outcome, c.Writer.Written(), service.SmartMediaAttemptNotAccepted) {
+				lastRetryableAPIErr = setupErr
+				lastRetryableTaskErr = taskErrorFromSmartAPI(setupErr, false)
+				continue
+			}
+			recordChannelErrorLog(c, setupErr)
+			return taskErrorFromSmartAPI(setupErr, false)
+		}
+		addUsedChannel(c, channel.Id)
+		bodyStorage, bodyErr := common.GetBodyStorage(c)
+		if bodyErr != nil {
+			taskErr := service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusBadRequest)
+			apiErr := smartTaskAPIError(taskErr)
+			outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(apiErr), false)
+			recordChannelErrorLog(c, apiErr)
+			return taskErr
+		}
+		if _, seekErr := bodyStorage.Seek(0, io.SeekStart); seekErr != nil {
+			taskErr := service.TaskErrorWrapperLocal(seekErr, "read_request_body_failed", http.StatusBadRequest)
+			apiErr := smartTaskAPIError(taskErr)
+			outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(apiErr), false)
+			recordChannelErrorLog(c, apiErr)
+			return taskErr
+		}
+		c.Request.Body = io.NopCloser(bodyStorage)
+
+		attemptInfo, infoErr := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
+		if infoErr != nil {
+			taskErr := service.TaskErrorWrapperLocal(infoErr, "gen_relay_info_failed", http.StatusInternalServerError)
+			apiErr := smartTaskAPIError(taskErr)
+			outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(apiErr), false)
+			recordChannelErrorLog(c, apiErr)
+			return taskErr
+		}
+		attemptInfo.PublicTaskID = publicTaskID
+		preparation, taskErr := relay.PrepareTaskSubmit(c, attemptInfo)
+		if taskErr != nil {
+			apiErr := smartTaskAPIError(taskErr)
+			outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+			appendSmartRouteAudit(c, attemptNumber, handle, 0, outcome, statusCode(apiErr), false)
+			if session.CanTryNextMedia(outcome, c.Writer.Written(), service.SmartMediaAttemptNotAccepted) {
+				lastRetryableAPIErr = apiErr
+				lastRetryableTaskErr = taskErr
+				continue
+			}
+			recordChannelErrorLog(c, apiErr)
+			return taskErr
+		}
+		changed, validateErr := session.ReplanIfPriceQuoteChanged(
+			c.Request.Context(), handle, attemptInfo.PriceData.PricingRevision,
+		)
+		if validateErr != nil {
+			return taskErrorFromSmartAPI(smartRouteControllerError(validateErr), false)
+		}
+		if changed {
+			attemptNumber--
+			continue
+		}
+
+		quote := service.QuotaReservationRouteQuote{
+			RouteId: handle.Plan.RouteID, ChannelId: handle.Plan.ChannelID, Group: handle.Plan.Group,
+			CatalogVersion: handle.Plan.CatalogVersion, PriceVersion: handle.Plan.PriceVersion,
+			RatioPPM: handle.Plan.RatioPPM, QuotedQuota: preparation.QuotedQuota,
+		}
+		if billing == nil {
+			billing, taskErr = newSmartVideoBilling(c, attemptInfo, preparation.QuotedQuota, quote)
+			if taskErr != nil {
+				apiErr := smartTaskAPIError(taskErr)
+				outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+				session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+				appendSmartRouteAudit(c, attemptNumber, handle, preparation.QuotedQuota, outcome, statusCode(apiErr), false)
+				recordChannelErrorLog(c, apiErr)
+				return taskErr
+			}
+		} else {
+			billing.BindRelayInfo(attemptInfo)
+			if reserveErr := billing.ReserveAndRecordRouteQuote(preparation.QuotedQuota, quote); reserveErr != nil {
+				apiErr := service.SmartRouteBillingError(reserveErr)
+				outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+				session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+				appendSmartRouteAudit(c, attemptNumber, handle, preparation.QuotedQuota, outcome, statusCode(apiErr), false)
+				recordChannelErrorLog(c, apiErr)
+				return taskErrorFromSmartAPI(apiErr, false)
+			}
+		}
+		billing.BindRelayInfo(attemptInfo)
+
+		originalRequest := c.Request
+		attemptCtx, cancelAttempt := handle.AttemptContext(originalRequest.Context())
+		c.Request = originalRequest.WithContext(attemptCtx)
+		result, taskErr := relay.RelayTaskSubmitPrepared(c, attemptInfo, preparation)
+		attemptContextErr := attemptCtx.Err()
+		c.Request = originalRequest
+		cancelAttempt()
+
+		if taskErr == nil {
+			outcome := service.ClassifySmartRouteOutcome(nil, nil)
+			responseLatency := time.Since(handle.StartedAt())
+			session.RecordAttempt(c.Request.Context(), handle, outcome, 0, responseLatency, true)
+			appendSmartRouteAudit(c, attemptNumber, handle, preparation.QuotedQuota, outcome, 0, c.Writer.Written())
+			task, persistErr := persistSmartVideoTask(c, result, attemptInfo)
+			if persistErr != nil {
+				logger.LogError(c, "insert smart video task error: "+persistErr.Error())
+				billing.Refund(c)
+				completed = true
+				return nil
+			}
+			finalizePersistedTaskSubmission(c, attemptInfo, task)
+			completed = true
+			return nil
+		}
+
+		apiErr := smartTaskAPIError(taskErr)
+		if errors.Is(attemptContextErr, context.DeadlineExceeded) && originalRequest.Context().Err() == nil {
+			apiErr = service.MarkSmartMediaSubmissionAmbiguous(apiErr)
+		}
+		disposition := service.ClassifySmartMediaAttempt(apiErr)
+		if disposition == service.SmartMediaAttemptAcceptanceUnknown {
+			apiErr = service.MarkSmartMediaSubmissionAmbiguous(apiErr)
+			billing.Refund(c)
+			if refundErr := billing.LastError(); refundErr != nil {
+				logger.LogError(c, "failed to refund ambiguous video reservation: "+refundErr.Error())
+			}
+			taskErr.Code = "submission_acceptance_unknown"
+			taskErr.Data = gin.H{"task_id": publicTaskID, "status": "unknown"}
+			persistAmbiguousSmartVideoTask(c, preparation.Platform, attemptInfo, publicTaskID, taskErr.Message)
+			completed = true
+		}
+		outcome := service.ClassifySmartRouteOutcome(apiErr, originalRequest.Context().Err())
+		session.RecordAttempt(c.Request.Context(), handle, outcome, 0, 0, false)
+		appendSmartRouteAudit(c, attemptNumber, handle, preparation.QuotedQuota, outcome, statusCode(apiErr), c.Writer.Written())
+		if !taskErr.LocalError {
+			autoBanCredential := outcome.FailureScope == service.SmartFailureCredential && channel.GetAutoBan()
+			channelError := *types.NewChannelError(
+				channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
+				common.GetContextKeyString(c, constant.ContextKeyChannelKey), autoBanCredential,
+			)
+			processChannelOperationalError(c, channelError, apiErr)
+		}
+		if session.CanTryNextMedia(outcome, c.Writer.Written(), disposition) {
+			lastRetryableAPIErr = apiErr
+			lastRetryableTaskErr = taskErr
+			continue
+		}
+		recordChannelErrorLog(c, apiErr)
+		return taskErr
+	}
+}
+
+func newSmartVideoBilling(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	quota int,
+	quote service.QuotaReservationRouteQuote,
+) (*service.SmartRouteBillingSession, *dto.TaskError) {
+	billing, apiErr := service.NewSmartRouteBillingSessionWithQuote(c, info, quota, quote)
+	if apiErr != nil {
+		return nil, taskErrorFromSmartAPI(apiErr, false)
+	}
+	return billing, nil
+}
+
+func smartTaskAPIError(taskErr *dto.TaskError) *types.NewAPIError {
+	if taskErr == nil {
+		return nil
+	}
+	err := taskErr.Error
+	if err == nil {
+		err = errors.New(taskErr.Message)
+	}
+	code := types.ErrorCodeBadResponseStatusCode
+	if taskErr.LocalError {
+		code = types.ErrorCodeInvalidRequest
+	}
+	switch taskErr.Code {
+	case "do_request_failed":
+		code = types.ErrorCodeDoRequestFailed
+	case "model_mapping_failed":
+		code = types.ErrorCodeChannelModelMappedError
+	case "read_request_body_failed":
+		code = types.ErrorCodeReadRequestBodyFailed
+	case "build_request_failed":
+		code = types.ErrorCodeConvertRequestFailed
+	case "invalid_api_platform":
+		code = types.ErrorCodeInvalidApiType
+	}
+	apiErr := types.NewErrorWithStatusCode(err, code, taskErr.StatusCode)
+	if errors.Is(err, service.ErrSmartMediaSubmissionAmbiguous) {
+		apiErr = service.MarkSmartMediaSubmissionAmbiguous(apiErr)
+	}
+	if service.IsSmartMediaRoutePreparationFailure(apiErr) {
+		apiErr = service.MarkSmartMediaRouteNotAccepted(apiErr)
+	}
+	return apiErr
+}
+
+func taskErrorFromSmartAPI(apiErr *types.NewAPIError, local bool) *dto.TaskError {
+	if apiErr == nil {
+		return nil
+	}
+	taskErr := service.TaskErrorWrapper(apiErr, string(apiErr.GetErrorCode()), apiErr.StatusCode)
+	taskErr.LocalError = local
+	return taskErr
+}
+
+func persistSmartVideoTask(c *gin.Context, result *relay.TaskSubmitResult, info *relaycommon.RelayInfo) (*model.Task, error) {
+	if result == nil || info == nil {
+		return nil, errors.New("smart video task result is required")
+	}
+	task := buildCompletedSmartVideoTask(result, info)
+	if err := relaycommon.PersistTaskWithMediaReferences(c, task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func buildCompletedSmartVideoTask(result *relay.TaskSubmitResult, info *relaycommon.RelayInfo) *model.Task {
+	if result == nil || info == nil {
+		return nil
+	}
+	task := buildSmartVideoTask(result.Platform, info, result.Quota)
+	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+	task.Data = result.TaskData
+	return task
+}
+
+func persistAmbiguousSmartVideoTask(c *gin.Context, platform constant.TaskPlatform, info *relaycommon.RelayInfo, publicTaskID, reason string) {
+	if info == nil {
+		return
+	}
+	info.PublicTaskID = publicTaskID
+	task := buildSmartVideoTask(platform, info, info.PriceData.Quota)
+	task.Status = model.TaskStatusUnknown
+	task.FailReason = reason
+	task.SetData(map[string]any{"request_id": info.RequestId, "submission_status": "acceptance_unknown"})
+	if err := relaycommon.PersistTaskWithMediaReferences(c, task); err != nil {
+		common.SysError("insert ambiguous smart video task error: " + err.Error())
+	}
+}
+
+func buildSmartVideoTask(platform constant.TaskPlatform, info *relaycommon.RelayInfo, quota int) *model.Task {
+	task := model.InitTask(platform, taskInitParams(info))
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.BillingRequestID = info.RequestId
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	task.PrivateData.BillingContext = snapshotTaskBillingContext(info)
+	task.BillingReservationID = service.BillingReservationID(info.Billing)
+	task.Quota = quota
+	task.Action = info.Action
+	return task
+}

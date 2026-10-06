@@ -1,0 +1,52 @@
+package common
+
+import (
+	"encoding/base64"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/gabriel-vasile/mimetype"
+)
+
+// NormalizeNativeMediaArrays puts public native inputs through the same
+// ownership, type, quantity and generation validation as unified references.
+// It does not decode whole files or change prompt/order within a media type.
+func NormalizeNativeMediaArrays(req *TaskSubmitReq) error {
+	if len(req.VideoB64s) == 0 && len(req.AudioB64s) == 0 {
+		return nil
+	}
+	if len(req.References) > 0 || req.Image != "" || req.InputReference != "" {
+		return fmt.Errorf("请使用统一 references 或原生素材数组，不要混用两种素材来源")
+	}
+	refs := make([]MediaReference, 0, len(req.Images)+len(req.VideoB64s)+len(req.AudioB64s))
+	for _, group := range []struct {
+		kind   string
+		values []string
+	}{{"image", req.Images}, {"video", req.VideoB64s}, {"audio", req.AudioB64s}} {
+		for index, raw := range group.values {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				return fmt.Errorf("%s 素材 %d 为空", group.kind, index+1)
+			}
+			if !strings.HasPrefix(value, "data:") {
+				// Sniff a bounded decoded prefix. Full decoding and byte limits
+				// are enforced by the streaming provider adapter before dispatch.
+				prefix := make([]byte, 3072)
+				n, err := io.ReadFull(base64.NewDecoder(base64.StdEncoding, strings.NewReader(value)), prefix)
+				if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+					return fmt.Errorf("%s 素材 %d 不是有效 Base64", group.kind, index+1)
+				}
+				mimeType := mimetype.Detect(prefix[:n]).String()
+				if !strings.HasPrefix(mimeType, group.kind+"/") {
+					return fmt.Errorf("%s 素材 %d 的文件类型不匹配", group.kind, index+1)
+				}
+				value = "data:" + mimeType + ";base64," + value
+			}
+			refs = append(refs, MediaReference{Type: group.kind, Role: "reference", DataURL: value})
+		}
+	}
+	req.References = refs
+	req.Images, req.VideoB64s, req.AudioB64s = nil, nil, nil
+	return nil
+}

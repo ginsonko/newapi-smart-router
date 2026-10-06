@@ -1,0 +1,1828 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import type { TFunction } from 'i18next'
+import { RefreshCwIcon, ShieldCheckIcon } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { SectionPageLayout } from '@/components/layout'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { toIntlLocale } from '@/i18n/languages'
+
+import {
+  type TenantCostSlotProvisionInput,
+  getTenantCostAudit,
+  createTenantReportingToken,
+  getTenantCostCatalog,
+  getTenantCostBindings,
+  getTenantCostDownstreams,
+  getTenantCostEvents,
+  getTenantCostOverview,
+  getTenantCostOutbox,
+  getTenantCostProfiles,
+  getTenantCostProjectionRetries,
+  getTenantCostWorkerControl,
+  getTenantReportingTokens,
+  replayTenantCostOutbox,
+  revokeTenantReportingToken,
+  rotateTenantReportingToken,
+  provisionTenantCostSlot,
+  rotateTenantCostBindingKey,
+  setTenantCostBindingStatus,
+  setTenantCostDownstreamStatus,
+  setTenantCostWorkerControl,
+  upsertTenantCostDownstream,
+} from './api'
+
+type ProvisionForm = {
+  product_pool_id: string
+  product_family: string
+  service_tier: string
+  public_label: string
+  sort_order: number
+  profile_id: string
+  profile_revision: string
+  model_selector: string
+  min_ratio_ppm: number
+  max_ratio_ppm: number
+  provider_class: string
+  candidate_spec: string
+  capability_spec: string
+  profile_status: string
+  disabled_reason: string
+  token_id: string
+  model_catalog_revision: string
+  binding_status: string
+}
+
+type ProvisionRequestState = {
+  tenantId: string
+  fingerprint: string
+  requestId: string
+}
+
+type SecretOperation = {
+  tenantId: string
+  epoch: number
+  requestId: string
+}
+
+const ONE_TIME_SECRET_TTL_MS = 5 * 60 * 1000
+
+const emptyProvisionForm: ProvisionForm = {
+  product_pool_id: '',
+  product_family: '',
+  service_tier: '',
+  public_label: '',
+  sort_order: 0,
+  profile_id: '',
+  profile_revision: '',
+  model_selector: '',
+  min_ratio_ppm: 0,
+  max_ratio_ppm: 0,
+  provider_class: 'anonymous',
+  candidate_spec: '',
+  capability_spec: '',
+  profile_status: 'pending',
+  disabled_reason: '',
+  token_id: '',
+  model_catalog_revision: '',
+  binding_status: '',
+}
+
+function newRequestId(prefix: string) {
+  if (
+    typeof crypto !== 'undefined' &&
+    typeof crypto.randomUUID === 'function'
+  ) {
+    return crypto.randomUUID()
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function formatTime(value: number | undefined, formatter: Intl.DateTimeFormat) {
+  if (!value) return '—'
+  const millis = value > 10_000_000_000 ? value / 1_000_000 : value * 1000
+  return formatter.format(new Date(millis))
+}
+
+function statusLabel(status: string, t: TFunction): string {
+  switch (status) {
+    case 'enabled':
+      return t('tenantCost.status.enabled')
+    case 'pending':
+      return t('tenantCost.status.pending')
+    case 'disabled':
+      return t('tenantCost.status.disabled')
+    case 'revoked':
+      return t('tenantCost.status.revoked')
+    case 'ready':
+      return t('tenantCost.status.ready')
+    case 'sent':
+      return t('tenantCost.status.sent')
+    case 'failed':
+      return t('tenantCost.status.failed')
+    case 'final':
+      return t('tenantCost.status.final')
+    case 'review':
+      return t('tenantCost.status.review')
+    case 'settlement':
+      return t('tenantCost.status.settlement')
+    case 'charged_failure':
+      return t('tenantCost.status.chargedFailure')
+    case 'refund':
+      return t('tenantCost.status.refund')
+    case 'reversal':
+      return t('tenantCost.status.reversal')
+    case 'supplement':
+      return t('tenantCost.status.supplement')
+    case 'correction':
+      return t('tenantCost.status.correction')
+    case 'observed_zero':
+      return t('tenantCost.status.observedZero')
+    case 'exact':
+      return t('tenantCost.status.exact')
+    case 'observed':
+      return t('tenantCost.status.observed')
+    case 'estimated':
+      return t('tenantCost.status.estimated')
+    case 'fallback':
+      return t('tenantCost.status.fallback')
+    case 'unknown':
+      return t('tenantCost.status.unknown')
+    default:
+      return status
+  }
+}
+
+function familyLabel(family: string, t: TFunction): string {
+  const normalized = family.trim()
+  switch (normalized) {
+    case 'openai_gpt':
+    case 'gpt':
+      return t('tenantCost.family.openai')
+    case 'claude_kiro':
+      return t('tenantCost.family.claudeKiro')
+    case 'claude_third_party':
+      return t('tenantCost.family.claudeThirdParty')
+    case 'claude_ccmax':
+      return t('tenantCost.family.claudeCcmax')
+    case 'image_generation':
+    case 'image':
+      return t('tenantCost.family.image')
+    case 'video_generation':
+    case 'video':
+      return t('tenantCost.family.video')
+    case 'grok':
+      return t('tenantCost.family.grok')
+    case 'gemini':
+      return t('tenantCost.family.gemini')
+    case 'other_models':
+    case 'other':
+    case '':
+      return t('tenantCost.family.unclassified')
+    default:
+      return t('tenantCost.family.unclassifiedNamed', { value: normalized })
+  }
+}
+
+function tierLabel(label: string, t: TFunction): string {
+  switch (label.trim()) {
+    case '基础':
+      return t('tenantCost.tier.basic')
+    case '专业':
+      return t('tenantCost.tier.pro')
+    case '旗舰':
+      return t('tenantCost.tier.max')
+    default:
+      return label
+  }
+}
+
+function readableError(error: unknown, fallback: string) {
+  if (error && typeof error === 'object' && 'response' in error) {
+    const response = (error as { response?: { data?: { message?: string } } })
+      .response
+    if (response?.data?.message) return response.data.message
+  }
+  return error instanceof Error ? error.message : fallback
+}
+
+export function TenantCostAdminPage() {
+  const { t, i18n } = useTranslation()
+  const queryClient = useQueryClient()
+  const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null)
+  const oneTimeSecretTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  )
+  const secretOperationEpochRef = useRef(0)
+  const [selectedTenant, setSelectedTenant] = useState('')
+  const [rotationRequest, setRotationRequest] = useState<{
+    bindingId: number
+    requestId: string
+  } | null>(null)
+  const [provisionForm, setProvisionForm] =
+    useState<ProvisionForm>(emptyProvisionForm)
+  const [provisionRequest, setProvisionRequest] =
+    useState<ProvisionRequestState | null>(null)
+  const [newTenantId, setNewTenantId] = useState('')
+  const [newTenantName, setNewTenantName] = useState('')
+  const [newTenantConfigKey, setNewTenantConfigKey] = useState('')
+
+  const publishOneTimeSecret = (secret: string | null) => {
+    if (oneTimeSecretTimerRef.current) {
+      clearTimeout(oneTimeSecretTimerRef.current)
+      oneTimeSecretTimerRef.current = null
+    }
+    setOneTimeSecret(secret)
+    if (secret) {
+      oneTimeSecretTimerRef.current = setTimeout(() => {
+        oneTimeSecretTimerRef.current = null
+        setOneTimeSecret(null)
+      }, ONE_TIME_SECRET_TTL_MS)
+    }
+  }
+  const intlLocale = toIntlLocale(i18n.resolvedLanguage ?? i18n.language)
+  const numberFormat = useMemo(
+    () => new Intl.NumberFormat(intlLocale),
+    [intlLocale]
+  )
+  const dateTimeFormat = useMemo(
+    () =>
+      new Intl.DateTimeFormat(intlLocale, {
+        dateStyle: 'medium',
+        timeStyle: 'medium',
+        hour12: false,
+      }),
+    [intlLocale]
+  )
+  const downstreamsQuery = useQuery({
+    queryKey: ['tenant-cost-downstreams'],
+    queryFn: getTenantCostDownstreams,
+    staleTime: 30_000,
+  })
+  useEffect(() => {
+    if (selectedTenant || !downstreamsQuery.data?.length) return
+    const firstActive = downstreamsQuery.data.find(
+      (downstream) => downstream.status === 'active'
+    )
+    setSelectedTenant((firstActive ?? downstreamsQuery.data[0]).tenant_id)
+  }, [downstreamsQuery.data, selectedTenant])
+  const catalogQuery = useQuery({
+    queryKey: ['tenant-cost-catalog', selectedTenant],
+    queryFn: () => getTenantCostCatalog(selectedTenant),
+    staleTime: 10_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const profilesQuery = useQuery({
+    queryKey: ['tenant-cost-profiles', selectedTenant],
+    queryFn: () => getTenantCostProfiles(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const overviewQuery = useQuery({
+    queryKey: ['tenant-cost-overview', selectedTenant],
+    queryFn: () => getTenantCostOverview(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const eventsQuery = useQuery({
+    queryKey: ['tenant-cost-events', selectedTenant],
+    queryFn: () => getTenantCostEvents(selectedTenant),
+    enabled: Boolean(selectedTenant),
+  })
+  const outboxQuery = useQuery({
+    queryKey: ['tenant-cost-outbox', selectedTenant],
+    queryFn: () => getTenantCostOutbox(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const projectionRetryQuery = useQuery({
+    queryKey: ['tenant-cost-projection-retries', selectedTenant],
+    queryFn: () => getTenantCostProjectionRetries(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const auditQuery = useQuery({
+    queryKey: ['tenant-cost-audit', selectedTenant],
+    queryFn: () => getTenantCostAudit(selectedTenant),
+    enabled: Boolean(selectedTenant),
+  })
+  const bindingsQuery = useQuery({
+    queryKey: ['tenant-cost-bindings', selectedTenant],
+    queryFn: () => getTenantCostBindings(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const tokensQuery = useQuery({
+    queryKey: ['tenant-cost-reporting-tokens', selectedTenant],
+    queryFn: () => getTenantReportingTokens(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+  const workerQuery = useQuery({
+    queryKey: ['tenant-cost-worker', selectedTenant],
+    queryFn: () => getTenantCostWorkerControl(selectedTenant),
+    refetchInterval: 15_000,
+    enabled: Boolean(selectedTenant),
+  })
+
+  const invalidateAdmin = () => {
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-downstreams'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-catalog'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-profiles'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-overview'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-events'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-bindings'] }),
+      queryClient.invalidateQueries({
+        queryKey: ['tenant-cost-reporting-tokens'],
+      }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-worker'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-audit'] }),
+      queryClient.invalidateQueries({ queryKey: ['tenant-cost-outbox'] }),
+      queryClient.invalidateQueries({
+        queryKey: ['tenant-cost-projection-retries'],
+      }),
+    ])
+  }
+  const downstreamMutation = useMutation({
+    mutationFn: () =>
+      upsertTenantCostDownstream({
+        tenant_id: newTenantId.trim(),
+        display_name: newTenantName.trim(),
+        config_key: newTenantConfigKey.trim() || undefined,
+      }),
+    onSuccess: (downstream) => {
+      clearSecretAndMutationState()
+      setSelectedTenant(downstream.tenant_id)
+      setNewTenantId('')
+      setNewTenantName('')
+      setNewTenantConfigKey('')
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.downstreamSaved'))
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.downstreamSaveFailed'))
+      ),
+  })
+  const downstreamStatusMutation = useMutation({
+    mutationFn: ({ tenantId, status }: { tenantId: string; status: string }) =>
+      setTenantCostDownstreamStatus(tenantId, status),
+    onSuccess: () => {
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.downstreamStatusUpdated'))
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.downstreamStatusFailed'))
+      ),
+  })
+  const createTokenMutation = useMutation({
+    mutationFn: (operation: SecretOperation) =>
+      createTenantReportingToken(
+        undefined,
+        operation.tenantId,
+        operation.requestId
+      ),
+    onSuccess: (result, operation) => {
+      if (
+        operation.tenantId !== selectedTenant ||
+        operation.epoch !== secretOperationEpochRef.current
+      ) {
+        createTokenMutation.reset()
+        return
+      }
+      publishOneTimeSecret(result.secret || null)
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.tokenCreated'))
+      createTokenMutation.reset()
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.tokenCreateFailed'))
+      ),
+  })
+  const rotateTokenMutation = useMutation({
+    mutationFn: (operation: SecretOperation & { tokenId: string }) =>
+      rotateTenantReportingToken(
+        operation.tokenId,
+        undefined,
+        operation.tenantId,
+        operation.requestId
+      ),
+    onSuccess: (result, operation) => {
+      if (
+        operation.tenantId !== selectedTenant ||
+        operation.epoch !== secretOperationEpochRef.current
+      ) {
+        rotateTokenMutation.reset()
+        return
+      }
+      publishOneTimeSecret(result.secret || null)
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.tokenRotated'))
+      rotateTokenMutation.reset()
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.tokenRotateFailed'))
+      ),
+  })
+  const revokeTokenMutation = useMutation({
+    mutationFn: (tokenId: string) =>
+      revokeTenantReportingToken(tokenId, selectedTenant),
+    onSuccess: () => {
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.tokenRevoked'))
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.tokenRevokeFailed'))
+      ),
+  })
+  const bindingMutation = useMutation({
+    mutationFn: ({ id, status }: { id: number; status: string }) =>
+      setTenantCostBindingStatus(id, status, selectedTenant),
+    onSuccess: () => {
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.slotUpdated'))
+    },
+    onError: (error) =>
+      toast.error(readableError(error, t('tenantCost.toast.slotUpdateFailed'))),
+  })
+  const provisionMutation = useMutation({
+    mutationFn: (variables: {
+      tenantId: string
+      input: TenantCostSlotProvisionInput
+      epoch: number
+    }) => provisionTenantCostSlot(variables.tenantId, variables.input),
+    onSuccess: (result, variables) => {
+      if (
+        variables.tenantId !== selectedTenant ||
+        variables.epoch !== secretOperationEpochRef.current
+      ) {
+        provisionMutation.reset()
+        return
+      }
+      publishOneTimeSecret(result.secret || null)
+      setProvisionForm(emptyProvisionForm)
+      setProvisionRequest(null)
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.provisioned'))
+      provisionMutation.reset()
+    },
+    onError: (error) =>
+      toast.error(readableError(error, t('tenantCost.toast.provisionFailed'))),
+  })
+  const bindingRotationMutation = useMutation({
+    mutationFn: (variables: {
+      tenantId: string
+      bindingId: number
+      requestId: string
+      epoch: number
+    }) =>
+      rotateTenantCostBindingKey(
+        variables.tenantId,
+        variables.bindingId,
+        variables.requestId
+      ),
+    onSuccess: (result, variables) => {
+      if (
+        variables.tenantId !== selectedTenant ||
+        variables.epoch !== secretOperationEpochRef.current
+      ) {
+        bindingRotationMutation.reset()
+        return
+      }
+      publishOneTimeSecret(result.secret || null)
+      setRotationRequest(null)
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.bindingKeyRotated'))
+      bindingRotationMutation.reset()
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.bindingKeyRotationFailed'))
+      ),
+  })
+  const replayMutation = useMutation({
+    mutationFn: (eventIds: string[]) =>
+      replayTenantCostOutbox(eventIds, selectedTenant),
+    onSuccess: (result) => {
+      invalidateAdmin()
+      toast.success(
+        t('tenantCost.toast.outboxReplayed', { count: result.replayed })
+      )
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.outboxReplayFailed'))
+      ),
+  })
+  const workerMutation = useMutation({
+    mutationFn: (paused: boolean) =>
+      setTenantCostWorkerControl(paused, selectedTenant),
+    onSuccess: () => {
+      invalidateAdmin()
+      toast.success(t('tenantCost.toast.workerUpdated'))
+    },
+    onError: (error) =>
+      toast.error(
+        readableError(error, t('tenantCost.toast.workerUpdateFailed'))
+      ),
+  })
+
+  const clearSecretAndMutationState = () => {
+    secretOperationEpochRef.current += 1
+    publishOneTimeSecret(null)
+    setRotationRequest(null)
+    createTokenMutation.reset()
+    rotateTokenMutation.reset()
+    provisionMutation.reset()
+    bindingRotationMutation.reset()
+  }
+
+  const beginSecretOperation = () => {
+    clearSecretAndMutationState()
+    return secretOperationEpochRef.current
+  }
+
+  const mutationResetRef = useRef<(() => void) | null>(null)
+  mutationResetRef.current = () => {
+    createTokenMutation.reset()
+    rotateTokenMutation.reset()
+    provisionMutation.reset()
+    bindingRotationMutation.reset()
+  }
+
+  useEffect(() => {
+    return () => {
+      if (oneTimeSecretTimerRef.current) {
+        clearTimeout(oneTimeSecretTimerRef.current)
+        oneTimeSecretTimerRef.current = null
+      }
+      setOneTimeSecret(null)
+      mutationResetRef.current?.()
+    }
+  }, [])
+
+  const handleTenantChange = (tenantId: string) => {
+    if (tenantId === selectedTenant) return
+    clearSecretAndMutationState()
+    setProvisionRequest(null)
+    setSelectedTenant(tenantId)
+  }
+
+  const rotateBinding = (bindingId: number) => {
+    const request =
+      rotationRequest?.bindingId === bindingId
+        ? rotationRequest
+        : { bindingId, requestId: newRequestId('tenant-key-rotation') }
+    const epoch = beginSecretOperation()
+    setRotationRequest(request)
+    bindingRotationMutation.mutate({
+      tenantId: selectedTenant,
+      bindingId,
+      requestId: request.requestId,
+      epoch,
+    })
+  }
+
+  const updateProvisionField = <K extends keyof ProvisionForm>(
+    field: K,
+    value: ProvisionForm[K]
+  ) => {
+    setProvisionForm((previous) => ({ ...previous, [field]: value }))
+  }
+
+  const submitProvision = () => {
+    if (!selectedTenant) {
+      toast.error(t('tenantCost.provision.validationTenant'))
+      return
+    }
+    const requiredFields: Array<keyof ProvisionForm> = [
+      'product_pool_id',
+      'service_tier',
+      'public_label',
+      'profile_id',
+      'profile_revision',
+    ]
+    if (
+      requiredFields.some((field) => {
+        const value = provisionForm[field]
+        return typeof value === 'string' && !value.trim()
+      })
+    ) {
+      toast.error(t('tenantCost.provision.validationRequired'))
+      return
+    }
+    const tokenValue = provisionForm.token_id.trim()
+    const tokenId = tokenValue ? Number(tokenValue) : undefined
+    if (tokenValue && (!Number.isInteger(tokenId) || (tokenId ?? 0) <= 0)) {
+      toast.error(t('tenantCost.provision.validationToken'))
+      return
+    }
+    const productFamily =
+      provisionForm.product_family.trim() ||
+      provisionForm.product_pool_id.trim()
+    if (
+      provisionForm.max_ratio_ppm > 0 &&
+      provisionForm.max_ratio_ppm < provisionForm.min_ratio_ppm
+    ) {
+      toast.error(t('tenantCost.provision.validationRatio'))
+      return
+    }
+    if (tokenId && !provisionForm.model_catalog_revision.trim()) {
+      toast.error(t('tenantCost.provision.validationCatalog'))
+      return
+    }
+    if (
+      !tokenId &&
+      (provisionForm.model_catalog_revision.trim() ||
+        provisionForm.binding_status.trim())
+    ) {
+      toast.error(t('tenantCost.provision.validationBinding'))
+      return
+    }
+    const input: TenantCostSlotProvisionInput = {
+      request_id: '',
+      product_pool_id: provisionForm.product_pool_id.trim(),
+      product_family: productFamily,
+      service_tier: provisionForm.service_tier.trim(),
+      public_label: provisionForm.public_label.trim(),
+      sort_order: provisionForm.sort_order,
+      profile_id: provisionForm.profile_id.trim(),
+      profile_revision: provisionForm.profile_revision.trim(),
+      model_selector: provisionForm.model_selector.trim(),
+      min_ratio_ppm: provisionForm.min_ratio_ppm,
+      max_ratio_ppm: provisionForm.max_ratio_ppm,
+      provider_class: provisionForm.provider_class.trim(),
+      candidate_spec: provisionForm.candidate_spec.trim(),
+      capability_spec: provisionForm.capability_spec.trim(),
+      profile_status: provisionForm.profile_status,
+      disabled_reason: provisionForm.disabled_reason.trim(),
+      ...(tokenId ? { token_id: tokenId } : {}),
+      model_catalog_revision: provisionForm.model_catalog_revision.trim(),
+      binding_status: provisionForm.binding_status,
+    }
+    const fingerprint = JSON.stringify(input)
+    const requestId =
+      provisionRequest?.tenantId === selectedTenant &&
+      provisionRequest.fingerprint === fingerprint
+        ? provisionRequest.requestId
+        : newRequestId('tenant-slot-provision')
+    input.request_id = requestId
+    setProvisionRequest({
+      tenantId: selectedTenant,
+      fingerprint,
+      requestId,
+    })
+    const epoch = beginSecretOperation()
+    provisionMutation.mutate({ tenantId: selectedTenant, input, epoch })
+  }
+
+  const refresh = () => {
+    void Promise.all([
+      downstreamsQuery.refetch(),
+      catalogQuery.refetch(),
+      overviewQuery.refetch(),
+      eventsQuery.refetch(),
+      outboxQuery.refetch(),
+      projectionRetryQuery.refetch(),
+      auditQuery.refetch(),
+      bindingsQuery.refetch(),
+      profilesQuery.refetch(),
+      tokensQuery.refetch(),
+      workerQuery.refetch(),
+    ])
+  }
+  const overview = overviewQuery.data
+  const downstreams = downstreamsQuery.data ?? []
+  const selectedDownstream = downstreams.find(
+    (downstream) => downstream.tenant_id === selectedTenant
+  )
+  const slots = catalogQuery.data?.slots ?? []
+  const events = eventsQuery.data?.events ?? []
+  const outbox = outboxQuery.data ?? []
+  const projectionRetries = projectionRetryQuery.data ?? []
+  const audit = auditQuery.data ?? []
+  const bindings = bindingsQuery.data ?? []
+  const tokens = tokensQuery.data ?? []
+  const worker = workerQuery.data
+  const pendingOutboxIds = outbox
+    .filter((row) => row.state !== 'sent')
+    .map((row) => row.event_id)
+    .slice(0, 100)
+
+  return (
+    <SectionPageLayout fixedContent>
+      <SectionPageLayout.Title>
+        {t('tenantCost.page.title')}
+      </SectionPageLayout.Title>
+      <SectionPageLayout.Actions>
+        <Button
+          size='sm'
+          variant='outline'
+          onClick={refresh}
+          disabled={catalogQuery.isFetching || overviewQuery.isFetching}
+        >
+          <RefreshCwIcon
+            aria-hidden='true'
+            className={overviewQuery.isFetching ? 'animate-spin' : undefined}
+          />
+          {t('tenantCost.actions.refresh')}
+        </Button>
+      </SectionPageLayout.Actions>
+      <SectionPageLayout.Content>
+        <div className='hover-scrollbar h-full overflow-y-auto pb-4'>
+          <div className='mx-auto max-w-7xl space-y-4'>
+            <div className='flex items-start gap-3 rounded-lg border p-4'>
+              <ShieldCheckIcon
+                className='mt-0.5 size-5 shrink-0'
+                aria-hidden='true'
+              />
+              <div>
+                <h3 className='font-semibold'>
+                  {t('tenantCost.factChain.title')}
+                </h3>
+                <p className='text-muted-foreground mt-1 text-sm'>
+                  {t('tenantCost.factChain.description')}
+                </p>
+              </div>
+            </div>
+
+            <section className='rounded-lg border'>
+              <header className='flex flex-wrap items-center justify-between gap-3 border-b p-4'>
+                <div>
+                  <h3 className='font-semibold'>
+                    {t('tenantCost.downstream.title')}
+                  </h3>
+                  <p className='text-muted-foreground mt-1 text-xs'>
+                    {t('tenantCost.downstream.description')}
+                  </p>
+                </div>
+                <div className='flex flex-wrap items-center gap-2'>
+                  <label
+                    className='text-muted-foreground text-xs'
+                    htmlFor='tenant-cost-selector'
+                  >
+                    {t('tenantCost.downstream.selectorLabel')}
+                  </label>
+                  <select
+                    id='tenant-cost-selector'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={selectedTenant}
+                    onChange={(event) => handleTenantChange(event.target.value)}
+                    disabled={
+                      downstreamsQuery.isFetching && !downstreams.length
+                    }
+                  >
+                    {!downstreams.length && (
+                      <option value=''>
+                        {t('tenantCost.downstream.noDownstreams')}
+                      </option>
+                    )}
+                    {downstreams.map((downstream) => (
+                      <option
+                        key={downstream.tenant_id}
+                        value={downstream.tenant_id}
+                      >
+                        {downstream.display_name} · {downstream.tenant_id}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedDownstream && (
+                    <Button
+                      size='sm'
+                      variant={
+                        selectedDownstream.status === 'active'
+                          ? 'outline'
+                          : 'default'
+                      }
+                      onClick={() =>
+                        downstreamStatusMutation.mutate({
+                          tenantId: selectedDownstream.tenant_id,
+                          status:
+                            selectedDownstream.status === 'active'
+                              ? 'disabled'
+                              : 'active',
+                        })
+                      }
+                      disabled={downstreamStatusMutation.isPending}
+                    >
+                      {selectedDownstream.status === 'active'
+                        ? t('tenantCost.downstream.disable')
+                        : t('tenantCost.downstream.enable')}
+                    </Button>
+                  )}
+                </div>
+              </header>
+              <div className='grid gap-4 p-4 lg:grid-cols-[1fr_1.2fr]'>
+                <div className='rounded-md border p-3 text-sm'>
+                  {selectedDownstream ? (
+                    <>
+                      <div className='flex items-center justify-between gap-2'>
+                        <span className='font-medium'>
+                          {selectedDownstream.display_name}
+                        </span>
+                        <Badge
+                          variant={
+                            selectedDownstream.status === 'active'
+                              ? 'default'
+                              : 'outline'
+                          }
+                        >
+                          {selectedDownstream.status === 'active'
+                            ? t('tenantCost.downstream.active')
+                            : t('tenantCost.downstream.disabled')}
+                        </Badge>
+                      </div>
+                      <dl className='text-muted-foreground mt-3 space-y-1 text-xs'>
+                        <div className='flex justify-between gap-2'>
+                          <dt>{t('tenantCost.downstream.tenantId')}</dt>
+                          <dd className='font-mono'>
+                            {selectedDownstream.tenant_id}
+                          </dd>
+                        </div>
+                        <div className='flex justify-between gap-2'>
+                          <dt>{t('tenantCost.downstream.configKey')}</dt>
+                          <dd className='font-mono'>
+                            {selectedDownstream.config_key}
+                          </dd>
+                        </div>
+                      </dl>
+                    </>
+                  ) : (
+                    <p className='text-muted-foreground'>
+                      {t('tenantCost.downstream.empty')}
+                    </p>
+                  )}
+                </div>
+                <form
+                  className='grid gap-2 rounded-md border p-3 sm:grid-cols-3 sm:items-end'
+                  onSubmit={(event) => {
+                    event.preventDefault()
+                    if (newTenantId.trim() && newTenantName.trim()) {
+                      downstreamMutation.mutate()
+                    }
+                  }}
+                >
+                  <label className='grid gap-1 text-xs' htmlFor='new-tenant-id'>
+                    {t('tenantCost.downstream.tenantId')}
+                    <input
+                      id='new-tenant-id'
+                      className='bg-background h-9 rounded-md border px-2 text-sm'
+                      value={newTenantId}
+                      onChange={(event) => setNewTenantId(event.target.value)}
+                      placeholder='media-partner'
+                      maxLength={64}
+                    />
+                  </label>
+                  <label
+                    className='grid gap-1 text-xs'
+                    htmlFor='new-tenant-name'
+                  >
+                    {t('tenantCost.downstream.displayName')}
+                    <input
+                      id='new-tenant-name'
+                      className='bg-background h-9 rounded-md border px-2 text-sm'
+                      value={newTenantName}
+                      onChange={(event) => setNewTenantName(event.target.value)}
+                      maxLength={128}
+                    />
+                  </label>
+                  <label
+                    className='grid gap-1 text-xs'
+                    htmlFor='new-tenant-config'
+                  >
+                    {t('tenantCost.downstream.configKey')}
+                    <input
+                      id='new-tenant-config'
+                      className='bg-background h-9 rounded-md border px-2 text-sm'
+                      value={newTenantConfigKey}
+                      onChange={(event) =>
+                        setNewTenantConfigKey(event.target.value)
+                      }
+                      placeholder='media_partner'
+                      maxLength={64}
+                    />
+                  </label>
+                  <Button
+                    className='sm:col-span-3'
+                    type='submit'
+                    disabled={
+                      downstreamMutation.isPending ||
+                      !newTenantId.trim() ||
+                      !newTenantName.trim()
+                    }
+                  >
+                    {downstreamMutation.isPending
+                      ? t('tenantCost.downstream.saving')
+                      : t('tenantCost.downstream.add')}
+                  </Button>
+                </form>
+              </div>
+            </section>
+
+            <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-5'>
+              {[
+                [
+                  t('tenantCost.metrics.recorded'),
+                  overview?.expected_events ?? 0,
+                ],
+                [
+                  t('tenantCost.metrics.published'),
+                  overview?.published_events ?? 0,
+                ],
+                [
+                  t('tenantCost.metrics.pendingOutbox'),
+                  overview?.pending_outbox ?? 0,
+                ],
+                [
+                  t('tenantCost.metrics.pendingProjection'),
+                  overview?.pending_projection_retries ?? 0,
+                ],
+                [
+                  t('tenantCost.metrics.needsReview'),
+                  overview?.conflict_count ?? 0,
+                ],
+              ].map(([label, value]) => (
+                <div className='rounded-lg border p-4' key={String(label)}>
+                  <div className='text-muted-foreground text-xs'>
+                    {String(label)}
+                  </div>
+                  <div className='mt-1 text-2xl font-semibold tabular-nums'>
+                    {numberFormat.format(Number(value))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <section className='rounded-lg border'>
+              <header className='border-b p-4'>
+                <div className='flex flex-wrap items-center justify-between gap-2'>
+                  <div>
+                    <h3 className='font-semibold'>
+                      {t('tenantCost.provision.title')}
+                    </h3>
+                    <p className='text-muted-foreground mt-1 text-xs'>
+                      {t('tenantCost.provision.description')}
+                    </p>
+                  </div>
+                  <Badge variant='outline'>
+                    {t('tenantCost.provision.profileCount', {
+                      count: profilesQuery.data?.length ?? 0,
+                    })}
+                  </Badge>
+                </div>
+              </header>
+              <form
+                className='grid gap-3 p-4 sm:grid-cols-2 lg:grid-cols-4'
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  submitProvision()
+                }}
+              >
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-pool'
+                >
+                  {t('tenantCost.provision.productPool')}
+                  <input
+                    id='tenant-provision-pool'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.product_pool_id}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'product_pool_id',
+                        event.target.value
+                      )
+                    }
+                    maxLength={64}
+                    required
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-family'
+                >
+                  {t('tenantCost.provision.productFamily')}
+                  <input
+                    id='tenant-provision-family'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.product_family}
+                    onChange={(event) =>
+                      updateProvisionField('product_family', event.target.value)
+                    }
+                    placeholder={t(
+                      'tenantCost.provision.productFamilyPlaceholder'
+                    )}
+                    maxLength={64}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-tier'
+                >
+                  {t('tenantCost.provision.serviceTier')}
+                  <input
+                    id='tenant-provision-tier'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.service_tier}
+                    onChange={(event) =>
+                      updateProvisionField('service_tier', event.target.value)
+                    }
+                    maxLength={32}
+                    required
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-label'
+                >
+                  {t('tenantCost.provision.publicLabel')}
+                  <input
+                    id='tenant-provision-label'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.public_label}
+                    onChange={(event) =>
+                      updateProvisionField('public_label', event.target.value)
+                    }
+                    maxLength={64}
+                    required
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-sort'
+                >
+                  {t('tenantCost.provision.sortOrder')}
+                  <input
+                    id='tenant-provision-sort'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    type='number'
+                    min={0}
+                    max={1000000}
+                    value={provisionForm.sort_order}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'sort_order',
+                        Number(event.target.value) || 0
+                      )
+                    }
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-profile-id'
+                >
+                  {t('tenantCost.provision.profileId')}
+                  <input
+                    id='tenant-provision-profile-id'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.profile_id}
+                    onChange={(event) =>
+                      updateProvisionField('profile_id', event.target.value)
+                    }
+                    list='tenant-cost-profile-options'
+                    maxLength={128}
+                    required
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-profile-revision'
+                >
+                  {t('tenantCost.provision.profileRevision')}
+                  <input
+                    id='tenant-provision-profile-revision'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.profile_revision}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'profile_revision',
+                        event.target.value
+                      )
+                    }
+                    maxLength={96}
+                    required
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-selector'
+                >
+                  {t('tenantCost.provision.modelSelector')}
+                  <input
+                    id='tenant-provision-selector'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.model_selector}
+                    onChange={(event) =>
+                      updateProvisionField('model_selector', event.target.value)
+                    }
+                    maxLength={256}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-min-ratio'
+                >
+                  {t('tenantCost.provision.minRatio')}
+                  <input
+                    id='tenant-provision-min-ratio'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    type='number'
+                    min={0}
+                    value={provisionForm.min_ratio_ppm}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'min_ratio_ppm',
+                        Number(event.target.value) || 0
+                      )
+                    }
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-max-ratio'
+                >
+                  {t('tenantCost.provision.maxRatio')}
+                  <input
+                    id='tenant-provision-max-ratio'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    type='number'
+                    min={0}
+                    value={provisionForm.max_ratio_ppm}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'max_ratio_ppm',
+                        Number(event.target.value) || 0
+                      )
+                    }
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-provider'
+                >
+                  {t('tenantCost.provision.providerClass')}
+                  <input
+                    id='tenant-provision-provider'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.provider_class}
+                    onChange={(event) =>
+                      updateProvisionField('provider_class', event.target.value)
+                    }
+                    maxLength={128}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-status'
+                >
+                  {t('tenantCost.provision.profileStatus')}
+                  <select
+                    id='tenant-provision-status'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.profile_status}
+                    onChange={(event) =>
+                      updateProvisionField('profile_status', event.target.value)
+                    }
+                  >
+                    <option value='pending'>
+                      {t('tenantCost.status.pending')}
+                    </option>
+                    <option value='enabled'>
+                      {t('tenantCost.status.enabled')}
+                    </option>
+                    <option value='disabled'>
+                      {t('tenantCost.status.disabled')}
+                    </option>
+                  </select>
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-token'
+                >
+                  {t('tenantCost.provision.tokenId')}
+                  <input
+                    id='tenant-provision-token'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    type='number'
+                    min={1}
+                    value={provisionForm.token_id}
+                    onChange={(event) =>
+                      updateProvisionField('token_id', event.target.value)
+                    }
+                    placeholder={t('tenantCost.provision.tokenIdPlaceholder')}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-catalog-revision'
+                >
+                  {t('tenantCost.provision.catalogRevision')}
+                  <input
+                    id='tenant-provision-catalog-revision'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.model_catalog_revision}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'model_catalog_revision',
+                        event.target.value
+                      )
+                    }
+                    maxLength={96}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs'
+                  htmlFor='tenant-provision-binding-status'
+                >
+                  {t('tenantCost.provision.bindingStatus')}
+                  <select
+                    id='tenant-provision-binding-status'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.binding_status}
+                    onChange={(event) =>
+                      updateProvisionField('binding_status', event.target.value)
+                    }
+                  >
+                    <option value=''>
+                      {t('tenantCost.provision.notBound')}
+                    </option>
+                    <option value='pending'>
+                      {t('tenantCost.status.pending')}
+                    </option>
+                    <option value='enabled'>
+                      {t('tenantCost.status.enabled')}
+                    </option>
+                    <option value='disabled'>
+                      {t('tenantCost.status.disabled')}
+                    </option>
+                  </select>
+                </label>
+                <label
+                  className='grid gap-1 text-xs sm:col-span-2'
+                  htmlFor='tenant-provision-disabled-reason'
+                >
+                  {t('tenantCost.provision.disabledReason')}
+                  <input
+                    id='tenant-provision-disabled-reason'
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={provisionForm.disabled_reason}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'disabled_reason',
+                        event.target.value
+                      )
+                    }
+                    maxLength={512}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs sm:col-span-2'
+                  htmlFor='tenant-provision-candidate'
+                >
+                  {t('tenantCost.provision.candidateSpec')}
+                  <textarea
+                    id='tenant-provision-candidate'
+                    className='bg-background min-h-20 rounded-md border px-2 py-1 text-sm'
+                    value={provisionForm.candidate_spec}
+                    onChange={(event) =>
+                      updateProvisionField('candidate_spec', event.target.value)
+                    }
+                    maxLength={4096}
+                  />
+                </label>
+                <label
+                  className='grid gap-1 text-xs sm:col-span-2'
+                  htmlFor='tenant-provision-capability'
+                >
+                  {t('tenantCost.provision.capabilitySpec')}
+                  <textarea
+                    id='tenant-provision-capability'
+                    className='bg-background min-h-20 rounded-md border px-2 py-1 text-sm'
+                    value={provisionForm.capability_spec}
+                    onChange={(event) =>
+                      updateProvisionField(
+                        'capability_spec',
+                        event.target.value
+                      )
+                    }
+                    maxLength={4096}
+                  />
+                </label>
+                <datalist id='tenant-cost-profile-options'>
+                  {(profilesQuery.data ?? []).map((profile) => (
+                    <option
+                      key={`${profile.profile_id}-${profile.revision}`}
+                      value={profile.profile_id}
+                    >
+                      {profile.public_label} · {profile.revision}
+                    </option>
+                  ))}
+                </datalist>
+                <div className='flex flex-wrap items-center gap-2 sm:col-span-2 lg:col-span-4'>
+                  <Button
+                    type='submit'
+                    disabled={provisionMutation.isPending || !selectedTenant}
+                  >
+                    {provisionMutation.isPending
+                      ? t('tenantCost.provision.submitting')
+                      : t('tenantCost.provision.submit')}
+                  </Button>
+                  <Button
+                    type='button'
+                    variant='outline'
+                    onClick={() => setProvisionForm(emptyProvisionForm)}
+                    disabled={provisionMutation.isPending}
+                  >
+                    {t('tenantCost.provision.reset')}
+                  </Button>
+                </div>
+              </form>
+            </section>
+
+            <section className='rounded-lg border'>
+              <header className='flex flex-wrap items-center justify-between gap-3 border-b p-4'>
+                <div>
+                  <h3 className='font-semibold'>
+                    {t('tenantCost.controls.title')}
+                  </h3>
+                  <p className='text-muted-foreground mt-1 text-xs'>
+                    {t('tenantCost.controls.description')}
+                  </p>
+                </div>
+                <div className='flex flex-wrap gap-2'>
+                  <Button
+                    size='sm'
+                    onClick={() => {
+                      const epoch = beginSecretOperation()
+                      createTokenMutation.mutate({
+                        tenantId: selectedTenant,
+                        epoch,
+                        requestId: newRequestId('tenant-reporting-token'),
+                      })
+                    }}
+                    disabled={createTokenMutation.isPending}
+                  >
+                    {createTokenMutation.isPending
+                      ? t('tenantCost.actions.creatingToken')
+                      : t('tenantCost.actions.createToken')}
+                  </Button>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    onClick={() => workerMutation.mutate(!worker?.paused)}
+                    disabled={
+                      workerMutation.isPending || workerQuery.isFetching
+                    }
+                  >
+                    {worker?.paused
+                      ? t('tenantCost.actions.resumeWorker')
+                      : t('tenantCost.actions.pauseWorker')}
+                  </Button>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    onClick={() => {
+                      if (!pendingOutboxIds.length) {
+                        toast.info(t('tenantCost.outbox.noneReplayable'))
+                        return
+                      }
+                      if (
+                        window.confirm(t('tenantCost.outbox.confirmReplay'))
+                      ) {
+                        replayMutation.mutate(pendingOutboxIds)
+                      }
+                    }}
+                    disabled={
+                      replayMutation.isPending || !pendingOutboxIds.length
+                    }
+                  >
+                    {replayMutation.isPending
+                      ? t('tenantCost.actions.replaying')
+                      : t('tenantCost.actions.replayPending')}
+                  </Button>
+                </div>
+              </header>
+              {oneTimeSecret && (
+                <div className='m-4 rounded-md border border-amber-500/50 bg-amber-50 p-3 text-sm dark:bg-amber-950/20'>
+                  <div className='font-medium'>
+                    {t('tenantCost.secret.notice')}
+                  </div>
+                  <code className='mt-2 block text-xs break-all'>
+                    {oneTimeSecret}
+                  </code>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    className='mt-2'
+                    onClick={clearSecretAndMutationState}
+                  >
+                    {t('tenantCost.secret.dismiss')}
+                  </Button>
+                </div>
+              )}
+              <div className='grid gap-4 p-4 lg:grid-cols-2'>
+                <div>
+                  <div className='mb-2 flex items-center justify-between'>
+                    <h4 className='font-medium'>
+                      {t('tenantCost.token.title')}
+                    </h4>
+                    <Badge
+                      variant={
+                        tokens.some((row) => !row.revoked_at)
+                          ? 'default'
+                          : 'outline'
+                      }
+                    >
+                      {tokens.filter((row) => !row.revoked_at).length}{' '}
+                      {t('tenantCost.token.activeCount')}
+                    </Badge>
+                  </div>
+                  <div className='divide-y rounded-md border'>
+                    {tokens.map((token) => (
+                      <div
+                        className='flex flex-wrap items-center justify-between gap-2 p-3 text-sm'
+                        key={token.id}
+                      >
+                        <div className='min-w-0'>
+                          <div className='font-mono text-xs'>
+                            {token.token_id}
+                          </div>
+                          <div className='text-muted-foreground mt-1 text-xs'>
+                            {token.revoked_at
+                              ? t('tenantCost.token.revoked')
+                              : t('tenantCost.token.active')}{' '}
+                            · {t('tenantCost.token.expires')}{' '}
+                            {formatTime(token.expires_at, dateTimeFormat)}
+                          </div>
+                        </div>
+                        <div className='flex gap-1'>
+                          {!token.revoked_at && (
+                            <>
+                              <Button
+                                size='sm'
+                                variant='outline'
+                                onClick={() => {
+                                  if (
+                                    window.confirm(
+                                      t('tenantCost.token.confirmRotate')
+                                    )
+                                  ) {
+                                    const epoch = beginSecretOperation()
+                                    rotateTokenMutation.mutate({
+                                      tokenId: token.token_id,
+                                      tenantId: selectedTenant,
+                                      epoch,
+                                      requestId: newRequestId(
+                                        'tenant-reporting-token-rotate'
+                                      ),
+                                    })
+                                  }
+                                }}
+                                disabled={rotateTokenMutation.isPending}
+                              >
+                                {t('tenantCost.actions.rotate')}
+                              </Button>
+                              <Button
+                                size='sm'
+                                variant='destructive'
+                                onClick={() => {
+                                  if (
+                                    window.confirm(
+                                      t('tenantCost.token.confirmRevoke')
+                                    )
+                                  ) {
+                                    revokeTokenMutation.mutate(token.token_id)
+                                  }
+                                }}
+                                disabled={revokeTokenMutation.isPending}
+                              >
+                                {t('tenantCost.actions.revoke')}
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                    {!tokens.length && (
+                      <p className='text-muted-foreground p-3 text-sm'>
+                        {t('tenantCost.token.empty')}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <h4 className='mb-2 font-medium'>
+                    {t('tenantCost.worker.title')}
+                  </h4>
+                  <div className='rounded-md border p-3 text-sm'>
+                    <div className='flex items-center justify-between'>
+                      <span>{t('tenantCost.worker.currentStatus')}</span>
+                      <Badge variant={worker?.paused ? 'outline' : 'default'}>
+                        {worker?.paused
+                          ? t('tenantCost.worker.paused')
+                          : t('tenantCost.worker.running')}
+                      </Badge>
+                    </div>
+                    <p className='text-muted-foreground mt-2 text-xs'>
+                      {t('tenantCost.worker.description')}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className='rounded-lg border'>
+              <header className='flex items-center justify-between border-b p-4'>
+                <div>
+                  <h3 className='font-semibold'>
+                    {t('tenantCost.slots.title')}
+                  </h3>
+                  <p className='text-muted-foreground mt-1 text-xs'>
+                    {t('tenantCost.slots.description')}
+                  </p>
+                </div>
+                <Badge variant='outline'>
+                  {t('tenantCost.slots.count', { count: slots.length })}
+                </Badge>
+              </header>
+              <div className='overflow-x-auto'>
+                <table className='w-full min-w-[760px] text-sm'>
+                  <thead className='bg-muted/30 text-muted-foreground text-left text-xs'>
+                    <tr>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.family')}
+                      </th>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.tier')}
+                      </th>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.status')}
+                      </th>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.keyId')}
+                      </th>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.profileRevision')}
+                      </th>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.reason')}
+                      </th>
+                      <th className='p-3'>
+                        {t('tenantCost.slots.columns.actions')}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {slots.map((slot) => (
+                      <tr
+                        className='border-t'
+                        key={`${slot.product_pool_id}-${slot.service_tier}`}
+                      >
+                        <td className='p-3 font-medium'>
+                          {familyLabel(slot.product_family, t)}
+                        </td>
+                        <td className='p-3'>
+                          {tierLabel(slot.public_label, t)}
+                        </td>
+                        <td className='p-3'>
+                          <Badge
+                            variant={
+                              slot.status === 'enabled' ? 'default' : 'outline'
+                            }
+                          >
+                            {statusLabel(slot.status, t)}
+                          </Badge>
+                        </td>
+                        <td className='p-3 font-mono text-xs'>
+                          {slot.key_id || '—'}
+                        </td>
+                        <td className='max-w-48 truncate p-3 font-mono text-xs'>
+                          {slot.profile_revision || '—'}
+                        </td>
+                        <td className='max-w-64 p-3 text-xs'>
+                          {slot.disabled_reason || '—'}
+                        </td>
+                        <td className='p-3'>
+                          {(() => {
+                            const binding = bindings.find(
+                              (candidate) =>
+                                candidate.product_pool_id ===
+                                  slot.product_pool_id &&
+                                candidate.service_tier === slot.service_tier
+                            )
+                            if (
+                              !binding ||
+                              binding.binding_status === 'revoked'
+                            ) {
+                              return '—'
+                            }
+                            const nextStatus =
+                              binding.binding_status === 'enabled'
+                                ? 'disabled'
+                                : 'enabled'
+                            return (
+                              <div className='flex flex-wrap gap-1'>
+                                <Button
+                                  size='sm'
+                                  variant='outline'
+                                  onClick={() => {
+                                    if (
+                                      window.confirm(
+                                        t('tenantCost.slots.confirmStatus', {
+                                          status:
+                                            nextStatus === 'enabled'
+                                              ? t('tenantCost.actions.enable')
+                                              : t('tenantCost.actions.disable'),
+                                        })
+                                      )
+                                    ) {
+                                      bindingMutation.mutate({
+                                        id: binding.id,
+                                        status: nextStatus,
+                                      })
+                                    }
+                                  }}
+                                  disabled={bindingMutation.isPending}
+                                >
+                                  {nextStatus === 'enabled'
+                                    ? t('tenantCost.actions.enable')
+                                    : t('tenantCost.actions.disable')}
+                                </Button>
+                                <Button
+                                  size='sm'
+                                  variant='outline'
+                                  onClick={() => {
+                                    if (
+                                      window.confirm(
+                                        t('tenantCost.binding.confirmRotateKey')
+                                      )
+                                    ) {
+                                      rotateBinding(binding.id)
+                                    }
+                                  }}
+                                  disabled={bindingRotationMutation.isPending}
+                                >
+                                  {bindingRotationMutation.isPending &&
+                                  rotationRequest?.bindingId === binding.id
+                                    ? t('tenantCost.binding.rotatingKey')
+                                    : t('tenantCost.binding.rotateKey')}
+                                </Button>
+                              </div>
+                            )
+                          })()}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <div className='grid gap-4 xl:grid-cols-2'>
+              <section className='overflow-hidden rounded-lg border'>
+                <header className='border-b p-4'>
+                  <h3 className='font-semibold'>
+                    {t('tenantCost.events.title')}
+                  </h3>
+                </header>
+                <div className='divide-y'>
+                  {events.slice(0, 12).map((event) => (
+                    <div
+                      className='grid grid-cols-[1fr_auto] gap-3 p-3 text-sm'
+                      key={event.event_id}
+                    >
+                      <div className='min-w-0'>
+                        <div className='flex flex-wrap items-center gap-2'>
+                          <span className='font-medium'>
+                            {event.model?.canonical ||
+                              event.model?.requested ||
+                              t('tenantCost.events.unknownModel')}
+                          </span>
+                          <Badge variant='outline'>
+                            {statusLabel(event.evidence, t)}
+                          </Badge>
+                          <Badge variant='outline'>
+                            {statusLabel(event.event_type, t)}
+                          </Badge>
+                        </div>
+                        <div className='text-muted-foreground mt-1 truncate text-xs'>
+                          {familyLabel(
+                            event.binding?.product_pool_id || 'other',
+                            t
+                          )}{' '}
+                          · {event.binding?.service_tier || '—'} ·{' '}
+                          {event.binding?.key_id || '—'}
+                        </div>
+                      </div>
+                      <div className='text-right text-xs tabular-nums'>
+                        <div>
+                          {event.billing?.gateway_charge_amount || '—'}{' '}
+                          {event.billing?.currency || ''}
+                        </div>
+                        <div className='text-muted-foreground mt-1'>
+                          {formatTime(event.created_at, dateTimeFormat)}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {!events.length && (
+                    <p className='text-muted-foreground p-4 text-sm'>
+                      {t('tenantCost.events.empty')}
+                    </p>
+                  )}
+                </div>
+              </section>
+
+              <section className='overflow-hidden rounded-lg border'>
+                <header className='border-b p-4'>
+                  <h3 className='font-semibold'>
+                    {t('tenantCost.queue.title')}
+                  </h3>
+                </header>
+                <div className='divide-y'>
+                  {projectionRetries.slice(0, 4).map((row) => (
+                    <div
+                      className='flex items-center justify-between gap-3 p-3 text-sm'
+                      key={`projection-${row.event_id}`}
+                    >
+                      <span className='truncate font-mono text-xs'>
+                        {row.event_id}
+                      </span>
+                      <Badge
+                        variant={row.state === 'sent' ? 'default' : 'outline'}
+                      >
+                        {t('tenantCost.queue.projectionSummary', {
+                          status: statusLabel(row.state, t),
+                          attempts: row.attempts,
+                        })}
+                      </Badge>
+                    </div>
+                  ))}
+                  {outbox.slice(0, 8).map((row) => (
+                    <div
+                      className='flex items-center justify-between gap-3 p-3 text-sm'
+                      key={row.event_id}
+                    >
+                      <span className='truncate font-mono text-xs'>
+                        {row.event_id}
+                      </span>
+                      <Badge
+                        variant={row.state === 'sent' ? 'default' : 'outline'}
+                      >
+                        {statusLabel(row.state, t)} · {row.attempts}
+                      </Badge>
+                    </div>
+                  ))}
+                  {audit.slice(0, 4).map((row) => (
+                    <div className='p-3 text-xs' key={row.id}>
+                      <div className='font-medium'>{row.action}</div>
+                      <div className='text-muted-foreground mt-1'>
+                        {formatTime(row.created_at, dateTimeFormat)} ·{' '}
+                        {t('tenantCost.audit.user', {
+                          id: row.actor_user_id,
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                  {!projectionRetries.length &&
+                    !outbox.length &&
+                    !audit.length && (
+                      <p className='text-muted-foreground p-4 text-sm'>
+                        {t('tenantCost.queue.empty')}
+                      </p>
+                    )}
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </SectionPageLayout.Content>
+    </SectionPageLayout>
+  )
+}

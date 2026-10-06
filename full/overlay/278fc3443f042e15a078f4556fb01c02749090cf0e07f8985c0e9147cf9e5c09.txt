@@ -1,0 +1,442 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  Clock3Icon,
+  DownloadIcon,
+  ExternalLinkIcon,
+  Loader2Icon,
+  RotateCcwIcon,
+} from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
+
+import { deleteMediaAssets } from '../api'
+import {
+  downloadMediaAsset,
+  downloadMediaAssets,
+  openMediaAsset,
+} from '../asset-delivery'
+import { formatMediaDate } from '../lib'
+import type { MediaAsset, StudioOutput } from '../types'
+import { AssetPreview } from './asset-preview'
+import { MediaQueryError } from './query-error'
+
+type StudioResultsProps = {
+  outputs: StudioOutput[]
+  onPreview: (asset: MediaAsset) => void
+  onReuse: (asset: MediaAsset) => void
+  loading?: boolean
+  error?: boolean
+  onRetry: () => void
+  onAssetsDeleted?: (assetIds: string[]) => void
+}
+
+function progressValue(progress?: string) {
+  if (!progress) return undefined
+  const parsed = Number.parseFloat(progress)
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(100, parsed)
+    : undefined
+}
+
+function StudioProgress(props: { output: StudioOutput }) {
+  const { t } = useTranslation()
+  const value = progressValue(props.output.progress)
+  let stage = t('Processing media')
+  if (props.output.stage === 'preparing_input') {
+    stage = t('Preparing input')
+  } else if (props.output.stage === 'reading_reference') {
+    stage = t('Reading reference assets')
+  } else if (props.output.stage === 'uploading_reference') {
+    stage = t('Uploading reference assets')
+  } else if (props.output.stage === 'submitting_request') {
+    stage = t('Submitting request')
+  } else if (props.output.stage === 'upstream_generating') {
+    stage = t('Waiting for upstream generation')
+  } else if (props.output.stage === 'archiving_result') {
+    stage = t('Archiving generated assets')
+  } else if (props.output.stage === 'queued') {
+    stage = t('Waiting in queue')
+  } else if (props.output.stage === 'in_progress') {
+    stage = t('Generating media')
+  } else if (props.output.stage === 'resolving_artifacts') {
+    stage = t('Preparing assets')
+  } else if (props.output.stage === 'confirming_result') {
+    stage = t('Confirming the saved result')
+  }
+  return (
+    <div className='space-y-1.5'>
+      <Progress value={value ?? null} />
+      <div className='text-muted-foreground flex min-w-0 items-center justify-between gap-3 text-xs'>
+        <span>
+          {value === undefined ? stage : `${Math.round(value)}% · ${stage}`}
+        </span>
+        <span className='truncate font-mono'>{props.output.taskId}</span>
+      </div>
+    </div>
+  )
+}
+
+export function StudioResults(props: StudioResultsProps) {
+  const { t } = useTranslation()
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const selectableAssets = useMemo(() => {
+    const seen = new Set<string>()
+    return props.outputs.flatMap((output) =>
+      output.assets.filter((asset) => {
+        if (seen.has(asset.id)) return false
+        seen.add(asset.id)
+        return true
+      })
+    )
+  }, [props.outputs])
+  const selectedAssets = selectableAssets.filter((asset) =>
+    selectedIds.has(asset.id)
+  )
+  const allSelected =
+    selectableAssets.length > 0 &&
+    selectedAssets.length === selectableAssets.length
+
+  const toggleAll = (checked: boolean) => {
+    setSelectedIds(
+      checked ? new Set(selectableAssets.map((asset) => asset.id)) : new Set()
+    )
+  }
+
+  const downloadSelected = async () => {
+    if (selectedAssets.length === 0) return
+    setDownloading(true)
+    try {
+      const result = await downloadMediaAssets(selectedAssets)
+      if (result.failed > 0) {
+        toast.warning(
+          t('{{success}} assets packaged, {{failed}} unavailable', {
+            success: result.success,
+            failed: result.failed,
+          })
+        )
+      } else {
+        toast.success(
+          t('{{count}} assets packaged into one ZIP', { count: result.success })
+        )
+      }
+    } catch {
+      toast.error(t('Batch download failed. Please retry.'))
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  const deleteSelected = async () => {
+    if (selectedAssets.length === 0) return
+    const results = await deleteMediaAssets(
+      selectedAssets.map((asset) => asset.id)
+    )
+    const deleted = results
+      .filter((result) => result.ok)
+      .map((result) => result.id)
+    const failed = results.length - deleted.length
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      deleted.forEach((id) => next.delete(id))
+      return next
+    })
+    props.onAssetsDeleted?.(deleted)
+    setDeleteOpen(false)
+    if (failed > 0) {
+      toast.warning(
+        t('{{success}} deleted, {{failed}} failed', {
+          success: deleted.length,
+          failed,
+        })
+      )
+    } else {
+      toast.success(t('{{count}} assets deleted', { count: deleted.length }))
+    }
+  }
+
+  if (props.error && props.outputs.length === 0) {
+    return <MediaQueryError className='m-4' onRetry={props.onRetry} />
+  }
+  if (props.outputs.length === 0) {
+    return (
+      <div className='text-muted-foreground flex min-h-80 flex-1 flex-col items-center justify-center gap-3 p-8 text-center'>
+        <div className='bg-muted flex size-12 items-center justify-center rounded-full'>
+          {props.loading ? (
+            <Loader2Icon aria-hidden='true' className='size-5 animate-spin' />
+          ) : (
+            <Clock3Icon aria-hidden='true' className='size-5' />
+          )}
+        </div>
+        <p className='text-sm font-medium'>
+          {props.loading
+            ? t('Loading recent tasks')
+            : t('Your creations will appear here')}
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className='divide-y'>
+      {props.error && (
+        <MediaQueryError className='m-4' compact onRetry={props.onRetry} />
+      )}
+      {selectableAssets.length > 0 && (
+        <div className='bg-muted/20 flex flex-wrap items-center gap-2 border-b px-4 py-2 sm:px-5'>
+          <Checkbox
+            aria-label={t('Select all creation assets')}
+            checked={allSelected}
+            onCheckedChange={(checked) => toggleAll(checked === true)}
+          />
+          <span className='text-muted-foreground text-xs'>
+            {t('{{count}} selected', { count: selectedAssets.length })}
+          </span>
+          <Button
+            disabled={selectedAssets.length === 0 || downloading}
+            onClick={() => void downloadSelected()}
+            size='sm'
+            variant='outline'
+          >
+            {downloading ? (
+              <Loader2Icon aria-hidden='true' className='animate-spin' />
+            ) : (
+              <DownloadIcon aria-hidden='true' />
+            )}
+            {t('Download selected')}
+          </Button>
+          <Button
+            disabled={selectedAssets.length === 0}
+            onClick={() => setDeleteOpen(true)}
+            size='sm'
+            variant='destructive'
+          >
+            {t('Delete selected')}
+          </Button>
+        </div>
+      )}
+      {props.outputs.map((output) => (
+        <section
+          className='min-w-0 space-y-3 p-4 sm:p-5'
+          key={output.requestId}
+        >
+          <div className='flex flex-wrap items-center gap-2'>
+            <Badge
+              variant={output.status === 'failed' ? 'destructive' : 'secondary'}
+            >
+              {(output.status === 'running' ||
+                output.status === 'confirming') && (
+                <Loader2Icon aria-hidden='true' className='animate-spin' />
+              )}
+              {t(output.status)}
+            </Badge>
+            <span className='text-sm font-medium'>{t(output.mode)}</span>
+            {output.model && (
+              <span className='text-muted-foreground max-w-48 truncate text-xs'>
+                {output.model}
+              </span>
+            )}
+            <span className='text-muted-foreground ml-auto text-xs'>
+              {formatMediaDate(Math.floor(output.createdAt / 1000))}
+            </span>
+          </div>
+
+          {(output.status === 'running' || output.status === 'confirming') && (
+            <StudioProgress output={output} />
+          )}
+
+          {output.status === 'unconfirmed' && (
+            <div className='border-border bg-muted/30 rounded-lg border p-3 text-sm'>
+              {t(
+                'The result is not yet confirmed. Check My Assets later; the paid request was not submitted again.'
+              )}
+            </div>
+          )}
+
+          {output.prompt && (
+            <p className='text-muted-foreground line-clamp-2 text-sm'>
+              {output.prompt}
+            </p>
+          )}
+
+          {output.error && (
+            <div className='text-destructive border-destructive/20 bg-destructive/5 space-y-2 rounded-lg border p-3 text-sm'>
+              <p>{output.error}</p>
+              {output.errorDetails && (
+                <details className='text-muted-foreground text-xs'>
+                  <summary className='text-foreground cursor-pointer font-medium'>
+                    {t('Diagnostic details')}
+                  </summary>
+                  <dl className='mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1'>
+                    {output.errorDetails.upstreamStatus && (
+                      <>
+                        <dt>{t('Upstream status')}</dt>
+                        <dd>{output.errorDetails.upstreamStatus}</dd>
+                      </>
+                    )}
+                    {output.errorDetails.field && (
+                      <>
+                        <dt>{t('Field')}</dt>
+                        <dd className='font-mono'>
+                          {output.errorDetails.field}
+                        </dd>
+                      </>
+                    )}
+                    {output.errorDetails.requestId && (
+                      <>
+                        <dt>{t('Request ID')}</dt>
+                        <dd className='font-mono break-all'>
+                          {output.errorDetails.requestId}
+                        </dd>
+                      </>
+                    )}
+                    {output.errorDetails.detail && (
+                      <>
+                        <dt>{t('Detail')}</dt>
+                        <dd>{output.errorDetails.detail}</dd>
+                      </>
+                    )}
+                  </dl>
+                </details>
+              )}
+            </div>
+          )}
+
+          {output.text && output.assets.length === 0 && (
+            <div className='bg-muted/30 rounded-lg border p-4 text-sm whitespace-pre-wrap'>
+              {output.text}
+            </div>
+          )}
+
+          {output.assets.length > 0 && (
+            <div className='grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3'>
+              {output.assets.map((asset) => (
+                <article
+                  className='min-w-0 overflow-hidden rounded-lg border'
+                  key={asset.id}
+                >
+                  <button
+                    className='bg-muted/30 block aspect-video w-full min-w-0 overflow-hidden'
+                    onClick={() => props.onPreview(asset)}
+                    type='button'
+                  >
+                    <AssetPreview asset={asset} controls={false} />
+                    <span className='sr-only'>{t('Preview')}</span>
+                  </button>
+                  <div className='border-t px-2 pt-2'>
+                    <Checkbox
+                      aria-label={t('Select {{name}}', {
+                        name: asset.filename,
+                      })}
+                      checked={selectedIds.has(asset.id)}
+                      onCheckedChange={(checked) =>
+                        setSelectedIds((current) => {
+                          const next = new Set(current)
+                          if (checked === true) next.add(asset.id)
+                          else next.delete(asset.id)
+                          return next
+                        })
+                      }
+                    />
+                  </div>
+                  <div className='flex min-w-0 items-center gap-1 border-t p-2'>
+                    <Button
+                      aria-label={t('Use as reference')}
+                      onClick={() => props.onReuse(asset)}
+                      size='icon-sm'
+                      variant='ghost'
+                    >
+                      <RotateCcwIcon aria-hidden='true' />
+                    </Button>
+                    <Button
+                      aria-label={t('Open')}
+                      onClick={() =>
+                        void openMediaAsset(asset).catch(() =>
+                          toast.error(t('Request failed'))
+                        )
+                      }
+                      size='icon-sm'
+                      type='button'
+                      variant='ghost'
+                    >
+                      <ExternalLinkIcon aria-hidden='true' />
+                    </Button>
+                    <Button
+                      aria-label={t('Download')}
+                      className='ml-auto'
+                      onClick={() =>
+                        void downloadMediaAsset(asset).catch(() =>
+                          toast.error(t('Request failed'))
+                        )
+                      }
+                      size='icon-sm'
+                      type='button'
+                      variant='ghost'
+                    >
+                      <DownloadIcon aria-hidden='true' />
+                    </Button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      ))}
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('Delete {{count}} assets?', { count: selectedAssets.length })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('The stored file and its download link will be removed.')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('Cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => void deleteSelected()}
+              variant='destructive'
+            >
+              {t('Delete')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  )
+}

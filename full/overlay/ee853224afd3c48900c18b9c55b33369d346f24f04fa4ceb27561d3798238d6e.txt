@@ -1,0 +1,44 @@
+package openai
+
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestConfiguredReferenceAndPricingWire(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/images/edits", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelOtherSettings: dto.ChannelOtherSettings{ImageAdapter: &dto.ImageAdapterConfig{Protocol: "generation_references", ReferenceField: "image_urls"}}}}
+	count := uint(1)
+	wire, err := convertConfiguredImage(c, info, dto.ImageRequest{Model: "upstream", Prompt: "edit", Size: "2048x2048", Quality: "2k", N: &count, Extra: map[string]json.RawMessage{"image_urls": json.RawMessage(`["https://example.test/input.png"]`)}})
+	require.NoError(t, err)
+	raw, err := common.Marshal(wire)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"image_urls":["https://example.test/input.png"]`)
+	require.NoError(t, helper.ValidateParameterImageWire(&types.ParameterPriceSnapshot{UpstreamModel: "upstream", Parameters: map[string]string{"count": "1", "quality": "2k", "resolution": "2048x2048"}}, raw))
+}
+
+func TestConfiguredChatImageResponse(t *testing.T) {
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"created":123,"choices":[{"message":{"content":"![image](data:image/png;base64,aGVsbG8=)"}}],"usage":{"total_tokens":1}}`))}
+	got, err := configuredChatImageResponse(resp)
+	require.Nil(t, err)
+	raw, e := io.ReadAll(got.Body)
+	require.NoError(t, e)
+	require.Contains(t, string(raw), `"b64_json":"aGVsbG8="`)
+	resp.Body = io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"no image"}}]}`))
+	_, err = configuredChatImageResponse(resp)
+	require.NotNil(t, err)
+	require.True(t, types.IsSkipRetryError(err))
+}

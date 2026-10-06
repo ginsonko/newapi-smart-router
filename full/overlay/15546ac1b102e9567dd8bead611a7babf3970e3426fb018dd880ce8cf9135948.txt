@@ -1,0 +1,23 @@
+package sora
+
+import (
+	"encoding/json"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestVideoStatusUsesPublicIDForBothAliases(t *testing.T) {
+	for _, raw := range []string{`{"id":"upstream-private","task_id":"upstream-private","status":"in_progress","progress":30}`, `{"id":"upstream-private","status":"completed"}`} {
+		task := &model.Task{TaskID: "task_public"}
+		task.Data = []byte(raw)
+		body, err := (&TaskAdaptor{}).ConvertToOpenAIVideo(task)
+		require.NoError(t, err)
+		var result map[string]any
+		require.NoError(t, json.Unmarshal(body, &result))
+		require.Equal(t, "task_public", result["id"])
+		require.Equal(t, "task_public", result["task_id"])
+		require.NotEmpty(t, result["status"])
+		require.JSONEq(t, raw, string(task.Data))
+	}
+}

@@ -1,0 +1,210 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestValidateTenantRouteProfileAcceptsOpenWorldIdentifiersAndVisibleLabels(t *testing.T) {
+	base := TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "future-profile", Revision: "rev-1", ProductPoolID: "future_reasoning", ServiceTier: "burst", PublicLabel: "高并发", ProviderClass: "anonymous"}
+	require.NoError(t, ValidateTenantRouteProfile(&base))
+
+	for _, edit := range []func(*TenantRouteProfile){
+		func(p *TenantRouteProfile) { p.ProductPoolID = "sk-secret" },
+		func(p *TenantRouteProfile) { p.ServiceTier = "https://example.invalid" },
+		func(p *TenantRouteProfile) { p.ServiceTier = "tier/unsafe" },
+		func(p *TenantRouteProfile) { p.PublicLabel = "sk-secret" },
+		func(p *TenantRouteProfile) { p.PublicLabel = "https://example.invalid" },
+	} {
+		invalid := base
+		edit(&invalid)
+		assert.Error(t, ValidateTenantRouteProfile(&invalid))
+	}
+
+	base.ProductPoolID = "claude_ccmax"
+	base.PublicLabel = "旗舰"
+	base.ProviderClass = "third-party"
+	base.ServiceTier = "max"
+	if err := ValidateTenantRouteProfile(&base); err == nil {
+		t.Fatal("high Claude profile without explicit CCMax accepted")
+	}
+	noProviderClass := TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "claude-no-provider", Revision: "r", ProductPoolID: "claude_kiro", ServiceTier: "basic", PublicLabel: "基础", Status: TenantBindingEnabled}
+	if err := ValidateTenantRouteProfile(&noProviderClass); err == nil {
+		t.Fatal("enabled Claude profile without provider isolation evidence accepted")
+	}
+}
+
+func TestValidateTenantRouteProfileAllowsIndependentTiersAndRatioWindows(t *testing.T) {
+	kiroMax := TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "kiro-max", Revision: "r", ProductPoolID: "claude_kiro", ServiceTier: "max", PublicLabel: "旗舰", ProviderClass: "kiro", MinRatioPPM: 300000, MaxRatioPPM: 900000}
+	assert.NoError(t, ValidateTenantRouteProfile(&kiroMax))
+	thirdPartyPro := TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "third-party-pro", Revision: "r", ProductPoolID: "claude_third_party", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "claude-third-party"}
+	assert.NoError(t, ValidateTenantRouteProfile(&thirdPartyPro))
+	ccmaxBasic := TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "ccmax-basic", Revision: "r", ProductPoolID: "claude_ccmax", ServiceTier: "basic", PublicLabel: "基础", ProviderClass: "ccmax", MinRatioPPM: 700001}
+	assert.NoError(t, ValidateTenantRouteProfile(&ccmaxBasic))
+	gptMax := TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "gpt-max", Revision: "r", ProductPoolID: "openai_gpt", ServiceTier: "max", PublicLabel: "旗舰", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	assert.NoError(t, ValidateTenantRouteProfile(&gptMax))
+}
+
+func TestValidateTenantRouteProfileRejectsCrossPoolTierLabelAndProviderMixes(t *testing.T) {
+	cases := []TenantRouteProfile{
+		{TenantID: DownstreamTenantID, ProfileID: "ccmax-third-party", Revision: "r", ProductPoolID: "claude_ccmax", ServiceTier: "max", PublicLabel: "旗舰", ProviderClass: "third-party"},
+		{TenantID: DownstreamTenantID, ProfileID: "kiro-ccmax", Revision: "r", ProductPoolID: "claude_kiro", ServiceTier: "basic", PublicLabel: "基础", ProviderClass: "ccmax"},
+		{TenantID: DownstreamTenantID, ProfileID: "kiro-anonymous", Revision: "r", ProductPoolID: "claude_kiro", ServiceTier: "basic", PublicLabel: "基础", ProviderClass: "anonymous"},
+		{TenantID: DownstreamTenantID, ProfileID: "third-anonymous", Revision: "r", ProductPoolID: "claude_third_party", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous"},
+		{TenantID: DownstreamTenantID, ProfileID: "ccmax-mixed", Revision: "r", ProductPoolID: "claude_ccmax", ServiceTier: "max", PublicLabel: "旗舰", ProviderClass: "ccmax-kiro"},
+	}
+	for _, profile := range cases {
+		assert.Error(t, ValidateTenantRouteProfile(&profile), "invalid profile unexpectedly accepted: %+v", profile)
+	}
+}
+
+func TestTenantCostBindingRejectsSecretAndMismatchedProfile(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	profile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "profile-safe", Revision: "rev-safe",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantRouteProfile(profile))
+	bad := &TenantCredentialBinding{TokenID: 91, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "sk-secret", KeySuffix: "1234", ProductPoolID: "openai_gpt", ServiceTier: "pro", RouteProfileID: "profile-safe", ProfileRevision: "rev-safe", ModelCatalogRevision: "rev-cat", BindingStatus: TenantBindingEnabled}
+	assert.ErrorIs(t, UpsertTenantCredentialBinding(bad), ErrTenantCostInvalidInput)
+	bad.KeyID = "safe-key"
+	bad.ServiceTier = "basic"
+	assert.ErrorIs(t, UpsertTenantCredentialBinding(bad), ErrTenantCostInvalidInput)
+	assert.NotNil(t, db)
+}
+
+func TestTenantCostBindingAcceptsGPTMaxSlot(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	profile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "gpt-max", Revision: "rev-gpt-max",
+		ProductPoolID: "openai_gpt", ServiceTier: "max", PublicLabel: "旗舰", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantRouteProfile(profile))
+	binding := &TenantCredentialBinding{TokenID: 99, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "safe-key", KeySuffix: "1234", ProductPoolID: "openai_gpt", ServiceTier: "max", RouteProfileID: "gpt-max", ProfileRevision: "rev-gpt-max", ModelCatalogRevision: "rev-cat", BindingStatus: TenantBindingEnabled}
+	assert.NoError(t, UpsertTenantCredentialBinding(binding))
+	assert.NotNil(t, db)
+}
+
+func TestTenantCostBindingCannotStartEnabledAgainstDisabledProfile(t *testing.T) {
+	setupTenantCostTestDB(t)
+	profile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "disabled-profile", Revision: "rev-disabled",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous", Status: TenantBindingDisabled}
+	require.NoError(t, UpsertTenantRouteProfile(profile))
+	binding := &TenantCredentialBinding{TokenID: 1001, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "safe-key", KeySuffix: "1001", ProductPoolID: "openai_gpt", ServiceTier: "pro", RouteProfileID: profile.ProfileID,
+		ProfileRevision: profile.Revision, ModelCatalogRevision: "rev-cat", BindingStatus: TenantBindingEnabled}
+	assert.Error(t, UpsertTenantCredentialBinding(binding))
+}
+
+func TestTenantCostBindingCannotMoveOrMutateEnabledIdentity(t *testing.T) {
+	setupTenantCostTestDB(t)
+	second := &TenantCostDownstream{TenantID: "second-tenant", DisplayName: "Second Tenant", ConfigKey: "second_tenant", Status: TenantCostDownstreamActive}
+	require.NoError(t, UpsertTenantCostDownstream(second))
+
+	firstProfile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "immutable-profile", Revision: "rev-immutable",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	secondProfile := &TenantRouteProfile{TenantID: second.TenantID, ProfileID: "second-profile", Revision: "rev-second",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantRouteProfile(firstProfile))
+	require.NoError(t, UpsertTenantRouteProfile(secondProfile))
+	binding := &TenantCredentialBinding{TokenID: 2001, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "key-immutable", KeySuffix: "2001", ProductPoolID: "openai_gpt", ServiceTier: "pro", RouteProfileID: firstProfile.ProfileID,
+		ProfileRevision: firstProfile.Revision, ModelCatalogRevision: "catalog-1", BindingStatus: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantCredentialBinding(binding))
+
+	moved := *binding
+	moved.TenantID = second.TenantID
+	moved.RouteProfileID = secondProfile.ProfileID
+	moved.ProfileRevision = secondProfile.Revision
+	assert.ErrorIs(t, UpsertTenantCredentialBinding(&moved), ErrTenantCostConflict)
+
+	mutated := *binding
+	mutated.KeyID = "key-other"
+	assert.ErrorIs(t, UpsertTenantCredentialBinding(&mutated), ErrTenantCostConflict)
+}
+
+func TestEnabledRouteProfileRejectsPrivateIdentityMutation(t *testing.T) {
+	setupTenantCostTestDB(t)
+	profile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "private-identity-profile", Revision: "rev-private-identity",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ModelSelector: "selector-a",
+		MinRatioPPM: 100, MaxRatioPPM: 200, ProviderClass: "anonymous", CandidateSpec: "candidate-a",
+		CapabilitySpec: "capability-a", Status: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantRouteProfile(profile))
+	binding := &TenantCredentialBinding{TokenID: 2101, TenantID: DownstreamTenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: "key-private-identity", KeySuffix: "2101", ProductPoolID: "openai_gpt", ServiceTier: "pro",
+		RouteProfileID: profile.ProfileID, ProfileRevision: profile.Revision, ModelCatalogRevision: "catalog-private-identity",
+		BindingStatus: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantCredentialBinding(binding))
+
+	cases := []struct {
+		name string
+		edit func(*TenantRouteProfile)
+	}{
+		{name: "model selector", edit: func(p *TenantRouteProfile) { p.ModelSelector = "selector-b" }},
+		{name: "minimum ratio", edit: func(p *TenantRouteProfile) { p.MinRatioPPM = 101 }},
+		{name: "maximum ratio", edit: func(p *TenantRouteProfile) { p.MaxRatioPPM = 201 }},
+		{name: "provider class", edit: func(p *TenantRouteProfile) { p.ProviderClass = "anonymous-v2" }},
+		{name: "candidate spec", edit: func(p *TenantRouteProfile) { p.CandidateSpec = "candidate-b" }},
+		{name: "capability spec", edit: func(p *TenantRouteProfile) { p.CapabilitySpec = "capability-b" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := *profile
+			tc.edit(&mutated)
+			assert.Error(t, UpsertTenantRouteProfile(&mutated))
+		})
+	}
+	var persisted TenantRouteProfile
+	require.NoError(t, DB.Where("tenant_id = ? AND profile_id = ?", profile.TenantID, profile.ProfileID).First(&persisted).Error)
+	assert.Equal(t, "selector-a", persisted.ModelSelector)
+	assert.EqualValues(t, 100, persisted.MinRatioPPM)
+	assert.EqualValues(t, 200, persisted.MaxRatioPPM)
+	assert.Equal(t, "anonymous", persisted.ProviderClass)
+	assert.Equal(t, "candidate-a", persisted.CandidateSpec)
+	assert.Equal(t, "capability-a", persisted.CapabilitySpec)
+}
+
+func TestBuildTenantCostCatalogUsesOnlyRegisteredDynamicSlots(t *testing.T) {
+	setupTenantCostTestDB(t)
+	_, err := ProvisionTenantCostSlot(TenantCostSlotProvisionSpec{
+		TenantID: DownstreamTenantID, ProductPoolID: "future_reasoning", ProductFamily: "reasoning",
+		ServiceTier: "burst", PublicLabel: "高并发", SortOrder: 20, ProfileID: "future-burst",
+		ProfileRevision: "rev-1", ProviderClass: "anonymous", ProfileStatus: TenantBindingPending,
+	}, 7)
+	require.NoError(t, err)
+	catalog, err := BuildTenantCostCatalog()
+	require.NoError(t, err)
+	require.Len(t, catalog, 1)
+	assert.Equal(t, "future_reasoning", catalog[0].ProductPoolID)
+	assert.Equal(t, "reasoning", catalog[0].ProductFamily)
+	assert.Equal(t, "burst", catalog[0].ServiceTier)
+	assert.Equal(t, "高并发", catalog[0].PublicLabel)
+	assert.Equal(t, TenantBindingPending, catalog[0].Status)
+	assert.Contains(t, catalog[0].DisabledReason, "尚未绑定")
+}
+
+func TestBuildTenantCostCatalogFailsClosedForMalformedBinding(t *testing.T) {
+	db := setupTenantCostTestDB(t)
+	require.NoError(t, db.Create(&TenantCostProductSlot{TenantID: DownstreamTenantID, ProductPoolID: "openai_gpt",
+		ProductFamily: "gpt", ServiceTier: "pro", PublicLabel: "专业", SortOrder: 1, CreatedAt: 1, UpdatedAt: 1}).Error)
+	profile := &TenantRouteProfile{TenantID: DownstreamTenantID, ProfileID: "catalog-profile", Revision: "rev-catalog",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", PublicLabel: "专业", ProviderClass: "anonymous", Status: TenantBindingEnabled}
+	require.NoError(t, UpsertTenantRouteProfile(profile))
+	// Insert a legacy/malformed row directly to model data written before the
+	// stricter binding contract.  The public catalog must not let the later
+	// status assignment turn this back into an enabled slot.
+	require.NoError(t, db.Create(&TenantCredentialBinding{TokenID: 1002, TenantID: DownstreamTenantID,
+		CredentialPurpose: TenantCredentialPurposeDataPlane, KeyID: "sk-leaked", KeySuffix: "1002",
+		ProductPoolID: "openai_gpt", ServiceTier: "pro", RouteProfileID: profile.ProfileID,
+		ProfileRevision: profile.Revision, ModelCatalogRevision: "rev-catalog", BindingStatus: TenantBindingEnabled}).Error)
+	catalog, err := BuildTenantCostCatalog()
+	require.NoError(t, err)
+	require.Len(t, catalog, 1)
+	for _, slot := range catalog {
+		if slot.ProductPoolID == "openai_gpt" && slot.ServiceTier == "pro" {
+			assert.Equal(t, TenantBindingDisabled, slot.Status)
+			assert.NotEmpty(t, slot.DisabledReason)
+			assert.Empty(t, slot.KeyID)
+		}
+	}
+}

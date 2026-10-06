@@ -1,0 +1,95 @@
+package openai
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/require"
+)
+
+func TestOaiStreamHandlerSmartBareEOFIsNotNormalCompletion(t *testing.T) {
+	c, recorder, resp, info := newClaudeEntryTestContext(t, "/v1/chat/completions", strings.Join([]string{
+		`data: {"id":"chatcmpl_eof","model":"gpt-test","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`,
+		``,
+	}, "\n"))
+	info.RelayFormat = types.RelayFormatOpenAI
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+
+	usage, apiErr := OaiStreamHandler(c, info, resp)
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	require.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+	require.True(t, apiErr.HasUpstreamResponse())
+	require.Empty(t, recorder.Body.String(), "an uncommitted route must remain replayable")
+}
+
+func TestOaiStreamHandlerSmartFinishReasonMakesEOFComplete(t *testing.T) {
+	c, recorder, resp, info := newClaudeEntryTestContext(t, "/v1/chat/completions", strings.Join([]string{
+		`data: {"id":"chatcmpl_done","model":"gpt-test","choices":[{"index":0,"delta":{"content":"complete"},"finish_reason":"stop"}]}`,
+		``,
+	}, "\n"))
+	info.RelayFormat = types.RelayFormatOpenAI
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+
+	usage, apiErr := OaiStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	require.Contains(t, recorder.Body.String(), "[DONE]")
+	require.True(t, info.StreamStatus.HasTerminal())
+	require.Equal(t, "chat_finish_reason", info.StreamStatus.TerminalKind())
+}
+
+func TestOaiStreamHandlerSmartCommittedBareEOFDoesNotEmitDone(t *testing.T) {
+	c, recorder, resp, info := newClaudeEntryTestContext(t, "/v1/chat/completions", strings.Join([]string{
+		`data: {"id":"chatcmpl_eof2","model":"gpt-test","choices":[{"index":0,"delta":{"content":"first"},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_eof2","model":"gpt-test","choices":[{"index":0,"delta":{"content":"second"},"finish_reason":null}]}`,
+		``,
+	}, "\n"))
+	info.RelayFormat = types.RelayFormatOpenAI
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+
+	_, apiErr := OaiStreamHandler(c, info, resp)
+	require.NotNil(t, apiErr)
+	output := recorder.Body.String()
+	require.Contains(t, output, "first")
+	require.Contains(t, output, "second")
+	require.NotContains(t, output, "[DONE]", "an incomplete stream must not be finalized")
+}
+
+func TestSmartStreamStatusTerminalForCompletionsFinishReason(t *testing.T) {
+	status := relaycommon.NewStreamStatus()
+	info := &relaycommon.RelayInfo{StreamStatus: status, RelayMode: relayconstant.RelayModeCompletions}
+	markOpenAIStreamTerminal(info, `{"choices":[{"text":"ok","finish_reason":"stop"}]}`)
+	require.True(t, status.HasTerminal())
+}
+
+func TestSmartOpenAIStreamClientGoneIsNotMarkedAsProviderFailure(t *testing.T) {
+	c, _, _, info := newClaudeEntryTestContext(t, "/v1/chat/completions", "")
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+	info.IsStream = true
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+
+	apiErr := smartOpenAIStreamIncompleteError(c, info)
+	require.NotNil(t, apiErr)
+	require.ErrorIs(t, apiErr, context.Canceled)
+	require.False(t, apiErr.HasUpstreamResponse())
+}
+
+func TestSmartOpenAIStreamTerminalWinsOverConcurrentClientGone(t *testing.T) {
+	c, _, _, info := newClaudeEntryTestContext(t, "/v1/chat/completions", "")
+	common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, true)
+	info.IsStream = true
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+	info.StreamStatus.MarkTerminalKind("chat_finish_reason")
+
+	require.Nil(t, smartOpenAIStreamIncompleteError(c, info))
+}

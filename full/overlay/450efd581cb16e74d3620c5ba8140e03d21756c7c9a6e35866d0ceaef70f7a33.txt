@@ -1,0 +1,408 @@
+package model
+
+// Generic, tenant-scoped batch data-plane credential provisioning.  This
+// file deliberately does not contain a Downstream-only allowlist: the
+// registered downstream/slot/profile rows are the authority for every
+// tenant and future product pool.
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+const (
+	TenantCostBatchProvisionPending   = "pending"
+	TenantCostBatchProvisionPartial   = "partial"
+	TenantCostBatchProvisionSucceeded = "succeeded"
+	TenantCostBatchProvisionFailed    = "failed"
+	TenantCostBatchItemPending        = "pending"
+	TenantCostBatchItemSucceeded      = "succeeded"
+	TenantCostBatchItemFailed         = "failed"
+)
+
+// TenantCostBatchProvisionReceipt is the durable parent idempotency record.
+// It intentionally contains no secret material.
+type TenantCostBatchProvisionReceipt struct {
+	ID                int64  `json:"id" gorm:"primaryKey"`
+	TenantID          string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	RequestID         string `json:"request_id" gorm:"type:varchar(96);uniqueIndex:idx_tenant_cost_batch_request;not null"`
+	InputFingerprint  string `json:"input_fingerprint" gorm:"type:char(64);index;not null"`
+	OwnerUserID       int    `json:"owner_user_id" gorm:"index;not null"`
+	ExpectedItemCount int    `json:"expected_item_count" gorm:"not null"`
+	ActualItemCount   int    `json:"actual_item_count" gorm:"not null"`
+	Status            string `json:"status" gorm:"type:varchar(24);index;not null"`
+	CreatedAt         int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt         int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostBatchProvisionReceipt) TableName() string {
+	return "tenant_cost_batch_provision_receipts"
+}
+
+// TenantCostBatchProvisionItemReceipt is the durable per-item result.  Only
+// safe key identity metadata is retained; the generated secret is never
+// persisted and therefore cannot be recovered by replay.
+type TenantCostBatchProvisionItemReceipt struct {
+	ID            int64  `json:"id" gorm:"primaryKey"`
+	BatchID       int64  `json:"batch_id" gorm:"index;uniqueIndex:idx_tenant_cost_batch_item;not null"`
+	ItemIndex     int    `json:"item_index" gorm:"uniqueIndex:idx_tenant_cost_batch_item;not null"`
+	TenantID      string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	SlotID        int64  `json:"slot_id" gorm:"index;not null"`
+	ProfileID     string `json:"profile_id" gorm:"type:varchar(128);not null"`
+	ProductPoolID string `json:"product_pool_id" gorm:"type:varchar(64);not null"`
+	ServiceTier   string `json:"service_tier" gorm:"type:varchar(32);not null"`
+	Status        string `json:"status" gorm:"type:varchar(24);index;not null"`
+	TokenID       int    `json:"token_id" gorm:"index;not null"`
+	BindingID     int64  `json:"binding_id" gorm:"index;not null"`
+	KeyID         string `json:"key_id" gorm:"type:varchar(128)"`
+	KeySuffix     string `json:"key_suffix" gorm:"type:varchar(8)"`
+	ErrorCode     string `json:"error_code,omitempty" gorm:"type:varchar(64)"`
+	ErrorMessage  string `json:"error_message,omitempty" gorm:"type:varchar(255)"`
+	CreatedAt     int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt     int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostBatchProvisionItemReceipt) TableName() string {
+	return "tenant_cost_batch_provision_item_receipts"
+}
+
+// TenantCostBatchProvisionItemSpec references registered identities.  The
+// client cannot submit a raw key, token id, provider URL, or physical route.
+type TenantCostBatchProvisionItemSpec struct {
+	SlotID         int64  `json:"slot_id"`
+	ProfileID      string `json:"profile_id"`
+	Name           string `json:"name"`
+	Group          string `json:"group"`
+	RoutingPolicy  string `json:"routing_policy"`
+	RemainQuota    int    `json:"remain_quota"`
+	UnlimitedQuota bool   `json:"unlimited_quota"`
+	ExpiredTime    int64  `json:"expired_time"`
+	BindingStatus  string `json:"binding_status"`
+}
+
+type TenantCostBatchProvisionSpec struct {
+	RequestID         string                             `json:"request_id"`
+	TenantID          string                             `json:"tenant_id"`
+	OwnerUserID       int                                `json:"owner_user_id"`
+	ExpectedItemCount int                                `json:"expected_item_count"`
+	Items             []TenantCostBatchProvisionItemSpec `json:"items"`
+}
+
+type TenantCostBatchProvisionItemResult struct {
+	ItemIndex     int    `json:"item_index"`
+	SlotID        int64  `json:"slot_id"`
+	ProfileID     string `json:"profile_id"`
+	ProductPoolID string `json:"product_pool_id"`
+	ServiceTier   string `json:"service_tier"`
+	Status        string `json:"status"`
+	TokenID       int    `json:"token_id,omitempty"`
+	BindingID     int64  `json:"binding_id,omitempty"`
+	KeyID         string `json:"key_id,omitempty"`
+	KeySuffix     string `json:"key_suffix,omitempty"`
+	Secret        string `json:"secret,omitempty"`
+	ErrorCode     string `json:"error_code,omitempty"`
+	ErrorMessage  string `json:"error_message,omitempty"`
+}
+
+type TenantCostBatchProvisionResult struct {
+	RequestID         string                               `json:"request_id"`
+	TenantID          string                               `json:"tenant_id"`
+	ExpectedItemCount int                                  `json:"expected_item_count"`
+	ActualItemCount   int                                  `json:"actual_item_count"`
+	Status            string                               `json:"status"`
+	Replayed          bool                                 `json:"replayed"`
+	Items             []TenantCostBatchProvisionItemResult `json:"items"`
+}
+
+func batchProvisionFingerprint(spec TenantCostBatchProvisionSpec) (string, error) {
+	canonical := struct {
+		TenantID          string                             `json:"tenant_id"`
+		OwnerUserID       int                                `json:"owner_user_id"`
+		ExpectedItemCount int                                `json:"expected_item_count"`
+		Items             []TenantCostBatchProvisionItemSpec `json:"items"`
+	}{spec.TenantID, spec.OwnerUserID, spec.ExpectedItemCount, spec.Items}
+	b, err := common.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	sum := common.Sha256Raw(b)
+	return hex.EncodeToString(sum), nil
+}
+
+func normalizeBatchProvisionSpec(spec *TenantCostBatchProvisionSpec) (string, error) {
+	if spec == nil || DB == nil {
+		return "", ErrTenantCostInvalidInput
+	}
+	spec.RequestID = strings.TrimSpace(spec.RequestID)
+	spec.TenantID = strings.TrimSpace(spec.TenantID)
+	if !validTenantCostPublicIdentifier(spec.RequestID, 96) || !IsValidTenantCostTenantID(spec.TenantID) ||
+		spec.OwnerUserID <= 0 || spec.ExpectedItemCount <= 0 || spec.ExpectedItemCount > 500 ||
+		len(spec.Items) != spec.ExpectedItemCount {
+		return "", ErrTenantCostInvalidInput
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(spec.TenantID); err != nil {
+		return "", err
+	}
+	seen := make(map[int64]struct{}, len(spec.Items))
+	for i := range spec.Items {
+		item := &spec.Items[i]
+		item.ProfileID = strings.TrimSpace(item.ProfileID)
+		item.Name = strings.TrimSpace(item.Name)
+		item.Group = strings.TrimSpace(item.Group)
+		item.RoutingPolicy = strings.TrimSpace(item.RoutingPolicy)
+		item.BindingStatus = strings.TrimSpace(item.BindingStatus)
+		if item.SlotID <= 0 || !validTenantCostPublicIdentifier(item.ProfileID, 128) {
+			return "", ErrTenantCostInvalidInput
+		}
+		if _, ok := seen[item.SlotID]; ok {
+			return "", ErrTenantCostConflict
+		}
+		seen[item.SlotID] = struct{}{}
+		if item.Name == "" {
+			item.Name = fmt.Sprintf("tenant-%d", i+1)
+		}
+		if len([]rune(item.Name)) > 50 || item.RemainQuota < 0 {
+			return "", ErrTenantCostInvalidInput
+		}
+		if item.Group == "" {
+			item.Group = "default"
+		}
+		if len(item.Group) > 64 || strings.Contains(item.Group, "sk-") {
+			return "", ErrTenantCostInvalidInput
+		}
+		if item.ExpiredTime != 0 && item.ExpiredTime <= common.GetTimestamp() {
+			return "", ErrTenantCostInvalidInput
+		}
+		if item.BindingStatus == "" {
+			item.BindingStatus = TenantBindingEnabled
+		}
+		if !validTenantBindingStatus(item.BindingStatus) || item.BindingStatus == TenantBindingRevoked {
+			return "", ErrTenantCostInvalidInput
+		}
+		if item.RoutingPolicy != "" {
+			normalized, err := NormalizeTokenRoutingPolicy(item.Group, item.RoutingPolicy)
+			if err != nil {
+				return "", err
+			}
+			item.RoutingPolicy = normalized
+			if normalized != "" {
+				probe := &Token{Group: item.Group, RoutingPolicy: normalized}
+				policy, err := probe.GetSmartRoutingPolicy()
+				if err != nil {
+					return "", err
+				}
+				if err := ValidateSmartRouterPolicyLimits(*policy); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	return batchProvisionFingerprint(*spec)
+}
+
+func batchProvisionResultFromRows(parent TenantCostBatchProvisionReceipt, rows []TenantCostBatchProvisionItemReceipt, includeSecrets map[int]string, replayed bool) *TenantCostBatchProvisionResult {
+	result := &TenantCostBatchProvisionResult{RequestID: parent.RequestID, TenantID: parent.TenantID, ExpectedItemCount: parent.ExpectedItemCount, ActualItemCount: parent.ActualItemCount, Status: parent.Status, Replayed: replayed, Items: make([]TenantCostBatchProvisionItemResult, 0, len(rows))}
+	for _, row := range rows {
+		item := TenantCostBatchProvisionItemResult{ItemIndex: row.ItemIndex, SlotID: row.SlotID, ProfileID: row.ProfileID, ProductPoolID: row.ProductPoolID, ServiceTier: row.ServiceTier, Status: row.Status, TokenID: row.TokenID, BindingID: row.BindingID, KeyID: row.KeyID, KeySuffix: row.KeySuffix, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage}
+		// includeSecrets contains only secrets generated during this invocation;
+		// a replay therefore discloses at most newly-created item secrets and
+		// never recovers historical material from the receipt.
+		if includeSecrets != nil {
+			item.Secret = includeSecrets[row.ItemIndex]
+		}
+		result.Items = append(result.Items, item)
+	}
+	return result
+}
+
+func loadBatchProvisionRows(tx *gorm.DB, parent *TenantCostBatchProvisionReceipt) ([]TenantCostBatchProvisionItemReceipt, error) {
+	var rows []TenantCostBatchProvisionItemReceipt
+	err := tx.Where("batch_id = ?", parent.ID).Order("item_index asc").Find(&rows).Error
+	return rows, err
+}
+
+func updateBatchParentTx(tx *gorm.DB, parent *TenantCostBatchProvisionReceipt, now int64) error {
+	var rows []TenantCostBatchProvisionItemReceipt
+	if err := tx.Where("batch_id = ?", parent.ID).Find(&rows).Error; err != nil {
+		return err
+	}
+	succeeded, failed := 0, 0
+	for _, row := range rows {
+		if row.Status == TenantCostBatchItemSucceeded {
+			succeeded++
+		}
+		if row.Status == TenantCostBatchItemFailed {
+			failed++
+		}
+	}
+	parent.ActualItemCount, parent.UpdatedAt = succeeded, now
+	parent.Status = TenantCostBatchProvisionPending
+	if failed > 0 && succeeded > 0 {
+		parent.Status = TenantCostBatchProvisionPartial
+	} else if failed > 0 && succeeded == 0 {
+		parent.Status = TenantCostBatchProvisionFailed
+	} else if succeeded == parent.ExpectedItemCount {
+		parent.Status = TenantCostBatchProvisionSucceeded
+	}
+	return tx.Model(&TenantCostBatchProvisionReceipt{}).Where("id = ?", parent.ID).Updates(map[string]interface{}{"actual_item_count": parent.ActualItemCount, "status": parent.Status, "updated_at": now}).Error
+}
+
+// ProvisionTenantCostBatch creates server-generated keys and bindings for a
+// registered manifest. It is safe to replay: an existing request receipt is
+// returned without any historical secret, and a fingerprint mismatch fails.
+func ProvisionTenantCostBatch(spec TenantCostBatchProvisionSpec, actorUserID int) (*TenantCostBatchProvisionResult, error) {
+	if actorUserID <= 0 {
+		return nil, ErrTenantCostInvalidInput
+	}
+	// Batch issuance is an administrator operation.  Keys are owned by the
+	// authenticated root actor; accepting an unrelated user ID would create a
+	// cross-tenant ownership ambiguity without adding user-facing value.
+	if spec.OwnerUserID != actorUserID {
+		return nil, ErrTenantCostScope
+	}
+	fingerprint, err := normalizeBatchProvisionSpec(&spec)
+	if err != nil {
+		return nil, err
+	}
+	var parent TenantCostBatchProvisionReceipt
+	replayed := false
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		// Existing receipts remain readable after an operator disables a
+		// downstream.  Only a genuinely new batch requires the active gate.
+		if _, err := requireTenantCostDownstreamTx(tx, spec.TenantID, false); err != nil {
+			return err
+		}
+		var existing TenantCostBatchProvisionReceipt
+		err := lockForUpdate(tx).Where("request_id = ?", spec.RequestID).First(&existing).Error
+		if err == nil {
+			if existing.TenantID != spec.TenantID || existing.InputFingerprint != fingerprint || existing.OwnerUserID != spec.OwnerUserID || existing.ExpectedItemCount != spec.ExpectedItemCount {
+				return ErrTenantCostConflict
+			}
+			parent, replayed = existing, true
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if _, err := requireTenantCostDownstreamTx(tx, spec.TenantID, true); err != nil {
+			return err
+		}
+		var owner User
+		if err := tx.Where("id = ?", spec.OwnerUserID).First(&owner).Error; err != nil {
+			return err
+		}
+		now := common.GetTimestamp()
+		parent = TenantCostBatchProvisionReceipt{TenantID: spec.TenantID, RequestID: spec.RequestID, InputFingerprint: fingerprint, OwnerUserID: spec.OwnerUserID, ExpectedItemCount: spec.ExpectedItemCount, Status: TenantCostBatchProvisionPending, CreatedAt: now, UpdatedAt: now}
+		if err := tx.Create(&parent).Error; err != nil {
+			return err
+		}
+		for i, item := range spec.Items {
+			if err := tx.Create(&TenantCostBatchProvisionItemReceipt{BatchID: parent.ID, ItemIndex: i, TenantID: spec.TenantID, SlotID: item.SlotID, ProfileID: item.ProfileID, Status: TenantCostBatchItemPending, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	secrets := make(map[int]string)
+	for i, item := range spec.Items {
+		var secret string
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var lockedParent TenantCostBatchProvisionReceipt
+			if err := lockForUpdate(tx).Where("id = ? AND request_id = ?", parent.ID, spec.RequestID).First(&lockedParent).Error; err != nil {
+				return err
+			}
+			var receipt TenantCostBatchProvisionItemReceipt
+			if err := lockForUpdate(tx).Where("batch_id = ? AND item_index = ?", parent.ID, i).First(&receipt).Error; err != nil {
+				return err
+			}
+			if receipt.Status == TenantCostBatchItemSucceeded {
+				return nil
+			}
+			var slot TenantCostProductSlot
+			if err := lockForUpdate(tx).Where("id = ? AND tenant_id = ?", item.SlotID, spec.TenantID).First(&slot).Error; err != nil {
+				return err
+			}
+			var profile TenantRouteProfile
+			if err := lockForUpdate(tx).Where("tenant_id = ? AND profile_id = ?", spec.TenantID, item.ProfileID).First(&profile).Error; err != nil {
+				return err
+			}
+			if profile.ProductPoolID != slot.ProductPoolID || profile.ServiceTier != slot.ServiceTier || profile.PublicLabel != slot.PublicLabel || ValidateTenantRouteProfile(&profile) != nil {
+				return ErrTenantCostConflict
+			}
+			if item.BindingStatus == TenantBindingEnabled && profile.Status != TenantBindingEnabled {
+				return ErrTenantCostBindingUnavailable
+			}
+			rawKey, err := common.GenerateKey()
+			if err != nil {
+				return err
+			}
+			now := common.GetTimestamp()
+			token := Token{UserId: spec.OwnerUserID, Name: item.Name, Key: rawKey, Status: common.TokenStatusEnabled, CreatedTime: now, AccessedTime: now, ExpiredTime: item.ExpiredTime, RemainQuota: item.RemainQuota, UnlimitedQuota: item.UnlimitedQuota, Group: item.Group, RoutingPolicy: item.RoutingPolicy}
+			if item.BindingStatus != TenantBindingEnabled {
+				token.Status = common.TokenStatusDisabled
+			}
+			if err := tx.Create(&token).Error; err != nil {
+				return err
+			}
+			suffix, err := tenantCostKeySuffix(rawKey)
+			if err != nil {
+				return err
+			}
+			binding := TenantCredentialBinding{TokenID: token.Id, TenantID: spec.TenantID, CredentialPurpose: TenantCredentialPurposeDataPlane, KeyID: tenantCostDerivedKeyID(token.Id), KeySuffix: suffix, ProductPoolID: slot.ProductPoolID, ServiceTier: slot.ServiceTier, RouteProfileID: profile.ProfileID, ProfileRevision: profile.Revision, ModelCatalogRevision: "batch-v1", BindingStatus: item.BindingStatus, CreatedAt: now, UpdatedAt: now}
+			if err := tx.Create(&binding).Error; err != nil {
+				return err
+			}
+			if result := tx.Model(&Token{}).Where("id = ? AND tenant_cost_binding_id = 0", token.Id).Update("tenant_cost_binding_id", binding.ID); result.Error != nil || result.RowsAffected != 1 {
+				if result.Error != nil {
+					return result.Error
+				}
+				return ErrTenantCostConflict
+			}
+			if err := tx.Model(&TenantCostBatchProvisionItemReceipt{}).Where("id = ?", receipt.ID).Updates(map[string]interface{}{"tenant_id": spec.TenantID, "profile_id": profile.ProfileID, "product_pool_id": slot.ProductPoolID, "service_tier": slot.ServiceTier, "status": TenantCostBatchItemSucceeded, "token_id": token.Id, "binding_id": binding.ID, "key_id": binding.KeyID, "key_suffix": suffix, "updated_at": now}).Error; err != nil {
+				return err
+			}
+			if err := appendTenantCostAuditEventForTenantTx(tx, spec.TenantID, actorUserID, "tenant_batch_key_provisioned", fmt.Sprintf("batch:%d/item:%d", parent.ID, i), fmt.Sprintf("token_id=%d key_id=%s suffix=%s", token.Id, binding.KeyID, suffix), now); err != nil {
+				return err
+			}
+			if err := updateBatchParentTx(tx, &lockedParent, now); err != nil {
+				return err
+			}
+			secret = tenantCostFullKey(rawKey)
+			return nil
+		})
+		if err != nil {
+			// Preserve a bounded, redacted failure receipt.  The original error is
+			// returned to the caller only through the stable status/code fields.
+			_ = DB.Transaction(func(tx *gorm.DB) error {
+				now := common.GetTimestamp()
+				if updateErr := tx.Model(&TenantCostBatchProvisionItemReceipt{}).Where("batch_id = ? AND item_index = ? AND status <> ?", parent.ID, i, TenantCostBatchItemSucceeded).Updates(map[string]interface{}{"status": TenantCostBatchItemFailed, "error_code": "item_provision_failed", "error_message": "item provisioning failed", "updated_at": now}).Error; updateErr != nil {
+					return updateErr
+				}
+				var locked TenantCostBatchProvisionReceipt
+				if lockErr := lockForUpdate(tx).Where("id = ?", parent.ID).First(&locked).Error; lockErr != nil {
+					return lockErr
+				}
+				return updateBatchParentTx(tx, &locked, now)
+			})
+		} else if secret != "" {
+			secrets[i] = secret
+		}
+	}
+	var finalParent TenantCostBatchProvisionReceipt
+	if err := DB.Where("id = ?", parent.ID).First(&finalParent).Error; err != nil {
+		return nil, err
+	}
+	var rows []TenantCostBatchProvisionItemReceipt
+	if err := DB.Where("batch_id = ?", parent.ID).Order("item_index asc").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return batchProvisionResultFromRows(finalParent, rows, secrets, replayed), nil
+}

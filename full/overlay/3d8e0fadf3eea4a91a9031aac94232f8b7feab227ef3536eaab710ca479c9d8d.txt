@@ -1,0 +1,223 @@
+package sora
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/png"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func inlineTestImage(t *testing.T, value uint8) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	img.Set(0, 0, color.RGBA{R: value, A: 255})
+	require.NoError(t, png.Encode(&buffer, img))
+	return buffer.Bytes()
+}
+
+func prepareInlineTest(t *testing.T) (string, mediaservice.Capability) {
+	t.Helper()
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.MediaBlob{}, &model.TaskArtifact{}, &model.MediaStorageState{}, &model.MediaStorageReservation{}))
+	previous := mediasetting.Get()
+	next := previous
+	next.Enabled = true
+	next.StoragePath = t.TempDir()
+	next.ReservedFreeBytes = 1
+	require.NoError(t, mediasetting.Replace(next))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previous)) })
+	require.NoError(t, mediaservice.EnsureStorage())
+	return next.StoragePath, mediaservice.Capability{RuntimeEnforced: true, ReferenceImage: true, ImageRoles: []string{"reference"}, MaxImages: 6,
+		ReferenceFields: map[string]string{"image": "images"}, ReferenceEncoding: map[string]string{"image": "data_url"},
+		GenerationFields: map[string]string{"seconds": "duration", "aspect_ratio": "ratio"},
+		MaxImageBytes:    50 << 20, MaxRemoteImageBytes: 25_000_000, MaxTotalImageBytes: 70 << 20, ImageMIMETypes: []string{"image/png", "image/jpeg", "image/webp"}}
+}
+
+func inlineContext(t *testing.T, raw string) *gin.Context {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(raw))
+	c.Request.Header.Set("Content-Type", "application/json")
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	t.Cleanup(func() { storage.Close() })
+	return c
+}
+
+func inlineInfo() *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{UserId: 1, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "vendor-model"}}
+}
+
+func TestInlineImagesPreserveBytesOrderPromptAndActualDuration(t *testing.T) {
+	root, capability := prepareInlineTest(t)
+	first, second := inlineTestImage(t, 10), inlineTestImage(t, 200)
+	inputs := []string{"data:image/png;base64," + base64.StdEncoding.EncodeToString(first), base64.StdEncoding.EncodeToString(second)}
+	prompt := "  @图片2 先于 @图片1\n保持原文  "
+	raw, err := common.Marshal(map[string]interface{}{"prompt": prompt, "images": inputs, "duration": 15, "ratio": "16:9"})
+	require.NoError(t, err)
+	c := inlineContext(t, string(raw))
+	req := relaycommon.TaskSubmitReq{Prompt: prompt, Images: inputs, Duration: 15, Seconds: "15", AspectRatio: "16:9", Resolution: "720p"}
+	body, err := buildInlineImageRequest(c, inlineInfo(), req, capability)
+	require.NoError(t, err)
+	spool, ok := body.(*encodedImageBody)
+	require.True(t, ok)
+	upstream, err := http.NewRequest(http.MethodPost, "https://provider.invalid/v1/videos", body)
+	require.NoError(t, err)
+	require.NoError(t, (&TaskAdaptor{}).BuildRequestHeader(c, upstream, inlineInfo()))
+	require.Equal(t, spool.size, upstream.ContentLength)
+	require.Nil(t, upstream.GetBody)
+	var wire map[string]interface{}
+	require.NoError(t, common.DecodeJson(body, &wire))
+	require.Equal(t, prompt, wire["prompt"])
+	require.EqualValues(t, 15, wire["duration"])
+	require.Equal(t, "16:9", wire["ratio"])
+	require.NotContains(t, wire, "seconds")
+	require.NotContains(t, wire, "references")
+	require.NotContains(t, wire, "input_reference")
+	images := wire["images"].([]interface{})
+	require.Len(t, images, 2)
+	for i, expected := range [][]byte{first, second} {
+		encoded := strings.TrimPrefix(images[i].(string), "data:image/png;base64,")
+		actual, err := base64.StdEncoding.DecodeString(encoded)
+		require.NoError(t, err)
+		require.Equal(t, expected, actual)
+	}
+	require.NoError(t, spool.Close())
+	require.NoError(t, spool.Close())
+	entries, err := os.ReadDir(filepath.Join(root, "tmp"))
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	var reserved int64
+	require.NoError(t, model.DB.Model(&model.MediaStorageReservation{}).Where("state = ?", "active").Count(&reserved).Error)
+	require.Zero(t, reserved)
+}
+
+func TestInlineImagesOwnedFileAndCrossUserIsolation(t *testing.T) {
+	root, capability := prepareInlineTest(t)
+	data := inlineTestImage(t, 42)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "objects", "test.png"), data, 0600))
+	blob := model.MediaBlob{PublicID: "file_owned", UserID: 1, StorageBackend: model.MediaStorageBackendLocal, ObjectKey: "objects/test.png", Status: model.MediaBlobStatusReady, MimeType: "image/png", SizeBytes: int64(len(data))}
+	require.NoError(t, model.DB.Create(&blob).Error)
+	source := inlineImageSource{reference: relaycommon.MediaReference{Type: "image", FileID: blob.PublicID}}
+	reader, limit, err := openInlineImage(context.Background(), 1, source, capability, capability.MaxImageBytes)
+	require.NoError(t, err)
+	defer reader.Close()
+	require.Equal(t, capability.MaxImageBytes, limit)
+	actual, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, data, actual)
+	_, _, err = openInlineImage(context.Background(), 2, source, capability, capability.MaxImageBytes)
+	require.Error(t, err)
+}
+
+func TestInlineImagesRejectUnsupportedInputsAndCleanFailedSpools(t *testing.T) {
+	root, capability := prepareInlineTest(t)
+	data := inlineTestImage(t, 33)
+	encoded := "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+	for _, tc := range []struct {
+		name string
+		req  relaycommon.TaskSubmitReq
+		raw  string
+		max  int64
+	}{
+		{"video", relaycommon.TaskSubmitReq{References: []relaycommon.MediaReference{{Type: "video", URL: "https://example.test/a.mp4"}}}, `{}`, 0},
+		{"too_large", relaycommon.TaskSubmitReq{Images: []string{encoded}}, `{}`, int64(len(data) - 1)},
+		{"total", relaycommon.TaskSubmitReq{Images: []string{encoded, encoded}}, `{}`, int64(len(data) + 1)},
+		{"html", relaycommon.TaskSubmitReq{Images: []string{base64.StdEncoding.EncodeToString([]byte("<html>bad image</html>"))}}, `{}`, 0},
+		{"hidden_inputs", relaycommon.TaskSubmitReq{}, `{"referenceVideos":["https://example.test/a.mp4"]}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cap := capability
+			if tc.max > 0 {
+				cap.MaxTotalImageBytes = tc.max
+			}
+			_, err := buildInlineImageRequest(inlineContext(t, tc.raw), inlineInfo(), tc.req, cap)
+			require.Error(t, err)
+			entries, err := os.ReadDir(filepath.Join(root, "tmp"))
+			require.NoError(t, err)
+			require.Empty(t, entries)
+		})
+	}
+}
+
+func TestInlineImageMultipartBridgeAndCancellation(t *testing.T) {
+	_, capability := prepareInlineTest(t)
+	var input bytes.Buffer
+	writer := multipart.NewWriter(&input)
+	part, err := writer.CreateFormFile("input_reference", "photo.png")
+	require.NoError(t, err)
+	_, err = part.Write(inlineTestImage(t, 9))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", &input)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	storage, err := common.GetBodyStorage(c)
+	require.NoError(t, err)
+	defer storage.Close()
+	body, err := buildInlineImageRequest(c, inlineInfo(), relaycommon.TaskSubmitReq{Seconds: "30"}, capability)
+	require.NoError(t, err)
+	defer body.(io.Closer).Close()
+	var wire map[string]interface{}
+	require.NoError(t, common.DecodeJson(body, &wire))
+	require.EqualValues(t, 30, wire["duration"])
+	require.Len(t, wire["images"], 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = openInlineImage(ctx, 1, inlineImageSource{}, capability, 100)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestInlineImageFetchUsesPolicyAndChecksActualLength(t *testing.T) {
+	_, capability := prepareInlineTest(t)
+	previous := *system_setting.GetFetchSetting()
+	t.Cleanup(func() { *system_setting.GetFetchSetting() = previous; service.InitHttpClient() })
+	system_setting.GetFetchSetting().EnableSSRFProtection = true
+	system_setting.GetFetchSetting().AllowPrivateIp = false
+	service.InitHttpClient()
+	_, _, err := openInlineImage(context.Background(), 1, inlineImageSource{reference: relaycommon.MediaReference{URL: "http://127.0.0.1:1234/private"}}, capability, 1000)
+	require.Error(t, err)
+	data := inlineTestImage(t, 17)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Empty(t, r.Header.Get("Authorization"))
+		w.(http.Flusher).Flush()
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	system_setting.GetFetchSetting().EnableSSRFProtection = false
+	service.InitHttpClient()
+	capability.MaxRemoteImageBytes = int64(len(data) - 1)
+	reader, limit, err := openInlineImage(context.Background(), 1, inlineImageSource{reference: relaycommon.MediaReference{URL: server.URL}}, capability, 1000)
+	require.NoError(t, err)
+	defer reader.Close()
+	_, err = writeInlineImage(io.Discard, reader, limit, capability.ImageMIMETypes)
+	require.ErrorContains(t, err, "byte limit")
+}

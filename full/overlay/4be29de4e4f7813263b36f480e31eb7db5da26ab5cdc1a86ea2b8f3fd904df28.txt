@@ -1,0 +1,43 @@
+package sora
+
+import (
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestManagedReferenceSourceField(t *testing.T) {
+	req := relaycommon.TaskSubmitReq{Seconds: "4", Resolution: "720p", References: []relaycommon.MediaReference{
+		{Type: "image", Role: "reference", FileID: "private-file", ResolvedURL: "https://media.example/image"},
+		{Type: "video", Role: "reference", ResolvedURL: "https://media.example/video"},
+		{Type: "audio", Role: "reference", ResolvedURL: "https://media.example/audio"},
+	}}
+	for _, field := range []string{"", "source", "download_href"} {
+		t.Run(field, func(t *testing.T) {
+			body := map[string]interface{}{"references": "old private input"}
+			require.NoError(t, applyManagedCapabilityPayload(body, req, mediaservice.Capability{RuntimeEnforced: true, ReferenceURLField: field}))
+			want := field
+			if want == "" {
+				want = "url"
+			}
+			refs := body["references"].([]map[string]string)
+			require.Len(t, refs, 3)
+			for i, ref := range refs {
+				require.Equal(t, req.References[i].ResolvedURL, ref[want])
+				require.Equal(t, req.References[i].Type, ref["type"])
+				require.NotContains(t, ref, "file_id")
+				if want != "url" {
+					require.NotContains(t, ref, "url")
+				}
+			}
+			require.Equal(t, "4", body["seconds"])
+			require.Equal(t, "720p", body["resolution"])
+		})
+	}
+	require.Equal(t, "https://media.example/image", providerReferencePayload(req.References)[0]["url"], "unconfigured legacy calls retain their wire")
+	body := map[string]interface{}{}
+	require.NoError(t, applyManagedCapabilityPayload(body, req, mediaservice.Capability{RuntimeEnforced: true, ReferenceURLField: "source", ReferenceFields: map[string]string{"image": "image_inputs", "video": "video_inputs", "audio": "audio_inputs"}}))
+	require.NotContains(t, body, "references")
+	require.Equal(t, []string{"https://media.example/video"}, body["video_inputs"])
+}

@@ -1,0 +1,257 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+)
+
+func parameterRetryContext() *gin.Context {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	return c
+}
+
+func TestParameterRelayRetryGuards(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name                    string
+		pinned, cancelled, skip bool
+		budget                  int
+	}{
+		{name: "fixed channel", pinned: true, budget: 2},
+		{name: "budget exhausted", budget: 0},
+		{name: "cancelled", cancelled: true, budget: 2},
+		{name: "explicit no retry", skip: true, budget: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := parameterRetryContext()
+			if tc.pinned {
+				c.Set("specific_channel_id", "31")
+			}
+			if tc.cancelled {
+				ctx, cancel := context.WithCancel(c.Request.Context())
+				cancel()
+				c.Request = c.Request.WithContext(ctx)
+			}
+			var opts []types.NewAPIErrorOptions
+			if tc.skip {
+				opts = append(opts, types.ErrOptionWithSkipRetry())
+			}
+			err := types.NewErrorWithStatusCode(errors.New("credential unavailable"), types.ErrorCode("channel:test_unavailable"), http.StatusServiceUnavailable, opts...)
+			require.False(t, shouldRetry(c, err, tc.budget))
+		})
+	}
+	clientErr := types.NewErrorWithStatusCode(errors.New("n must be positive"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	require.False(t, shouldRetry(parameterRetryContext(), clientErr, 3))
+	candidateErr := types.NewErrorWithStatusCode(types.ErrParameterCandidateUnavailable, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	require.True(t, shouldRetry(parameterRetryContext(), candidateErr, 3), "only the typed supply incompatibility may bypass the helper's local skip marker")
+}
+
+func TestParameterTaskRetryGuards(t *testing.T) {
+	c := parameterRetryContext()
+	local := service.TaskErrorWrapperLocal(errors.New("durable quote write failed"), "persist_parameter_cost_failed", http.StatusInternalServerError)
+	require.False(t, shouldRetryTaskRelay(c, 31, local, 3), "local persistence failure cannot authorize another supplier candidate")
+	ambiguous := service.TaskErrorWrapper(errors.Join(service.ErrSmartMediaSubmissionAmbiguous, errors.New("rejection persistence failed")), "submission_reconciliation_pending", http.StatusInternalServerError)
+	require.False(t, shouldRetryTaskRelay(c, 31, ambiguous, 3))
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	cancel()
+	c.Request = c.Request.WithContext(ctx)
+	rejected := service.TaskErrorWrapper(errors.New("upstream explicitly rejected"), "upstream_submission_rejected", http.StatusTooManyRequests)
+	require.False(t, shouldRetryTaskRelay(c, 31, rejected, 3))
+}
+
+func parameterPriceSelectionFixture(t *testing.T, cache bool) (*gin.Context, *relaycommon.RelayInfo) {
+	t.Helper()
+	configureSmartRelayTestGlobals(t)
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	previousPricing := billing_setting.GetParameterPricingJSONString()
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:parameter-retry-%s?mode=memory&cache=shared", t.Name())), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = db, db
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		_, _, restoreErr := billing_setting.UpdateParameterPricingFromJSONString(previousPricing)
+		require.NoError(t, restoreErr)
+		sqlDB, closeErr := db.DB()
+		require.NoError(t, closeErr)
+		require.NoError(t, sqlDB.Close())
+	})
+	high, low := int64(100), int64(90)
+	for _, ch := range []model.Channel{
+		{Id: 30, Type: constant.ChannelTypeOpenAI, Key: "local-fixture-30", Status: common.ChannelStatusEnabled, Models: "parameter-image", Group: "default", Priority: &high},
+		{Id: 31, Type: constant.ChannelTypeOpenAI, Key: "local-fixture-31", Status: common.ChannelStatusEnabled, Models: "parameter-image", Group: "default", Priority: &high},
+		{Id: 32, Type: constant.ChannelTypeOpenAI, Key: "local-fixture-32", Status: common.ChannelStatusEnabled, Models: "parameter-image", Group: "default", Priority: &low},
+	} {
+		require.NoError(t, db.Create(&ch).Error)
+		require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "parameter-image", ChannelId: ch.Id, Enabled: true, Priority: ch.Priority, Weight: 100}).Error)
+	}
+	common.MemoryCacheEnabled = cache
+	if cache {
+		model.InitChannelCache()
+	}
+	_, _, err = billing_setting.UpdateParameterPricingFromJSONString(`{"schema_version":1,"rules":[{"id":"sibling","group":"default","model":"parameter-image","channel_id":31,"unit":"per_request","unit_price":"0.036","currency":"USD","source_unit_price":"0.03","source_currency":"USD"},{"id":"lower","group":"default","model":"parameter-image","channel_id":32,"unit":"per_request","unit_price":"0.012","currency":"USD","source_unit_price":"0.01","source_currency":"USD"}]}`)
+	require.NoError(t, err)
+	c := parameterRetryContext()
+	initial, err := model.CacheGetChannel(30)
+	require.NoError(t, err)
+	require.Nil(t, middleware.SetupContextForSelectedChannel(c, initial, "parameter-image"))
+	info := &relaycommon.RelayInfo{OriginModelName: "parameter-image", UserGroup: "default", TokenGroup: "default", UsingGroup: "default",
+		RelayMode: relayconstant.RelayModeImagesGenerations,
+		Request:   &dto.ImageRequest{Model: "parameter-image", N: common.GetPointer(uint(1)), Size: "1024x1024"}}
+	return c, info
+}
+
+func TestParameterPriceSelectionPreservesPriorityAndDistinctCandidates(t *testing.T) {
+	for _, cache := range []bool{true} {
+		t.Run(fmt.Sprintf("cache_%t", cache), func(t *testing.T) {
+			c, info := parameterPriceSelectionFixture(t, cache)
+			legacy, legacyErr := model.GetRandomSatisfiedChannel("default", "parameter-image", 1, c.Request.URL.Path)
+			require.NoError(t, legacyErr)
+			require.Equal(t, 32, legacy.Id, "legacy callers must retain the original priority-index behavior")
+			price, selections, err := prepareDirectRelayPrice(c, info, 0, &types.TokenCountMeta{}, 2)
+			require.NoError(t, err)
+			require.Equal(t, 1, selections)
+			require.Equal(t, 31, price.ParameterPricing.ChannelID, "same-priority eligible sibling must be considered before lower priority")
+			param := &service.RetryParam{Ctx: c, TokenGroup: "default", ModelName: "parameter-image", RequestPath: c.Request.URL.Path}
+			selected, apiErr := getChannel(c, info, param)
+			require.Nil(t, apiErr)
+			require.Equal(t, 31, selected.Id, "first dispatch must reuse the exact quoted route")
+			info.LastError = types.NewErrorWithStatusCode(types.ErrParameterCandidateUnavailable, types.ErrorCodeModelPriceError, http.StatusBadRequest)
+			excludeParameterCandidate(c, info)
+			// Auto-group routing may reset its priority counter. This is not a
+			// second permission to reuse the first quoted channel.
+			selected, apiErr = getChannel(c, info, param)
+			require.Nil(t, apiErr)
+			require.Equal(t, 32, selected.Id)
+		})
+	}
+}
+
+func TestParameterPriceSelectionBudgetPinAndClientErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		budget                     int
+		pinned, invalid, cancelled bool
+	}{
+		{name: "zero budget", budget: 0}, {name: "fixed channel", budget: 3, pinned: true},
+		{name: "invalid request", budget: 3, invalid: true}, {name: "cancelled", budget: 3, cancelled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, info := parameterPriceSelectionFixture(t, true)
+			if tc.pinned {
+				c.Set("specific_channel_id", "30")
+			}
+			if tc.invalid {
+				info.Request.(*dto.ImageRequest).N = common.GetPointer(uint(0))
+			}
+			if tc.cancelled {
+				ctx, cancel := context.WithCancel(c.Request.Context())
+				cancel()
+				c.Request = c.Request.WithContext(ctx)
+			}
+			_, selections, err := prepareDirectRelayPrice(c, info, 0, &types.TokenCountMeta{}, tc.budget)
+			require.Error(t, err)
+			require.Zero(t, selections)
+			require.Equal(t, 30, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+			if tc.invalid {
+				require.NotErrorIs(t, err, types.ErrParameterCandidateUnavailable)
+			}
+		})
+	}
+}
+
+func TestParameterPriceSelectionKeepsCommitmentAndStopsAtBudget(t *testing.T) {
+	for _, budget := range []int{1, 2} {
+		t.Run(fmt.Sprintf("budget_%d", budget), func(t *testing.T) {
+			c, info := parameterPriceSelectionFixture(t, true)
+			promised, err := billing_setting.ResolveParameterPrice(billing_setting.ParameterPriceInput{Group: "default", Model: "parameter-image", ChannelID: 32, Resolution: "1024x1024", Count: 1})
+			require.NoError(t, err)
+			c.Set(types.ParameterQuoteContextKey, promised)
+			price, selections, err := prepareDirectRelayPrice(c, info, 0, &types.TokenCountMeta{}, budget)
+			require.Equal(t, budget, selections)
+			if budget == 1 {
+				require.ErrorIs(t, err, types.ErrParameterCandidateUnavailable)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, 32, price.ParameterPricing.ChannelID)
+			require.Equal(t, promised.Amount, price.ParameterPricing.Amount)
+			require.Equal(t, "0.01", price.ParameterPricing.SourceAmount)
+			require.Equal(t, []string{"30", "31"}, c.GetStringSlice("use_channel"))
+		})
+	}
+}
+
+func TestParameterImageUnknownAcceptanceCannotRetry(t *testing.T) {
+	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeImagesGenerations, PriceData: types.PriceData{ParameterPricing: &types.ParameterPriceSnapshot{}}}
+	for _, code := range []types.ErrorCode{types.ErrorCodeDoRequestFailed, types.ErrorCodeReadResponseBodyFailed, types.ErrorCodeBadResponseBody} {
+		c := parameterRetryContext()
+		apiErr := types.NewErrorWithStatusCode(errors.New("response unavailable"), code, http.StatusBadGateway)
+		guarded := guardDirectParameterImageResult(info, apiErr)
+		require.ErrorIs(t, guarded, service.ErrSmartMediaSubmissionAmbiguous)
+		require.False(t, shouldRetry(c, guarded, 3))
+	}
+	c := parameterRetryContext()
+	rejected := types.NewErrorWithStatusCode(errors.New("explicit upstream rejection"), types.ErrorCodeBadResponseStatusCode, http.StatusServiceUnavailable)
+	require.Same(t, rejected, guardDirectParameterImageResult(info, rejected))
+	require.True(t, shouldRetry(c, rejected, 3))
+	c.Writer.WriteHeaderNow()
+	require.Same(t, rejected, guardDirectParameterImageResult(info, rejected), "local response headers are not evidence of upstream acceptance")
+}
+
+func TestParameterPriceSelectionUsesOnlyAuthorizedAutoGroups(t *testing.T) {
+	c, info := parameterPriceSelectionFixture(t, true)
+	oldAuto := rootsetting.AutoGroups2JsonString()
+	require.NoError(t, rootsetting.UpdateAutoGroupsByJsonString(`["default","cheap","unauthorized"]`))
+	t.Cleanup(func() { require.NoError(t, rootsetting.UpdateAutoGroupsByJsonString(oldAuto)) })
+	priority := int64(100)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "cheap", Model: "parameter-image", ChannelId: 30, Enabled: true, Priority: &priority, Weight: 100}).Error)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 30).Update("group", "default,cheap").Error)
+	model.InitChannelCache()
+	contract := billing_setting.GetParameterPricingContract()
+	rule := contract.Rules[0]
+	rule.ID, rule.Group, rule.ChannelID, rule.UnitPrice, rule.SourceUnitPrice = "cheap-30", "cheap", 30, "0.001", "0.0008"
+	contract.Revision = ""
+	contract.Rules = append(contract.Rules, rule)
+	raw, err := common.Marshal(contract)
+	require.NoError(t, err)
+	_, _, err = billing_setting.UpdateParameterPricingFromJSONString(string(raw))
+	require.NoError(t, err)
+	promised, err := billing_setting.ResolveParameterPrice(billing_setting.ParameterPriceInput{Group: "cheap", Model: "parameter-image", ChannelID: 30, Resolution: "1024x1024", Count: 1})
+	require.NoError(t, err)
+	promised.Group = "default"
+	c.Set(types.ParameterQuoteContextKey, promised)
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	info.TokenGroup = "auto"
+	price, selections, err := prepareDirectRelayPrice(c, info, 0, &types.TokenCountMeta{}, 3)
+	require.NoError(t, err)
+	require.Equal(t, 3, selections, "auto-group priority resets must not reset the overall selection budget")
+	require.Equal(t, 30, price.ParameterPricing.ChannelID, "exclusion is scoped to group/channel, allowing an authorized offer for the same physical channel")
+	require.Equal(t, "default", price.ParameterPricing.Group)
+	require.Equal(t, "cheap", price.ParameterPricing.SupplyGroup)
+	require.Equal(t, "cheap", info.UsingGroup)
+	require.Equal(t, "0.001", price.ParameterPricing.Amount)
+	require.Equal(t, []string{"default", "cheap"}, service.GetUserAutoGroup("default"))
+}

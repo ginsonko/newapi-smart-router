@@ -1,0 +1,258 @@
+package common
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+type StreamEndReason string
+
+const (
+	StreamEndReasonNone        StreamEndReason = ""
+	StreamEndReasonDone        StreamEndReason = "done"
+	StreamEndReasonTimeout     StreamEndReason = "timeout"
+	StreamEndReasonClientGone  StreamEndReason = "client_gone"
+	StreamEndReasonScannerErr  StreamEndReason = "scanner_error"
+	StreamEndReasonHandlerStop StreamEndReason = "handler_stop"
+	StreamEndReasonEOF         StreamEndReason = "eof"
+	StreamEndReasonPanic       StreamEndReason = "panic"
+	StreamEndReasonPingFail    StreamEndReason = "ping_fail"
+)
+
+const maxStreamErrorEntries = 20
+
+type StreamErrorEntry struct {
+	Message   string
+	Timestamp time.Time
+}
+
+type StreamStatus struct {
+	EndReason        StreamEndReason
+	EndError         error
+	endOnce          sync.Once
+	terminal         bool
+	semanticTerminal bool
+	terminalKind     string
+	terminalAt       time.Time
+	clientGone       bool
+	clientGoneAt     time.Time
+
+	mu         sync.Mutex
+	Errors     []StreamErrorEntry
+	ErrorCount int
+}
+
+// MarkTerminal records an explicit provider-level completion event (for
+// example a Chat Completions finish_reason or Claude message_delta stop).
+// Transport EOF alone is deliberately not terminal.
+func (s *StreamStatus) MarkTerminal() {
+	s.MarkTerminalKind("provider_terminal")
+}
+
+// MarkTerminalKind records a successful protocol-level completion boundary.
+// The completion fact is independent from transport EOF/client cancellation,
+// so a later transport event cannot erase provider evidence.
+func (s *StreamStatus) MarkTerminalKind(kind string) {
+	s.MarkSemanticTerminal(kind, true)
+}
+
+// MarkSemanticTerminal records any explicit provider terminal event. A failed
+// or incomplete terminal is still useful evidence for logs, but only a
+// completed terminal makes EOF/client_gone safe for settlement.
+func (s *StreamStatus) MarkSemanticTerminal(kind string, completed bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.semanticTerminal = true
+	if completed {
+		s.terminal = true
+	}
+	if s.terminalKind == "" && strings.TrimSpace(kind) != "" {
+		s.terminalKind = strings.TrimSpace(kind)
+	}
+	if s.terminalAt.IsZero() {
+		s.terminalAt = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+func (s *StreamStatus) HasTerminal() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminal
+}
+
+func (s *StreamStatus) HasSemanticTerminal() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.semanticTerminal
+}
+
+func (s *StreamStatus) TerminalKind() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminalKind
+}
+
+func (s *StreamStatus) ClientDisconnected() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clientGone
+}
+
+// IsExplicitlyComplete reports whether the provider (or the relay protocol)
+// supplied a completion boundary that makes a transport EOF safe. A bare EOF
+// is deliberately incomplete; smart routing uses this distinction to avoid
+// finalising and billing a silently truncated response.
+func (s *StreamStatus) IsExplicitlyComplete() bool {
+	if s == nil {
+		return false
+	}
+	if s.HasErrors() {
+		return false
+	}
+	if s.EndReason == StreamEndReasonDone || s.EndReason == StreamEndReasonHandlerStop {
+		return true
+	}
+	return (s.EndReason == StreamEndReasonEOF || s.EndReason == StreamEndReasonClientGone) && s.HasTerminal()
+}
+
+// NeedsErrorTermination mirrors the smart-router stream commit boundary. A
+// handler stop without an error is an intentional provider-specific end, while
+// a bare EOF or any transport/scanner failure requires an explicit error path.
+func (s *StreamStatus) NeedsErrorTermination() bool {
+	if s == nil {
+		return false
+	}
+	if s.HasErrors() {
+		return true
+	}
+	if s.IsExplicitlyComplete() {
+		return false
+	}
+	if s.EndReason == StreamEndReasonEOF || s.EndReason == StreamEndReasonClientGone {
+		return !s.HasTerminal()
+	}
+	return !s.IsNormalEnd()
+}
+
+// IncompleteError returns the first transport/handler error for an incomplete
+// stream, or a bounded diagnostic when the provider simply closed the socket.
+// It is used by protocol handlers before they emit a synthetic final chunk.
+func (s *StreamStatus) IncompleteError() error {
+	if s == nil || !s.NeedsErrorTermination() {
+		return nil
+	}
+	if s.EndError != nil {
+		return s.EndError
+	}
+	return fmt.Errorf("stream ended without an explicit provider terminal event (reason=%s)", s.EndReason)
+}
+
+func NewStreamStatus() *StreamStatus {
+	return &StreamStatus{}
+}
+
+func (s *StreamStatus) SetEndReason(reason StreamEndReason, err error) {
+	if s == nil {
+		return
+	}
+	if reason == StreamEndReasonClientGone {
+		s.mu.Lock()
+		s.clientGone = true
+		if s.clientGoneAt.IsZero() {
+			s.clientGoneAt = time.Now()
+		}
+		s.mu.Unlock()
+	}
+	s.endOnce.Do(func() {
+		s.EndReason = reason
+		s.EndError = err
+	})
+}
+
+func (s *StreamStatus) RecordError(msg string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ErrorCount++
+	if len(s.Errors) < maxStreamErrorEntries {
+		s.Errors = append(s.Errors, StreamErrorEntry{
+			Message:   msg,
+			Timestamp: time.Now(),
+		})
+	}
+}
+
+func (s *StreamStatus) HasErrors() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ErrorCount > 0
+}
+
+func (s *StreamStatus) TotalErrorCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ErrorCount
+}
+
+func (s *StreamStatus) IsNormalEnd() bool {
+	if s == nil {
+		return true
+	}
+	return s.EndReason == StreamEndReasonDone ||
+		s.EndReason == StreamEndReasonEOF ||
+		s.EndReason == StreamEndReasonHandlerStop
+}
+
+func (s *StreamStatus) Summary() string {
+	if s == nil {
+		return "StreamStatus<nil>"
+	}
+	b := &strings.Builder{}
+	fmt.Fprintf(b, "reason=%s", s.EndReason)
+	if s.EndError != nil {
+		fmt.Fprintf(b, " end_error=%q", s.EndError.Error())
+	}
+	s.mu.Lock()
+	if s.semanticTerminal {
+		fmt.Fprintf(b, " semantic_terminal=true")
+	}
+	if s.terminal {
+		fmt.Fprintf(b, " provider_completed=true")
+	}
+	if s.terminalKind != "" {
+		fmt.Fprintf(b, " terminal_kind=%q", s.terminalKind)
+	}
+	if s.clientGone {
+		fmt.Fprintf(b, " client_disconnected=true")
+	}
+	if s.ErrorCount > 0 {
+		fmt.Fprintf(b, " soft_errors=%d", s.ErrorCount)
+	}
+	s.mu.Unlock()
+	return b.String()
+}

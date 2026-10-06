@@ -10,7 +10,7 @@ import (
 	"github.com/ginsonko/newapi-smart-router/core/smartrouter"
 )
 
-const ProtocolVersion = "bridge-spi-v1alpha3"
+const ProtocolVersion = "bridge-spi-v1alpha4"
 
 type HookID string
 
@@ -24,6 +24,9 @@ const (
 	HookBilling         HookID = "HOOK-BILL-001"
 	HookLog             HookID = "HOOK-LOG-001"
 	HookMedia           HookID = "HOOK-MEDIA-001"
+	HookPolicyMemory    HookID = "HOOK-POLICY-MEMORY-001"
+	HookCatalogScope    HookID = "HOOK-CATALOG-SCOPE-001"
+	HookImageJob        HookID = "HOOK-IMAGE-JOB-001"
 )
 
 var criticalHooks = []HookID{
@@ -36,6 +39,9 @@ var criticalHooks = []HookID{
 	HookBilling,
 	HookLog,
 	HookMedia,
+	HookPolicyMemory,
+	HookCatalogScope,
+	HookImageJob,
 }
 
 type HookStatus struct {

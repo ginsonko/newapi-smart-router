@@ -1,0 +1,176 @@
+package service
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestBuildSmartRouteRecentEvidenceBackfillUsesExactContractAndCollapsesConfirmation(t *testing.T) {
+	contractID, endpoint, _, err := SmartContractIdentity("gpt-5.6-sol", "/v1/responses")
+	require.NoError(t, err)
+	route := smartrouter.CertifiedRoute{
+		RouteID: "responses-cheap", Group: "cheap", ChannelID: 46, ChannelGeneration: "generation-1",
+		UpstreamModel: "provider-sol", CacheDomain: "cache-46", CacheNamespaceRevision: "revision-1",
+	}
+	alias := route
+	alias.RouteID = "responses-cheap-alias"
+	alias.Group = "cheap-alias"
+	catalog := smartrouter.CertifiedRouteCatalog{
+		Version: "catalog-1",
+		Contracts: map[string]smartrouter.ContractCatalog{
+			contractID: {
+				Contract: smartrouter.RouteContract{ContractID: contractID, CanonicalModel: "gpt-5.6-sol", Endpoint: endpoint},
+				Pools:    map[string]smartrouter.CertifiedPool{"auto": {Candidates: []smartrouter.CertifiedRoute{route, alias}}},
+			},
+		},
+	}
+	other, err := json.Marshal(map[string]any{
+		"request_path": "/v1/responses", "frt": 1_234, "cache_tokens": 900, "input_tokens_total": 1_000,
+		"admin_info": map[string]any{"smart_router_attempts": []map[string]any{
+			{"attempt": 1, "route_id": route.RouteID, "channel_id": 46, "group": route.Group, "outcome": "infrastructure_failure"},
+			{"attempt": 2, "route_id": route.RouteID, "channel_id": 46, "group": route.Group, "outcome": "success", "committed": true,
+				"observation_id": smartRouteCanonicalObservationID("request", "request-1")},
+		}},
+	})
+	require.NoError(t, err)
+	logs := []*model.Log{{
+		Id: 1, CreatedAt: time.Now().Unix(), Type: model.LogTypeConsume, RequestId: "request-1",
+		ModelName: "gpt-5.6-sol", PromptTokens: 1_000, ChannelId: 46, Group: route.Group, Other: string(other),
+	}}
+
+	result := buildSmartRouteRecentEvidenceBackfill(catalog, logs)
+	require.Len(t, result.actualInput, 1)
+	assert.EqualValues(t, 900, result.actualInput[0].CacheReadTokens)
+	assert.EqualValues(t, 100, result.actualInput[0].RegularInputTokens)
+	// The first same-route failure is request-local; only the confirmation
+	// success and the final TTFT are projected to the route and its alias.
+	require.Len(t, result.recent, 4)
+	for _, item := range result.recent {
+		if item.OutcomeObserved {
+			assert.True(t, item.Success)
+		}
+		assert.Contains(t, []string{route.RouteID, alias.RouteID}, item.RouteID)
+		assert.Equal(t, smartRouteCanonicalObservationID("request", "request-1"), item.ObservationID)
+		assert.False(t, item.LegacyIdentity)
+	}
+	assert.Equal(t, smartRouteCanonicalObservationID("actual-input", "request-1", result.actualInput[0].Key), result.actualInput[0].ObservationID)
+}
+
+func TestBuildSmartRouteRecentEvidenceBackfillRejectsProtocolMismatch(t *testing.T) {
+	contractID, endpoint, _, err := SmartContractIdentity("gpt-5.6-sol", "/v1/responses")
+	require.NoError(t, err)
+	route := smartrouter.CertifiedRoute{
+		RouteID: "responses-only", Group: "cheap", ChannelID: 46, ChannelGeneration: "generation-1",
+		UpstreamModel: "provider-sol", CacheDomain: "cache-46",
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog-1", Contracts: map[string]smartrouter.ContractCatalog{
+		contractID: {
+			Contract: smartrouter.RouteContract{ContractID: contractID, CanonicalModel: "gpt-5.6-sol", Endpoint: endpoint},
+			Pools:    map[string]smartrouter.CertifiedPool{"auto": {Candidates: []smartrouter.CertifiedRoute{route}}},
+		},
+	}}
+	other, err := json.Marshal(map[string]any{
+		"request_path": "/v1/messages", "frt": 500, "cache_tokens": 90, "input_tokens_total": 100,
+		"admin_info": map[string]any{"smart_router_attempts": []map[string]any{{
+			"attempt": 1, "route_id": route.RouteID, "channel_id": 46, "group": route.Group, "outcome": "success",
+		}}},
+	})
+	require.NoError(t, err)
+	result := buildSmartRouteRecentEvidenceBackfill(catalog, []*model.Log{{
+		CreatedAt: time.Now().Unix(), Type: model.LogTypeConsume, RequestId: "request-protocol-mismatch",
+		ModelName: "gpt-5.6-sol", PromptTokens: 100, ChannelId: 46, Group: route.Group, Other: string(other),
+	}})
+	assert.Empty(t, result.recent)
+	assert.Empty(t, result.actualInput)
+}
+
+func TestBuildSmartRouteRecentEvidenceBackfillUsesUniqueFixedRouteAndHonorsGenerationProof(t *testing.T) {
+	contractID, endpoint, _, err := SmartContractIdentity("gpt-5.6-sol", "/v1/responses")
+	require.NoError(t, err)
+	route := smartrouter.CertifiedRoute{
+		RouteID: "responses-fixed", Group: "cheap", ChannelID: 46, ChannelGeneration: "generation-1",
+		UpstreamModel: "provider-sol", CacheDomain: "cache-46", CacheNamespaceRevision: "revision-1",
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog-1", Contracts: map[string]smartrouter.ContractCatalog{
+		contractID: {
+			Contract: smartrouter.RouteContract{ContractID: contractID, CanonicalModel: "gpt-5.6-sol", Endpoint: endpoint},
+			Pools:    map[string]smartrouter.CertifiedPool{"auto": {Candidates: []smartrouter.CertifiedRoute{route}}},
+		},
+	}}
+	makeLog := func(requestID, generation string) *model.Log {
+		other := map[string]any{
+			"request_path": "/v1/responses", "frt": 1_234, "cache_tokens": 900, "input_tokens_total": 1_000,
+		}
+		if generation != "" {
+			other["channel_generation"] = generation
+		}
+		raw, marshalErr := json.Marshal(other)
+		require.NoError(t, marshalErr)
+		return &model.Log{
+			Id: 1, CreatedAt: time.Now().Unix(), Type: model.LogTypeConsume, RequestId: requestID,
+			ModelName: "gpt-5.6-sol", PromptTokens: 1_000, ChannelId: 46, Group: route.Group, Other: string(raw),
+		}
+	}
+
+	withoutProof := buildSmartRouteRecentEvidenceBackfill(catalog, []*model.Log{makeLog("fixed-unproven", "")})
+	require.Len(t, withoutProof.recent, 2)
+	require.Len(t, withoutProof.actualInput, 1)
+	assert.Equal(t, route.RouteID, withoutProof.recent[0].RouteID)
+
+	wrongGeneration := buildSmartRouteRecentEvidenceBackfill(catalog, []*model.Log{makeLog("fixed-old", "generation-0")})
+	assert.Empty(t, wrongGeneration.recent)
+	assert.Empty(t, wrongGeneration.actualInput)
+
+	proved := buildSmartRouteRecentEvidenceBackfill(catalog, []*model.Log{makeLog("fixed-current", route.ChannelGeneration)})
+	require.Len(t, proved.recent, 2)
+	require.Len(t, proved.actualInput, 1)
+	assert.Equal(t, route.RouteID, proved.recent[0].RouteID)
+
+	ambiguous := route
+	ambiguous.RouteID = "responses-fixed-duplicate"
+	ambiguous.ChannelGeneration = "generation-2"
+	ambiguousCatalog := catalog
+	contract := ambiguousCatalog.Contracts[contractID]
+	contract.Pools = map[string]smartrouter.CertifiedPool{
+		"auto": {Candidates: []smartrouter.CertifiedRoute{route, ambiguous}},
+	}
+	ambiguousCatalog.Contracts[contractID] = contract
+	ambiguousResult := buildSmartRouteRecentEvidenceBackfill(
+		ambiguousCatalog, []*model.Log{makeLog("fixed-ambiguous", "")},
+	)
+	assert.Empty(t, ambiguousResult.recent)
+	assert.Empty(t, ambiguousResult.actualInput)
+}
+
+func TestBuildSmartRouteRecentEvidenceBackfillPreservesMeasuredZeroCache(t *testing.T) {
+	contractID, endpoint, _, err := SmartContractIdentity("gpt-5.6-sol", "/v1/responses")
+	require.NoError(t, err)
+	route := smartrouter.CertifiedRoute{
+		RouteID: "responses-zero-cache", Group: "cheap", ChannelID: 46, ChannelGeneration: "generation-1",
+		UpstreamModel: "provider-sol", CacheDomain: "cache-46", CacheNamespaceRevision: "revision-1",
+	}
+	catalog := smartrouter.CertifiedRouteCatalog{Version: "catalog-1", Contracts: map[string]smartrouter.ContractCatalog{
+		contractID: {
+			Contract: smartrouter.RouteContract{ContractID: contractID, CanonicalModel: "gpt-5.6-sol", Endpoint: endpoint},
+			Pools:    map[string]smartrouter.CertifiedPool{"auto": {Candidates: []smartrouter.CertifiedRoute{route}}},
+		},
+	}}
+	other, err := json.Marshal(map[string]any{
+		"request_path": "/v1/responses", "frt": 2_000, "cache_tokens": 0,
+	})
+	require.NoError(t, err)
+	result := buildSmartRouteRecentEvidenceBackfill(catalog, []*model.Log{{
+		CreatedAt: time.Now().Unix(), Type: model.LogTypeConsume, RequestId: "fixed-zero-cache",
+		ModelName: "gpt-5.6-sol", PromptTokens: 1_000, ChannelId: 46, Group: route.Group, Other: string(other),
+	}})
+	require.Len(t, result.actualInput, 1)
+	assert.Zero(t, result.actualInput[0].CacheReadTokens)
+	assert.EqualValues(t, 1_000, result.actualInput[0].RegularInputTokens)
+	assert.EqualValues(t, 1_000, result.actualInput[0].TotalInputTokens)
+}

@@ -1,0 +1,39 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// LogSearchCountLimit bounds browsing, not accounting. Narrowing the date or
+// other filters makes older records accessible without an unbounded OFFSET.
+const LogSearchCountLimit = 10_000
+
+var ErrLogPagination = errors.New("日志页码超出范围，请缩小时间或筛选范围后重试")
+
+func logReadContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, 5*time.Second)
+}
+
+func validateLogPagination(offset, limit int) error {
+	if offset < 0 || offset >= LogSearchCountLimit || limit < 1 || limit > 100 {
+		return ErrLogPagination
+	}
+	return nil
+}
+
+// Return one sentinel above the browse limit so clients can distinguish a
+// capped result from an exact count. LIMIT on COUNT itself does not bound its
+// input; the limit must be inside the derived table.
+func countLogSearchMatches(ctx context.Context, query *gorm.DB) (int64, error) {
+	var count int64
+	matched := query.Session(&gorm.Session{}).Model(&Log{}).Select("1").Limit(LogSearchCountLimit + 1)
+	err := LOG_DB.WithContext(ctx).Table("(?) AS matched_logs", matched).Count(&count).Error
+	return count, err
+}

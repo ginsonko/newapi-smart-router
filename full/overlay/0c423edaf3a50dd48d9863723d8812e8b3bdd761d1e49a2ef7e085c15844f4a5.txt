@@ -1,0 +1,642 @@
+package service
+
+import (
+	"context"
+	"math"
+	"sync"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	rootsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTieredExpressionInputPredictionUsesStableDefaultRequestBranch(t *testing.T) {
+	require.True(t, tieredExpressionSupportsInputPrediction(
+		`param("service_tier") == "priority" ? p * 4 : p * 2`,
+	), "request-dependent expressions have a deterministic empty/default context and learn real contexts separately")
+	require.True(t, tieredExpressionSupportsInputPrediction(
+		`has(header("anthropic-beta"), "fast-mode") ? p * 4 : p * 2`,
+	))
+	require.False(t, tieredExpressionSupportsInputPrediction(
+		`hour("Asia/Hong_Kong") < 12 ? p * 2 : p * 3`,
+	), "wall-clock expressions must wait for matching historical evidence")
+}
+
+type fakeSmartRatioSource struct {
+	mu       sync.Mutex
+	revision uint64
+	ratios   map[string]map[string]int64
+}
+
+func (source *fakeSmartRatioSource) Revision() uint64 {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	return source.revision
+}
+
+func (source *fakeSmartRatioSource) RouteRatioPPM(userGroup, usingGroup string) (int64, bool) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	groups := source.ratios[userGroup]
+	ratio, exists := groups[usingGroup]
+	return ratio, exists
+}
+
+func (source *fakeSmartRatioSource) update(revision uint64, userGroup, group string, ratio int64) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.revision = revision
+	if source.ratios[userGroup] == nil {
+		source.ratios[userGroup] = make(map[string]int64)
+	}
+	source.ratios[userGroup][group] = ratio
+}
+
+func (source *fakeSmartRatioSource) updateWithoutRevision(userGroup, group string, ratio int64) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.ratios[userGroup] == nil {
+		source.ratios[userGroup] = make(map[string]int64)
+	}
+	source.ratios[userGroup][group] = ratio
+}
+
+func publishedCatalogManager(t *testing.T) *CatalogManager {
+	t.Helper()
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAI)
+	manager := NewCatalogManager(smartCatalogFixture("gpt-test", constant.ChannelTypeOpenAI), func() smartroutersetting.Setting {
+		return setting
+	})
+	_, err := manager.Refresh(context.Background())
+	require.NoError(t, err)
+	return manager
+}
+
+func TestPriceSnapshotUsesPerUserGroupRatiosAndOmitsMissingRoutes(t *testing.T) {
+	catalogs := publishedCatalogManager(t)
+	ratios := &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000},
+		},
+	}
+	manager := NewPriceSnapshotManager(catalogs, ratios)
+
+	snapshot, err := manager.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	require.Len(t, snapshot.RatiosPPM, 2)
+	for _, ratio := range snapshot.RatiosPPM {
+		assert.Equal(t, int64(20_000), ratio)
+	}
+}
+
+func TestPriceSnapshotIncludesNewOpenAIResponsesRouteAtItsActualGroupRatio(t *testing.T) {
+	setting := smartCatalogTestSetting(constant.EndpointTypeOpenAIResponse)
+	priority := int64(10)
+	source := &staticCatalogSource{
+		abilities: []model.Ability{
+			{Group: "Example Discount gpt", Model: "gpt-5.6-terra", ChannelId: 36, Enabled: true, Priority: &priority},
+			{Group: "plus", Model: "gpt-5.6-terra", ChannelId: 37, Enabled: true, Priority: &priority},
+			{Group: "pro", Model: "gpt-5.6-terra", ChannelId: 38, Enabled: true, Priority: &priority},
+		},
+		channels: []model.Channel{
+			{Id: 36, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 37, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+			{Id: 38, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled},
+		},
+	}
+	catalogs := NewCatalogManager(source, func() smartroutersetting.Setting { return setting })
+	catalog, err := catalogs.Refresh(context.Background())
+	require.NoError(t, err)
+	responses := contractByEndpoint(t, *catalog, SmartEndpointResponses)
+
+	routeByGroup := make(map[string]string)
+	for _, route := range responses.Pools[SmartRouteAutoDiscoveredPool].Candidates {
+		routeByGroup[route.Group] = route.RouteID
+	}
+	require.Contains(t, routeByGroup, "Example Discount gpt")
+
+	prices := NewPriceSnapshotManager(catalogs, &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"Example Discount gpt": 20_000, "plus": 60_000, "pro": 80_000},
+		},
+	})
+	snapshot, err := prices.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.Equal(t, int64(20_000), snapshot.RatiosPPM[routeByGroup["Example Discount gpt"]])
+	assert.Equal(t, int64(60_000), snapshot.RatiosPPM[routeByGroup["plus"]])
+	assert.Equal(t, int64(80_000), snapshot.RatiosPPM[routeByGroup["pro"]])
+}
+
+func TestPriceSnapshotFailsClosedWhenEveryGroupRatioIsMissing(t *testing.T) {
+	manager := NewPriceSnapshotManager(publishedCatalogManager(t), &fakeSmartRatioSource{
+		revision: 1,
+		ratios:   map[string]map[string]int64{},
+	})
+
+	_, err := manager.Refresh(context.Background(), "standard")
+	require.ErrorIs(t, err, ErrNoPricedSmartRoutes)
+	_, exists := manager.Current("standard")
+	assert.False(t, exists)
+}
+
+func TestPriceSnapshotRevisionRefreshesContentAndExplicitInvalidation(t *testing.T) {
+	catalogs := publishedCatalogManager(t)
+	ratios := &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000, "fallback": 50_000},
+		},
+	}
+	manager := NewPriceSnapshotManager(catalogs, ratios)
+
+	first, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	second, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.Same(t, first, second)
+
+	ratios.update(2, "standard", "economy", 30_000)
+	_, exists := manager.Current("standard")
+	assert.False(t, exists)
+	changed, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Version, changed.Version)
+
+	manager.Invalidate("standard")
+	_, exists = manager.Current("standard")
+	assert.False(t, exists)
+	rebuilt, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.Equal(t, changed.Version, rebuilt.Version)
+}
+
+func TestPriceSnapshotRefreshesWhenUserUsableGroupsChange(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+	})
+
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"economy":"Economy"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"economy":0.02,"fallback":0.05}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+
+	manager := NewPriceSnapshotManager(publishedCatalogManager(t), NewAPIRouteRatioSource{})
+	first, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	require.Len(t, first.RatiosPPM, 2)
+
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{
+		"economy":"Economy",
+		"fallback":"Fallback"
+	}`))
+	_, current := manager.Current("standard")
+	assert.False(t, current)
+
+	refreshed, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.Len(t, refreshed.RatiosPPM, 4)
+	assert.NotEqual(t, first.Version, refreshed.Version)
+}
+
+func TestPriceSnapshotVersionIsContentHashNotRevisionNumber(t *testing.T) {
+	catalogs := publishedCatalogManager(t)
+	ratios := &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000, "fallback": 50_000},
+		},
+	}
+	manager := NewPriceSnapshotManager(catalogs, ratios)
+
+	first, err := manager.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	ratios.update(2, "standard", "economy", 20_000)
+	second, err := manager.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.Same(t, first, second)
+	assert.Equal(t, first.Version, second.Version)
+}
+
+func TestExplicitPriceRefreshRebuildsEvenWhenRevisionSignalWasMissed(t *testing.T) {
+	catalogs := publishedCatalogManager(t)
+	ratios := &fakeSmartRatioSource{
+		revision: 1,
+		ratios: map[string]map[string]int64{
+			"standard": {"economy": 20_000, "fallback": 50_000},
+		},
+	}
+	manager := NewPriceSnapshotManager(catalogs, ratios)
+
+	first, err := manager.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	ratios.updateWithoutRevision("standard", "economy", 25_000)
+	second, err := manager.Refresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Version, second.Version)
+}
+
+func TestRatioToFixedPPMRoundsDeterministicallyAndRejectsInvalidValues(t *testing.T) {
+	ppm, ok := ratioToFixedPPM(0.0200004)
+	require.True(t, ok)
+	assert.Equal(t, int64(20_000), ppm)
+	ppm, ok = ratioToFixedPPM(0.02000051)
+	require.True(t, ok)
+	assert.Equal(t, int64(20_001), ppm)
+
+	for _, invalid := range []float64{-1, math.NaN(), math.Inf(1), math.Inf(-1), math.MaxFloat64, float64(math.MaxInt64) / 1_000_000} {
+		_, ok := ratioToFixedPPM(invalid)
+		assert.False(t, ok)
+	}
+}
+
+func TestNewAPIRouteRatioSourceUsesGroupGroupOverrideAndFailsClosed(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+	})
+
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"route":"route"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"route":0.05}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{"vip":{"route":0.02}}`))
+
+	source := NewAPIRouteRatioSource{}
+	ppm, exists := source.RouteRatioPPM("vip", "route")
+	require.True(t, exists)
+	assert.Equal(t, int64(20_000), ppm)
+	ppm, exists = source.RouteRatioPPM("standard", "route")
+	require.True(t, exists)
+	assert.Equal(t, int64(50_000), ppm)
+	_, exists = source.RouteRatioPPM("standard", "missing")
+	assert.False(t, exists)
+}
+
+func TestRoutePriceRevisionAndScoreMoveTogetherAfterRatioChange(t *testing.T) {
+	originalUsableGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalUsableGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+	})
+
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"future-route":"Future route"}`))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"future-model":2}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"future-route":0.1}`))
+
+	source := NewAPIRouteRatioSource{}
+	ratioA, ok := source.RouteRatioPPM("", "future-route")
+	require.True(t, ok)
+	priceA, err := source.RoutePriceDescriptor("future-model", "future-route", ratioA)
+	require.NoError(t, err)
+
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"future-route":0.25}`))
+	ratioB, ok := source.RouteRatioPPM("", "future-route")
+	require.True(t, ok)
+	priceB, err := source.RoutePriceDescriptor("future-model", "future-route", ratioB)
+	require.NoError(t, err)
+
+	require.Equal(t, int64(200_000), priceA.ScorePPM)
+	require.Equal(t, int64(500_000), priceB.ScorePPM)
+	require.NotEqual(t, priceA.Revision, priceB.Revision)
+}
+
+func TestPriceSnapshotUsesGroupModelPriceAndRefreshesAfterContractChange(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+	})
+
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"economy":"Economy","fallback":"Fallback"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"economy":0.02,"fallback":0.05}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"schema_version":1,
+		"groups":{
+			"economy":{"gpt-test":{"billing_mode":"fixed_price","model_price":0.5,"task_profile":{"unit":"per_second"}}},
+			"fallback":{"gpt-test":{"billing_mode":"fixed_price","model_price":0.1,"task_profile":{"unit":"per_second"}}}
+		}
+	}`)
+	require.NoError(t, err)
+
+	manager := NewPriceSnapshotManager(publishedCatalogManager(t), NewAPIRouteRatioSource{})
+	first, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	require.NotEmpty(t, first.RoutePrices)
+
+	pricesByGroup := make(map[string]smartrouter.RoutePrice)
+	catalog, exists := manager.catalogs.Current()
+	require.True(t, exists)
+	for _, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				if price, ok := first.RoutePrices[route.RouteID]; ok {
+					pricesByGroup[route.Group] = price
+				}
+			}
+		}
+	}
+	assert.Equal(t, int64(10_000), pricesByGroup["economy"].ScorePPM)
+	assert.Equal(t, int64(5_000), pricesByGroup["fallback"].ScorePPM)
+	assert.True(t, pricesByGroup["economy"].ComparableWith(pricesByGroup["fallback"]))
+
+	_, _, err = billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"schema_version":1,
+		"groups":{
+			"economy":{"gpt-test":{"billing_mode":"fixed_price","model_price":0.5,"task_profile":{"unit":"per_second"}}},
+			"fallback":{"gpt-test":{"billing_mode":"fixed_price","model_price":0.2,"task_profile":{"unit":"per_second"}}}
+		}
+	}`)
+	require.NoError(t, err)
+	_, current := manager.Current("standard")
+	assert.False(t, current)
+	refreshed, err := manager.GetOrRefresh(context.Background(), "standard")
+	require.NoError(t, err)
+	assert.NotEqual(t, first.Version, refreshed.Version)
+}
+
+func TestRoutePriceDescriptorRejectsMissingInheritedGlobalRatio(t *testing.T) {
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+	})
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{"groups":{}}`)
+	require.NoError(t, err)
+
+	source := NewAPIRouteRatioSource{}
+	unconfigured, err := source.RoutePriceDescriptor("r27-unconfigured-model", "legacy", 20_000)
+	require.NoError(t, err)
+	assert.Equal(t, billing_setting.BillingModeRatio, unconfigured.BillingMode)
+	assert.Equal(t, "global", unconfigured.Scope)
+	assert.False(t, unconfigured.StaticComparable)
+	assert.False(t, unconfigured.Synthetic)
+	assert.Equal(t, smartrouter.PriceIncomparableUnresolved, unconfigured.IncomparableReason)
+
+	_, _, err = billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{"strict":{"r27-unconfigured-model":{
+			"billing_mode":"inherit","task_profile":{"unit":"per_second"}
+		}}}
+	}`)
+	require.NoError(t, err)
+	strict, err := source.RoutePriceDescriptor("r27-unconfigured-model", "strict", 20_000)
+	require.NoError(t, err)
+	assert.False(t, strict.StaticComparable)
+	assert.False(t, strict.Synthetic)
+	assert.Equal(t, smartrouter.PriceIncomparableUnresolved, strict.IncomparableReason)
+	assert.Equal(t, "per_second", strict.BillingUnit)
+
+	_, _, err = billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{"strict":{"r27-unconfigured-model":{
+			"billing_mode":"inherit","task_profile":{"unit":"per_request"}
+		}}}
+	}`)
+	require.NoError(t, err)
+	strictToken, err := source.RoutePriceDescriptor("r27-unconfigured-model", "strict", 20_000)
+	require.NoError(t, err)
+	assert.False(t, strictToken.StaticComparable)
+	assert.False(t, strictToken.Synthetic)
+	assert.Equal(t, "per_request", strictToken.BillingUnit)
+	assert.False(t, strict.ComparableWith(strictToken), "different inherited billing units remain incomparable")
+}
+
+func TestRoutePriceDescriptorUsesInheritedGlobalModelRatio(t *testing.T) {
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalCompletionRatios := ratio_setting.CompletionRatio2JSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(originalCompletionRatios))
+	})
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{"groups":{}}`)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-5.6-sol":2.5}`))
+	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-5.6-sol":6}`))
+
+	source := NewAPIRouteRatioSource{}
+	unconfigured, err := source.RoutePriceDescriptor("gpt-5.6-sol", "unconfigured", 50_000)
+	require.NoError(t, err)
+	assert.Equal(t, billing_setting.BillingModeRatio, unconfigured.BillingMode)
+	assert.Equal(t, "global", unconfigured.Scope)
+	assert.Equal(t, int64(125_000), unconfigured.ScorePPM)
+	assert.False(t, unconfigured.Synthetic)
+
+	_, _, err = billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{"configured":{"gpt-5.6-sol":{
+			"billing_mode":"ratio","model_ratio":2.5,"completion_ratio":6
+		}}}
+	}`)
+	require.NoError(t, err)
+	configured, err := source.RoutePriceDescriptor("gpt-5.6-sol", "configured", 50_000)
+	require.NoError(t, err)
+	assert.Equal(t, "group_model", configured.Scope)
+	assert.Equal(t, int64(125_000), configured.ScorePPM)
+	assert.False(t, configured.Synthetic)
+	assert.True(t, unconfigured.ComparableWith(configured))
+}
+
+func TestRoutePriceDescriptorUsesRuntimeDefaultCachePrices(t *testing.T) {
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalCacheRatios := ratio_setting.CacheRatio2JSONString()
+	originalCreateCacheRatios := ratio_setting.CreateCacheRatio2JSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateCacheRatioByJSONString(originalCacheRatios))
+		require.NoError(t, ratio_setting.UpdateCreateCacheRatioByJSONString(originalCreateCacheRatios))
+	})
+
+	const modelName = "r40-default-cache-model"
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{"groups":{}}`)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"r40-default-cache-model":2}`))
+	require.NoError(t, ratio_setting.UpdateCacheRatioByJSONString(`{}`))
+	require.NoError(t, ratio_setting.UpdateCreateCacheRatioByJSONString(`{}`))
+
+	resolved := billing_setting.ResolveModelPricing(modelName, "standard")
+	assert.False(t, resolved.HasCacheRatio)
+	assert.False(t, resolved.HasCacheCreationRatio)
+	assert.Equal(t, 1.0, resolved.CacheRatio)
+	assert.Equal(t, 1.25, resolved.CacheCreation5mRatio)
+	assert.Equal(t, 2.0, resolved.CacheCreation1hRatio)
+
+	price, err := (NewAPIRouteRatioSource{}).RoutePriceDescriptor(modelName, "standard", 100_000)
+	require.NoError(t, err)
+	assert.True(t, price.CachePricingKnown)
+	assert.Equal(t, int64(1_000_000), price.CacheReadRatioPPM)
+	assert.Equal(t, int64(1_250_000), price.CacheCreation5mRatioPPM)
+	assert.Equal(t, int64(2_000_000), price.CacheCreation1hRatioPPM)
+}
+
+func TestRoutePriceDescriptorRanksInheritedAndExplicitRatiosByBilledInputBase(t *testing.T) {
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalCompletionRatios := ratio_setting.CompletionRatio2JSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(originalCompletionRatios))
+	})
+
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"inherit":"Inherited","explicit":"Explicit"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"inherit":0.15,"explicit":0.2}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-5.6-sol":2.5}`))
+	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{"gpt-5.6-sol":6}`))
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{"explicit":{"gpt-5.6-sol":{
+			"billing_mode":"ratio","model_ratio":2,"completion_ratio":6
+		}}}
+	}`)
+	require.NoError(t, err)
+
+	source := NewAPIRouteRatioSource{}
+	inherited, err := source.RoutePriceDescriptor("gpt-5.6-sol", "inherit", 150_000)
+	require.NoError(t, err)
+	explicit, err := source.RoutePriceDescriptor("gpt-5.6-sol", "explicit", 200_000)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(375_000), inherited.ScorePPM)
+	assert.Equal(t, int64(400_000), explicit.ScorePPM)
+	assert.True(t, inherited.ComparableWith(explicit))
+	assert.False(t, inherited.Synthetic)
+	assert.False(t, explicit.Synthetic)
+}
+
+func TestPriceSnapshotAppliesUserGroupOverrideAndSeparatesBillingUnits(t *testing.T) {
+	originalGroups := rootsetting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	originalOverrides := ratio_setting.GroupGroupRatio2JSONString()
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	t.Cleanup(func() {
+		require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(originalOverrides))
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+	})
+
+	require.NoError(t, rootsetting.UpdateUserUsableGroupsByJSONString(`{"economy":"Economy","fallback":"Fallback"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"economy":0.02,"fallback":0.05}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{"vip":{"economy":0.01,"fallback":0.06}}`))
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"schema_version":1,
+		"groups":{
+			"economy":{"gpt-test":{"billing_mode":"fixed_price","model_price":0.5,"task_profile":{"unit":"per_second"}}},
+			"fallback":{"gpt-test":{"billing_mode":"fixed_price","model_price":0.1,"task_profile":{"unit":"per_request"}}}
+		}
+	}`)
+	require.NoError(t, err)
+
+	manager := NewPriceSnapshotManager(publishedCatalogManager(t), NewAPIRouteRatioSource{})
+	snapshot, err := manager.GetOrRefresh(context.Background(), "vip")
+	require.NoError(t, err)
+
+	pricesByGroup := make(map[string]smartrouter.RoutePrice)
+	catalog, exists := manager.catalogs.Current()
+	require.True(t, exists)
+	for _, contract := range catalog.Contracts {
+		for _, pool := range contract.Pools {
+			for _, route := range pool.Candidates {
+				if price, ok := snapshot.RoutePrices[route.RouteID]; ok {
+					pricesByGroup[route.Group] = price
+				}
+			}
+		}
+	}
+	assert.Equal(t, int64(5_000), pricesByGroup["economy"].ScorePPM)
+	assert.Equal(t, int64(6_000), pricesByGroup["fallback"].ScorePPM)
+	assert.False(t, pricesByGroup["economy"].ComparableWith(pricesByGroup["fallback"]))
+}
+
+func TestRoutePriceDescriptorKeepsDurationAndTieredPriceClassesCoherent(t *testing.T) {
+	originalContract := billing_setting.GetGroupModelPricingJSONString()
+	t.Cleanup(func() {
+		_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(originalContract)
+		require.NoError(t, err)
+	})
+
+	_, _, err := billing_setting.UpdateGroupModelPricingFromJSONString(`{
+		"groups":{
+			"per-request":{"video-model":{"billing_mode":"fixed_price","model_price":0.4,"task_profile":{"unit":"per_request"}}},
+			"per-second":{"video-model":{"billing_mode":"fixed_price","model_price":0.2,"task_profile":{"unit":"per_second"}}},
+			"fixed-15-a":{"video-model":{"billing_mode":"fixed_price","model_price":1,"task_profile":{"unit":"fixed_duration","fixed_duration_seconds":15}}},
+			"fixed-15-b":{"video-model":{"billing_mode":"fixed_price","model_price":1,"task_profile":{"unit":"fixed_duration","fixed_duration_seconds":15}}},
+			"fixed-20":{"video-model":{"billing_mode":"fixed_price","model_price":1,"task_profile":{"unit":"fixed_duration","fixed_duration_seconds":20}}},
+			"tier-a":{"token-model":{"billing_mode":"tiered_expr","billing_expr":"tier(\"base\", p * 2 + c * 12)"}},
+			"tier-b":{"token-model":{"billing_mode":"tiered_expr","billing_expr":"tier(\"base\", p * 2 + c * 12)"}},
+			"tier-other":{"token-model":{"billing_mode":"tiered_expr","billing_expr":"tier(\"base\", p * 3 + c * 12)"}}
+		}
+	}`)
+	require.NoError(t, err)
+
+	source := NewAPIRouteRatioSource{}
+	perRequest, err := source.RoutePriceDescriptor("video-model", "per-request", 500_000)
+	require.NoError(t, err)
+	perSecond, err := source.RoutePriceDescriptor("video-model", "per-second", 500_000)
+	require.NoError(t, err)
+	fixed15A, err := source.RoutePriceDescriptor("video-model", "fixed-15-a", 100_000)
+	require.NoError(t, err)
+	fixed15B, err := source.RoutePriceDescriptor("video-model", "fixed-15-b", 200_000)
+	require.NoError(t, err)
+	fixed20, err := source.RoutePriceDescriptor("video-model", "fixed-20", 100_000)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(200_000), perRequest.ScorePPM)
+	assert.Equal(t, int64(100_000), perSecond.ScorePPM)
+	assert.Equal(t, int64(100_000), fixed15A.ScorePPM)
+	assert.Equal(t, int64(200_000), fixed15B.ScorePPM)
+	assert.False(t, perRequest.ComparableWith(perSecond))
+	assert.True(t, fixed15A.ComparableWith(fixed15B))
+	assert.False(t, fixed15A.ComparableWith(fixed20))
+
+	tierA, err := source.RoutePriceDescriptor("token-model", "tier-a", 100_000)
+	require.NoError(t, err)
+	tierB, err := source.RoutePriceDescriptor("token-model", "tier-b", 200_000)
+	require.NoError(t, err)
+	tierOther, err := source.RoutePriceDescriptor("token-model", "tier-other", 50_000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100_000), tierA.ScorePPM)
+	assert.Equal(t, int64(200_000), tierB.ScorePPM)
+	assert.True(t, tierA.ComparableWith(tierB))
+	assert.False(t, tierA.ComparableWith(tierOther))
+}

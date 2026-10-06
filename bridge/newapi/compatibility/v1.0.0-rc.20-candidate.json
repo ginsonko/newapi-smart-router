@@ -1,5 +1,5 @@
 {
-  "manifest_version": "3.0.0-alpha.1",
+  "manifest_version": "4.0.0-alpha.1",
   "form": "certified_bridge_candidate",
   "host": {
     "module": "github.com/QuantumNous/new-api",
@@ -9,7 +9,7 @@
     "latest_upstream_observed": "v1.0.0-rc.21",
     "exact_commit_required": true
   },
-  "bridge_protocol": "bridge-spi-v1alpha3",
+  "bridge_protocol": "bridge-spi-v1alpha4",
   "certification_status": "public_alpha_reference_candidate_not_certified",
   "full_parity": false,
   "required_hooks": [
@@ -21,7 +21,10 @@
     "HOOK-OUTCOME-001",
     "HOOK-BILL-001",
     "HOOK-LOG-001",
-    "HOOK-MEDIA-001"
+    "HOOK-MEDIA-001",
+    "HOOK-POLICY-MEMORY-001",
+    "HOOK-CATALOG-SCOPE-001",
+    "HOOK-IMAGE-JOB-001"
   ],
   "observed_r52_capabilities": [
     "actual_input_cost_snapshot",
@@ -36,5 +39,12 @@
     "sqlite_mysql_postgresql_roundtrip",
     "external_non_production_site_roundtrip",
     "web_worker_identical_artifact_receipt"
+  ],
+  "observed_r98_capabilities": [
+    "nullable_per_key_policy_memory",
+    "current_authorized_catalog_and_quote_scope",
+    "durable_image_refund_fallback",
+    "unknown_acceptance_no_replay",
+    "configurable_one_hour_image_health"
   ]
 }

@@ -1,0 +1,197 @@
+package controller
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+const smartRouteExternalSuccessTimeout = 2 * time.Second
+
+// observeSuccessfulExactRoute lets successful fixed-group, ordinary-Key and
+// real channel-test traffic recover the matching Smart Router physical route.
+// It is deliberately best-effort: the already successful user response must
+// never be turned into an error by an auxiliary health projection.
+func observeSuccessfulExactRoute(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	channel *model.Channel,
+	requestPathOverride string,
+) {
+	if c == nil || c.Request == nil || info == nil || info.IsSmartRouteProbe || channel == nil || channel.Id <= 0 {
+		return
+	}
+	if c.GetBool(service.ImageTaskOwnedContextKey) || c.GetBool("image_attempt_uncertain") {
+		return
+	}
+	if providerErr := openaichannel.ResponsesTerminalError(c); providerErr != nil {
+		observeFailedExactRoute(c, info, channel, requestPathOverride, providerErr)
+		return
+	}
+	requestPath := successfulRouteRequestPath(c.Request.URL.Path, requestPathOverride, info.RelayMode)
+	_, endpoint, _, err := service.SmartContractIdentity(info.OriginModelName, requestPath)
+	if err != nil {
+		return
+	}
+	// A Responses route is recovered only by its own explicit completed
+	// terminal. Chat success, a fake HTTP 200, response.incomplete, partial
+	// output and EOF must not turn the independent Responses contract healthy.
+	if endpoint == service.SmartEndpointResponses && !openaichannel.SmartResponsesCompletedSeen(c) {
+		return
+	}
+	upstreamModel := strings.TrimSpace(info.UpstreamModelName)
+	if upstreamModel == "" {
+		return
+	}
+
+	ttft, observed := successfulRouteTTFT(info)
+	startedAtMS := int64(0)
+	if !info.StartTime.IsZero() {
+		startedAtMS = info.StartTime.UnixMilli()
+	}
+	parent := context.Background()
+	if c.Request.Context() != nil {
+		parent = context.WithoutCancel(c.Request.Context())
+	}
+	ctx, cancel := context.WithTimeout(parent, smartRouteExternalSuccessTimeout)
+	defer cancel()
+	_, err = service.ObserveSmartRouteExternalSuccess(ctx, service.SmartRouteExternalSuccess{
+		ChannelID:         channel.Id,
+		ChannelGeneration: service.SmartRouteChannelGeneration(*channel),
+		CanonicalModel:    info.OriginModelName,
+		UpstreamModel:     upstreamModel,
+		RequestPath:       requestPath,
+		ObservationID:     info.RequestId,
+		StartedAtMS:       startedAtMS,
+		TTFT:              ttft,
+		TTFTObserved:      observed,
+	})
+	if err != nil {
+		logger.LogWarn(c, "successful route health projection failed: "+err.Error())
+	}
+}
+
+// observeFailedExactRoute completes the site-wide evidence contract for
+// ordinary and fixed-group traffic. Only failures already classified as an
+// exact provider/route fault are projected; request validation, policy,
+// content, cancellation and unknown transport acceptance stay request-local.
+func observeFailedExactRoute(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	channel *model.Channel,
+	requestPathOverride string,
+	apiErr *types.NewAPIError,
+) {
+	if c == nil || c.Request == nil || info == nil || info.IsSmartRouteProbe || channel == nil || channel.Id <= 0 || apiErr == nil {
+		return
+	}
+	if c.GetBool(service.ImageTaskOwnedContextKey) || c.GetBool("image_attempt_uncertain") {
+		return
+	}
+	outcome := service.ClassifySmartRouteOutcome(apiErr, c.Request.Context().Err())
+	if !outcome.AffectsRouteHealth {
+		return
+	}
+	switch outcome.Outcome {
+	case smartrouter.OutcomeInfrastructure, smartrouter.OutcomeCredential, smartrouter.OutcomeCapacityLimited:
+	default:
+		return
+	}
+	requestPath := successfulRouteRequestPath(c.Request.URL.Path, requestPathOverride, info.RelayMode)
+	upstreamModel := strings.TrimSpace(info.UpstreamModelName)
+	if upstreamModel == "" {
+		return
+	}
+	startedAtMS := int64(0)
+	if !info.StartTime.IsZero() {
+		startedAtMS = info.StartTime.UnixMilli()
+	}
+	parent := context.WithoutCancel(c.Request.Context())
+	ctx, cancel := context.WithTimeout(parent, smartRouteExternalSuccessTimeout)
+	defer cancel()
+	_, err := service.ObserveSmartRouteExternalFailure(ctx, service.SmartRouteExternalFailure{
+		SmartRouteExternalSuccess: service.SmartRouteExternalSuccess{
+			ChannelID: channel.Id, ChannelGeneration: service.SmartRouteChannelGeneration(*channel),
+			CanonicalModel: info.OriginModelName, UpstreamModel: upstreamModel,
+			RequestPath: requestPath, ObservationID: info.RequestId, StartedAtMS: startedAtMS,
+		},
+		Outcome: outcome.Outcome, RetryAfter: apiErr.RetryAfter,
+		HTTPStatus: outcome.HTTPStatus, ErrorSummary: outcome.ErrorSummary,
+	})
+	if err != nil {
+		logger.LogWarn(c, "failed route health projection failed: "+err.Error())
+	}
+}
+
+func successfulRouteRequestPath(actualPath, override string, relayMode int) string {
+	if strings.TrimSpace(override) != "" {
+		return strings.TrimSpace(override)
+	}
+	actualPath = strings.TrimSpace(actualPath)
+	if _, _, _, err := service.SmartContractIdentity("status-path-probe", actualPath); err == nil {
+		return actualPath
+	}
+	switch relayMode {
+	case relayconstant.RelayModeResponses, relayconstant.RelayModeResponsesCompact:
+		return "/v1/responses"
+	case relayconstant.RelayModeCompletions:
+		return "/v1/completions"
+	case relayconstant.RelayModeImagesGenerations:
+		return "/v1/images/generations"
+	case relayconstant.RelayModeImagesEdits:
+		return "/v1/images/edits"
+	case relayconstant.RelayModeAudioSpeech:
+		return "/v1/audio/speech"
+	case relayconstant.RelayModeAudioTranscription:
+		return "/v1/audio/transcriptions"
+	case relayconstant.RelayModeAudioTranslation:
+		return "/v1/audio/translations"
+	case relayconstant.RelayModeChatCompletions:
+		return "/v1/chat/completions"
+	default:
+		return actualPath
+	}
+}
+
+func successfulChannelTestRequestPath(endpointType string, relayMode int) string {
+	switch constant.EndpointType(strings.TrimSpace(endpointType)) {
+	case constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAIResponseCompact:
+		return "/v1/responses"
+	case constant.EndpointTypeAnthropic:
+		return "/v1/messages"
+	case constant.EndpointTypeImageGeneration:
+		if relayMode == relayconstant.RelayModeImagesEdits {
+			return "/v1/images/edits"
+		}
+		return "/v1/images/generations"
+	case constant.EndpointTypeOpenAIVideo:
+		return "/v1/videos"
+	case constant.EndpointTypeAudioSpeech:
+		return "/v1/audio/speech"
+	case constant.EndpointTypeAudioTranscription:
+		return "/v1/audio/transcriptions"
+	case constant.EndpointTypeAudioTranslation:
+		return "/v1/audio/translations"
+	default:
+		return successfulRouteRequestPath("", "", relayMode)
+	}
+}
+
+func successfulRouteTTFT(info *relaycommon.RelayInfo) (time.Duration, bool) {
+	if info == nil || info.StartTime.IsZero() {
+		return 0, false
+	}
+	return info.FirstTokenLatency()
+}

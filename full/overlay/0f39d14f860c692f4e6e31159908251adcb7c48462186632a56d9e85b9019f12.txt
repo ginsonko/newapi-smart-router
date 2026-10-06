@@ -1,0 +1,174 @@
+package sora
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	media "github.com/QuantumNous/new-api/pkg/media"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+)
+
+func nativeTestCapability(t *testing.T) (string, media.Capability) {
+	root, c := prepareInlineTest(t)
+	c.ReferenceVideo, c.ReferenceAudio = true, true
+	c.MinVisual = 1
+	c.MaxVideos, c.MaxAudios = 3, 3
+	c.VideoRoles, c.AudioRoles = []string{"reference"}, []string{"reference"}
+	c.MaxVideoBytes, c.MaxRemoteVideoBytes, c.MaxTotalVideoBytes = 50<<20, 50<<20, 60<<20
+	c.MaxAudioBytes, c.MaxRemoteAudioBytes, c.MaxTotalAudioBytes = 50<<20, 50<<20, 60<<20
+	c.VideoMIMETypes = []string{"video/mp4", "video/quicktime", "video/webm"}
+	c.AudioMIMETypes = []string{"audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/x-wav", "audio/ogg"}
+	c.ReferenceFields = map[string]string{"image": "images", "video": "video_b64s", "audio": "audio_b64s"}
+	c.ReferenceEncoding = map[string]string{"image": "data_url", "video": "data_url", "audio": "data_url"}
+	c.MaxRequestBytes = 128 << 20
+	return root, c
+}
+
+func nativeContainer(brand string) []byte {
+	return append([]byte{0, 0, 0, 24, 'f', 't', 'y', 'p'}, append([]byte(brand), make([]byte, 32)...)...)
+}
+
+func TestNativeMediaArraysAndMixedWire(t *testing.T) {
+	root, cap := nativeTestCapability(t)
+	png := inlineTestImage(t, 8)
+	mp4 := nativeContainer("isom")
+	mov := nativeContainer("qt  ")
+	m4a := nativeContainer("M4A ")
+	enc := func(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+	prompt := "  @视频2 和 @图片1 保持原文\n不自动改写 "
+	raw, e := common.Marshal(map[string]interface{}{"prompt": prompt, "model": "public-model", "duration": 15, "ratio": "9:16", "resolution": "720p", "images": []string{enc(png)}, "video_b64s": []string{enc(mp4), "data:video/quicktime;base64," + enc(mov)}, "audio_b64s": []string{enc(m4a)}, "future_scalar": "preserved"})
+	require.NoError(t, e)
+	c := inlineContext(t, string(raw))
+	var req relaycommon.TaskSubmitReq
+	require.NoError(t, common.Unmarshal(raw, &req))
+	require.NoError(t, relaycommon.NormalizeTaskMediaReferences(c, inlineInfo(), &req))
+	require.Len(t, req.References, 4)
+	require.Equal(t, "9:16", req.AspectRatio)
+	body, e := buildInlineImageRequest(c, inlineInfo(), req, cap)
+	require.NoError(t, e)
+	spool := body.(*encodedImageBody)
+	var wire map[string]interface{}
+	require.NoError(t, common.DecodeJson(body, &wire))
+	require.NoError(t, spool.Close())
+	require.Equal(t, prompt, wire["prompt"])
+	require.Equal(t, "vendor-model", wire["model"])
+	require.EqualValues(t, 15, wire["duration"])
+	require.Equal(t, "9:16", wire["ratio"])
+	require.Equal(t, "preserved", wire["future_scalar"])
+	require.NotContains(t, wire, "references")
+	require.NotContains(t, wire, "seconds")
+	for field, want := range map[string][][]byte{"images": {png}, "video_b64s": {mp4, mov}, "audio_b64s": {m4a}} {
+		arr := wire[field].([]interface{})
+		require.Len(t, arr, len(want))
+		for i, v := range arr {
+			_, payload, ok := strings.Cut(v.(string), ";base64,")
+			require.True(t, ok)
+			b, e := base64.StdEncoding.DecodeString(payload)
+			require.NoError(t, e)
+			require.Equal(t, want[i], b)
+		}
+	}
+	entries, e := os.ReadDir(filepath.Join(root, "tmp"))
+	require.NoError(t, e)
+	require.Empty(t, entries)
+}
+
+func TestNativeVideoOnlyAndFailureCleanup(t *testing.T) {
+	root, cap := nativeTestCapability(t)
+	video := nativeContainer("isom")
+	audio := nativeContainer("M4A ")
+	data := func(kind string, b []byte) relaycommon.MediaReference {
+		return relaycommon.MediaReference{Type: kind, Role: "reference", DataURL: "data:" + map[string]string{"video": "video/mp4", "audio": "audio/x-m4a"}[kind] + ";base64," + base64.StdEncoding.EncodeToString(b)}
+	}
+	for _, tc := range []struct {
+		name  string
+		refs  []relaycommon.MediaReference
+		tweak func(*media.Capability)
+		fail  bool
+	}{
+		{"video_only", []relaycommon.MediaReference{data("video", video)}, nil, false},
+		{"audio_only", []relaycommon.MediaReference{data("audio", audio)}, nil, true},
+		{"mime_mismatch", []relaycommon.MediaReference{data("video", []byte("<html>not media</html>"))}, nil, true},
+		{"per_file", []relaycommon.MediaReference{data("video", video)}, func(c *media.Capability) { c.MaxVideoBytes = 8 }, true},
+		{"total", []relaycommon.MediaReference{data("video", video), data("video", video)}, func(c *media.Capability) { c.MaxTotalVideoBytes = int64(len(video)) }, true},
+		{"json_limit", []relaycommon.MediaReference{data("video", video)}, func(c *media.Capability) { c.MaxRequestBytes = 64 }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cap
+			if tc.tweak != nil {
+				tc.tweak(&cfg)
+			}
+			req := relaycommon.TaskSubmitReq{Prompt: "unchanged", Duration: 15, Seconds: "15", References: tc.refs}
+			body, e := buildInlineImageRequest(inlineContext(t, `{}`), inlineInfo(), req, cfg)
+			if tc.fail {
+				require.Error(t, e)
+			} else {
+				require.NoError(t, e)
+				var wire map[string]interface{}
+				require.NoError(t, common.DecodeJson(body, &wire))
+				require.NotContains(t, wire, "images")
+				require.Len(t, wire["video_b64s"], 1)
+				require.NoError(t, body.(io.Closer).Close())
+			}
+			entries, e := os.ReadDir(filepath.Join(root, "tmp"))
+			require.NoError(t, e)
+			require.Empty(t, entries)
+		})
+	}
+	c := inlineContext(t, `{}`)
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	cancel()
+	c.Request = c.Request.WithContext(ctx)
+	_, e := buildInlineImageRequest(c, inlineInfo(), relaycommon.TaskSubmitReq{References: []relaycommon.MediaReference{data("video", video)}}, cap)
+	require.Error(t, e)
+	var reservations int64
+	require.NoError(t, model.DB.Model(&model.MediaStorageReservation{}).Where("state = ?", "active").Count(&reservations).Error)
+	require.Zero(t, reservations)
+}
+
+func TestNativeReferencesOwnershipAndLocalHTTPWire(t *testing.T) {
+	root, cap := nativeTestCapability(t)
+	content := nativeContainer("isom")
+	require.NoError(t, os.WriteFile(filepath.Join(root, "objects", "owned.mp4"), content, 0600))
+	blob := model.MediaBlob{PublicID: "native-owned", UserID: 1, StorageBackend: model.MediaStorageBackendLocal, ObjectKey: "objects/owned.mp4", Status: model.MediaBlobStatusReady, MimeType: "video/mp4", SizeBytes: int64(len(content))}
+	require.NoError(t, model.DB.Create(&blob).Error)
+	source := inlineImageSource{reference: relaycommon.MediaReference{Type: "video", FileID: blob.PublicID}}
+	_, _, e := openInlineImage(context.Background(), 2, source, cap, cap.MaxVideoBytes)
+	require.Error(t, e)
+	reader, _, e := openInlineImage(context.Background(), 1, source, cap, cap.MaxVideoBytes)
+	require.NoError(t, e)
+	got, e := io.ReadAll(reader)
+	require.NoError(t, e)
+	reader.Close()
+	require.Equal(t, content, got)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wire map[string]interface{}
+		require.NoError(t, common.DecodeJson(r.Body, &wire))
+		require.Len(t, wire["video_b64s"], 1)
+		require.NotContains(t, wire, "file_id")
+		w.Write([]byte(`{"id":"local-mock-only"}`))
+	}))
+	defer server.Close()
+	body, e := buildInlineImageRequest(inlineContext(t, `{}`), inlineInfo(), relaycommon.TaskSubmitReq{References: []relaycommon.MediaReference{source.reference}}, cap)
+	require.NoError(t, e)
+	request, e := http.NewRequest(http.MethodPost, server.URL, body)
+	require.NoError(t, e)
+	request.ContentLength = body.(*encodedImageBody).size
+	response, e := http.DefaultClient.Do(request)
+	require.NoError(t, e)
+	defer response.Body.Close()
+	raw, e := io.ReadAll(response.Body)
+	require.NoError(t, e)
+	require.True(t, bytes.Contains(raw, []byte("local-mock-only")))
+}

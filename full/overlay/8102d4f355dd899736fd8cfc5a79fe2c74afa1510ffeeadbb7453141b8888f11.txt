@@ -1,0 +1,65 @@
+package model
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+func MarkParameterTaskSubmissionRejected(ctx context.Context, reservationID string, userID int, taskID, requestID string) error {
+	if DB == nil || reservationID == "" || userID <= 0 || taskID == "" || requestID == "" {
+		return ErrTenantCostInvalidInput
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var reservation QuotaReservation
+		if err := lockForUpdate(tx).Where("reservation_id = ?", reservationID).First(&reservation).Error; err != nil {
+			return err
+		}
+		if reservation.UserId != userID || reservation.ParameterCostContext == nil {
+			return ErrTenantCostScope
+		}
+		var cost ParameterReservationCostContext
+		if err := common.UnmarshalJsonStr(*reservation.ParameterCostContext, &cost); err != nil {
+			return err
+		}
+		if cost.TaskPublicID != taskID || cost.RequestID != requestID || cost.Terminal != nil {
+			return ErrTenantCostScope
+		}
+		if reservation.Status != QuotaReservationStatusActive || reservation.SettlementPending {
+			return ErrQuotaReservationFinalized
+		}
+		if cost.SubmissionState == "rejected" {
+			return nil
+		}
+		if cost.SubmissionState != "dispatching" {
+			return ErrTenantCostConflict
+		}
+		cost.SubmissionState = "rejected"
+		raw, err := common.Marshal(cost)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&reservation).Update("parameter_cost_context", string(raw)).Error
+	})
+}
+
+// restoreParameterTaskBillingTx joins the accepted task to its pre-dispatch
+// financial identity. Recovery uses the frozen contract, never current prices.
+func restoreParameterTaskBillingTx(tx *gorm.DB, task *Task, reservation *QuotaReservation) error {
+	if reservation.ParameterCostContext == nil {
+		return nil
+	}
+	var cost ParameterReservationCostContext
+	if err := common.UnmarshalJsonStr(*reservation.ParameterCostContext, &cost); err != nil {
+		return err
+	}
+	if cost.TaskPublicID == "" {
+		return nil
+	}
+	if cost.TaskPublicID != task.TaskID || cost.RequestID != task.PrivateData.BillingRequestID || cost.TaskBilling == nil ||
+		cost.SubmissionState != "dispatching" || cost.Quote.Quota != task.Quota || cost.Quote.ChannelID != task.ChannelId {
+		return ErrTaskBillingReceiptConflict
+	}
+	task.PrivateData.BillingContext = cost.TaskBilling
+	return tx.Model(task).Update("private_data", task.PrivateData).Error
+}

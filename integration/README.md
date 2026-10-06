@@ -1,5 +1,7 @@
 # Custom Fork Integration Kit
 
+Current Alpha version: [**v0.4.0-alpha.1**](https://github.com/ginsonko/newapi-smart-router/releases/tag/v0.4.0-alpha.1), Bridge protocol `bridge-spi-v1alpha4`. Integrate and evidence all [R98 host hooks](../parts/spec/r98-host-hooks.md), including policy memory, current authorization scope and durable image jobs. The example's top-level `bridge_protocol` is current; `r52_evidence` is retained historical context. The versioned sections below are historical requirements, with current replay semantics described in [the v0.4 delta](../docs/v0.4-contract-delta.md).
+
 The Integration Kit is for an existing New API fork. It does not apply a
 patch automatically.
 

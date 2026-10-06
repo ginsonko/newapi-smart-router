@@ -1,0 +1,423 @@
+package model
+
+import (
+	"errors"
+	"net/url"
+	"path/filepath"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"gorm.io/gorm"
+)
+
+const (
+	ImageRouteJobReady       = "ready"
+	ImageRouteJobDispatching = "dispatching"
+	ImageRouteJobWaiting     = "waiting"
+	ImageRouteJobSucceeded   = "succeeded"
+	ImageRouteJobFailed      = "failed"
+	ImageRouteJobUnknown     = "unknown"
+)
+
+var ErrImageRouteJobConflict = errors.New("image route job state or identity conflict")
+
+type ImageRouteJob struct {
+	ID                    int64  `json:"id" gorm:"primaryKey"`
+	PublicTaskID          string `json:"public_task_id" gorm:"type:varchar(191);not null;uniqueIndex"`
+	UserID                int    `json:"user_id" gorm:"not null;index"`
+	TokenID               int    `json:"-" gorm:"not null"`
+	RequestPath           string `json:"-" gorm:"type:text;not null"`
+	ContentType           string `json:"-" gorm:"type:text;not null"`
+	BodyPath              string `json:"-" gorm:"type:text;not null"`
+	BodyReservation       string `json:"-" gorm:"type:text;not null"`
+	ResultPath            string `json:"-" gorm:"type:text;not null"`
+	ResultReservation     string `json:"-" gorm:"type:text;not null"`
+	ResponseFormat        string `json:"response_format" gorm:"type:varchar(32);not null"`
+	NoRetention           bool   `json:"no_retention" gorm:"not null"`
+	FrozenGroupsJSON      string `json:"-" gorm:"type:text;not null"`
+	TenantRequestID       string `json:"-" gorm:"type:varchar(191);not null"`
+	QuoteToken            string `json:"-" gorm:"type:text;not null"`
+	QuoteSnapshotJSON     string `json:"-" gorm:"type:text;not null"`
+	CommitmentJSON        string `json:"-" gorm:"type:text;not null"`
+	PolicyJSON            string `json:"-" gorm:"type:text;not null"`
+	ClientIP              string `json:"-" gorm:"type:varchar(64);not null"`
+	State                 string `json:"state" gorm:"type:varchar(20);not null;index"`
+	AttemptedChannelsJSON string `json:"-" gorm:"type:text;not null"`
+	CurrentTaskID         string `json:"-" gorm:"type:varchar(191);not null;index"`
+	Version               int64  `json:"version" gorm:"not null"`
+	CreatedAt             int64  `json:"created_at" gorm:"not null"`
+	UpdatedAt             int64  `json:"updated_at" gorm:"not null"`
+	LastError             string `json:"-" gorm:"type:text"`
+}
+
+func (ImageRouteJob) TableName() string { return "image_route_jobs" }
+
+func CreateImageRouteJob(job *ImageRouteJob, root *Task) error {
+	if DB == nil || job == nil || root == nil || job.ID != 0 || root.ID != 0 ||
+		strings.TrimSpace(job.PublicTaskID) == "" || len(job.PublicTaskID) > 191 ||
+		job.UserID <= 0 || job.TokenID < 0 || !filepath.IsAbs(job.BodyPath) ||
+		(root.TaskID != "" && root.TaskID != job.PublicTaskID) ||
+		(root.UserId != 0 && root.UserId != job.UserID) {
+		return ErrImageRouteJobConflict
+	}
+	var policy *smartrouter.Policy
+	if err := common.UnmarshalJsonStr(job.PolicyJSON, &policy); err != nil || policy == nil {
+		return ErrImageRouteJobConflict
+	}
+	policyJSON, err := common.Marshal(policy)
+	if err != nil {
+		return err
+	}
+	groups := []string{}
+	if job.FrozenGroupsJSON != "" {
+		if err := common.UnmarshalJsonStr(job.FrozenGroupsJSON, &groups); err != nil || groups == nil {
+			return ErrImageRouteJobConflict
+		}
+	}
+	groupsJSON, err := common.Marshal(groups)
+	if err != nil {
+		return err
+	}
+	created, task := *job, *root
+	created.PolicyJSON, created.FrozenGroupsJSON = string(policyJSON), string(groupsJSON)
+	created.State, created.Version = ImageRouteJobReady, 1
+	created.AttemptedChannelsJSON, created.CurrentTaskID = "[]", ""
+	created.ResultPath, created.LastError = "", ""
+	created.CreatedAt, created.UpdatedAt = common.GetTimestamp(), common.GetTimestamp()
+	imageContext := ImageTaskContext{}
+	if root.PrivateData.ImageTask != nil {
+		imageContext = *root.PrivateData.ImageTask
+	}
+	if created.ResponseFormat == "" {
+		created.ResponseFormat = imageContext.ResponseFormat
+	}
+	if created.ResponseFormat == "" {
+		created.ResponseFormat = "url"
+	}
+	if created.ResponseFormat != "url" && created.ResponseFormat != "b64_json" {
+		return ErrImageRouteJobConflict
+	}
+	imageContext.ResponseFormat, imageContext.NoRetention = created.ResponseFormat, created.NoRetention
+	imageContext.RetryableFailure = false
+	task.PrivateData = TaskPrivateData{ImageTask: &imageContext, TokenId: created.TokenID, BillingRequestID: root.PrivateData.BillingRequestID}
+	task.TaskID, task.UserId, task.Platform = created.PublicTaskID, created.UserID, "smart_image"
+	task.ChannelId, task.Quota, task.BillingReservationID = 0, 0, ""
+	if task.ReconcileSince == 0 {
+		task.ReconcileSince = created.CreatedAt
+	}
+	task.NextPollAt = 253402300799
+	task.Status, task.Progress, task.FailReason = TaskStatusSubmitted, "5%", ""
+	task.StartTime, task.FinishTime = 0, 0
+	task.CreatedAt, task.UpdatedAt, task.SubmitTime = created.CreatedAt, created.UpdatedAt, created.CreatedAt
+	task.Data = []byte(`{}`)
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := HoldImageRouteSpoolTx(tx, created.BodyReservation); err != nil {
+			return err
+		}
+		var existing int64
+		if err := tx.Model(&Task{}).Where("task_id = ?", created.PublicTaskID).Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing != 0 {
+			return ErrImageRouteJobConflict
+		}
+		if err := tx.Create(&created).Error; err != nil {
+			return err
+		}
+		return tx.Create(&task).Error
+	})
+	if err == nil {
+		*job, *root = created, task
+	}
+	return err
+}
+
+func GetImageRouteJob(publicID string, userID int) (*ImageRouteJob, bool, error) {
+	if DB == nil || userID <= 0 || publicID == "" {
+		return nil, false, ErrImageRouteJobConflict
+	}
+	var job ImageRouteJob
+	err := DB.Where("public_task_id = ? AND user_id = ?", publicID, userID).First(&job).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &job, true, nil
+}
+
+func ClaimImageRouteJob(id, version int64) (*ImageRouteJob, bool, error) {
+	if DB == nil || id <= 0 || version <= 0 {
+		return nil, false, ErrImageRouteJobConflict
+	}
+	var job ImageRouteJob
+	claimed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&ImageRouteJob{}).
+			Where("id = ? AND version = ? AND state = ? AND current_task_id = ?", id, version, ImageRouteJobReady, "").
+			Updates(map[string]any{"state": ImageRouteJobDispatching, "version": gorm.Expr("version + 1"), "updated_at": common.GetTimestamp()})
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		claimed = true
+		return tx.First(&job, id).Error
+	})
+	if err != nil || !claimed {
+		return nil, false, err
+	}
+	return &job, true, nil
+}
+
+func RecordImageRouteJobChannel(id int64, channelID int) error {
+	if DB == nil || id <= 0 || channelID <= 0 {
+		return ErrImageRouteJobConflict
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var job ImageRouteJob
+		if err := tx.First(&job, id).Error; err != nil {
+			return err
+		}
+		if job.State != ImageRouteJobDispatching || job.CurrentTaskID != "" {
+			return ErrImageRouteJobConflict
+		}
+		var channels []int
+		if err := common.UnmarshalJsonStr(job.AttemptedChannelsJSON, &channels); err != nil || channels == nil {
+			return ErrImageRouteJobConflict
+		}
+		for _, attempted := range channels {
+			if attempted == channelID || attempted <= 0 {
+				return ErrImageRouteJobConflict
+			}
+		}
+		encoded, err := common.Marshal(append(channels, channelID))
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&ImageRouteJob{}).
+			Where("id = ? AND version = ? AND state = ?", id, job.Version, ImageRouteJobDispatching).
+			Updates(map[string]any{"attempted_channels_json": string(encoded), "version": gorm.Expr("version + 1"), "updated_at": common.GetTimestamp()})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrImageRouteJobConflict
+		}
+		return nil
+	})
+}
+
+func BindImageRouteJobTask(id int64, taskID string) error {
+	if DB == nil || id <= 0 || strings.TrimSpace(taskID) == "" {
+		return ErrImageRouteJobConflict
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		return bindImageRouteJobTaskTx(tx, id, taskID)
+	})
+}
+
+func bindImageRouteJobTaskTx(tx *gorm.DB, id int64, taskID string) error {
+	if tx == nil || id <= 0 || strings.TrimSpace(taskID) == "" {
+		return ErrImageRouteJobConflict
+	}
+	var job ImageRouteJob
+	if err := lockForUpdate(tx).First(&job, id).Error; err != nil {
+		return err
+	}
+	if job.State == ImageRouteJobWaiting && job.CurrentTaskID == taskID {
+		return nil
+	}
+	if job.State != ImageRouteJobDispatching || job.CurrentTaskID != "" || job.PublicTaskID == taskID {
+		return ErrImageRouteJobConflict
+	}
+	var children []Task
+	if err := tx.Where("task_id = ? AND user_id = ?", taskID, job.UserID).Limit(2).Find(&children).Error; err != nil {
+		return err
+	}
+	if len(children) != 1 || children[0].Platform == "smart_image" || children[0].PrivateData.TokenId != job.TokenID {
+		return ErrImageRouteJobConflict
+	}
+	result := tx.Model(&ImageRouteJob{}).
+		Where("id = ? AND version = ? AND state = ?", id, job.Version, ImageRouteJobDispatching).
+		Updates(map[string]any{"current_task_id": taskID, "state": ImageRouteJobWaiting, "version": gorm.Expr("version + 1"), "updated_at": common.GetTimestamp()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrImageRouteJobConflict
+	}
+	return nil
+}
+
+func CompleteImageRouteJob(id, expectedVersion int64, state string, data []byte, reason string, resultPath ...string) (bool, error) {
+	if DB == nil || id <= 0 || expectedVersion <= 0 || len(resultPath) > 1 {
+		return false, ErrImageRouteJobConflict
+	}
+	var status TaskStatus
+	switch state {
+	case ImageRouteJobSucceeded:
+		status = TaskStatusSuccess
+		reason = ""
+	case ImageRouteJobFailed:
+		status = TaskStatusFailure
+	case ImageRouteJobUnknown:
+		status = TaskStatusUnknown
+	default:
+		return false, ErrImageRouteJobConflict
+	}
+	privatePath := ""
+	if len(resultPath) == 1 {
+		privatePath = resultPath[0]
+		if privatePath != "" && !filepath.IsAbs(privatePath) {
+			return false, ErrImageRouteJobConflict
+		}
+	}
+	safeData := []byte(`{}`)
+	if state == ImageRouteJobSucceeded {
+		var response dto.ImageResponse
+		if len(data) > 0 {
+			if err := common.Unmarshal(data, &response); err != nil {
+				return false, err
+			}
+		}
+		type imageURL struct {
+			URL string `json:"url"`
+		}
+		urls := []imageURL{}
+		for _, item := range response.Data {
+			if item.B64Json != "" && privatePath == "" {
+				return false, ErrImageRouteJobConflict
+			}
+			if item.Url == "" {
+				continue
+			}
+			parsed, err := url.Parse(strings.TrimSpace(item.Url))
+			if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+				return false, ErrImageRouteJobConflict
+			}
+			for name := range parsed.Query() {
+				switch strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(name)) {
+				case "key", "token", "apikey", "authorization", "accesstoken", "password", "secret":
+					return false, ErrImageRouteJobConflict
+				}
+			}
+			urls = append(urls, imageURL{URL: parsed.String()})
+		}
+		if len(urls) == 0 && privatePath == "" {
+			return false, ErrImageRouteJobConflict
+		}
+		if len(urls) > 0 {
+			var err error
+			safeData, err = common.Marshal(struct {
+				Data    []imageURL `json:"data"`
+				Created int64      `json:"created"`
+			}{Data: urls, Created: response.Created})
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+	completed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var job ImageRouteJob
+		if err := tx.First(&job, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		now := common.GetTimestamp()
+		result := tx.Model(&ImageRouteJob{}).
+			Where("id = ? AND version = ? AND state IN ?", id, expectedVersion, []string{ImageRouteJobReady, ImageRouteJobDispatching, ImageRouteJobWaiting}).
+			Updates(map[string]any{"state": state, "result_path": privatePath, "last_error": reason, "version": gorm.Expr("version + 1"), "updated_at": now})
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		result = tx.Model(&Task{}).
+			Where("task_id = ? AND user_id = ? AND platform = ? AND status IN ?", job.PublicTaskID, job.UserID, "smart_image",
+				[]TaskStatus{TaskStatusNotStart, TaskStatusSubmitted, TaskStatusQueued, TaskStatusInProgress, TaskStatusFinalizing}).
+			Updates(map[string]any{"status": status, "quota": 0, "data": safeData, "fail_reason": reason, "progress": "100%", "finish_time": now, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrImageRouteJobConflict
+		}
+		completed = true
+		return nil
+	})
+	return completed && err == nil, err
+}
+
+func ResumeImageRouteJob(id, expectedVersion int64) (bool, error) {
+	if DB == nil || id <= 0 || expectedVersion <= 0 {
+		return false, ErrImageRouteJobConflict
+	}
+	resumed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var job ImageRouteJob
+		if err := lockForUpdate(tx).Where("id = ? AND version = ? AND state = ?", id, expectedVersion, ImageRouteJobWaiting).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if job.CurrentTaskID == "" || job.CurrentTaskID == job.PublicTaskID {
+			return nil
+		}
+		var children []Task
+		if err := tx.Where("task_id = ? AND user_id = ?", job.CurrentTaskID, job.UserID).Limit(2).Find(&children).Error; err != nil {
+			return err
+		}
+		if len(children) != 1 {
+			return nil
+		}
+		var receipt TaskBillingReceipt
+		if err := lockForUpdate(tx).Where("task_row_id = ?", children[0].ID).First(&receipt).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var child Task
+		if err := lockForUpdate(tx).First(&child, children[0].ID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if child.TaskID != job.CurrentTaskID || child.UserId != job.UserID || child.Platform == "smart_image" ||
+			child.Status != TaskStatusFailure || child.Quota != 0 || child.PrivateData.TokenId != job.TokenID ||
+			child.PrivateData.ImageTask == nil || !child.PrivateData.ImageTask.RetryableFailure ||
+			receipt.UserID != job.UserID || receipt.TokenID != job.TokenID || receipt.ChannelID != child.ChannelId ||
+			receipt.State != TaskBillingReceiptApplied || receipt.TerminalTargetStatus != TaskStatusFailure ||
+			receipt.TargetQuota != 0 || receipt.AppliedQuota != 0 || receipt.UsageAppliedQuota != 0 {
+			return nil
+		}
+		result := tx.Model(&ImageRouteJob{}).
+			Where("id = ? AND version = ? AND state = ? AND current_task_id = ?", id, expectedVersion, ImageRouteJobWaiting, child.TaskID).
+			Updates(map[string]any{"state": ImageRouteJobReady, "current_task_id": "", "version": gorm.Expr("version + 1"), "updated_at": common.GetTimestamp(), "last_error": child.FailReason})
+		if result.Error != nil {
+			return result.Error
+		}
+		resumed = result.RowsAffected == 1
+		return nil
+	})
+	return resumed && err == nil, err
+}
+
+func UpdateImageRouteJobActiveTasks(afterID ...int64) ([]*ImageRouteJob, error) {
+	if DB == nil || len(afterID) > 1 || (len(afterID) == 1 && afterID[0] < 0) {
+		return nil, ErrImageRouteJobConflict
+	}
+	cursor := int64(0)
+	if len(afterID) == 1 {
+		cursor = afterID[0]
+	}
+	jobs := []*ImageRouteJob{}
+	err := DB.Where("id > ? AND state IN ?", cursor, []string{ImageRouteJobReady, ImageRouteJobWaiting}).
+		Order("id ASC").Limit(50).Find(&jobs).Error
+	return jobs, err
+}

@@ -1,0 +1,1165 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+const smartRouteColdStartSuccessTTL = 2 * time.Minute
+
+func smartRouteColdStartWaveLockKey(waveKey string) string {
+	return smartRouteRedisKey("cold-start-wave:" + smartRouteRedisComponent(waveKey))
+}
+
+func (worker *SmartRouteProbeWorker) acquireColdStartWaveOwnership(
+	waveKey string,
+	setting smartroutersetting.Setting,
+) bool {
+	if worker == nil || waveKey == "" {
+		return false
+	}
+	if common.RDB == nil || !common.RedisEnabled {
+		return true
+	}
+	ttl := time.Duration(setting.EffectiveProbeLeaseTTLSeconds()*2) * time.Second
+	if ttl < 2*time.Minute {
+		ttl = 2 * time.Minute
+	}
+	const acquireOrRenew = `
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 1 end
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+return 0
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	owned, err := common.RDB.Eval(
+		ctx,
+		acquireOrRenew,
+		[]string{smartRouteColdStartWaveLockKey(waveKey)},
+		worker.owner,
+		ttl.Milliseconds(),
+	).Int()
+	return err == nil && owned == 1
+}
+
+func (worker *SmartRouteProbeWorker) releaseColdStartWaveOwnership(waveKey string) {
+	if worker == nil || waveKey == "" || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	go worker.releaseColdStartWaveOwnershipNow(waveKey)
+}
+
+func (worker *SmartRouteProbeWorker) releaseColdStartWaveOwnershipNow(waveKey string) {
+	if worker == nil || waveKey == "" || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	const compareAndDelete = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = common.RDB.Eval(
+		ctx,
+		compareAndDelete,
+		[]string{smartRouteColdStartWaveLockKey(waveKey)},
+		worker.owner,
+	).Err()
+}
+
+func (worker *SmartRouteProbeWorker) releaseColdStartWaveOwnershipsNow(waveKeys []string) {
+	if worker == nil || len(waveKeys) == 0 || common.RDB == nil || !common.RedisEnabled {
+		return
+	}
+	keys := make([]string, 0, len(waveKeys))
+	for _, waveKey := range waveKeys {
+		if waveKey != "" {
+			keys = append(keys, smartRouteColdStartWaveLockKey(waveKey))
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	const compareAndDeleteMany = `
+local deleted = 0
+for index = 1, #KEYS do
+  if redis.call('GET', KEYS[index]) == ARGV[1] then
+    deleted = deleted + redis.call('DEL', KEYS[index])
+  end
+end
+return deleted
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	_ = common.RDB.Eval(ctx, compareAndDeleteMany, keys, worker.owner).Err()
+}
+
+// smartRouteColdStartWave owns one ordered discovery sequence for an exact
+// contract/model/endpoint. The first batch may run concurrently; later batches
+// are admitted only after every probe in the current batch has failed.
+type smartRouteColdStartWave struct {
+	key            string
+	catalogVersion string
+	request        smartrouter.RouteRequest
+	scopePhysical  map[string]struct{}
+	remaining      map[string]*smartRouteProbeJob
+	active         map[string]struct{}
+	attempted      map[string]struct{}
+	succeeded      map[string]struct{}
+	physicalDomain map[string]string
+	coverageTarget int
+	notified       bool
+	durableKey     string
+	running        int
+	lastHint       time.Time
+}
+
+func smartRouteColdStartWaveKey(hint SmartRouteRecoveryHint, jobs []*smartRouteProbeJob) string {
+	type candidateFingerprint struct {
+		PhysicalKey string `json:"physical_key"`
+		RatioPPM    int64  `json:"ratio_ppm"`
+		ManualRank  int    `json:"manual_rank"`
+		Manual      bool   `json:"manual"`
+	}
+	candidates := make([]candidateFingerprint, 0, len(jobs))
+	for _, job := range jobs {
+		candidates = append(candidates, candidateFingerprint{
+			PhysicalKey: job.key, RatioPPM: job.ratioPPM,
+			ManualRank: job.coldStartRank, Manual: job.coldStartManual,
+		})
+	}
+	payload, err := common.Marshal(struct {
+		ContractID     string                 `json:"contract_id"`
+		CanonicalModel string                 `json:"canonical_model"`
+		Endpoint       string                 `json:"endpoint"`
+		Policy         smartrouter.Policy     `json:"policy"`
+		Candidates     []candidateFingerprint `json:"candidates"`
+	}{
+		ContractID: hint.Request.ContractID, CanonicalModel: hint.Request.CanonicalModel,
+		Endpoint: hint.Request.Endpoint, Policy: smartrouter.NormalizePolicy(hint.Policy), Candidates: candidates,
+	})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func smartRouteHasColdStartAlternative(
+	request smartrouter.RouteRequest,
+	routes []smartrouter.CertifiedRoute,
+) bool {
+	physical := make(map[string]struct{}, len(routes))
+	for _, route := range routes {
+		key := smartRoutePhysicalProbeKey(request.ContractID, request.Endpoint, route)
+		if key != "" {
+			physical[key] = struct{}{}
+		}
+	}
+	return len(physical) > 1
+}
+
+func (worker *SmartRouteProbeWorker) ColdStartSucceeded(
+	request smartrouter.RouteRequest,
+	physicalKey string,
+) {
+	if worker == nil {
+		return
+	}
+	persistSmartRouteColdStartSuccess(worker.successSem, request, physicalKey)
+	worker.completeColdStartSuccess(request, physicalKey)
+}
+
+func (worker *SmartRouteProbeWorker) completeColdStartSuccess(
+	request smartrouter.RouteRequest,
+	physicalKey string,
+) {
+	if worker == nil || physicalKey == "" {
+		return
+	}
+	setting := smartroutersetting.Normalize(worker.settings())
+	worker.mu.Lock()
+	notifications, completed := worker.recordColdStartSuccessLocked(physicalKey, setting)
+	worker.mu.Unlock()
+	for _, notification := range notifications {
+		notifySmartRouteDiscovery(notification)
+	}
+	if len(notifications) == 0 {
+		notifySmartRouteDiscovery(request)
+	}
+	for _, durableKey := range completed {
+		worker.ackDurableRecoveryKey(durableKey)
+	}
+	worker.signal()
+}
+
+func persistSmartRouteColdStartSuccess(
+	semaphore chan struct{},
+	request smartrouter.RouteRequest,
+	physicalKey string,
+) bool {
+	if common.RDB == nil || !common.RedisEnabled || semaphore == nil || physicalKey == "" {
+		return false
+	}
+	acquireTimer := time.NewTimer(time.Second)
+	defer acquireTimer.Stop()
+	select {
+	case semaphore <- struct{}{}:
+	case <-acquireTimer.C:
+		return false
+	}
+	defer func() { <-semaphore }()
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		key := smartRouteColdStartSuccessRedisKey(request)
+		pipeline := common.RDB.TxPipeline()
+		pipeline.SAdd(ctx, key, physicalKey)
+		pipeline.Expire(ctx, key, smartRouteColdStartSuccessTTL)
+		_, err := pipeline.Exec(ctx)
+		cancel()
+		if err == nil {
+			return true
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+		}
+	}
+	return false
+}
+
+func smartRouteColdStartSuccessRedisKey(request smartrouter.RouteRequest) string {
+	return smartRouteRedisKey("cold-start-success:" + smartRouteRedisComponent(smartRouteDiscoveryKey(request)))
+}
+
+func (worker *SmartRouteProbeWorker) sharedColdStartSuccesses(job *smartRouteProbeJob) []string {
+	if worker == nil || job == nil || common.RDB == nil || !common.RedisEnabled {
+		return nil
+	}
+	worker.mu.Lock()
+	job = worker.currentColdStartJobLocked(job)
+	if len(job.coldStartWaves) == 0 {
+		worker.mu.Unlock()
+		return nil
+	}
+	scope := make(map[string]struct{})
+	var request smartrouter.RouteRequest
+	for waveKey := range job.coldStartWaves {
+		wave := worker.coldStartWaves[waveKey]
+		if wave == nil {
+			continue
+		}
+		request = wave.request
+		for physicalKey := range wave.scopePhysical {
+			scope[physicalKey] = struct{}{}
+		}
+	}
+	worker.mu.Unlock()
+	if len(scope) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	succeeded, err := common.RDB.SMembers(ctx, smartRouteColdStartSuccessRedisKey(request)).Result()
+	if err != nil {
+		return nil
+	}
+	result := make([]string, 0, len(succeeded))
+	for _, physicalKey := range succeeded {
+		if _, ok := scope[physicalKey]; ok {
+			result = append(result, physicalKey)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (worker *SmartRouteProbeWorker) sharedColdStartSuccess(job *smartRouteProbeJob) string {
+	succeeded := worker.sharedColdStartSuccesses(job)
+	if len(succeeded) == 0 {
+		return ""
+	}
+	return succeeded[0]
+}
+
+// absorbSharedColdStartSuccesses imports foreground or peer-worker evidence
+// without treating one successful route as completion of the entire coverage
+// wave. It returns true only when this concrete job is already successful or
+// every subscribed wave has reached its coverage target.
+func (worker *SmartRouteProbeWorker) absorbSharedColdStartSuccesses(
+	job *smartRouteProbeJob,
+	setting smartroutersetting.Setting,
+) bool {
+	succeeded := worker.sharedColdStartSuccesses(job)
+	if len(succeeded) == 0 {
+		return false
+	}
+	jobSucceeded := false
+	request := smartrouter.RouteRequest{
+		ContractID: job.contractID, CanonicalModel: job.canonicalModel, Endpoint: job.endpoint,
+	}
+	for _, physicalKey := range succeeded {
+		worker.adoptSharedColdStartSuccess(job, physicalKey)
+		worker.completeColdStartSuccess(request, physicalKey)
+		if physicalKey == job.key {
+			jobSucceeded = true
+		}
+	}
+	if jobSucceeded {
+		return true
+	}
+	worker.mu.Lock()
+	job = worker.currentColdStartJobLocked(job)
+	live := false
+	for waveKey := range job.coldStartWaves {
+		if worker.coldStartWaves[waveKey] != nil {
+			live = true
+			break
+		}
+	}
+	worker.mu.Unlock()
+	_ = setting
+	return !live
+}
+
+// adoptSharedColdStartSuccess projects one confirmed physical success onto any
+// newly published aliases that were not present in the process that observed
+// the upstream response. Existing healthy aliases are left untouched so the
+// shared marker cannot inflate success counters.
+func (worker *SmartRouteProbeWorker) adoptSharedColdStartSuccess(
+	job *smartRouteProbeJob,
+	physicalKey string,
+) {
+	if worker == nil || worker.engine == nil || worker.engine.State == nil || job == nil || physicalKey == "" {
+		return
+	}
+	routes := worker.currentPhysicalAliases(job, physicalKey)
+	if len(routes) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runtime, err := worker.engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{
+		Routes: smartRouteStateRoutes(routes),
+	})
+	if err != nil {
+		return
+	}
+	for _, route := range routes {
+		quality := runtime.Quality.Routes[route.RouteID]
+		if smartRouteQualityHasObservedSuccess(quality) {
+			continue
+		}
+		_ = worker.engine.State.RecordAttempt(ctx, SmartRouteAttemptRecord{
+			CatalogVersion: job.catalogVersion,
+			RouteID:        route.RouteID, Group: route.Group, Model: job.canonicalModel,
+			ChannelID: route.ChannelID, ContractID: job.contractID, Endpoint: job.endpoint,
+			CapacityDomain: route.CapacityDomain, CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			StableFallback: route.StableFallback, Outcome: smartrouter.OutcomeSuccess,
+			Admission: smartrouter.AdmissionNormal, SkipDomainUpdate: true,
+		})
+	}
+}
+
+func (worker *SmartRouteProbeWorker) currentPhysicalAliases(
+	job *smartRouteProbeJob,
+	physicalKey string,
+) []smartrouter.CertifiedRoute {
+	aliases := make(map[string]smartrouter.CertifiedRoute)
+	if worker != nil && worker.engine != nil && worker.engine.Catalogs != nil {
+		if catalog, ok := worker.engine.Catalogs.Current(); ok && catalog != nil {
+			if entry, exists := catalog.Contracts[job.contractID]; exists && entry.Contract.Endpoint == job.endpoint {
+				for _, pool := range entry.Pools {
+					for _, route := range pool.Candidates {
+						if smartRoutePhysicalProbeKey(job.contractID, job.endpoint, route) == physicalKey {
+							aliases[route.RouteID] = route
+						}
+					}
+				}
+			}
+		}
+	}
+	if job.key == physicalKey {
+		for routeID, route := range job.aliases {
+			aliases[routeID] = route
+		}
+	}
+	routes := mapSmartRouteAliases(aliases)
+	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteID < routes[j].RouteID })
+	return routes
+}
+
+func smartRouteJobHasCurrentSuccess(runtime SmartRouteRuntimeSnapshot, job *smartRouteProbeJob) bool {
+	if job == nil {
+		return false
+	}
+	for routeID := range job.aliases {
+		if smartRouteQualityHasObservedSuccess(runtime.Quality.Routes[routeID]) {
+			return true
+		}
+	}
+	return false
+}
+
+func smartRouteQualityHasObservedSuccess(quality smartrouter.QualityState) bool {
+	if quality.Phase == smartrouter.QualityHealthy {
+		return true
+	}
+	return quality.LastSuccessMS > 0 && quality.LastSuccessMS >= quality.LastFailureMS &&
+		quality.LastOutcome == smartrouter.OutcomeSuccess
+}
+
+func (worker *SmartRouteProbeWorker) renewColdStartJobOwnership(
+	job *smartRouteProbeJob,
+	setting smartroutersetting.Setting,
+) bool {
+	if worker == nil || job == nil || len(job.coldStartWaves) == 0 {
+		return true
+	}
+	for waveKey := range job.coldStartWaves {
+		if !worker.acquireColdStartWaveOwnership(waveKey, setting) {
+			return false
+		}
+	}
+	return true
+}
+
+func (worker *SmartRouteProbeWorker) renewActiveColdStartWaveOwnerships(
+	setting smartroutersetting.Setting,
+) {
+	if worker == nil {
+		return
+	}
+	worker.mu.Lock()
+	waveKeys := make([]string, 0, len(worker.coldStartWaves))
+	for waveKey := range worker.coldStartWaves {
+		waveKeys = append(waveKeys, waveKey)
+	}
+	worker.mu.Unlock()
+	for _, waveKey := range waveKeys {
+		if worker.acquireColdStartWaveOwnership(waveKey, setting) {
+			continue
+		}
+		worker.abandonColdStartJobWaves(&smartRouteProbeJob{
+			coldStartWaves: map[string]struct{}{waveKey: {}},
+		})
+	}
+}
+
+func (worker *SmartRouteProbeWorker) pauseColdStartWaves() []string {
+	if worker == nil {
+		return nil
+	}
+	worker.mu.Lock()
+	waveKeys := make([]string, 0, len(worker.coldStartWaves))
+	for waveKey := range worker.coldStartWaves {
+		waveKeys = append(waveKeys, waveKey)
+	}
+	for key, pending := range worker.pending {
+		if len(pending.coldStartWaves) > 0 {
+			delete(worker.pending, key)
+		}
+	}
+	worker.coldStartWaves = make(map[string]*smartRouteColdStartWave)
+	worker.mu.Unlock()
+	worker.releaseColdStartWaveOwnershipsNow(waveKeys)
+	return waveKeys
+}
+
+func (worker *SmartRouteProbeWorker) pruneStaleColdStartWavesLocked(now time.Time) {
+	if worker == nil {
+		return
+	}
+	stale := make(map[string]struct{})
+	for waveKey, wave := range worker.coldStartWaves {
+		if wave == nil || now.Sub(wave.lastHint) > smartRouteRecoveryHintFreshness {
+			stale[waveKey] = struct{}{}
+			delete(worker.coldStartWaves, waveKey)
+			worker.releaseColdStartWaveOwnership(waveKey)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	for key, pending := range worker.pending {
+		hadColdStartSubscribers := len(pending.coldStartWaves) > 0
+		for waveKey := range stale {
+			removeSmartRouteColdStartSubscriber(pending, waveKey)
+		}
+		if hadColdStartSubscribers && len(pending.coldStartWaves) == 0 {
+			// A job admitted exclusively through a virgin discovery wave has no work
+			// once its subscribers expire. Regular recovery jobs have no wave map
+			// and therefore never enter this branch.
+			delete(worker.pending, key)
+		}
+	}
+}
+
+func (worker *SmartRouteProbeWorker) abandonColdStartJobWaves(job *smartRouteProbeJob) {
+	if worker == nil || job == nil {
+		return
+	}
+	worker.mu.Lock()
+	job = worker.currentColdStartJobLocked(job)
+	if len(job.coldStartWaves) == 0 {
+		worker.mu.Unlock()
+		return
+	}
+	for waveKey := range job.coldStartWaves {
+		delete(worker.coldStartWaves, waveKey)
+		for key, pending := range worker.pending {
+			_, subscribed := pending.coldStartWaves[waveKey]
+			if !subscribed {
+				continue
+			}
+			removeSmartRouteColdStartSubscriber(pending, waveKey)
+			if len(pending.coldStartWaves) == 0 {
+				delete(worker.pending, key)
+			}
+		}
+	}
+	worker.mu.Unlock()
+	worker.signal()
+}
+
+func (worker *SmartRouteProbeWorker) recordColdStartSuccessLocked(
+	physicalKey string,
+	setting smartroutersetting.Setting,
+) ([]smartrouter.RouteRequest, []string) {
+	notifications := make([]smartrouter.RouteRequest, 0)
+	completedKeys := make([]string, 0)
+	for waveKey, wave := range worker.coldStartWaves {
+		if wave == nil || wave.scopePhysical == nil {
+			continue
+		}
+		if _, ok := wave.scopePhysical[physicalKey]; !ok {
+			continue
+		}
+		if wave.succeeded == nil {
+			wave.succeeded = make(map[string]struct{})
+		}
+		if _, duplicate := wave.succeeded[physicalKey]; duplicate {
+			continue
+		}
+		wave.succeeded[physicalKey] = struct{}{}
+		wave.attempted[physicalKey] = struct{}{}
+		delete(wave.active, physicalKey)
+		delete(wave.remaining, physicalKey)
+		if !wave.notified {
+			wave.notified = true
+			notifications = append(notifications, wave.request)
+		}
+		if pending := worker.pending[physicalKey]; pending != nil {
+			removeSmartRouteColdStartSubscriber(pending, waveKey)
+			if len(pending.coldStartWaves) == 0 {
+				delete(worker.pending, physicalKey)
+			}
+		}
+		if len(wave.succeeded) >= wave.coverageTarget {
+			if durableKey := worker.finishColdStartWaveLocked(waveKey); durableKey != "" {
+				completedKeys = append(completedKeys, durableKey)
+			}
+			continue
+		}
+		worker.scheduleColdStartBatchLocked(wave, setting)
+		if len(wave.remaining) == 0 && len(wave.active) == 0 {
+			if durableKey := worker.finishColdStartWaveLocked(waveKey); durableKey != "" {
+				completedKeys = append(completedKeys, durableKey)
+			}
+		}
+	}
+	return notifications, completedKeys
+}
+
+func (worker *SmartRouteProbeWorker) finishColdStartWaveLocked(waveKey string) string {
+	wave := worker.coldStartWaves[waveKey]
+	if wave == nil {
+		return ""
+	}
+	delete(worker.coldStartWaves, waveKey)
+	worker.releaseColdStartWaveOwnership(wave.key)
+	for key, pending := range worker.pending {
+		if _, subscribed := pending.coldStartWaves[waveKey]; !subscribed {
+			continue
+		}
+		removeSmartRouteColdStartSubscriber(pending, waveKey)
+		if len(pending.coldStartWaves) == 0 {
+			delete(worker.pending, key)
+		}
+	}
+	for _, running := range worker.runningColdStart {
+		removeSmartRouteColdStartSubscriber(running, waveKey)
+	}
+	return wave.durableKey
+}
+
+func (worker *SmartRouteProbeWorker) handleColdStartHint(
+	hint SmartRouteRecoveryHint,
+	setting smartroutersetting.Setting,
+) (SmartRouteProbeEnqueueDisposition, bool) {
+	if setting.TextProbeDelayMS() > 0 || worker == nil || hint.ForceProbe || !SmartRouteSyntheticProbeAllowed(hint.Request.Endpoint, hint.Request.CanonicalModel, hint.Routes...) {
+		return SmartRouteProbeNotDue, false
+	}
+	jobs, scopePhysical, hasVirgin := smartRouteColdStartJobs(hint)
+	physicalDomains := make(map[string]string, len(jobs))
+	for _, job := range jobs {
+		physicalDomains[job.key] = smartrouter.RouteFailureDomain(job.route)
+	}
+	waveKey := smartRouteColdStartWaveKey(hint, jobs)
+	if waveKey == "" {
+		return SmartRouteProbeNotDue, false
+	}
+	durableKey := hint.DurableKey
+	if durableKey == "" {
+		durableKey = "cold-start\x00" + waveKey
+	}
+	for _, job := range jobs {
+		job.durableKey = durableKey
+	}
+
+	worker.mu.Lock()
+	wave := worker.coldStartWaves[waveKey]
+	worker.mu.Unlock()
+	if wave == nil {
+		if !hasVirgin {
+			return SmartRouteProbeNotDue, false
+		}
+		foregroundKey := strings.TrimSpace(hint.ForegroundPhysicalKey)
+		if foregroundKey == "" {
+			// The pre-plan hint cannot identify which virgin route the user request
+			// will own. Consume only the virgin portion for now; ordinary failed
+			// routes in the same hint continue through worker.hint.
+			return SmartRouteProbeNotDue, true
+		}
+		if _, inScope := scopePhysical[foregroundKey]; !inScope {
+			return SmartRouteProbeNotDue, false
+		}
+		if len(jobs) < 2 {
+			// The foreground is the only virgin candidate. Its real outcome will
+			// either make it directly usable or place it in automatic recovery.
+			return SmartRouteProbeNotDue, true
+		}
+		if !worker.acquireColdStartWaveOwnership(waveKey, setting) {
+			// Keep a durable hand-off intact so the owner can restore it. Returning
+			// queue-full here is a deferral signal, not an actual local queue fault.
+			return SmartRouteProbeQueueFull, true
+		}
+	}
+
+	worker.mu.Lock()
+	wave = worker.coldStartWaves[waveKey]
+	if wave == nil {
+		// The foreground request owns the first strategy-ranked route. The
+		// background wave starts with every later physical candidate so the user
+		// path still performs at most one direct virgin attempt.
+		backgroundJobs := make([]*smartRouteProbeJob, 0, len(jobs)-1)
+		for _, job := range jobs {
+			if job.key != hint.ForegroundPhysicalKey {
+				backgroundJobs = append(backgroundJobs, job)
+			}
+		}
+		jobs = backgroundJobs
+		wave = &smartRouteColdStartWave{
+			key: waveKey, catalogVersion: hint.CatalogVersion, request: hint.Request,
+			scopePhysical: make(map[string]struct{}, len(scopePhysical)),
+			remaining:     make(map[string]*smartRouteProbeJob, len(jobs)),
+			active:        make(map[string]struct{}), attempted: make(map[string]struct{}),
+			succeeded: make(map[string]struct{}), physicalDomain: physicalDomains,
+			// Discovery stops at the first confirmed usable route. V4.4 does not
+			// spend probe quota constructing a synthetic primary-plus-two-backups
+			// set; successful routes remain available until real traffic says
+			// otherwise.
+			coverageTarget: 1, durableKey: durableKey,
+		}
+		worker.coldStartWaves[waveKey] = wave
+	}
+	wave.request = hint.Request
+	wave.catalogVersion = hint.CatalogVersion
+	wave.lastHint = time.Now()
+	for physicalKey := range scopePhysical {
+		wave.scopePhysical[physicalKey] = struct{}{}
+	}
+	for _, job := range jobs {
+		if _, attempted := wave.attempted[job.key]; attempted {
+			continue
+		}
+		if _, active := wave.active[job.key]; active {
+			if pending := worker.pending[job.key]; pending != nil {
+				mergeSmartRouteProbeJob(pending, job)
+				addSmartRouteColdStartSubscriber(pending, wave.key)
+			} else if running := worker.runningColdStart[job.key]; running != nil {
+				mergeSmartRouteProbeJob(running, job)
+				addSmartRouteColdStartSubscriber(running, wave.key)
+			}
+			continue
+		}
+		if current := wave.remaining[job.key]; current != nil {
+			mergeSmartRouteProbeJob(current, job)
+		} else {
+			copyJob := *job
+			wave.remaining[job.key] = &copyJob
+		}
+	}
+
+	disposition := worker.scheduleColdStartBatchLocked(wave, setting)
+	worker.mu.Unlock()
+	if disposition == SmartRouteProbeEnqueued || disposition == SmartRouteProbeAlreadyQueued {
+		worker.signal()
+	}
+	return disposition, true
+}
+
+func smartRouteColdStartJobs(hint SmartRouteRecoveryHint) ([]*smartRouteProbeJob, map[string]struct{}, bool) {
+	// Unknown means usable, not unhealthy. Automatic discovery is established
+	// by the first real foreground request and must not spend probe budget or
+	// make a fresh release wait behind a cold-start wave. ForceProbe is the
+	// explicit administrator-only exception.
+	if !hint.ForceProbe {
+		return nil, map[string]struct{}{}, false
+	}
+	allowed := stringSetService(hint.AllowedGroups)
+	excludedGroups := stringSetService(hint.Policy.ExcludedGroups)
+	excluded := stringSetService(append(append([]string(nil), hint.Policy.ExcludedRoutes...), hint.ExcludedRoutes...))
+	manualGroupRanks := make(map[string]int, len(hint.Policy.ManualGroupOrder))
+	for index, group := range hint.Policy.ManualGroupOrder {
+		manualGroupRanks[group] = index
+	}
+	manualRouteRanks := map[string]int{}
+	if override, ok := hint.Policy.ContractOverrides[hint.Request.ContractID]; ok {
+		manualRouteRanks = make(map[string]int, len(override.ManualRouteOrder))
+		for index, routeID := range override.ManualRouteOrder {
+			manualRouteRanks[routeID] = index
+		}
+	}
+	manual := hint.Policy.EffectiveStrategy() == smartrouter.StrategyManual
+	physical := make(map[string]*smartRouteProbeJob)
+	publishedAliases := make(map[string]map[string]smartrouter.CertifiedRoute)
+	for _, route := range hint.Routes {
+		if route.RouteID == "" {
+			continue
+		}
+		physicalKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		if physicalKey == "" {
+			continue
+		}
+		if publishedAliases[physicalKey] == nil {
+			publishedAliases[physicalKey] = make(map[string]smartrouter.CertifiedRoute)
+		}
+		publishedAliases[physicalKey][route.RouteID] = route
+	}
+	scopePhysical := make(map[string]struct{})
+	now := time.Now()
+	for _, route := range hint.Routes {
+		if route.RouteID == "" || !allowed[route.Group] || !hint.Policy.AllowsGroup(route.Group) ||
+			excludedGroups[route.Group] || excluded[route.RouteID] ||
+			route.Capabilities&hint.Request.RequiredCapabilities != hint.Request.RequiredCapabilities ||
+			hint.Request.EstimatedContext < 0 || hint.Request.EstimatedContext > route.MaxContext {
+			continue
+		}
+		ratio, priced := hint.Prices.RatiosPPM[route.RouteID]
+		if len(hint.Prices.RatiosPPM) > 0 && (!priced || ratio < 0 ||
+			(hint.Policy.MaxEffectiveRatioPPM > 0 && ratio > hint.Policy.MaxEffectiveRatioPPM)) {
+			continue
+		}
+		if credential := hint.Runtime.Credentials.Domains[smartrouter.RouteCredentialDomain(route)]; credential.BlockedUntilMS > now.UnixMilli() {
+			continue
+		}
+		quality, ok := hint.Runtime.Quality.Routes[route.RouteID]
+		if !ok {
+			quality = smartrouter.InitialQuality(route.StableFallback)
+		}
+		if !smartrouter.IsVirginUnknown(quality) {
+			continue
+		}
+		physicalKey := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		if physicalKey == "" {
+			continue
+		}
+		scopePhysical[physicalKey] = struct{}{}
+		rank := len(manualGroupRanks) + len(manualRouteRanks) + len(hint.Routes)
+		if routeRank, ok := manualRouteRanks[route.RouteID]; ok {
+			rank = routeRank
+		} else if groupRank, ok := manualGroupRanks[route.Group]; ok {
+			rank = groupRank
+		}
+		candidate := &smartRouteProbeJob{
+			key: physicalKey, catalogVersion: hint.CatalogVersion,
+			contractID: hint.Request.ContractID, canonicalModel: hint.Request.CanonicalModel,
+			endpoint: hint.Request.Endpoint, route: route,
+			aliases:  make(map[string]smartrouter.CertifiedRoute, len(publishedAliases[physicalKey])),
+			ratioPPM: ratio, priceKnown: priced, notBefore: now, lastHint: now,
+			coldStartRank: rank, coldStartManual: manual, durableKey: hint.DurableKey,
+		}
+		for routeID, alias := range publishedAliases[physicalKey] {
+			candidate.aliases[routeID] = alias
+		}
+		if current := physical[physicalKey]; current != nil {
+			mergeSmartRouteProbeJob(current, candidate)
+			if smartRouteColdStartJobLess(candidate, current) {
+				current.route = candidate.route
+				current.ratioPPM = candidate.ratioPPM
+				current.priceKnown = candidate.priceKnown
+				current.coldStartRank = candidate.coldStartRank
+			}
+		} else {
+			physical[physicalKey] = candidate
+		}
+	}
+	jobs := make([]*smartRouteProbeJob, 0, len(physical))
+	for _, job := range physical {
+		jobs = append(jobs, job)
+	}
+	sort.SliceStable(jobs, func(i, j int) bool { return smartRouteColdStartJobLess(jobs[i], jobs[j]) })
+	if !manual && len(jobs) > 1 {
+		rankedRoutes := make([]smartrouter.CertifiedRoute, 0, len(jobs))
+		for _, job := range jobs {
+			rankedRoutes = append(rankedRoutes, job.route)
+		}
+		coverage := smartrouter.SelectCoverage(rankedRoutes, len(rankedRoutes))
+		ranks := make(map[string]int, len(coverage.Routes))
+		for index, route := range coverage.Routes {
+			ranks[route.RouteID] = index
+		}
+		for _, job := range jobs {
+			job.coverageRank = ranks[job.route.RouteID]
+		}
+		sort.SliceStable(jobs, func(i, j int) bool { return smartRouteColdStartJobLess(jobs[i], jobs[j]) })
+	}
+	return jobs, scopePhysical, len(jobs) > 0
+}
+
+func smartRouteRecoveryHintWithoutVirginRoutes(hint SmartRouteRecoveryHint) SmartRouteRecoveryHint {
+	filtered := hint
+	filtered.Routes = make([]smartrouter.CertifiedRoute, 0, len(hint.Routes))
+	for _, route := range hint.Routes {
+		quality, ok := hint.Runtime.Quality.Routes[route.RouteID]
+		if !ok {
+			quality = smartrouter.InitialQuality(route.StableFallback)
+		}
+		if smartrouter.IsVirginUnknown(quality) {
+			continue
+		}
+		filtered.Routes = append(filtered.Routes, route)
+	}
+	return filtered
+}
+
+func smartRouteColdStartJobLess(left, right *smartRouteProbeJob) bool {
+	if left.coldStartManual || right.coldStartManual {
+		if left.coldStartRank != right.coldStartRank {
+			return left.coldStartRank < right.coldStartRank
+		}
+	}
+	if left.coverageRank != right.coverageRank {
+		return left.coverageRank < right.coverageRank
+	}
+	return smartRouteProbeJobLess(left, right)
+}
+
+func mergeSmartRouteProbeJob(current, incoming *smartRouteProbeJob) {
+	if current == nil || incoming == nil {
+		return
+	}
+	if current.aliases == nil {
+		current.aliases = make(map[string]smartrouter.CertifiedRoute)
+	}
+	for routeID, route := range incoming.aliases {
+		current.aliases[routeID] = route
+	}
+	if current.coldStartWaves == nil && len(incoming.coldStartWaves) > 0 {
+		current.coldStartWaves = make(map[string]struct{}, len(incoming.coldStartWaves))
+	}
+	for waveKey := range incoming.coldStartWaves {
+		current.coldStartWaves[waveKey] = struct{}{}
+	}
+	if incoming.notBefore.Before(current.notBefore) {
+		current.notBefore = incoming.notBefore
+	}
+	if incoming.priceKnown && (!current.priceKnown || incoming.ratioPPM < current.ratioPPM) {
+		current.ratioPPM = incoming.ratioPPM
+		current.priceKnown = true
+	}
+	if incoming.coldStartManual && (!current.coldStartManual || incoming.coldStartRank < current.coldStartRank) {
+		current.coldStartManual = true
+		current.coldStartRank = incoming.coldStartRank
+	}
+	if incoming.coverageRank < current.coverageRank {
+		current.coverageRank = incoming.coverageRank
+	}
+	if incoming.lastHint.After(current.lastHint) {
+		current.lastHint = incoming.lastHint
+	}
+	if current.durableKey == "" {
+		current.durableKey = incoming.durableKey
+	}
+	if current.durableKeys == nil && len(incoming.durableKeys) > 0 {
+		current.durableKeys = make(map[string]struct{}, len(incoming.durableKeys))
+	}
+	for durableKey := range incoming.durableKeys {
+		if strings.TrimSpace(durableKey) != "" {
+			current.durableKeys[durableKey] = struct{}{}
+		}
+	}
+	if durableKey := strings.TrimSpace(incoming.durableKey); durableKey != "" {
+		if current.durableKeys == nil {
+			current.durableKeys = make(map[string]struct{}, 1)
+		}
+		current.durableKeys[durableKey] = struct{}{}
+	}
+}
+
+func addSmartRouteColdStartSubscriber(job *smartRouteProbeJob, waveKey string) {
+	if job == nil || waveKey == "" {
+		return
+	}
+	if job.coldStartWaves == nil {
+		job.coldStartWaves = make(map[string]struct{})
+	}
+	job.coldStartWaves[waveKey] = struct{}{}
+}
+
+func removeSmartRouteColdStartSubscriber(job *smartRouteProbeJob, waveKey string) {
+	if job == nil || waveKey == "" || job.coldStartWaves == nil {
+		return
+	}
+	delete(job.coldStartWaves, waveKey)
+}
+
+// currentColdStartJobLocked resolves an immutable execution snapshot back to
+// the live subscription object. worker.mu must be held by the caller.
+func (worker *SmartRouteProbeWorker) currentColdStartJobLocked(job *smartRouteProbeJob) *smartRouteProbeJob {
+	if worker == nil || job == nil {
+		return job
+	}
+	if current := worker.runningColdStart[job.key]; current != nil {
+		return current
+	}
+	return job
+}
+
+func (worker *SmartRouteProbeWorker) scheduleColdStartBatchLocked(
+	wave *smartRouteColdStartWave,
+	setting smartroutersetting.Setting,
+) SmartRouteProbeEnqueueDisposition {
+	if wave == nil {
+		return SmartRouteProbeNotDue
+	}
+	slots := setting.ColdStartWaveBatchSize - len(wave.active)
+	if slots <= 0 {
+		return SmartRouteProbeAlreadyQueued
+	}
+	jobs := make([]*smartRouteProbeJob, 0, len(wave.remaining))
+	for _, job := range wave.remaining {
+		jobs = append(jobs, job)
+	}
+	sort.SliceStable(jobs, func(i, j int) bool { return smartRouteColdStartJobLess(jobs[i], jobs[j]) })
+	queued := 0
+	now := time.Now()
+	for _, job := range jobs {
+		if queued >= slots {
+			break
+		}
+		if job.notBefore.After(now) {
+			continue
+		}
+		if _, running := worker.running[job.key]; running {
+			if runningJob := worker.runningColdStart[job.key]; runningJob != nil {
+				delete(wave.remaining, job.key)
+				mergeSmartRouteProbeJob(runningJob, job)
+				addSmartRouteColdStartSubscriber(runningJob, wave.key)
+				wave.active[job.key] = struct{}{}
+				queued++
+			} else {
+				// A normal recovery already owns this physical route. Keep it in
+				// remaining and fill the cold-start slot from the next candidate.
+				job.notBefore = time.Now().Add(250 * time.Millisecond)
+			}
+			continue
+		}
+		delete(wave.remaining, job.key)
+		if existing := worker.pending[job.key]; existing != nil {
+			mergeSmartRouteProbeJob(existing, job)
+			addSmartRouteColdStartSubscriber(existing, wave.key)
+			wave.active[job.key] = struct{}{}
+			queued++
+			continue
+		}
+		if len(worker.pending) >= setting.ProbeQueueCapacity {
+			wave.remaining[job.key] = job
+			break
+		}
+		copyJob := *job
+		copyJob.coldStartWaves = map[string]struct{}{wave.key: {}}
+		worker.pending[job.key] = &copyJob
+		wave.active[job.key] = struct{}{}
+		queued++
+	}
+	if queued > 0 {
+		return SmartRouteProbeEnqueued
+	}
+	if len(wave.remaining) > 0 {
+		return SmartRouteProbeQueueFull
+	}
+	return SmartRouteProbeNotDue
+}
+
+func (worker *SmartRouteProbeWorker) deferColdStartJob(
+	job *smartRouteProbeJob,
+	setting smartroutersetting.Setting,
+	delay time.Duration,
+) bool {
+	if worker == nil || job == nil {
+		return false
+	}
+	if delay < 100*time.Millisecond {
+		delay = 100 * time.Millisecond
+	}
+	notBefore := time.Now().Add(delay)
+	worker.mu.Lock()
+	job = worker.currentColdStartJobLocked(job)
+	if len(job.coldStartWaves) == 0 {
+		worker.mu.Unlock()
+		return false
+	}
+	deferred := false
+	for waveKey := range job.coldStartWaves {
+		wave := worker.coldStartWaves[waveKey]
+		if wave == nil {
+			continue
+		}
+		delete(wave.active, job.key)
+		copyJob := *job
+		copyJob.coldStartWaves = nil
+		copyJob.notBefore = notBefore
+		copyJob.lastHint = time.Now()
+		if existing := wave.remaining[job.key]; existing != nil {
+			mergeSmartRouteProbeJob(existing, &copyJob)
+			if existing.notBefore.Before(notBefore) {
+				existing.notBefore = notBefore
+			}
+		} else {
+			wave.remaining[job.key] = &copyJob
+		}
+		deferred = true
+	}
+	if deferred {
+		worker.scheduleAllColdStartWavesLocked(setting)
+	}
+	worker.mu.Unlock()
+	if deferred {
+		worker.signal()
+	}
+	return deferred
+}
+
+func (worker *SmartRouteProbeWorker) scheduleAllColdStartWavesLocked(
+	setting smartroutersetting.Setting,
+) {
+	for _, wave := range worker.coldStartWaves {
+		worker.scheduleColdStartBatchLocked(wave, setting)
+	}
+}
+
+func (worker *SmartRouteProbeWorker) markColdStartJobRunningLocked(job *smartRouteProbeJob) {
+	if job == nil || len(job.coldStartWaves) == 0 {
+		return
+	}
+	for waveKey := range job.coldStartWaves {
+		if wave := worker.coldStartWaves[waveKey]; wave != nil {
+			wave.running++
+		}
+	}
+}
+
+func (worker *SmartRouteProbeWorker) coldStartJobStopped(job *smartRouteProbeJob) {
+	if worker == nil || job == nil {
+		return
+	}
+	worker.mu.Lock()
+	job = worker.currentColdStartJobLocked(job)
+	if len(job.coldStartWaves) == 0 {
+		worker.mu.Unlock()
+		return
+	}
+	for waveKey := range job.coldStartWaves {
+		if wave := worker.coldStartWaves[waveKey]; wave != nil && wave.running > 0 {
+			wave.running--
+		}
+	}
+	worker.mu.Unlock()
+}
+
+func (worker *SmartRouteProbeWorker) finishColdStartJob(
+	job *smartRouteProbeJob,
+	success bool,
+	setting smartroutersetting.Setting,
+) {
+	if worker == nil || job == nil {
+		return
+	}
+	var completedKeys []string
+	worker.mu.Lock()
+	job = worker.currentColdStartJobLocked(job)
+	if len(job.coldStartWaves) == 0 {
+		worker.mu.Unlock()
+		return
+	}
+	if success {
+		_, completedKeys = worker.recordColdStartSuccessLocked(job.key, setting)
+	} else {
+		for waveKey := range job.coldStartWaves {
+			wave := worker.coldStartWaves[waveKey]
+			if wave == nil {
+				continue
+			}
+			delete(wave.active, job.key)
+			wave.attempted[job.key] = struct{}{}
+			worker.scheduleColdStartBatchLocked(wave, setting)
+			if len(wave.remaining) == 0 && len(wave.active) == 0 {
+				if durableKey := worker.finishColdStartWaveLocked(waveKey); durableKey != "" {
+					completedKeys = append(completedKeys, durableKey)
+				}
+			}
+		}
+	}
+	worker.mu.Unlock()
+	for _, durableKey := range completedKeys {
+		worker.ackDurableRecoveryKey(durableKey)
+	}
+	worker.signal()
+}
+
+func (worker *SmartRouteProbeWorker) coldStartDispatchAllowedLocked(
+	job *smartRouteProbeJob,
+	selected map[string]int,
+	setting smartroutersetting.Setting,
+) bool {
+	if job == nil || len(job.coldStartWaves) == 0 {
+		return true
+	}
+	for waveKey := range job.coldStartWaves {
+		wave := worker.coldStartWaves[waveKey]
+		if wave == nil || wave.running+selected[waveKey] >= setting.ColdStartWaveMaxConcurrency {
+			return false
+		}
+	}
+	return true
+}
+
+func smartRouteQualityHasCurrentSuccess(quality smartrouter.QualityState) bool {
+	if quality.Phase == smartrouter.QualityHealthy || quality.Phase == smartrouter.QualityBootstrap {
+		return true
+	}
+	return quality.LastSuccessMS > 0 && quality.LastSuccessMS >= quality.LastFailureMS &&
+		quality.LastOutcome == smartrouter.OutcomeSuccess
+}

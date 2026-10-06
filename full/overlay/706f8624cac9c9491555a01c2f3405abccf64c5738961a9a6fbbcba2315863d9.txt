@@ -1,0 +1,681 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type {
+  MediaAsset,
+  MediaCapabilityContract,
+  MediaCapabilities,
+  StudioFormValue,
+  StudioMode,
+  StudioOutput,
+  StudioReference,
+  StudioTask,
+} from './types'
+
+export const STUDIO_RESULT_CONFIRMATION_TIMEOUT_MS = 30 * 60 * 1000
+export const STUDIO_BATCH_MAX_COUNT = 16
+export const STUDIO_BATCH_CONCURRENCY = 2
+
+export type StudioProgressEvent = {
+  operationId: string
+  stage:
+    | 'preparing_input'
+    | 'reading_reference'
+    | 'uploading_reference'
+    | 'submitting_request'
+    | 'upstream_generating'
+    | 'archiving_result'
+    | 'confirming_result'
+  progress?: number
+}
+
+export function validateStudioBatchCount(count: number) {
+  if (!Number.isInteger(count) || count < 1 || count > STUDIO_BATCH_MAX_COUNT) {
+    throw new Error(
+      `studio batch count must be an integer between 1 and ${STUDIO_BATCH_MAX_COUNT}`
+    )
+  }
+}
+
+export function studioBatchIndexes(count: number) {
+  validateStudioBatchCount(count)
+  return Array.from({ length: count }, (_, index) => index)
+}
+
+export function createStudioPlaceholders(
+  value: StudioFormValue,
+  operationIds: string[],
+  now = Date.now()
+): StudioOutput[] {
+  validateStudioBatchCount(value.count)
+  if (operationIds.length !== value.count) {
+    throw new Error('studio operation ids must match the requested count')
+  }
+  return operationIds.map((operationId, index) => ({
+    requestId: `operation-${operationId}`,
+    operationId,
+    taskId: operationId,
+    expectedAssetCount: 1,
+    mode: value.mode,
+    status: 'running',
+    stage: 'preparing_input',
+    model: value.model,
+    group: value.group,
+    prompt: value.prompt,
+    size: value.mode === 'videos' ? value.aspectRatio : value.size,
+    duration: value.duration,
+    referenceCount: value.references.length,
+    references: value.references,
+    assets: [],
+    createdAt: now + index,
+  }))
+}
+
+export function applyStudioProgressEvent(
+  outputs: StudioOutput[],
+  event: StudioProgressEvent
+) {
+  let changed = false
+  const next = outputs.map((output) => {
+    if (
+      output.operationId !== event.operationId ||
+      output.status !== 'running'
+    ) {
+      return output
+    }
+    changed = true
+    const exactProgress =
+      typeof event.progress === 'number' && Number.isFinite(event.progress)
+        ? String(Math.max(0, Math.min(100, Math.round(event.progress))))
+        : undefined
+    return { ...output, stage: event.stage, progress: exactProgress }
+  })
+  return changed ? next : outputs
+}
+
+export function isImage2ModelName(model: string) {
+  return model
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]/g, '')
+    .includes('image2')
+}
+
+export function mediaCapabilitySupportsOutput(
+  capability: MediaCapabilityContract,
+  mode: StudioMode,
+  size: string,
+  aspectRatio: string,
+  resolution: string
+) {
+  const normalized = (value: string) =>
+    value.toLowerCase().replaceAll(/\s+/g, '')
+  if (mode === 'videos') {
+    if (
+      capability.aspect_ratios?.length &&
+      !capability.aspect_ratios.some(
+        (candidate) => normalized(candidate) === normalized(aspectRatio)
+      )
+    ) {
+      return false
+    }
+    if (
+      capability.resolutions?.length &&
+      !capability.resolutions.some(
+        (candidate) => normalized(candidate) === normalized(resolution)
+      )
+    ) {
+      return false
+    }
+    return true
+  }
+  if (mode !== 'images' && mode !== 'image-edits') return true
+  const declared = capability.resolutions?.map(normalized) ?? []
+  if (declared.length === 0) return true
+  const requested = normalized(size)
+  const explicitlySized = declared.filter(
+    (candidate) => /^\d+x\d+$/.test(candidate) || /^(2k|4k)$/.test(candidate)
+  )
+  if (explicitlySized.length === 0) return true
+  if (explicitlySized.includes(requested)) return true
+  const requestedTier = requested.match(
+    /(?:^|[^a-z0-9])(2k|4k)(?:$|[^a-z0-9])/
+  )?.[1]
+  return requestedTier ? explicitlySized.includes(requestedTier) : false
+}
+
+export async function runBoundedBatch<T, R>(
+  items: T[],
+  task: (item: T, index: number) => Promise<R>,
+  concurrency = STUDIO_BATCH_CONCURRENCY
+) {
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error('batch concurrency must be a positive integer')
+  }
+  const results: Array<{
+    index: number
+    value?: R
+    error?: unknown
+  }> = []
+  let cursor = 0
+  const worker = async () => {
+    while (true) {
+      const index = cursor++
+      if (index >= items.length) return
+      try {
+        results[index] = {
+          index,
+          value: await task(items[index], index),
+        }
+      } catch (error) {
+        results[index] = { index, error }
+      }
+    }
+  }
+  const workerCount = Math.min(concurrency, Math.max(1, items.length))
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  return results
+}
+
+export class StudioRequestDispatchedError extends Error {
+  readonly operationId: string
+  readonly originalError: unknown
+
+  constructor(operationId: string, originalError: unknown) {
+    const message =
+      originalError instanceof Error ? originalError.message : 'Request failed'
+    super(message)
+    this.name = 'StudioRequestDispatchedError'
+    this.operationId = operationId
+    this.originalError = originalError
+  }
+}
+
+export function unwrapStudioRequestError(error: unknown) {
+  return error instanceof StudioRequestDispatchedError
+    ? error.originalError
+    : error
+}
+
+export function pendingStudioOperationID(error: unknown) {
+  if (!(error instanceof StudioRequestDispatchedError)) return undefined
+  const cause = error.originalError as { response?: unknown } | null
+  return cause?.response === undefined ? error.operationId : undefined
+}
+
+export function studioConfirmationPollDelay(elapsedMilliseconds: number) {
+  return elapsedMilliseconds < 60_000 ? 5_000 : 15_000
+}
+
+export function studioConfirmationExpired(startedAt: number, now = Date.now()) {
+  return now - startedAt >= STUDIO_RESULT_CONFIRMATION_TIMEOUT_MS
+}
+
+export function hasExpectedStudioAssets(
+  output: StudioOutput,
+  assets: MediaAsset[]
+) {
+  return assets.length >= Math.max(1, output.expectedAssetCount ?? 1)
+}
+
+export function completeStudioConfirmation(
+  output: StudioOutput,
+  assets: MediaAsset[]
+): StudioOutput {
+  return {
+    ...output,
+    status: 'succeeded',
+    stage: 'completed',
+    assets,
+    error: undefined,
+    errorDetails: undefined,
+  }
+}
+
+export function expireStudioConfirmation(output: StudioOutput): StudioOutput {
+  return {
+    ...output,
+    status: 'unconfirmed',
+    stage: 'result_unconfirmed',
+    error: undefined,
+    errorDetails: undefined,
+  }
+}
+
+export function studioMultipartResponseFormat(mode: StudioMode) {
+  switch (mode) {
+    case 'image-edits':
+      return 'url'
+    case 'transcriptions':
+    case 'translations':
+      return 'json'
+    default:
+      return undefined
+  }
+}
+
+const IMAGE_SIZE_BY_ASPECT_RATIO: Record<string, string> = {
+  '1:1': '1024x1024',
+  '2:3': '1024x1536',
+  '3:2': '1536x1024',
+}
+
+/**
+ * Keep the UI-friendly ratio aliases compatible with image APIs while
+ * preserving provider-specific explicit pixel sizes.
+ */
+export function normalizeImageSize(value: string) {
+  const normalized = value.trim().replaceAll(/\s+/g, '')
+  return IMAGE_SIZE_BY_ASPECT_RATIO[normalized] ?? normalized
+}
+
+export function createMultipartStudioRequest(value: StudioFormValue) {
+  const data = new FormData()
+  data.append('model', value.model)
+  if (value.prompt) data.append('prompt', value.prompt)
+  if (value.mode === 'image-edits') {
+    const size = normalizeImageSize(value.size)
+    if (size) data.append('size', size)
+    if (value.parameterResolution && value.resolution) {
+      data.append('resolution', value.resolution)
+    }
+    if (value.parameterQuality && value.quality) {
+      data.append('quality', value.quality)
+    }
+    value.references
+      .filter((reference) => reference.file && reference.type === 'image')
+      .forEach((reference) => {
+        if (reference.file) {
+          data.append('image', reference.file)
+        }
+      })
+  }
+  if (value.inputFile) data.append('file', value.inputFile)
+  const responseFormat = studioMultipartResponseFormat(value.mode)
+  if (responseFormat) data.append('response_format', responseFormat)
+  return data
+}
+
+export function studioFallbackGroups(value: StudioFormValue) {
+  const ordered = value.fallbackEnabled
+    ? (value.fallbackGroups ?? [])
+    : [value.group]
+  const groups = [...ordered, value.group].filter(
+    (group, index, all) => Boolean(group) && all.indexOf(group) === index
+  )
+  return groups.length > 0 ? groups : [value.group]
+}
+
+// The browser submits each Studio child exactly once. The ordered group scope
+// is data for the server-owned smart-media dispatcher, never an instruction
+// for a second browser request after a timeout or ambiguous response.
+export function studioRoutingParams(value: StudioFormValue) {
+  const groups = studioFallbackGroups(value)
+  const fallbackEnabled = Boolean(value.fallbackEnabled && groups.length > 1)
+  return {
+    group: fallbackEnabled ? groups[0] : value.group,
+    fallback_groups: fallbackEnabled ? JSON.stringify(groups) : undefined,
+  }
+}
+
+export function mediaCapabilitySupportsReferences(
+  capability: MediaCapabilityContract,
+  references: StudioReference[]
+) {
+  const counts = { image: 0, video: 0, audio: 0 }
+  for (const reference of references) {
+    counts[reference.type] += 1
+    const role = reference.role || 'reference'
+    if (
+      reference.type === 'image' &&
+      (!capability.reference_image ||
+        ((capability.image_roles?.length ?? 0) > 0 &&
+          !capability.image_roles?.includes(role)))
+    ) {
+      return false
+    }
+    if (
+      reference.type === 'video' &&
+      (!capability.reference_video ||
+        ((capability.video_roles?.length ?? 0) > 0 &&
+          !capability.video_roles?.includes(role)))
+    ) {
+      return false
+    }
+    if (
+      reference.type === 'audio' &&
+      (!capability.reference_audio ||
+        ((capability.audio_roles?.length ?? 0) > 0 &&
+          !capability.audio_roles?.includes(role)))
+    ) {
+      return false
+    }
+  }
+  return (
+    (!capability.max_images || counts.image <= capability.max_images) &&
+    (!capability.max_videos || counts.video <= capability.max_videos) &&
+    (!capability.max_audios || counts.audio <= capability.max_audios) &&
+    (!capability.min_images || counts.image >= capability.min_images) &&
+    (!capability.max_total_references ||
+      references.length <= capability.max_total_references)
+  )
+}
+
+export function selectMediaCapability(
+  capabilities: MediaCapabilities | undefined,
+  references: StudioReference[]
+) {
+  if (!capabilities) return undefined
+  const routes = capabilities.route_capabilities?.length
+    ? capabilities.route_capabilities
+    : [capabilities.available]
+  const eligible = routes.filter((route) =>
+    mediaCapabilitySupportsReferences(route, references)
+  )
+  const candidates = eligible.length ? eligible : routes
+  return [...candidates].sort((left, right) => {
+    const score = (value: MediaCapabilityContract) =>
+      (value.max_total_references ?? 0) * 1000 +
+      (value.max_images ?? 0) * 100 +
+      (value.max_videos ?? 0) * 10 +
+      (value.max_audios ?? 0)
+    return score(right) - score(left)
+  })[0]
+}
+
+export function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return '-'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(
+    Math.floor(Math.log(value) / Math.log(1024)),
+    units.length - 1
+  )
+  return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`
+}
+
+export function assetDeliveryUrl(asset: MediaAsset) {
+  if (asset.availability_status === 'unavailable') return ''
+  return asset.download_url || asset.content_url
+}
+
+export function formatMediaDate(value?: number) {
+  if (!value) return '-'
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value * 1000))
+}
+
+export function mediaTypeFromFile(file: File): 'image' | 'video' | 'audio' {
+  if (file.type.startsWith('video/')) return 'video'
+  if (file.type.startsWith('audio/')) return 'audio'
+  return 'image'
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+export function findTaskId(value: unknown): string | undefined {
+  const record = asRecord(value)
+  if (!record) return undefined
+  for (const key of ['task_id', 'id']) {
+    if (typeof record[key] === 'string' && record[key]) {
+      return record[key] as string
+    }
+  }
+  return findTaskId(record.data)
+}
+
+function inferredAsset(
+  url: string,
+  type: string,
+  index: number,
+  id?: string
+): MediaAsset {
+  return {
+    id: id || `ephemeral-${index}-${url.slice(-24)}`,
+    type,
+    role: 'result',
+    filename: `${type}-${index + 1}`,
+    mime_type: '',
+    size_bytes: 0,
+    status: 'ready',
+    moderation_status: 'unreviewed',
+    created_at: Math.floor(Date.now() / 1000),
+    content_url: url,
+    download_url: url,
+  }
+}
+
+export function extractAssets(value: unknown, fallbackType = 'image') {
+  const childKeys = [
+    'data',
+    'artifacts',
+    'output',
+    'response',
+    'videos',
+    'items',
+    'asset',
+  ]
+  const explicitAssets: MediaAsset[] = []
+  const explicitIDs = new Set<string>()
+  const visitExplicit = (entry: unknown) => {
+    if (Array.isArray(entry)) {
+      entry.forEach(visitExplicit)
+      return
+    }
+    const record = asRecord(entry)
+    if (!record) return
+    if (
+      typeof record.id === 'string' &&
+      typeof record.download_url === 'string'
+    ) {
+      const asset = record as unknown as MediaAsset
+      if (!explicitIDs.has(asset.id)) {
+        explicitIDs.add(asset.id)
+        explicitAssets.push(asset)
+      }
+    }
+    childKeys.forEach((key) => visitExplicit(record[key]))
+  }
+  visitExplicit(value)
+  // Durable artifacts are authoritative. Compatibility responses often repeat
+  // the same output as a top-level url; inferring that URL as another asset is
+  // what produced the visible 0 B duplicate beside the real video.
+  if (explicitAssets.length > 0) return explicitAssets
+
+  const seen = new Set<string>()
+  const assets: MediaAsset[] = []
+  const visitInferred = (entry: unknown) => {
+    if (Array.isArray(entry)) {
+      entry.forEach(visitInferred)
+      return
+    }
+    const record = asRecord(entry)
+    if (!record) return
+    for (const key of ['url', 'video_url', 'audio_url']) {
+      const url = record[key]
+      if (typeof url === 'string' && url && !seen.has(url)) {
+        seen.add(url)
+        let type = fallbackType
+        if (key === 'video_url') {
+          type = 'video'
+        } else if (key === 'audio_url') {
+          type = 'audio'
+        }
+        const assetID =
+          typeof record.asset_id === 'string' ? record.asset_id : undefined
+        assets.push(inferredAsset(url, type, assets.length, assetID))
+      }
+    }
+    if (typeof record.b64_json === 'string') {
+      const url = `data:image/png;base64,${record.b64_json}`
+      if (!seen.has(url)) {
+        seen.add(url)
+        assets.push(inferredAsset(url, 'image', assets.length))
+      }
+    }
+    childKeys.forEach((key) => visitInferred(record[key]))
+  }
+  visitInferred(value)
+  return assets
+}
+
+export function createStudioOutput(
+  value: StudioFormValue,
+  response: unknown
+): StudioOutput {
+  const localRequestId = crypto.randomUUID()
+  const prompt = ['transcriptions', 'translations'].includes(value.mode)
+    ? undefined
+    : value.prompt
+  if (response instanceof Blob) {
+    const type = response.type.startsWith('audio/') ? 'audio' : 'file'
+    const url = URL.createObjectURL(response)
+    return {
+      requestId: localRequestId,
+      mode: value.mode,
+      status: 'succeeded',
+      model: value.model,
+      group: value.group,
+      prompt,
+      size: value.size,
+      duration: value.duration,
+      referenceCount: value.references.length,
+      references: value.references,
+      assets: [inferredAsset(url, type, 0)],
+      raw: response,
+      createdAt: Date.now(),
+    }
+  }
+  const taskId = findTaskId(response)
+  const record = asRecord(response)
+  const textRecord = asRecord(record?.data)
+  let text: string | undefined
+  if (typeof record?.text === 'string') {
+    text = record.text
+  } else if (typeof textRecord?.text === 'string') {
+    text = textRecord.text
+  }
+  return {
+    requestId: taskId ? `task-${taskId}` : localRequestId,
+    mode: value.mode,
+    status: taskId ? 'running' : 'succeeded',
+    taskId,
+    stage: taskId ? 'queued' : 'completed',
+    model: value.model,
+    group: value.group,
+    prompt,
+    size: value.size,
+    duration: value.duration,
+    referenceCount: value.references.length,
+    references: value.references,
+    text,
+    assets: extractAssets(
+      response,
+      value.mode === 'videos' ? 'video' : 'image'
+    ),
+    raw: response,
+    createdAt: Date.now(),
+  }
+}
+
+export function studioTaskToOutput(task: StudioTask): StudioOutput {
+  let status: StudioOutput['status'] = 'running'
+  if (task.status === 'completed') {
+    status = 'succeeded'
+  } else if (task.status === 'failed') {
+    status = 'failed'
+  }
+  return {
+    requestId: `task-${task.id}`,
+    taskId: task.id,
+    mode: task.mode ?? 'videos',
+    status,
+    stage: task.status,
+    progress: task.progress,
+    model: task.model,
+    group: task.group,
+    prompt: task.prompt,
+    size: task.size,
+    duration: task.duration,
+    referenceCount: task.reference_count,
+    assets: task.artifacts ?? [],
+    createdAt: (task.created_at ?? Math.floor(Date.now() / 1000)) * 1000,
+    error: task.error,
+  }
+}
+
+function sameTaskOutput(left: StudioOutput, right: StudioOutput) {
+  if (
+    left.status !== right.status ||
+    left.stage !== right.stage ||
+    left.progress !== right.progress ||
+    left.error !== right.error ||
+    left.model !== right.model ||
+    left.group !== right.group ||
+    left.prompt !== right.prompt ||
+    left.assets.length !== right.assets.length
+  ) {
+    return false
+  }
+  return left.assets.every((asset, index) => {
+    const candidate = right.assets[index]
+    return (
+      candidate?.id === asset.id &&
+      candidate.status === asset.status &&
+      candidate.download_url === asset.download_url
+    )
+  })
+}
+
+export function mergeStudioTaskOutputs(
+  current: StudioOutput[],
+  tasks: StudioTask[]
+) {
+  const taskById = new Map(tasks.map((task) => [task.id, task]))
+  const knownTaskIDs = new Set<string>()
+  let changed = false
+  const next = current.map((output) => {
+    if (!output.taskId) return output
+    knownTaskIDs.add(output.taskId)
+    const task = taskById.get(output.taskId)
+    if (!task) return output
+    const restored = studioTaskToOutput(task)
+    const merged: StudioOutput = {
+      ...restored,
+      requestId: output.requestId,
+      prompt: restored.prompt || output.prompt,
+      references: output.references,
+      assets: restored.assets.length > 0 ? restored.assets : output.assets,
+      raw: output.raw,
+    }
+    if (sameTaskOutput(output, merged)) return output
+    changed = true
+    return merged
+  })
+  for (const task of tasks) {
+    if (knownTaskIDs.has(task.id)) continue
+    next.push(studioTaskToOutput(task))
+    changed = true
+  }
+  if (!changed) return current
+  return next.sort((left, right) => right.createdAt - left.createdAt)
+}

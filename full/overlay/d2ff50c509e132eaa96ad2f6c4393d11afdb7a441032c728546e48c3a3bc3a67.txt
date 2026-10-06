@@ -1,0 +1,15 @@
+package media
+
+import (
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestLaoliUpdateDiscreteResolutionDuration(t *testing.T) {
+	capability := Capability{RuntimeEnforced: true, Duration: DurationCapability{Mode: "range", Min: 5, Max: 30, Step: 1, Default: 5}, Resolutions: []string{"480p", "720p"}, DurationsByResolution: map[string][]int{"480p": {5, 6, 7, 8, 9, 10, 11, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30}}}
+	require.Error(t, capability.ValidateGeneration(12, "", "480p"))
+	require.Error(t, capability.ValidateGeneration(15, "", "480p"))
+	require.NoError(t, capability.ValidateGeneration(12, "", "720p"))
+	require.NoError(t, capability.ValidateGeneration(13, "", "480p"))
+	require.Error(t, capability.ValidateGeneration(31, "", "720p"))
+}

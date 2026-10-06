@@ -1,3 +1,41 @@
+# NewAPI Smart Router — v0.4.0-alpha.1
+
+**v0.4.0-alpha.1：R98 通用智能路由基线，Alpha / 非 Stable。** 保留 QuantumNous New API 身份、署名与 AGPL 许可。
+
+- [v0.4 固定版本入口与资产](https://github.com/ginsonko/newapi-smart-router/releases/tag/v0.4.0-alpha.1)
+- [最新功能、迁移与准确边界](docs/v0.4-contract-delta.md)
+- [四种发行形态与当前状态](RELEASE-STATUS.md)
+- [构建与校验命令](docs/build-v0.4.md)
+- [历版发行记录](https://github.com/ginsonko/newapi-smart-router/releases)
+
+## 本版新功能
+
+- 每 Key 策略记忆：固定模式清空活动策略但保留记忆；默认主题保留未完成草稿，并防止加载失败时跨 Key 误保存。
+- 授权目录、报价和任务隔离：按当前权限校验，保留实际输入／缓存／阶梯价格与核心选路能力。
+- 异步绘图：持久化任务和尝试身份，退款完成后才允许安全 fallback；未知上游受理状态仅核对、不重放。
+- 图片健康：默认 1 小时真实请求证据窗口，可配置；不因等待时间结束或模拟探测而宣称恢复。
+
+## 简明采用入口
+
+| 你的目标 | 入口 | 边界 |
+|---|---|---|
+| 部署完整通用宿主 | [Full 构建与运行](docs/build-v0.4.md) | 双主题、Worker、Linux 二进制；先在隔离环境校验配置与数据库迁移 |
+| 接入现有 New API | [Bridge 接点](bridge/newapi/README.md) | 需要宿主接线；没有任何官方 revision 获得 Certified |
+| 接入定制 fork | [Integration Kit](integration/README.md) | 只读 doctor、契约与清单；仍需实现并验证宿主 Hooks |
+| 复用算法和规范 | [Agent Parts](parts/docs/agent-context.md) | Development Kit / Not runnable |
+
+Full 不携带站点凭据、渠道、用户数据或私有小铺／课程／Bot 救济金。记忆字段迁移须先于新写入端；经典主题可构建，但没有默认主题的记忆草稿编辑器。详见 [v0.4 能力和迁移边界](docs/v0.4-contract-delta.md)。
+
+固定版本链接是采用入口，不代表已完成 publication、远端 CI 或认证；资产是否可用以版本页为准，具体构建结果以同包 `RELEASE-MANIFEST.json`、`SHA256SUMS` 与验证收据为准。Alpha 不承诺任意宿主兼容，未知官方 revision 不得称为 Certified。
+
+## 完整历史手册
+
+下文原文完整保留；旧版本的“当前”描述仅属于该历史版本。当前采用请使用本页顶部的 v0.4 入口。
+
+<details>
+<summary>展开 v0.1–v0.3 完整历史手册与发行记录</summary>
+
+<!-- historical-manual-start -->
 # NewAPI Smart Router
 
 > 面向 New API 站点的每 Key 智能路由、共享健康、自愈恢复、实际路线计费与可解释决策系统。
@@ -2408,3 +2446,5 @@ Web / Worker exact artifact hash equality
 ### 32.4 发布和兼容边界
 
 发布器只允许“公开 v0.2 Full ZIP + R52 明确白名单 + 隔离前端构建”这条来源链，拒绝枚举 R52 工作树。每个输入和组装文件都有 SHA-256 收据；依赖 junction 在构建后删除，归档不含 `node_modules`。README 的旧版正文必须保持严格字节前缀，发布仍为 Alpha/Pre-release，不宣称任意 New API fork、rc.21 或其他宿主自动兼容。完整门禁见 [`docs/v0.3-contract-delta.md`](docs/v0.3-contract-delta.md)、[`docs/source-provenance.md`](docs/source-provenance.md) 和发布资产中的 `RELEASE-MANIFEST.json`。
+
+</details>

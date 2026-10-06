@@ -1,5 +1,7 @@
 # New API Bridge candidate
 
+Current Alpha version: [**v0.4.0-alpha.1**](https://github.com/ginsonko/newapi-smart-router/releases/tag/v0.4.0-alpha.1), protocol `bridge-spi-v1alpha4`. Required R98 additions are nullable per-Key memory, current catalog/quote authorization scope and durable image-job refund/fallback hooks. See [R98 host hooks](../../parts/spec/r98-host-hooks.md). No official host revision is Certified; the versioned sections below describe historical deltas, not the current protocol selector.
+
 This directory defines the minimum trusted in-process boundary required for
 Full Smart Router behavior. It is a certification candidate, not a universal
 binary plugin.

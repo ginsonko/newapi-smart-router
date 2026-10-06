@@ -1,0 +1,122 @@
+package middleware
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	mediaQueueAheadHeader    = "X-Media-Queue-Ahead"
+	mediaQueuePositionHeader = "X-Media-Queue-Position"
+	mediaQueueWaitHeader     = "X-Media-Queue-Wait-Ms"
+	mediaActiveHeader        = "X-Media-Active"
+)
+
+// MediaGenerationAdmission is intentionally mounted after authentication and
+// before Distribute. Non-generation routes return immediately without touching
+// a media gate or bandwidth limiter.
+func MediaGenerationAdmission() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !isMediaGenerationSubmission(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		userID := c.GetInt("id")
+		if userID <= 0 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"error": gin.H{
+					"message": "authentication required",
+					"type":    "authentication_error",
+					"code":    "media_authentication_required",
+				},
+			})
+			return
+		}
+
+		release, snapshot, err := mediaservice.AcquireGeneration(c.Request.Context(), userID)
+		if err != nil {
+			writeMediaAdmissionHeaders(c, snapshot)
+			if errors.Is(err, mediaservice.ErrMediaSafetyCapacity) {
+				c.Header("Retry-After", "3")
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+					"error": gin.H{
+						"message": "媒体安全等待容量已满，请稍后重试",
+						"type":    "rate_limit_error",
+						"code":    "media_capacity_limited",
+					},
+				})
+				return
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				c.AbortWithStatusJSON(http.StatusRequestTimeout, gin.H{
+					"error": gin.H{
+						"message": "等待媒体生成资源超时，请重试",
+						"type":    "request_timeout",
+						"code":    "media_admission_timeout",
+					},
+				})
+				return
+			}
+			if errors.Is(err, context.Canceled) {
+				c.Abort()
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"error": gin.H{
+					"message": "媒体资源保护暂时不可用，请重试",
+					"type":    "server_error",
+					"code":    "media_admission_unavailable",
+				},
+			})
+			return
+		}
+		defer release()
+		c.Set("media_generation_release", release)
+
+		requestContext := mediaservice.WithGenerationAdmission(c.Request.Context())
+		requestContext, requestBody := mediaservice.WrapClientUploadBody(requestContext, c.Request.Body)
+		c.Request = c.Request.WithContext(requestContext)
+		c.Request.Body = requestBody
+		writeMediaAdmissionHeaders(c, snapshot)
+		c.Next()
+	}
+}
+
+func writeMediaAdmissionHeaders(c *gin.Context, snapshot mediaservice.AdmissionSnapshot) {
+	c.Header(mediaQueueAheadHeader, strconv.Itoa(max(snapshot.QueueAhead, 0)))
+	c.Header(mediaQueuePositionHeader, strconv.Itoa(max(snapshot.QueuePosition, 0)))
+	c.Header(mediaQueueWaitHeader, strconv.FormatInt(snapshot.Waited.Milliseconds(), 10))
+	c.Header(mediaActiveHeader, strconv.Itoa(snapshot.ActiveCount)+"/"+strconv.Itoa(snapshot.ActiveCapacity))
+}
+
+func isMediaGenerationSubmission(method, requestPath string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	requestPath = strings.TrimSuffix(strings.TrimSpace(requestPath), "/")
+	switch requestPath {
+	case "/v1/edits", "/v1/images/generations", "/v1/images/edits",
+		"/v1/videos", "/v1/video/generations",
+		"/kling/v1/videos/text2video", "/kling/v1/videos/image2video",
+		"/jimeng":
+		return true
+	}
+	if strings.HasPrefix(requestPath, "/v1/videos/") && strings.HasSuffix(requestPath, "/remix") {
+		return true
+	}
+	if strings.Contains(requestPath, "/mj/submit/") {
+		return true
+	}
+	if strings.HasPrefix(requestPath, "/api/media/studio/") {
+		mode := strings.TrimPrefix(requestPath, "/api/media/studio/")
+		return mode == "images" || mode == "image-edits" || mode == "videos"
+	}
+	return false
+}

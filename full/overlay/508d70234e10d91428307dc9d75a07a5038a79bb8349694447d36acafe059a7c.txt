@@ -1,0 +1,29 @@
+package model
+
+import (
+	"fmt"
+	"strings"
+)
+
+func ResolveTokenRoutingPolicyMemory(active, previousActive, previousMemory string, requested *string) (string, error) {
+	if strings.TrimSpace(active) != "" {
+		return active, nil
+	}
+	if requested == nil {
+		if strings.TrimSpace(previousActive) != "" {
+			return previousActive, nil
+		}
+		return previousMemory, nil
+	}
+	raw := strings.TrimSpace(*requested)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > 64*1024 {
+		return "", fmt.Errorf("智能路由记忆配置过大")
+	}
+	if _, err := parseTokenRoutingPolicy(raw); err != nil {
+		return "", err
+	}
+	return raw, nil
+}

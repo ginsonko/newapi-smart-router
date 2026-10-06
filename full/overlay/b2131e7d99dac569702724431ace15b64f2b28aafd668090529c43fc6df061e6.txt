@@ -1,0 +1,823 @@
+package service
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+)
+
+const routeAnalyticsProjectionVersionV1 = "route-analytics-projection-v1"
+
+type routeAnalyticsProjectionBuildResultV1 struct {
+	Dimensions  []model.RouteAnalyticsDimensionV1
+	Projections []model.RouteAnalyticsProjectionV1
+	Skipped     int
+}
+
+type routeAnalyticsMatchedAttemptV1 struct {
+	attempt        smartRouteBackfillAttempt
+	identity       smartRouteBackfillCatalogRoute
+	physicalDigest string
+}
+
+type routeAnalyticsAttemptGroupV1 struct {
+	identity       smartRouteBackfillCatalogRoute
+	physicalDigest string
+	attempts       []smartRouteBackfillAttempt
+}
+
+func buildRouteAnalyticsProjectionsV1(
+	catalog smartrouter.CertifiedRouteCatalog,
+	logs []*model.Log,
+) routeAnalyticsProjectionBuildResultV1 {
+	result := routeAnalyticsProjectionBuildResultV1{}
+	routesByID, _ := smartRouteBackfillCatalogIndex(catalog)
+	dimensions := make(map[string]model.RouteAnalyticsDimensionV1)
+	for _, entry := range logs {
+		if entry == nil || entry.CreatedAt <= 0 || entry.UserId <= 0 || entry.TokenId <= 0 || strings.TrimSpace(entry.ModelName) == "" {
+			result.Skipped++
+			continue
+		}
+		other, ok := smartRouteBackfillOther(entry.Other)
+		if !ok {
+			other = map[string]any{}
+		}
+		logicalID, legacyIdentity := routeAnalyticsLogicalIdentityV1(entry, other)
+		if logicalID == "" {
+			result.Skipped++
+			continue
+		}
+		requestPath := backfillString(other["request_path"])
+		contractID, endpoint, _, contractErr := SmartContractIdentity(entry.ModelName, requestPath)
+		if contractErr != nil {
+			endpoint = routeAnalyticsFallbackEndpointV1(other)
+		}
+		if endpoint == "" {
+			endpoint = "unknown"
+		}
+
+		attempts := smartRouteBackfillAttempts(other)
+		matched := routeAnalyticsMatchAttemptsV1(routesByID, attempts, contractID, entry.ModelName, endpoint)
+		groups := routeAnalyticsGroupAttemptsV1(matched)
+		for index, group := range groups {
+			dimension := routeAnalyticsDimensionV1(entry, group.identity, group.attempts[len(group.attempts)-1], group.physicalDigest)
+			dimensions[group.physicalDigest] = dimension
+			projections := routeAnalyticsRouteGroupProjectionsV1(
+				entry,
+				other,
+				logicalID,
+				legacyIdentity,
+				endpoint,
+				group,
+				index == len(groups)-1,
+			)
+			result.Projections = append(result.Projections, projections...)
+		}
+
+		if len(groups) == 0 && contractErr == nil {
+			identity, unique := smartRouteBackfillUniqueRoute(
+				routesByID,
+				contractID,
+				entry.ModelName,
+				endpoint,
+				entry.ChannelId,
+				entry.Group,
+			)
+			if unique {
+				physicalDigest := routeAnalyticsPhysicalDigestV1(identity)
+				fixedAttempt := routeAnalyticsFixedAttemptV1(entry, other, identity)
+				dimensions[physicalDigest] = routeAnalyticsDimensionV1(entry, identity, fixedAttempt, physicalDigest)
+				group := routeAnalyticsAttemptGroupV1{
+					identity: identity, physicalDigest: physicalDigest, attempts: []smartRouteBackfillAttempt{fixedAttempt},
+				}
+				result.Projections = append(
+					result.Projections,
+					routeAnalyticsRouteGroupProjectionsV1(entry, other, logicalID, legacyIdentity, endpoint, group, true)...,
+				)
+			}
+		}
+
+		result.Projections = append(
+			result.Projections,
+			routeAnalyticsKeyProjectionsV1(entry, other, logicalID, legacyIdentity, endpoint, groups)...,
+		)
+	}
+
+	digests := make([]string, 0, len(dimensions))
+	for digest := range dimensions {
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+	result.Dimensions = make([]model.RouteAnalyticsDimensionV1, 0, len(digests))
+	for _, digest := range digests {
+		result.Dimensions = append(result.Dimensions, dimensions[digest])
+	}
+	return result
+}
+
+func routeAnalyticsMatchAttemptsV1(
+	routesByID map[string]smartRouteBackfillCatalogRoute,
+	attempts []smartRouteBackfillAttempt,
+	contractID string,
+	modelName string,
+	endpoint string,
+) []routeAnalyticsMatchedAttemptV1 {
+	result := make([]routeAnalyticsMatchedAttemptV1, 0, len(attempts))
+	for _, attempt := range attempts {
+		identity, exists := routesByID[attempt.routeID]
+		if !exists || identity.contractID != contractID || identity.contract.CanonicalModel != modelName ||
+			identity.contract.Endpoint != endpoint || identity.route.ChannelID != attempt.channelID || identity.route.Group != attempt.group {
+			continue
+		}
+		result = append(result, routeAnalyticsMatchedAttemptV1{
+			attempt: attempt, identity: identity, physicalDigest: routeAnalyticsPhysicalDigestV1(identity),
+		})
+	}
+	return result
+}
+
+func routeAnalyticsGroupAttemptsV1(matched []routeAnalyticsMatchedAttemptV1) []routeAnalyticsAttemptGroupV1 {
+	result := make([]routeAnalyticsAttemptGroupV1, 0, len(matched))
+	for _, item := range matched {
+		if len(result) > 0 && result[len(result)-1].physicalDigest == item.physicalDigest {
+			result[len(result)-1].attempts = append(result[len(result)-1].attempts, item.attempt)
+			continue
+		}
+		result = append(result, routeAnalyticsAttemptGroupV1{
+			identity: item.identity, physicalDigest: item.physicalDigest, attempts: []smartRouteBackfillAttempt{item.attempt},
+		})
+	}
+	return result
+}
+
+func routeAnalyticsRouteGroupProjectionsV1(
+	entry *model.Log,
+	other map[string]any,
+	logicalID string,
+	legacyIdentity bool,
+	endpoint string,
+	group routeAnalyticsAttemptGroupV1,
+	lastGroup bool,
+) []model.RouteAnalyticsProjectionV1 {
+	if entry == nil || len(group.attempts) == 0 {
+		return nil
+	}
+	first := group.attempts[0]
+	last := group.attempts[len(group.attempts)-1]
+	success, observed := smartRouteBackfillOutcome(last.outcome)
+	if entry.Type == model.LogTypeConsume && lastGroup && (last.committed || last.outcome == smartrouter.OutcomeSuccess || last.routeID == "") {
+		success, observed = true, true
+	}
+	if !observed {
+		return nil
+	}
+	firstSuccess, firstObserved := smartRouteBackfillOutcome(first.outcome)
+	measures := model.RouteAnalyticsMeasuresV1{LogicalRequests: 1}
+	projectionRank := 100
+	if success {
+		projectionRank = 200
+		measures.FinalSuccesses = 1
+		if firstObserved && firstSuccess {
+			measures.FirstHitSuccesses = 1
+		} else if len(group.attempts) > 1 {
+			measures.RetryRecoveries = 1
+		}
+	} else {
+		measures.ConfirmedFailures = 1
+	}
+	if success && lastGroup && entry.Type == model.LogTypeConsume {
+		if frtMS, exists := backfillInt64(other["frt"]); exists && frtMS >= 0 {
+			measures.TTFTMS = &frtMS
+		}
+		if input, reliable := smartRouteBackfillActualInput(entry, other, group.identity, endpoint, len(group.attempts) > 0); reliable {
+			measures.CacheReadTokens = input.CacheReadTokens
+			measures.TotalInputTokens = input.TotalInputTokens
+			frozenPrice := routeAnalyticsFrozenRequestPriceV1(last.price, other)
+			if costPPM, costOK := smartrouter.ActualInputCostPPMForTokenMix(
+				frozenPrice,
+				frozenPrice.ScorePPM,
+				input.RegularInputTokens,
+				input.CacheReadTokens,
+				input.CacheCreation5mTokens,
+				input.CacheCreation1hTokens,
+			); costOK && (input.TotalInputTokens == 0 || costPPM <= math.MaxInt64/input.TotalInputTokens) {
+				measures.PredictedInputMicros = costPPM * input.TotalInputTokens
+				measures.PredictedInputTokens = input.TotalInputTokens
+			}
+		} else if entry.PromptTokens > 0 {
+			// Legacy logs can lack the normalized cache fields entirely. Treat the
+			// recorded prompt token count as an uncached input mix so the same
+			// frozen-price formula still produces a trend point.
+			frozenPrice := routeAnalyticsFrozenRequestPriceV1(last.price, other)
+			if costPPM, costOK := smartrouter.ActualInputCostPPMForCacheReadRate(
+				frozenPrice, frozenPrice.ScorePPM, 0,
+			); costOK && costPPM <= math.MaxInt64/int64(entry.PromptTokens) {
+				measures.TotalInputTokens = int64(entry.PromptTokens)
+				measures.PredictedInputTokens = int64(entry.PromptTokens)
+				measures.PredictedInputMicros = costPPM * int64(entry.PromptTokens)
+			}
+		}
+	}
+	measures.PriceRevision = routeAnalyticsPriceRevisionV1(last, other)
+	return routeAnalyticsRouteProjectionGranularitiesV1(
+		entry,
+		logicalID,
+		legacyIdentity,
+		projectionRank,
+		group,
+		endpoint,
+		measures,
+	)
+}
+
+func routeAnalyticsRouteProjectionGranularitiesV1(
+	entry *model.Log,
+	logicalID string,
+	legacyIdentity bool,
+	projectionRank int,
+	group routeAnalyticsAttemptGroupV1,
+	endpoint string,
+	measures model.RouteAnalyticsMeasuresV1,
+) []model.RouteAnalyticsProjectionV1 {
+	result := make([]model.RouteAnalyticsProjectionV1, 0, 2)
+	for _, granularity := range []string{model.RouteAnalyticsGranularity5m, model.RouteAnalyticsGranularity1h} {
+		bucketStartMS := routeAnalyticsBucketStartMSV1(entry.CreatedAt*1_000, granularity)
+		bucketKey := routeAnalyticsDigestV1(
+			"route-bucket",
+			group.physicalDigest,
+			strconv.FormatInt(bucketStartMS, 10),
+			granularity,
+			entry.ModelName,
+			endpoint,
+			group.identity.contract.CapabilityFingerprint,
+		)
+		identity := &model.RouteAnalyticsBucketIdentityV1{
+			BucketKey: bucketKey, RouteFingerprintDigest: group.physicalDigest,
+			BucketStartMS: bucketStartMS, Granularity: granularity, Model: entry.ModelName,
+			Endpoint: endpoint, CapabilityContract: routeAnalyticsCapabilityContractV1(group.identity),
+		}
+		projection := model.RouteAnalyticsProjectionV1{
+			ObservationDigest: routeAnalyticsDigestV1("route-observation", logicalID, group.physicalDigest, granularity),
+			ProjectionRank:    projectionRank, EventTimeMS: entry.CreatedAt * 1_000,
+			IngestedAtMS: entry.CreatedAt * 1_000, EventKind: "route_logical_request", Granularity: granularity,
+			RouteFingerprintDigest: group.physicalDigest, UserDigest: routeAnalyticsUserDigestV1(entry.UserId),
+			TokenID: entry.TokenId, LegacyIdentity: legacyIdentity, RouteBucket: identity, RouteMeasures: measures,
+		}
+		projection.ProjectionHash = routeAnalyticsProjectionHashV1(projection)
+		result = append(result, projection)
+	}
+	return result
+}
+
+func routeAnalyticsKeyProjectionsV1(
+	entry *model.Log,
+	other map[string]any,
+	logicalID string,
+	legacyIdentity bool,
+	endpoint string,
+	groups []routeAnalyticsAttemptGroupV1,
+) []model.RouteAnalyticsProjectionV1 {
+	if entry == nil {
+		return nil
+	}
+	groupName := routeAnalyticsKeyGroupV1(entry, groups)
+	if entry.Type == model.LogTypeRefund || routeAnalyticsTaskAdjustmentV1(other) {
+		measures := model.KeyUsageAnalyticsMeasuresV1{}
+		if entry.Type == model.LogTypeRefund && entry.Quota > 0 {
+			measures.RefundQuota = int64(entry.Quota)
+		} else if entry.Type == model.LogTypeConsume && entry.Quota > 0 {
+			measures.PositiveQuota = int64(entry.Quota)
+		}
+		return routeAnalyticsKeyProjectionGranularitiesV1(
+			entry,
+			routeAnalyticsDigestV1("key-finance-event", routeAnalyticsStableLogIdentityV1(entry, other)),
+			legacyIdentity,
+			300,
+			"key_finance_adjustment",
+			endpoint,
+			measures, groupName,
+		)
+	}
+
+	measures := model.KeyUsageAnalyticsMeasuresV1{LogicalRequests: 1}
+	projectionRank := 0
+	switch entry.Type {
+	case model.LogTypeConsume:
+		projectionRank = 200
+		measures.Successes = 1
+		if entry.Quota > 0 {
+			measures.PositiveQuota = int64(entry.Quota)
+		}
+		inputTokens, cacheReadTokens, inputKnown := routeAnalyticsKeyInputTokensV1(entry, other, endpoint)
+		if inputKnown {
+			measures.InputTokens = inputTokens
+			measures.CacheReadTokens = cacheReadTokens
+		}
+		if entry.CompletionTokens > 0 {
+			measures.OutputTokens = int64(entry.CompletionTokens)
+		}
+		if frtMS, exists := backfillInt64(other["frt"]); exists && frtMS >= 0 {
+			measures.TTFTMS = &frtMS
+		}
+	case model.LogTypeError:
+		if !routeAnalyticsEligibleFailureV1(other, groups) {
+			return nil
+		}
+		projectionRank = 100
+		measures.Failures = 1
+	default:
+		return nil
+	}
+	return routeAnalyticsKeyProjectionGranularitiesV1(
+		entry,
+		routeAnalyticsDigestV1("key-outcome", logicalID),
+		legacyIdentity,
+		projectionRank,
+		"key_logical_request",
+		endpoint,
+		measures, groupName,
+	)
+}
+
+// routeAnalyticsKeyGroupV1 records the group that actually handled a request.
+// Attempts are ordered chronologically; the last successful/committed attempt
+// is authoritative. For legacy/direct logs without attempts, retain the group
+// already persisted on the log. An empty value is intentional and renders as
+// unknown in the analytics UI rather than guessing a physical route.
+func routeAnalyticsKeyGroupV1(entry *model.Log, groups []routeAnalyticsAttemptGroupV1) string {
+	for index := len(groups) - 1; index >= 0; index-- {
+		attempts := groups[index].attempts
+		for attemptIndex := len(attempts) - 1; attemptIndex >= 0; attemptIndex-- {
+			attempt := attempts[attemptIndex]
+			if attempt.outcome == smartrouter.OutcomeSuccess || attempt.committed {
+				return strings.TrimSpace(attempt.group)
+			}
+		}
+	}
+	if entry != nil {
+		return strings.TrimSpace(entry.Group)
+	}
+	return ""
+}
+
+func routeAnalyticsKeyProjectionGranularitiesV1(
+	entry *model.Log,
+	observationBase string,
+	legacyIdentity bool,
+	projectionRank int,
+	eventKind string,
+	endpoint string,
+	measures model.KeyUsageAnalyticsMeasuresV1,
+	groupName string,
+) []model.RouteAnalyticsProjectionV1 {
+	result := make([]model.RouteAnalyticsProjectionV1, 0, 2)
+	for _, granularity := range []string{model.RouteAnalyticsGranularity5m, model.RouteAnalyticsGranularity1h} {
+		bucketStartMS := routeAnalyticsBucketStartMSV1(entry.CreatedAt*1_000, granularity)
+		bucketKey := routeAnalyticsDigestV1(
+			"key-bucket",
+			strconv.Itoa(entry.UserId),
+			strconv.Itoa(entry.TokenId),
+			strconv.FormatInt(bucketStartMS, 10),
+			granularity,
+			entry.ModelName,
+			endpoint,
+			groupName,
+		)
+		identity := &model.KeyUsageAnalyticsBucketIdentityV1{
+			BucketKey: bucketKey, UserID: entry.UserId, TokenID: entry.TokenId, BucketStartMS: bucketStartMS,
+			Granularity: granularity, Model: entry.ModelName, Endpoint: endpoint, Group: groupName,
+		}
+		projection := model.RouteAnalyticsProjectionV1{
+			ObservationDigest: routeAnalyticsDigestV1("key-observation", observationBase, granularity),
+			ProjectionRank:    projectionRank, EventTimeMS: entry.CreatedAt * 1_000,
+			IngestedAtMS: entry.CreatedAt * 1_000, EventKind: eventKind, Granularity: granularity,
+			UserDigest: routeAnalyticsUserDigestV1(entry.UserId), TokenID: entry.TokenId,
+			LegacyIdentity: legacyIdentity, KeyBucket: identity, KeyMeasures: measures,
+		}
+		projection.ProjectionHash = routeAnalyticsProjectionHashV1(projection)
+		result = append(result, projection)
+	}
+	return result
+}
+
+func routeAnalyticsEligibleFailureV1(other map[string]any, groups []routeAnalyticsAttemptGroupV1) bool {
+	for index := len(groups) - 1; index >= 0; index-- {
+		attempts := groups[index].attempts
+		if len(attempts) == 0 {
+			continue
+		}
+		if _, observed := smartRouteBackfillOutcome(attempts[len(attempts)-1].outcome); observed {
+			return true
+		}
+	}
+	_, observed := smartRouteBackfillHTTPOutcome(other)
+	return observed
+}
+
+func routeAnalyticsTaskAdjustmentV1(other map[string]any) bool {
+	if backfillString(other["task_id"]) == "" {
+		return false
+	}
+	_, hasPrevious := other["pre_consumed_quota"]
+	_, hasActual := other["actual_quota"]
+	billingReceipt, _ := other["billing_receipt"].(bool)
+	return hasPrevious || hasActual || billingReceipt
+}
+
+func routeAnalyticsKeyInputTokensV1(entry *model.Log, other map[string]any, endpoint string) (int64, int64, bool) {
+	cacheRead, cachePresent := backfillInt64(other["cache_tokens"])
+	if cacheRead < 0 {
+		return 0, 0, false
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: endpoint}).UsageSemantic()
+	if usageSemantic == "anthropic" {
+		create5m, create5mPresent := backfillInt64(other["cache_creation_tokens_5m"])
+		create1h, create1hPresent := backfillInt64(other["cache_creation_tokens_1h"])
+		creation, creationPresent := backfillInt64(other["cache_creation_tokens"])
+		if !create5mPresent && !create1hPresent && creationPresent {
+			create5m = creation
+		}
+		if create5m < 0 || create1h < 0 || (!cachePresent && !create5mPresent && !create1hPresent && !creationPresent) {
+			return 0, 0, false
+		}
+		total := int64(entry.PromptTokens) + cacheRead + create5m + create1h
+		return total, cacheRead, total >= 0
+	}
+	if explicit, exists := backfillInt64(other["input_tokens_total"]); exists && explicit >= cacheRead && explicit >= 0 {
+		return explicit, cacheRead, true
+	}
+	if cachePresent && int64(entry.PromptTokens) >= cacheRead {
+		return int64(entry.PromptTokens), cacheRead, true
+	}
+	if entry.PromptTokens >= 0 {
+		return int64(entry.PromptTokens), 0, true
+	}
+	return 0, 0, false
+}
+
+func routeAnalyticsLogicalIdentityV1(entry *model.Log, other map[string]any) (string, bool) {
+	if entry == nil {
+		return "", false
+	}
+	if requestID := strings.TrimSpace(entry.RequestId); requestID != "" {
+		return routeAnalyticsDigestV1(
+			"logical-request",
+			strconv.Itoa(entry.UserId),
+			strconv.Itoa(entry.TokenId),
+			entry.ModelName,
+			requestID,
+		), false
+	}
+	return routeAnalyticsDigestV1("legacy-logical-request", routeAnalyticsStableLogIdentityV1(entry, other)), true
+}
+
+func routeAnalyticsStableLogIdentityV1(entry *model.Log, other map[string]any) string {
+	if entry == nil {
+		return ""
+	}
+	otherText := entry.Other
+	if encoded, err := common.Marshal(other); err == nil {
+		otherText = string(encoded)
+	}
+	return routeAnalyticsDigestV1(
+		"log-row",
+		strconv.Itoa(entry.UserId),
+		strconv.Itoa(entry.TokenId),
+		strconv.FormatInt(entry.CreatedAt, 10),
+		strconv.Itoa(entry.Type),
+		entry.ModelName,
+		strconv.Itoa(entry.ChannelId),
+		entry.Group,
+		entry.RequestId,
+		strconv.Itoa(entry.Quota),
+		strconv.Itoa(entry.PromptTokens),
+		strconv.Itoa(entry.CompletionTokens),
+		otherText,
+	)
+}
+
+func routeAnalyticsFixedAttemptV1(
+	entry *model.Log,
+	other map[string]any,
+	identity smartRouteBackfillCatalogRoute,
+) smartRouteBackfillAttempt {
+	outcome := smartrouter.QualityOutcome("")
+	committed := false
+	if entry.Type == model.LogTypeConsume {
+		outcome = smartrouter.OutcomeSuccess
+		committed = true
+	} else if success, observed := smartRouteBackfillHTTPOutcome(other); observed {
+		if success {
+			outcome = smartrouter.OutcomeSuccess
+		} else {
+			outcome = smartrouter.OutcomeInfrastructure
+		}
+	}
+	return smartRouteBackfillAttempt{
+		attempt: 1, routeID: identity.route.RouteID, channelID: identity.route.ChannelID,
+		group: identity.route.Group, ratioPPM: routeAnalyticsLoggedRatioPPMV1(other),
+		price:        routeAnalyticsFrozenRequestPriceV1(smartrouter.RoutePrice{}, other),
+		priceVersion: backfillString(other["pricing_revision"]),
+		outcome:      outcome, committed: committed,
+	}
+}
+
+func routeAnalyticsLoggedRatioPPMV1(other map[string]any) int64 {
+	groupRatio, ok := routeAnalyticsFloat64V1(other["group_ratio"])
+	if !ok || groupRatio < 0 {
+		return 0
+	}
+	if userRatio, exists := routeAnalyticsFloat64V1(other["user_group_ratio"]); exists && userRatio >= 0 {
+		groupRatio *= userRatio
+	}
+	if groupRatio > float64(math.MaxInt64)/1_000_000 {
+		return 0
+	}
+	return int64(math.Round(groupRatio * 1_000_000))
+}
+
+func routeAnalyticsFrozenRequestPriceV1(recorded smartrouter.RoutePrice, other map[string]any) smartrouter.RoutePrice {
+	if recorded.BillingMode == "tiered_expr" {
+		// Attempt receipts omit the expression body (it is deliberately not part
+		// of the per-attempt JSON), while the request-level audit stores the
+		// immutable expression as base64. Restore it here so historical trend
+		// points use the same two-price projection as live ranking.
+		if encoded := backfillString(other["expr_b64"]); encoded != "" {
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil || strings.TrimSpace(string(decoded)) == "" {
+				return smartrouter.RoutePrice{}
+			}
+			decodedExpr := strings.TrimSpace(string(decoded))
+			decodedHash := billingexpr.ExprHashString(decodedExpr)
+			// The attempt receipt omits the expression body, but it preserves the
+			// frozen hash.  Always verify an existing hash before restoring the
+			// request-level expression; otherwise a mismatched historical price
+			// contract could silently produce a prediction from the wrong tier.
+			if strings.TrimSpace(recorded.TieredExpressionHash) != "" && decodedHash != strings.TrimSpace(recorded.TieredExpressionHash) {
+				return smartrouter.RoutePrice{}
+			}
+			if strings.TrimSpace(recorded.TieredExpression) == "" {
+				recorded.TieredExpression = decodedExpr
+			}
+			if strings.TrimSpace(recorded.TieredExpressionHash) == "" {
+				recorded.TieredExpressionHash = decodedHash
+			}
+		}
+		if strings.TrimSpace(recorded.TieredExpression) == "" {
+			return recorded
+		}
+		if strings.TrimSpace(recorded.TieredExpressionHash) == "" {
+			recorded.TieredExpressionHash = billingexpr.ExprHashString(recorded.TieredExpression)
+		}
+		if !recorded.TieredInputPredictable {
+			recorded.TieredInputPredictable = tieredExpressionSupportsInputPrediction(recorded.TieredExpression)
+		}
+		return recorded
+	}
+	// A complete ratio descriptor is already frozen by the Smart Router and
+	// should win over legacy log fields. Incomplete/legacy descriptors are
+	// intentionally rebuilt below from the request's immutable pricing fields;
+	// older attempts used legacy_ratio or omitted cache metadata, which made
+	// predicted input cost disappear for otherwise valid groups.
+	if recorded.BillingMode == "ratio" && recorded.BillingUnit == "per_token" &&
+		recorded.ActualInputComparisonClass != "" && recorded.CachePricingKnown {
+		return recorded
+	}
+	if recorded.BillingMode != "" && recorded.BillingMode != "ratio" && recorded.BillingMode != "legacy_ratio" {
+		return recorded
+	}
+
+	billingMode := strings.TrimSpace(backfillString(other["billing_mode"]))
+	if billingMode == "tiered_expr" {
+		encoded := backfillString(other["expr_b64"])
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		expression := strings.TrimSpace(string(decoded))
+		if err != nil || expression == "" || !tieredExpressionSupportsInputPrediction(expression) {
+			return smartrouter.RoutePrice{}
+		}
+		expressionHash := billingexpr.ExprHashString(expression)
+		if recordedHash := strings.TrimSpace(recorded.TieredExpressionHash); recordedHash != "" && recordedHash != expressionHash {
+			return smartrouter.RoutePrice{}
+		}
+		groupRatioPPM := routeAnalyticsLoggedRatioPPMV1(other)
+		return smartrouter.RoutePrice{
+			BillingMode: "tiered_expr", BillingUnit: "per_token", ComparisonClass: "logged-tiered",
+			ActualInputComparisonClass: "logged-tiered", ScorePPM: groupRatioPPM, StaticComparable: true,
+			TieredExpression: expression, TieredExpressionHash: expressionHash,
+			TieredInputPredictable: true, Scope: "historical-log", Revision: backfillString(other["pricing_revision"]),
+		}
+	}
+	if billingMode != "" && billingMode != "ratio" && billingMode != "fixed_price" {
+		return smartrouter.RoutePrice{}
+	}
+
+	modelRatio, modelOK := routeAnalyticsFloat64V1(other["model_ratio"])
+	// Price-based requests persist model_price (USD per million input tokens)
+	// while ratio-based requests persist model_ratio. Normalize both to the
+	// same ratio unit used by RoutePrice.ScorePPM (one ratio unit = USD 2/M).
+	if !modelOK || modelRatio <= 0 {
+		if modelPrice, priceOK := routeAnalyticsFloat64V1(other["model_price"]); priceOK && modelPrice >= 0 {
+			modelRatio = modelPrice / smartrouterActualInputCostUSDPerRatioV1
+			modelOK = true
+		}
+	}
+	if billingMode == "" && modelOK && modelRatio == 0 {
+		return smartrouter.RoutePrice{}
+	}
+	if billingMode == "fixed_price" {
+		return smartrouter.RoutePrice{}
+	}
+	groupRatioPPM := routeAnalyticsLoggedRatioPPMV1(other)
+	if !modelOK || modelRatio < 0 || groupRatioPPM < 0 || modelRatio > float64(math.MaxInt64)/float64(max(groupRatioPPM, 1)) {
+		return smartrouter.RoutePrice{}
+	}
+	score := int64(math.Round(modelRatio * float64(groupRatioPPM)))
+	price := smartrouter.RoutePrice{
+		BillingMode: "ratio", BillingUnit: "per_token", ComparisonClass: "logged-ratio",
+		ActualInputComparisonClass: "logged-ratio", ScorePPM: score, StaticComparable: true,
+		Scope: "historical-log", Revision: backfillString(other["pricing_revision"]),
+	}
+	cacheReadRatio, cacheReadPresent, cacheReadValid := routeAnalyticsPriceRatioFieldV1(
+		other, "cache_ratio", "cache_read_ratio", "cache_read_price_ratio", "input_cache_read_ratio",
+	)
+	// Cache-creation pricing is intentionally not part of the displayed
+	// prediction formula. Creation tokens are ordinary input; only the cache
+	// read price is needed here.
+	if !cacheReadPresent {
+		// Older consume logs did not persist the cache-read multiplier. The
+		// billing contract's documented default is 1x, so keep those historical
+		// requests in the same unified prediction formula instead of dropping
+		// their trend point. This is a price-contract default, not a second
+		// prediction algorithm.
+		cacheReadRatio = 1
+		cacheReadPresent = true
+	}
+	if !cacheReadValid || cacheReadRatio < 0 ||
+		cacheReadRatio > float64(math.MaxInt64)/1_000_000 {
+		return smartrouter.RoutePrice{}
+	}
+	price.CachePricingKnown = true
+	price.CacheReadRatioPPM = int64(math.Round(cacheReadRatio * 1_000_000))
+	// Preserve the documented runtime descriptor for old logs. These fields
+	// are not consulted by the strict display formula, which treats creation
+	// tokens as regular input.
+	return price
+}
+
+const smartrouterActualInputCostUSDPerRatioV1 = 2.0
+
+// routeAnalyticsPriceRatioFieldV1 reads the first present field from a set of
+// historical aliases. The second return value records presence and the third
+// records parse validity so callers can distinguish omitted legacy metadata
+// (safe to default) from malformed metadata (must remain unknown).
+func routeAnalyticsPriceRatioFieldV1(other map[string]any, keys ...string) (float64, bool, bool) {
+	for _, key := range keys {
+		raw, present := other[key]
+		if !present {
+			continue
+		}
+		value, valid := routeAnalyticsFloat64V1(raw)
+		return value, true, valid
+	}
+	return 0, false, true
+}
+
+func routeAnalyticsFloat64V1(value any) (float64, bool) {
+	switch current := value.(type) {
+	case float64:
+		return current, true
+	case float32:
+		return float64(current), true
+	case int:
+		return float64(current), true
+	case int64:
+		return float64(current), true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(current), 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func routeAnalyticsFallbackEndpointV1(other map[string]any) string {
+	if endpoint := backfillString(other["endpoint"]); endpoint != "" {
+		return endpoint
+	}
+	requestPath := strings.ToLower(backfillString(other["request_path"]))
+	switch {
+	case strings.Contains(requestPath, "/responses"):
+		return "openai-responses-v1"
+	case strings.Contains(requestPath, "/messages"):
+		return "anthropic-messages-v1"
+	case strings.Contains(requestPath, "/chat/completions"):
+		return "openai-chat-v1"
+	default:
+		return ""
+	}
+}
+
+func routeAnalyticsDimensionV1(
+	entry *model.Log,
+	identity smartRouteBackfillCatalogRoute,
+	attempt smartRouteBackfillAttempt,
+	physicalDigest string,
+) model.RouteAnalyticsDimensionV1 {
+	ratioPPM := attempt.ratioPPM
+	if ratioPPM < 0 {
+		ratioPPM = 0
+	}
+	return model.RouteAnalyticsDimensionV1{
+		RouteFingerprintDigest: physicalDigest,
+		ChannelID:              identity.route.ChannelID, ChannelGeneration: identity.route.ChannelGeneration,
+		UpstreamModel: identity.route.UpstreamModel, Model: entry.ModelName, Endpoint: identity.contract.Endpoint,
+		CapabilityContract: routeAnalyticsCapabilityContractV1(identity), PublicGroupName: identity.route.Group,
+		GroupRatioPPM: ratioPPM, ProjectionVersion: routeAnalyticsProjectionVersionV1,
+		FirstSeenAtMS: entry.CreatedAt * 1_000, LastSeenAtMS: entry.CreatedAt * 1_000,
+	}
+}
+
+func routeAnalyticsPhysicalDigestV1(identity smartRouteBackfillCatalogRoute) string {
+	return routeAnalyticsDigestV1(
+		"physical-route",
+		strconv.Itoa(identity.route.ChannelID),
+		identity.route.ChannelGeneration,
+		identity.route.UpstreamModel,
+		identity.contract.Endpoint,
+		routeAnalyticsCapabilityContractV1(identity),
+	)
+}
+
+func routeAnalyticsCapabilityContractV1(identity smartRouteBackfillCatalogRoute) string {
+	return identity.contract.ContractID + ":" + identity.contract.CapabilityFingerprint
+}
+
+func routeAnalyticsPriceRevisionV1(attempt smartRouteBackfillAttempt, other map[string]any) string {
+	if attempt.priceVersion != "" {
+		return attempt.priceVersion
+	}
+	if attempt.price.Revision != "" {
+		return attempt.price.Revision
+	}
+	return backfillString(other["pricing_revision"])
+}
+
+func routeAnalyticsUserDigestV1(userID int) string {
+	return routeAnalyticsDigestV1("user", strconv.Itoa(userID))
+}
+
+func routeAnalyticsProjectionHashV1(projection model.RouteAnalyticsProjectionV1) string {
+	copyProjection := projection
+	copyProjection.ProjectionHash = ""
+	encoded, err := common.Marshal(copyProjection)
+	if err != nil {
+		return routeAnalyticsDigestV1("projection-error")
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func routeAnalyticsDigestV1(kind string, parts ...string) string {
+	payload := routeAnalyticsProjectionVersionV1 + "\x00" + strings.TrimSpace(kind)
+	for _, part := range parts {
+		payload += "\x00" + strings.TrimSpace(part)
+	}
+	digest := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(digest[:])
+}
+
+func routeAnalyticsBucketStartMSV1(eventTimeMS int64, granularity string) int64 {
+	widthMS := int64(5 * 60 * 1_000)
+	if granularity == model.RouteAnalyticsGranularity1h {
+		widthMS = int64(60 * 60 * 1_000)
+	}
+	return eventTimeMS - eventTimeMS%widthMS
+}
+
+func attachRouteAnalyticsDetailIDsV1(
+	projections []model.RouteAnalyticsProjectionV1,
+	detailIDs map[string]string,
+) error {
+	for index := range projections {
+		if projections[index].RouteBucket == nil {
+			continue
+		}
+		detailID := detailIDs[projections[index].RouteFingerprintDigest]
+		if detailID == "" {
+			return fmt.Errorf("route analytics detail id missing for physical route")
+		}
+		projections[index].RouteBucket.DetailID = detailID
+		projections[index].ProjectionHash = routeAnalyticsProjectionHashV1(projections[index])
+	}
+	return nil
+}

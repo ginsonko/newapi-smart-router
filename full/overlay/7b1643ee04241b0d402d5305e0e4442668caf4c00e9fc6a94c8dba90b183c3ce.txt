@@ -1,0 +1,53 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestFilterChannelsByRequestPathStandaloneSearchUsesCompatibleOpenAIAndCodex(t *testing.T) {
+	old := channelsIDM
+	channelsIDM = map[int]*Channel{
+		1: {Id: 1, Type: constant.ChannelTypeOpenAI},
+		2: {Id: 2, Type: constant.ChannelTypeCodex},
+		3: {Id: 3, Type: constant.ChannelTypeAdvancedCustom},
+	}
+	t.Cleanup(func() { channelsIDM = old })
+	require.Equal(t, []int{1, 2}, filterChannelsByRequestPath([]int{1, 2, 3}, "/v1/alpha/search"))
+}
+
+func TestChannelSupportsRequestPathStandaloneSearchUsesCompatibleOpenAIAndCodex(t *testing.T) {
+	require.True(t, ChannelSupportsRequestPath(&Channel{Type: constant.ChannelTypeCodex}, "/v1/alpha/search"))
+	require.True(t, ChannelSupportsRequestPath(&Channel{Type: constant.ChannelTypeOpenAI}, "/v1/alpha/search"))
+}
+
+func TestFilterAbilitiesByRequestPathStandaloneSearchUsesCompatibleOpenAIAndCodex(t *testing.T) {
+	oldDB := DB
+	db, err := gorm.Open(sqlite.Open("file:standalone-search-filter?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() { DB = oldDB })
+	require.NoError(t, DB.AutoMigrate(&Channel{}))
+	require.NoError(t, DB.Create(&Channel{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: 2, Type: constant.ChannelTypeCodex, Status: common.ChannelStatusEnabled}).Error)
+	abilities := []Ability{{ChannelId: 1}, {ChannelId: 2}}
+	require.Equal(t, []Ability{{ChannelId: 1}, {ChannelId: 2}}, filterAbilitiesByRequestPath(abilities, "/v1/alpha/search"))
+}
+
+func TestFilterAbilitiesByRequestPathStandaloneSearchFailsClosedOnDatabaseError(t *testing.T) {
+	oldDB := DB
+	db, err := gorm.Open(sqlite.Open("file:standalone-search-filter-error?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() { DB = oldDB })
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+
+	require.Empty(t, filterAbilitiesByRequestPath([]Ability{{ChannelId: 1}}, "/v1/alpha/search"))
+}

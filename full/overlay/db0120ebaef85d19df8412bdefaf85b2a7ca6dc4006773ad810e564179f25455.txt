@@ -1,0 +1,293 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+
+	"gorm.io/gorm"
+)
+
+var mediaMaterializerLoop struct {
+	sync.Mutex
+	stop func()
+}
+
+// StartMediaMaterializer runs URL-to-local transfers out of band. Database
+// leases make it safe across several API instances, and every transfer remains
+// optional: a failure leaves the original remote proxy delivery intact.
+func StartMediaMaterializer() func() {
+	mediaMaterializerLoop.Lock()
+	defer mediaMaterializerLoop.Unlock()
+	if mediaMaterializerLoop.stop != nil {
+		return mediaMaterializerLoop.stop
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var workers sync.WaitGroup
+	var active atomic.Int32
+	go func() {
+		defer close(done)
+		defer workers.Wait()
+		for {
+			setting := mediasetting.Get()
+			if setting.Enabled && setting.RemoteMaterializeEnabled {
+				for int(active.Load()) < setting.RemoteMaterializeWorkers {
+					owner, err := mediaservice.NewPublicID("materialize_")
+					if err != nil {
+						common.SysLog("media materializer could not allocate lease owner: " + err.Error())
+						break
+					}
+					leaseTTL := time.Duration(setting.RemoteMaterializeTimeoutSeconds+60) * time.Second
+					blob, err := model.ClaimNextMediaMaterialization(owner, leaseTTL)
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						break
+					}
+					if err != nil {
+						common.SysLog("media materializer claim failed: " + err.Error())
+						break
+					}
+					active.Add(1)
+					workers.Add(1)
+					go func(blob *model.MediaBlob, leaseOwner string) {
+						defer workers.Done()
+						defer active.Add(-1)
+						materializeRemoteMediaBlob(ctx, blob, leaseOwner)
+					}(blob, owner)
+				}
+			}
+
+			interval := time.Duration(setting.RemoteMaterializeScanSeconds) * time.Second
+			if interval < time.Second {
+				interval = time.Second
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			<-done
+			mediaMaterializerLoop.Lock()
+			mediaMaterializerLoop.stop = nil
+			mediaMaterializerLoop.Unlock()
+		})
+	}
+	mediaMaterializerLoop.stop = stop
+	return stop
+}
+
+func materializeRemoteMediaBlob(parent context.Context, blob *model.MediaBlob, leaseOwner string) {
+	if blob == nil {
+		return
+	}
+	setting := mediasetting.Get()
+	source := strings.TrimSpace(blob.PrivateSource)
+	if !strings.HasPrefix(source, "http://") && !strings.HasPrefix(source, "https://") {
+		_ = model.DisableMediaMaterialization(blob.ID, leaseOwner, "source is delivered by an authenticated task proxy")
+		return
+	}
+	if err := ValidateSSRFProtectedFetchURL(source); err != nil {
+		recordMediaMaterializationFailure(blob, leaseOwner, fmt.Errorf("remote source blocked: %w", err))
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, time.Duration(setting.RemoteMaterializeTimeoutSeconds)*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err != nil {
+		recordMediaMaterializationFailure(blob, leaseOwner, err)
+		return
+	}
+	request.Header.Set("Accept", "image/*,video/*,audio/*,application/octet-stream;q=0.5")
+	matched, credentialErr := ApplyTaskContentAuthorization(request, blob.ID)
+	if credentialErr != nil {
+		if matched {
+			recordMediaMaterializationFailure(blob, leaseOwner, credentialErr)
+			return
+		}
+		// A lookup failure for a normal public remote URL is not a reason to
+		// block delivery; only task-content URLs require a credential.
+	}
+	baseClient := GetSSRFProtectedHTTPClient()
+	client := &http.Client{
+		Transport: baseClient.Transport,
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			// Go can retain Authorization on same-domain redirects. Re-evaluate
+			// every hop against the original task, including same-host paths.
+			next.Header.Del("Authorization")
+			next.Header.Del("Referer")
+			if baseClient.CheckRedirect != nil {
+				if err := baseClient.CheckRedirect(next, via); err != nil {
+					return err
+				}
+			}
+			if len(via) >= 10 {
+				return errors.New("too many media redirects")
+			}
+			if matched {
+				_, err := ApplyTaskContentAuthorization(next, blob.ID)
+				return err
+			}
+			return nil
+		},
+		Timeout: time.Duration(setting.RemoteMaterializeTimeoutSeconds) * time.Second,
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		recordMediaMaterializationFailure(blob, leaseOwner, err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		recordMediaMaterializationFailure(blob, leaseOwner, fmt.Errorf("remote source returned HTTP %d", response.StatusCode))
+		return
+	}
+	maxBytes := setting.RemoteMaterializeMaxBytes
+	if maxBytes <= 0 || maxBytes > setting.MaxFileBytes {
+		maxBytes = setting.MaxFileBytes
+	}
+	if response.ContentLength > maxBytes {
+		recordMediaMaterializationFailure(blob, leaseOwner, mediaservice.ErrMediaFileTooLarge)
+		return
+	}
+	if err := mediaservice.MaterializeRemoteBlob(
+		ctx, blob, leaseOwner, response.Body, response.ContentLength, response.Header.Get("Content-Type"),
+	); err != nil {
+		recordMediaMaterializationFailure(blob, leaseOwner, err)
+		return
+	}
+	// A slave Web may be the only node with this delivery implementation.
+	// Finish from the stored completion instead of depending on another poll.
+	if blob.TaskPublicID != "" && GetTaskAdaptorFunc != nil {
+		task, exists, err := model.GetByTaskId(blob.UserID, blob.TaskPublicID)
+		if err == nil && exists {
+			err = ResumeFinalizingVideoTask(ctx, task)
+		}
+		if err != nil && !errors.Is(err, ErrTaskArtifactsNotReady) {
+			common.SysLog("archived video finalization pending: " + err.Error())
+		}
+	}
+}
+
+// ApplyTaskContentAuthorization adds the server-side task credential only for
+// the exact provider task-content URL recorded in the immutable delivery
+// snapshot. It never forwards a client credential and never authorizes an
+// arbitrary remote media URL. The bool reports whether the source matched the
+// task-content contract, allowing callers to fail closed on missing custody.
+func ApplyTaskContentAuthorization(request *http.Request, blobID int64) (bool, error) {
+	if request == nil || request.URL == nil || blobID <= 0 {
+		return false, nil
+	}
+	// Never let a caller-supplied credential cross the media proxy boundary.
+	request.Header.Del("Authorization")
+	credential, err := model.GetMediaMaterializationCredential(blobID)
+	if err != nil {
+		if mediaservice.IsVideoTaskContentURL(request.URL.String()) {
+			return true, fmt.Errorf("task content credential lookup failed: %w", err)
+		}
+		return false, nil
+	}
+	if !mediaSourceMatchesAuthorizedTaskResult(request.URL.String(), credential) {
+		if mediaservice.IsVideoTaskContentURL(request.URL.String()) {
+			return true, errors.New("task content URL does not match its immutable delivery snapshot")
+		}
+		return false, nil
+	}
+	if strings.TrimSpace(credential.Credential) == "" {
+		return true, errors.New("task content credential is unavailable")
+	}
+	request.Header.Set("Authorization", "Bearer "+credential.Credential)
+	return true, nil
+}
+
+func mediaSourceMatchesAuthorizedTaskResult(source string, credential *model.MediaMaterializationCredential) bool {
+	if mediaservice.IsVideoTaskContentURL(source) {
+		return mediaSourceMatchesTaskContent(source, credential)
+	}
+	if credential == nil || strings.TrimSpace(credential.ResultURL) == "" ||
+		!sameMediaOrigin(source, credential.UpstreamBaseURL) {
+		return false
+	}
+	return exactMediaURLMatch(source, credential.ResultURL)
+}
+
+func sameMediaOrigin(left, right string) bool {
+	leftURL, leftErr := url.Parse(strings.TrimSpace(left))
+	rightURL, rightErr := url.Parse(strings.TrimSpace(right))
+	if leftErr != nil || rightErr != nil || leftURL.Scheme == "" || leftURL.Host == "" {
+		return false
+	}
+	return strings.EqualFold(leftURL.Scheme, rightURL.Scheme) &&
+		strings.EqualFold(leftURL.Host, rightURL.Host)
+}
+
+func exactMediaURLMatch(left, right string) bool {
+	leftURL, leftErr := url.Parse(strings.TrimSpace(left))
+	rightURL, rightErr := url.Parse(strings.TrimSpace(right))
+	if leftErr != nil || rightErr != nil || !sameMediaOrigin(left, right) {
+		return false
+	}
+	return path.Clean(leftURL.EscapedPath()) == path.Clean(rightURL.EscapedPath()) &&
+		leftURL.RawQuery == rightURL.RawQuery && leftURL.User == nil && rightURL.User == nil &&
+		leftURL.Fragment == "" && rightURL.Fragment == ""
+}
+
+func mediaSourceMatchesTaskContent(source string, credential *model.MediaMaterializationCredential) bool {
+	if credential == nil || strings.TrimSpace(credential.UpstreamBaseURL) == "" || strings.TrimSpace(credential.UpstreamTaskID) == "" {
+		return false
+	}
+	_, ok := mediaservice.ResolveVideoTaskContentURL(source, credential.UpstreamBaseURL, credential.UpstreamTaskID)
+	return ok
+}
+
+func recordMediaMaterializationFailure(blob *model.MediaBlob, leaseOwner string, transferErr error) {
+	if blob == nil {
+		return
+	}
+	setting := mediasetting.Get()
+	attempt := blob.MaterializeAttempts + 1
+	abandoned := attempt >= setting.RemoteMaterializeMaxAttempts
+	delay := time.Duration(setting.RemoteMaterializeInitialBackoffSeconds) * time.Second
+	for index := 1; index < attempt; index++ {
+		if delay >= time.Duration(setting.RemoteMaterializeMaxBackoffSeconds)*time.Second/2 {
+			delay = time.Duration(setting.RemoteMaterializeMaxBackoffSeconds) * time.Second
+			break
+		}
+		delay *= 2
+	}
+	maxDelay := time.Duration(setting.RemoteMaterializeMaxBackoffSeconds) * time.Second
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	message := "remote media materialization failed"
+	if transferErr != nil {
+		message = transferErr.Error()
+	}
+	if len(message) > 1000 {
+		message = message[:1000]
+	}
+	if err := model.FailMediaMaterialization(
+		blob.ID, leaseOwner, message, time.Now().Add(delay).Unix(), abandoned,
+	); err != nil {
+		common.SysLog(fmt.Sprintf("media materialization failure state update failed for %s: %s", blob.PublicID, err.Error()))
+	}
+}

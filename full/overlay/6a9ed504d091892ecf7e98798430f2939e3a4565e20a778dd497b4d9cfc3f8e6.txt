@@ -1,0 +1,149 @@
+package dto
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+// ImageAdapterConfig is opt-in per channel. Prices remain in the pricing contract.
+type ImageAdapterConfig struct {
+	Async             bool                         `json:"async,omitempty"`
+	NativeChatPricing bool                         `json:"native_chat_pricing,omitempty"`
+	Protocol          string                       `json:"protocol"`
+	ReferenceField    string                       `json:"reference_field,omitempty"`
+	MaxOutputs        int                          `json:"max_outputs,omitempty"`
+	Models            map[string]ImageAdapterModel `json:"models,omitempty"`
+}
+
+type ImageAdapterModel struct {
+	StrictDimensions bool                         `json:"strict_dimensions,omitempty"`
+	DefaultQuality   string                       `json:"default_quality"`
+	QualityOrder     []string                     `json:"quality_order"`
+	QualityAliases   map[string]string            `json:"quality_aliases"`
+	Sizes            map[string]ImageAdapterSize  `json:"sizes"`
+	TierSizes        map[string]map[string]string `json:"tier_sizes"`
+	AllowAuto        bool                         `json:"allow_auto,omitempty"`
+}
+
+type ImageAdapterSize struct {
+	Quality string `json:"quality"`
+	Aspect  string `json:"aspect"`
+}
+
+func (cfg *ImageAdapterConfig) Normalize(req ImageRequest, model string) (ImageRequest, error) {
+	if cfg == nil {
+		return req, nil
+	}
+	if cfg.MaxOutputs > 0 && req.N != nil && int(*req.N) > cfg.MaxOutputs {
+		return req, fmt.Errorf("此渠道单次最多生成%d张图片", cfg.MaxOutputs)
+	}
+	p, ok := cfg.Models[model]
+	if !ok {
+		return req, nil
+	}
+	canonical := func(v string) string {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if mapped, exists := p.QualityAliases[v]; exists {
+			return mapped
+		}
+		return v
+	}
+	rank := func(v string) int {
+		for i, q := range p.QualityOrder {
+			if q == v {
+				return i
+			}
+		}
+		return -1
+	}
+	quality := ""
+	choose := func(value string) error {
+		value = canonical(value)
+		if value == "" {
+			return nil
+		}
+		if rank(value) < 0 {
+			return fmt.Errorf("此渠道不支持图片质量档位：%s", value)
+		}
+		if rank(value) > rank(quality) {
+			quality = value
+		}
+		return nil
+	}
+	if err := choose(req.Quality); err != nil {
+		return req, err
+	}
+	size := strings.ToLower(strings.TrimSpace(req.Size))
+	aspect := "1:1"
+	if size != "" && size != "auto" {
+		if spec, exists := p.Sizes[size]; exists {
+			aspect = spec.Aspect
+			if err := choose(spec.Quality); err != nil {
+				return req, err
+			}
+		} else if rank(canonical(size)) >= 0 {
+			if err := choose(size); err != nil {
+				return req, err
+			}
+		} else if strings.Contains(size, ":") {
+			aspect = size
+		} else {
+			return req, fmt.Errorf("此渠道尚未配置图片尺寸：%s", size)
+		}
+	}
+	for _, field := range []string{"resolution", "aspect_ratio"} {
+		if raw, exists := req.Extra[field]; exists {
+			var value string
+			if err := common.Unmarshal(raw, &value); err != nil {
+				return req, fmt.Errorf("图片参数%s必须是文本", field)
+			}
+			if field == "resolution" {
+				if requested, exists := p.Sizes[strings.ToLower(strings.TrimSpace(value))]; exists {
+					value = requested.Quality
+				}
+				if sized, exists := p.Sizes[size]; p.StrictDimensions && exists && canonical(value) != "" && canonical(sized.Quality) != canonical(value) {
+					return req, fmt.Errorf("size and resolution select different configured resolution tiers")
+				}
+
+				if spec, exists := p.Sizes[strings.ToLower(value)]; exists {
+					value = spec.Quality
+				}
+				if err := choose(value); err != nil {
+					return req, err
+				}
+			} else if value != "" {
+				aspect = value
+			}
+		}
+	}
+	if sized, exists := p.Sizes[size]; p.StrictDimensions && exists && (canonical(quality) != canonical(sized.Quality) || aspect != sized.Aspect) {
+		return req, fmt.Errorf("explicit size conflicts with configured quality or aspect ratio")
+	}
+	if quality == "" {
+		quality = p.DefaultQuality
+	}
+	if _, configured := p.Sizes[size]; p.StrictDimensions && configured {
+		req.Size = size
+	} else if size == "auto" && p.AllowAuto {
+		req.Size = "auto"
+	} else {
+		resolved := p.TierSizes[quality][aspect]
+		if resolved == "" {
+			return req, fmt.Errorf("此渠道不支持%s档位的%s图片比例", quality, aspect)
+		}
+		req.Size = resolved
+	}
+	req.Quality = quality
+	// Do not mutate the client's map; another route must normalize its own input.
+	extra := make(map[string]json.RawMessage, len(req.Extra))
+	for k, v := range req.Extra {
+		if k != "resolution" && k != "aspect_ratio" {
+			extra[k] = v
+		}
+	}
+	req.Extra = extra
+	return req, nil
+}

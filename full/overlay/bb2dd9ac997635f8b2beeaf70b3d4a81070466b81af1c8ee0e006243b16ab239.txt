@@ -1,0 +1,48 @@
+package helper
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type failedStreamWriter struct {
+	*httptest.ResponseRecorder
+	err error
+}
+
+func (w *failedStreamWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestStreamDeliveryReportsDownstreamWriteErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		send func(*gin.Context) error
+		want string
+	}{
+		{"responses", func(c *gin.Context) error {
+			return ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.output_text.delta"}, `{"delta":"hello"}`)
+		}, "event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n"},
+		{"chat", func(c *gin.Context) error { return StringData(c, `{"content":"hello"}`) }, "data: {\"content\":\"hello\"}\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeErr := errors.New("client transport closed")
+			failed := &failedStreamWriter{httptest.NewRecorder(), writeErr}
+			c, _ := gin.CreateTestContext(failed)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			assert.ErrorIs(t, tc.send(c), writeErr)
+			assert.False(t, failed.Flushed)
+			recorder := httptest.NewRecorder()
+			c, _ = gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			require.NoError(t, tc.send(c))
+			assert.Equal(t, tc.want, recorder.Body.String())
+			assert.True(t, recorder.Flushed)
+		})
+	}
+}

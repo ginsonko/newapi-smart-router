@@ -1,0 +1,172 @@
+package controller
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"mime/multipart"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+// Exercises the public quote handler, signed intent verification, actual
+// relay price commitment and outgoing controls without any provider request.
+func TestImageQuoteCommitmentDimensionMatrix(t *testing.T) {
+	configureSmartRelayTestGlobals(t)
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldPricing := billing_setting.GetParameterPricingJSONString()
+	db, err := gorm.Open(sqlite.Open("file:image-dimension-commitment?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = db, db
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.ModelCapabilityCatalogHead{}))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		_, _, e := billing_setting.UpdateParameterPricingFromJSONString(oldPricing)
+		require.NoError(t, e)
+		sqlDB, _ := db.DB()
+		_ = sqlDB.Close()
+	})
+	require.NoError(t, db.Create(&model.User{Id: 902001, Username: "dimensions-fixture", Group: "default", Status: 1}).Error)
+	adapterModel := dto.ImageAdapterModel{StrictDimensions: true, DefaultQuality: "1k", QualityOrder: []string{"1k", "2k", "4k"}, Sizes: map[string]dto.ImageAdapterSize{}, TierSizes: map[string]map[string]string{}}
+	for _, p := range common.Image2DimensionPresets() {
+		adapterModel.Sizes[p.Size] = dto.ImageAdapterSize{Quality: p.Resolution, Aspect: p.AspectRatio}
+		if adapterModel.TierSizes[p.Resolution] == nil {
+			adapterModel.TierSizes[p.Resolution] = map[string]string{}
+		}
+		adapterModel.TierSizes[p.Resolution][p.AspectRatio] = p.Size
+	}
+	for _, name := range []string{"gpt-image-2", "gpt-image-2.5"} {
+		for _, adapterKind := range []string{"none", "matched", "unrelated"} {
+			var adapter *dto.ImageAdapterConfig
+			if adapterKind != "none" {
+				key := name
+				if adapterKind == "unrelated" {
+					key = "other-model"
+				}
+				adapter = &dto.ImageAdapterConfig{Models: map[string]dto.ImageAdapterModel{key: adapterModel}}
+			}
+			settings, _ := json.Marshal(dto.ChannelOtherSettings{ImageAdapter: adapter})
+			channel := model.Channel{Id: 902002, Type: constant.ChannelTypeOpenAI, Key: "local-only", Status: common.ChannelStatusEnabled, Models: name, Group: "default", OtherSettings: string(settings)}
+			require.NoError(t, db.Save(&channel).Error)
+			require.NoError(t, db.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
+			require.NoError(t, db.Create(&model.Ability{Group: "default", Model: name, ChannelId: channel.Id, Enabled: true}).Error)
+			pricing := map[string]any{"schema_version": 1, "rules": []any{map[string]any{"id": "dimension-fixture", "group": "default", "model": name, "unit": "per_request", "unit_price": "0.12", "currency": "USD", "source_unit_price": "0.1", "source_currency": "USD"}}}
+			rawPricing, _ := json.Marshal(pricing)
+			_, _, err = billing_setting.UpdateParameterPricingFromJSONString(string(rawPricing))
+			require.NoError(t, err)
+			for _, mode := range []string{"images", "image-edits"} {
+				for _, p := range common.Image2DimensionPresets() {
+					for _, resolutionKind := range []string{"absent", "tier", "pixels"} {
+						t.Run(fmt.Sprintf("%s/%s/%s/%s/%s", name, adapterKind, mode, p.Size, resolutionKind), func(t *testing.T) {
+							fields := map[string]json.RawMessage{}
+							for k, v := range map[string]string{"model": name, "prompt": "local-only", "size": p.Size, "n": "1"} {
+								fields[k], _ = json.Marshal(v)
+							}
+							if resolutionKind != "absent" {
+								v := p.Resolution
+								if resolutionKind == "pixels" {
+									v = p.Size
+								}
+								fields["resolution"], _ = json.Marshal(v)
+							}
+							quality := "standard"
+							if adapterKind == "matched" {
+								quality = p.Resolution
+							}
+							fields["quality"], _ = json.Marshal(quality)
+							req := parameterQuoteRequest{Mode: mode, Group: "default", Fields: fields}
+							if mode == "image-edits" {
+								req.Files = []parameterQuoteFile{{Field: "image", Name: "local.png", Size: 3, Type: "application/octet-stream"}}
+							}
+							quoteBody, _ := json.Marshal(req)
+							rec := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(rec)
+							c.Request = httptest.NewRequest("POST", "/api/media/parameter-quote", bytes.NewReader(quoteBody))
+							c.Request.Header.Set("Content-Type", "application/json")
+							c.Set("id", 902001)
+							MediaParameterQuote(c)
+							var response struct {
+								Success bool   `json:"success"`
+								Message string `json:"message"`
+								Data    struct {
+									Supported bool   `json:"supported"`
+									QuoteID   string `json:"quote_id"`
+								} `json:"data"`
+							}
+							require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+							require.True(t, response.Success, rec.Body.String())
+							require.True(t, response.Data.Supported)
+							claims, e := decodeParameterQuote(response.Data.QuoteID)
+							require.NoError(t, e)
+							require.Equal(t, p.Size, claims.Offer.Parameters["size"])
+							require.Equal(t, p.Resolution, claims.Offer.Parameters["resolution"])
+							path := "/v1/images/generations"
+							contentType := "application/json"
+							body, _ := json.Marshal(fields)
+							if mode == "image-edits" {
+								path = "/v1/images/edits"
+								var buf bytes.Buffer
+								w := multipart.NewWriter(&buf)
+								for k, v := range fields {
+									var s string
+									require.NoError(t, json.Unmarshal(v, &s))
+									require.NoError(t, w.WriteField(k, s))
+								}
+								part, e := w.CreateFormFile("image", "local.png")
+								require.NoError(t, e)
+								_, e = part.Write([]byte("abc"))
+								require.NoError(t, e)
+								require.NoError(t, w.Close())
+								body = buf.Bytes()
+								contentType = w.FormDataContentType()
+							}
+							submit, _ := gin.CreateTestContext(httptest.NewRecorder())
+							submit.Request = httptest.NewRequest("POST", path+"?group=default", bytes.NewReader(body))
+							submit.Request.Header.Set("Content-Type", contentType)
+							submit.Request.Header.Set(types.ParameterQuoteHeader, response.Data.QuoteID)
+							submit.Set("id", 902001)
+							require.NoError(t, verifyMediaParameterQuote(submit, mode))
+							require.Nil(t, middleware.SetupContextForSelectedChannel(submit, &channel, name))
+							extra := map[string]json.RawMessage{}
+							if v, ok := fields["resolution"]; ok {
+								extra["resolution"] = v
+							}
+							imageReq := dto.ImageRequest{Model: name, Size: p.Size, Quality: quality, N: common.GetPointer(uint(1)), Extra: extra}
+							info := &relaycommon.RelayInfo{OriginModelName: name, UsingGroup: "default", UserGroup: "default", TokenGroup: "default", RequestURLPath: path, Request: &imageReq}
+							quote, e := helper.ResolveRequestParameterPrice(submit, info)
+							require.NoError(t, e)
+							require.NotNil(t, quote)
+							require.Equal(t, claims.Offer.Quota, quote.Quota)
+							require.Equal(t, claims.Offer.Parameters, quote.Parameters)
+							wire, e := adapter.Normalize(imageReq, name)
+							require.NoError(t, e)
+							wire.Model = info.UpstreamModelName
+							info.PriceData.ParameterPricing = quote
+							require.NoError(t, helper.ValidateParameterImageRequest(info, &wire))
+							wire.Size = "999x999"
+							require.Error(t, helper.ValidateParameterImageRequest(info, &wire))
+							imageReq.Size = "999x999"
+							_, e = helper.ResolveRequestParameterPrice(submit, info)
+							require.Error(t, e, "changed dimensions cannot reuse the signed price")
+						})
+					}
+				}
+			}
+		}
+	}
+}

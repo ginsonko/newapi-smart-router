@@ -1,0 +1,235 @@
+/*
+Copyright (C) 2025 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Button,
+  Input,
+  InputNumber,
+  Modal,
+  Radio,
+  RadioGroup,
+  Space,
+  Spin,
+  Typography,
+} from '@douyinfe/semi-ui';
+import { useTranslation } from 'react-i18next';
+
+import { API, renderQuota, showError, showSuccess } from '../../helpers';
+import {
+  displayAmountToQuota,
+  quotaToDisplayAmount,
+} from '../../helpers/quota';
+
+const CommissionAdjustmentModal = ({
+  visible,
+  userId,
+  onCancel,
+  onSuccess,
+}) => {
+  const { t } = useTranslation();
+  const [summary, setSummary] = useState(null);
+  const [mode, setMode] = useState('add');
+  const [amount, setAmount] = useState('');
+  const [reason, setReason] = useState('manual_settlement');
+  const [preview, setPreview] = useState(null);
+  const [previewKey, setPreviewKey] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [applying, setApplying] = useState(false);
+
+  useEffect(() => {
+    if (!visible || !userId) return;
+    setLoading(true);
+    setPreview(null);
+    API.get(`/api/commission/admin/accounts/${userId}`)
+      .then((response) => {
+        if (!response.data.success) {
+          throw new Error(response.data.message || t('加载佣金账户失败'));
+        }
+        setSummary(response.data.data);
+      })
+      .catch((error) => showError(error.message || t('加载佣金账户失败')))
+      .finally(() => setLoading(false));
+  }, [visible, userId, t]);
+
+  const amountQuota = displayAmountToQuota(amount);
+  const requestKey = `${mode}:${amountQuota}:${reason}:${summary?.account_version || 0}`;
+  const valid =
+    amountQuota >= 0 &&
+    (mode === 'set' || amountQuota > 0) &&
+    reason.trim().length > 0;
+  const request = useMemo(
+    () => ({
+      mode,
+      value_quota: amountQuota,
+      expected_version: summary?.account_version || 0,
+      reason_code: reason.trim(),
+    }),
+    [amountQuota, mode, reason, summary?.account_version],
+  );
+
+  const runPreview = async () => {
+    if (!valid) return;
+    setLoading(true);
+    try {
+      const response = await API.post(
+        `/api/commission/admin/accounts/${userId}/adjust/preview`,
+        request,
+      );
+      if (!response.data.success) {
+        throw new Error(response.data.message || t('预览佣金调整失败'));
+      }
+      setPreview(response.data.data);
+      setPreviewKey(requestKey);
+    } catch (error) {
+      showError(error.message || t('预览佣金调整失败'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const apply = async () => {
+    if (!preview || previewKey !== requestKey) return;
+    setApplying(true);
+    try {
+      const idempotency =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const response = await API.post(
+        `/api/commission/admin/accounts/${userId}/adjust`,
+        request,
+        { headers: { 'Idempotency-Key': `commission-classic-${idempotency}` } },
+      );
+      if (!response.data.success) {
+        throw new Error(response.data.message || t('调整佣金失败'));
+      }
+      showSuccess(t('佣金调整成功'));
+      onCancel();
+      onSuccess();
+    } catch (error) {
+      showError(error.message || t('调整佣金失败'));
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      title={t('调整佣金')}
+      onCancel={onCancel}
+      footer={
+        <Space>
+          <Button onClick={onCancel}>{t('取消')}</Button>
+          <Button onClick={runPreview} disabled={!valid} loading={loading}>
+            {t('预览')}
+          </Button>
+          <Button
+            type='primary'
+            theme='solid'
+            onClick={apply}
+            disabled={!preview || previewKey !== requestKey}
+            loading={applying}
+          >
+            {t('确认调整')}
+          </Button>
+        </Space>
+      }
+      centered
+    >
+      <Spin spinning={loading && !summary}>
+        <div className='space-y-4'>
+          <div className='grid grid-cols-2 gap-3'>
+            <div className='rounded-lg border p-3'>
+              <Typography.Text type='tertiary' size='small'>
+                {t('可用佣金')}
+              </Typography.Text>
+              <div className='font-semibold mt-1'>
+                {renderQuota(summary?.commission_available_quota || 0)}
+              </div>
+            </div>
+            <div className='rounded-lg border p-3'>
+              <Typography.Text type='tertiary' size='small'>
+                {t('普通余额')}
+              </Typography.Text>
+              <div className='font-semibold mt-1'>
+                {renderQuota(summary?.ordinary_available_quota || 0)}
+              </div>
+            </div>
+          </div>
+          <RadioGroup
+            type='button'
+            value={mode}
+            onChange={(event) => {
+              setMode(event.target.value);
+              setPreview(null);
+            }}
+          >
+            <Radio value='add'>{t('增加')}</Radio>
+            <Radio value='subtract'>{t('减少')}</Radio>
+            <Radio value='set'>{t('覆盖')}</Radio>
+          </RadioGroup>
+          <div>
+            <div className='text-sm mb-1'>{t('金额')}</div>
+            <InputNumber
+              value={amount}
+              min={0}
+              precision={6}
+              step={0.000001}
+              onChange={(value) => {
+                setAmount(value);
+                setPreview(null);
+              }}
+              placeholder={String(
+                quotaToDisplayAmount(summary?.commission_available_quota || 0),
+              )}
+              style={{ width: '100%' }}
+            />
+          </div>
+          <div>
+            <div className='text-sm mb-1'>{t('原因代码')}</div>
+            <Input
+              value={reason}
+              maxLength={64}
+              onChange={(value) => {
+                setReason(value);
+                setPreview(null);
+              }}
+            />
+          </div>
+          {preview && (
+            <div className='rounded-lg border p-3'>
+              <div className='flex justify-between'>
+                <span>{t('调整后佣金')}</span>
+                <strong>{renderQuota(preview.account.available_quota)}</strong>
+              </div>
+              <div className='flex justify-between mt-2'>
+                <span>{t('普通余额（不受影响）')}</span>
+                <strong>{renderQuota(preview.user_quota)}</strong>
+              </div>
+            </div>
+          )}
+        </div>
+      </Spin>
+    </Modal>
+  );
+};
+
+export default CommissionAdjustmentModal;

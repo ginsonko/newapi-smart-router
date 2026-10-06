@@ -1,0 +1,291 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type imageRouteAtomicFixture struct {
+	database    *gorm.DB
+	path        string
+	job         *ImageRouteJob
+	root        *Task
+	child       *Task
+	bindings    []TaskMediaInputBinding
+	snapshot    *TaskDeliverySnapshot
+	reservation *QuotaReservation
+}
+
+func setupImageRouteAtomicTest(test *testing.T, tokenID int) *imageRouteAtomicFixture {
+	test.Helper()
+	previousDB := DB
+	path := filepath.Join(test.TempDir(), "route-atomic.sqlite")
+	database, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	require.NoError(test, err)
+	connection, err := database.DB()
+	require.NoError(test, err)
+	connection.SetMaxOpenConns(1)
+	DB = database
+	test.Cleanup(func() {
+		DB = previousDB
+		_ = connection.Close()
+	})
+	require.NoError(test, database.AutoMigrate(&User{}, &Task{}, &TaskBillingReceipt{}, &ImageRouteJob{},
+		&QuotaReservation{}, &MediaBlob{}, &TaskMediaInput{}, &TaskDeliverySnapshot{}))
+	job, root := newImageRouteJobTestInput(test)
+	job.TokenID = tokenID
+	job.QuoteSnapshotJSON = `{"amount":"0.02"}`
+	job.CommitmentJSON = `{"amount":"0.02"}`
+	require.NoError(test, database.Create(&User{Id: job.UserID, Username: "route-owner", AffCode: "route-owner", Quota: 900}).Error)
+	require.NoError(test, CreateImageRouteJob(job, root))
+	claimed, won, err := ClaimImageRouteJob(job.ID, job.Version)
+	require.NoError(test, err)
+	require.True(test, won)
+	require.NoError(test, RecordImageRouteJobChannel(claimed.ID, 73))
+	job = reloadImageRouteJobTest(test, job)
+	reservation := &QuotaReservation{
+		ReservationId: "route-reservation", RequestId: "route-request", UserId: job.UserID, TokenId: job.TokenID,
+		FundingSource: QuotaReservationFundingWallet, Status: QuotaReservationStatusActive, ReservedQuota: 100,
+	}
+	require.NoError(test, database.Create(reservation).Error)
+	child := &Task{
+		TaskID: "route-child", UserId: job.UserID, ChannelId: 73, Platform: "openai_image",
+		Status: TaskStatusNotStart, Progress: "0%", Quota: 100, BillingReservationID: reservation.ReservationId,
+		PrivateData: TaskPrivateData{TokenId: job.TokenID, BillingRequestID: reservation.RequestId,
+			BillingSource: QuotaReservationFundingWallet, ImageTask: &ImageTaskContext{RouteJobID: job.ID, ResponseFormat: "url"}},
+		Data: []byte(`{}`),
+	}
+	blob := &MediaBlob{PublicID: "route-reference", UserID: job.UserID, Status: MediaBlobStatusReady, TaskLeaseCount: 1}
+	require.NoError(test, database.Create(blob).Error)
+	return &imageRouteAtomicFixture{
+		database: database, path: path, job: job, root: root, child: child, reservation: reservation,
+		bindings: []TaskMediaInputBinding{{MediaBlobID: blob.ID, Type: "image", Role: "reference"}},
+		snapshot: &TaskDeliverySnapshot{ChannelID: 73, UpstreamBaseURL: "https://provider.invalid"},
+	}
+}
+
+func (fixture *imageRouteAtomicFixture) assertRolledBack(test *testing.T) {
+	test.Helper()
+	for _, table := range []any{&TaskBillingReceipt{}, &TaskMediaInput{}, &TaskDeliverySnapshot{}} {
+		var count int64
+		require.NoError(test, fixture.database.Model(table).Count(&count).Error)
+		assert.Zero(test, count, "%T must roll back", table)
+	}
+	var taskCount int64
+	require.NoError(test, fixture.database.Model(&Task{}).Count(&taskCount).Error)
+	assert.EqualValues(test, 1, taskCount)
+	actual := reloadImageRouteJobTest(test, fixture.job)
+	assert.Equal(test, fixture.job.State, actual.State)
+	assert.Equal(test, fixture.job.CurrentTaskID, actual.CurrentTaskID)
+	assert.Equal(test, fixture.job.Version, actual.Version)
+	assert.Equal(test, fixture.job.QuoteSnapshotJSON, actual.QuoteSnapshotJSON)
+	assert.Equal(test, fixture.job.CommitmentJSON, actual.CommitmentJSON)
+	var reservation QuotaReservation
+	require.NoError(test, fixture.database.First(&reservation, fixture.reservation.Id).Error)
+	assert.Equal(test, QuotaReservationStatusActive, reservation.Status)
+	assert.Equal(test, 100, reservation.ReservedQuota)
+	var user User
+	require.NoError(test, fixture.database.First(&user, fixture.job.UserID).Error)
+	assert.Equal(test, 900, user.Quota)
+}
+
+func TestImageRouteAtomicPersistBindsWithReceiptAndSurvivesReopen(test *testing.T) {
+	for _, tokenID := range []int{0, 72} {
+		test.Run(fmt.Sprintf("token-%d", tokenID), func(test *testing.T) {
+			fixture := setupImageRouteAtomicTest(test, tokenID)
+			require.NoError(test, InsertTaskWithMediaInputsAndSnapshot(fixture.child, fixture.bindings, fixture.snapshot))
+			connection, err := fixture.database.DB()
+			require.NoError(test, err)
+			require.NoError(test, connection.Close())
+			reopened, err := gorm.Open(sqlite.Open(fixture.path), &gorm.Config{})
+			require.NoError(test, err)
+			reopenedConnection, err := reopened.DB()
+			require.NoError(test, err)
+			reopenedConnection.SetMaxOpenConns(1)
+			test.Cleanup(func() { require.NoError(test, reopenedConnection.Close()) })
+			DB = reopened
+			waiting := reloadImageRouteJobTest(test, fixture.job)
+			assert.Equal(test, ImageRouteJobWaiting, waiting.State)
+			assert.Equal(test, fixture.child.TaskID, waiting.CurrentTaskID)
+			assert.Equal(test, fixture.job.Version+1, waiting.Version)
+			assert.Equal(test, fixture.job.QuoteSnapshotJSON, waiting.QuoteSnapshotJSON)
+			assert.Equal(test, fixture.job.CommitmentJSON, waiting.CommitmentJSON)
+			child, found, err := GetByTaskId(waiting.UserID, waiting.CurrentTaskID)
+			require.NoError(test, err)
+			require.True(test, found)
+			assert.Equal(test, fixture.job.ID, child.PrivateData.ImageTask.RouteJobID)
+			assert.Empty(test, child.PrivateData.UpstreamTaskID)
+			assert.Equal(test, TaskStatusNotStart, child.Status)
+			receipt, err := GetTaskBillingReceipt(child.ID)
+			require.NoError(test, err)
+			assert.Equal(test, TaskBillingReceiptSubmissionPending, receipt.State)
+			assert.Equal(test, child.TaskID, waiting.CurrentTaskID)
+			assert.Equal(test, 100, receipt.PreConsumedQuota)
+			assert.Equal(test, 100, receipt.SubmissionQuota)
+			assert.Zero(test, receipt.AppliedQuota)
+			var snapshot TaskDeliverySnapshot
+			require.NoError(test, reopened.Where("task_row_id = ?", child.ID).First(&snapshot).Error)
+			assert.Equal(test, child.ID, snapshot.TaskRowID)
+			var input TaskMediaInput
+			require.NoError(test, reopened.Where("task_row_id = ?", child.ID).First(&input).Error)
+			assert.Equal(test, fixture.bindings[0].MediaBlobID, input.MediaBlobID)
+			require.NoError(test, BindImageRouteJobTask(waiting.ID, child.TaskID))
+			assert.Equal(test, waiting.Version, reloadImageRouteJobTest(test, waiting).Version)
+			_, won, err := ClaimImageRouteJob(waiting.ID, waiting.Version)
+			require.NoError(test, err)
+			assert.False(test, won)
+			resumed, err := ResumeImageRouteJob(waiting.ID, waiting.Version)
+			require.NoError(test, err)
+			assert.False(test, resumed)
+			require.NoError(test, reopened.Model(&Task{}).Where("id = ?", child.ID).Update("status", TaskStatusUnknown).Error)
+			resumed, err = ResumeImageRouteJob(waiting.ID, waiting.Version)
+			require.NoError(test, err)
+			assert.False(test, resumed)
+			var root Task
+			require.NoError(test, reopened.First(&root, fixture.root.ID).Error)
+			assert.Equal(test, fixture.job.PublicTaskID, root.TaskID)
+			assert.EqualValues(test, TaskStatusSubmitted, root.Status)
+			assert.Zero(test, root.Quota)
+			assert.EqualValues(test, 253402300799, root.NextPollAt)
+		})
+	}
+}
+
+func TestImageRouteAtomicPersistWithoutDeliverySnapshotStillBinds(test *testing.T) {
+	fixture := setupImageRouteAtomicTest(test, 72)
+	require.NoError(test, InsertTaskWithMediaInputs(fixture.child, nil))
+	waiting := reloadImageRouteJobTest(test, fixture.job)
+	assert.Equal(test, ImageRouteJobWaiting, waiting.State)
+	assert.Equal(test, fixture.child.TaskID, waiting.CurrentTaskID)
+	require.NoError(test, BindImageRouteJobTask(waiting.ID, fixture.child.TaskID))
+	assert.Equal(test, waiting.Version, reloadImageRouteJobTest(test, waiting).Version)
+}
+
+func TestImageRouteAtomicBindFailureRollsBackEveryTaskWrite(test *testing.T) {
+	for _, phase := range []string{"before", "after", "lost-cas"} {
+		test.Run(phase, func(test *testing.T) {
+			fixture := setupImageRouteAtomicTest(test, 72)
+			sentinel := errors.New("injected bind failure")
+			observed := false
+			callback := func(tx *gorm.DB) {
+				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "image_route_jobs" {
+					return
+				}
+				observed = true
+				if phase == "lost-cas" {
+					tx.Statement.AddClause(clause.Where{Exprs: []clause.Expression{clause.Eq{Column: "id", Value: -1}}})
+				} else {
+					tx.AddError(sentinel)
+				}
+			}
+			if phase == "after" {
+				require.NoError(test, fixture.database.Callback().Update().After("gorm:update").Register("route_bind_failure", callback))
+			} else {
+				require.NoError(test, fixture.database.Callback().Update().Before("gorm:update").Register("route_bind_failure", callback))
+			}
+			err := InsertTaskWithMediaInputsAndSnapshot(fixture.child, fixture.bindings, fixture.snapshot)
+			require.True(test, observed)
+			if phase == "lost-cas" {
+				require.ErrorIs(test, err, ErrImageRouteJobConflict)
+			} else {
+				require.ErrorIs(test, err, sentinel)
+			}
+			fixture.assertRolledBack(test)
+		})
+	}
+}
+
+func TestImageRouteAtomicSnapshotFailureRollsBackBinding(test *testing.T) {
+	fixture := setupImageRouteAtomicTest(test, 72)
+	sentinel := errors.New("injected snapshot failure")
+	observed := false
+	require.NoError(test, fixture.database.Callback().Create().Before("gorm:create").Register("route_snapshot_failure", func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "task_delivery_snapshots" {
+			return
+		}
+		observed = true
+		var job ImageRouteJob
+		require.NoError(test, tx.Session(&gorm.Session{NewDB: true}).First(&job, fixture.job.ID).Error)
+		assert.Equal(test, ImageRouteJobWaiting, job.State)
+		assert.Equal(test, fixture.child.TaskID, job.CurrentTaskID)
+		tx.AddError(sentinel)
+	}))
+	require.ErrorIs(test, InsertTaskWithMediaInputsAndSnapshot(fixture.child, fixture.bindings, fixture.snapshot), sentinel)
+	require.True(test, observed)
+	fixture.assertRolledBack(test)
+}
+
+func TestImageRouteAtomicRejectsUnownedOrInactiveJob(test *testing.T) {
+	for _, condition := range []string{"foreign-owner", "foreign-token", "missing-job", "ready", "waiting", "unknown"} {
+		test.Run(condition, func(test *testing.T) {
+			fixture := setupImageRouteAtomicTest(test, 72)
+			switch condition {
+			case "foreign-owner":
+				fixture.job.UserID++
+				require.NoError(test, fixture.database.Model(&ImageRouteJob{}).Where("id = ?", fixture.job.ID).Update("user_id", fixture.job.UserID).Error)
+			case "foreign-token":
+				fixture.job.TokenID++
+				require.NoError(test, fixture.database.Model(&ImageRouteJob{}).Where("id = ?", fixture.job.ID).Update("token_id", fixture.job.TokenID).Error)
+			case "missing-job":
+				fixture.child.PrivateData.ImageTask.RouteJobID++
+			default:
+				fixture.job.State = condition
+				require.NoError(test, fixture.database.Model(&ImageRouteJob{}).Where("id = ?", fixture.job.ID).Update("state", condition).Error)
+			}
+			require.Error(test, InsertTaskWithMediaInputsAndSnapshot(fixture.child, fixture.bindings, fixture.snapshot))
+			if condition == "foreign-owner" {
+				fixture.job.UserID--
+				require.NoError(test, fixture.database.Model(&ImageRouteJob{}).Where("id = ?", fixture.job.ID).Update("user_id", fixture.job.UserID).Error)
+			}
+			fixture.assertRolledBack(test)
+		})
+	}
+}
+
+func TestImageRouteAtomicSecondChildCannotReplaceFirst(test *testing.T) {
+	fixture := setupImageRouteAtomicTest(test, 72)
+	require.NoError(test, InsertTaskWithMediaInputs(fixture.child, nil))
+	waiting := reloadImageRouteJobTest(test, fixture.job)
+	duplicate := *fixture.child
+	duplicate.ID = 0
+	require.ErrorIs(test, InsertTaskWithMediaInputs(&duplicate, nil), ErrImageTaskExists)
+	other := *fixture.child
+	other.ID, other.TaskID, other.BillingReservationID = 0, "second-child", ""
+	other.PrivateData.BillingSource = ""
+	require.ErrorIs(test, InsertTaskWithMediaInputs(&other, nil), ErrImageRouteJobConflict)
+	actual := reloadImageRouteJobTest(test, fixture.job)
+	assert.Equal(test, waiting.CurrentTaskID, actual.CurrentTaskID)
+	assert.Equal(test, waiting.Version, actual.Version)
+	var taskCount, receiptCount int64
+	require.NoError(test, fixture.database.Model(&Task{}).Count(&taskCount).Error)
+	require.NoError(test, fixture.database.Model(&TaskBillingReceipt{}).Count(&receiptCount).Error)
+	assert.EqualValues(test, 2, taskCount)
+	assert.EqualValues(test, 1, receiptCount)
+}
+
+func TestImageRouteAtomicUnrelatedTasksDoNotRequireJobTable(test *testing.T) {
+	for _, imageTask := range []bool{false, true} {
+		test.Run(fmt.Sprint(imageTask), func(test *testing.T) {
+			fixture := setupImageRouteAtomicTest(test, 72)
+			require.NoError(test, fixture.database.Migrator().DropTable(&ImageRouteJob{}))
+			if imageTask {
+				fixture.child.PrivateData.ImageTask.RouteJobID = 0
+			} else {
+				fixture.child.PrivateData.ImageTask = nil
+				fixture.child.Platform = "video"
+			}
+			require.NoError(test, InsertTaskWithMediaInputsAndSnapshot(fixture.child, fixture.bindings, fixture.snapshot))
+			receipt, err := GetTaskBillingReceipt(fixture.child.ID)
+			require.NoError(test, err)
+			assert.Equal(test, 100, receipt.SubmissionQuota)
+		})
+	}
+}

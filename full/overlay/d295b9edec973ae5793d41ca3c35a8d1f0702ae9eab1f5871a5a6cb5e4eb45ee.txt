@@ -1,0 +1,94 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	"gorm.io/gorm"
+)
+
+// Dedicated analytics workers skip the master-only global AutoMigrate path.
+// Keep this narrow, additive migration available to every process role.
+var routeAnalyticsSchemaProcessLock sync.Mutex
+
+const (
+	routeAnalyticsSchemaMySQLLockName = "newapi_route_analytics_schema_v1"
+	routeAnalyticsSchemaPostgresLock  = int64(0x4e41504952414e41)
+)
+
+var routeAnalyticsSchemaModels = []any{
+	&RouteAnalyticsDimensionV1{}, &RouteAnalyticsObservationV1{}, &RouteAnalyticsBucketV1{},
+	&KeyUsageAnalyticsBucketV1{}, &RouteAnalyticsHistoryV1{}, &RouteAnalyticsWorkerStateV1{},
+}
+
+// EnsureRouteAnalyticsSchema creates missing analytics tables and adds only
+// missing columns. It is idempotent and safe on Web and Worker startup.
+func EnsureRouteAnalyticsSchema(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("route analytics schema migration requires a database")
+	}
+	routeAnalyticsSchemaProcessLock.Lock()
+	defer routeAnalyticsSchemaProcessLock.Unlock()
+	migrate := func(locked *gorm.DB) error {
+		for _, item := range routeAnalyticsSchemaModels {
+			if !locked.Migrator().HasTable(item) {
+				if err := locked.Migrator().CreateTable(item); err != nil {
+					return fmt.Errorf("create route analytics table: %w", err)
+				}
+			}
+		}
+		if !locked.Migrator().HasColumn(&KeyUsageAnalyticsBucketV1{}, "Group") {
+			if err := locked.Migrator().AddColumn(&KeyUsageAnalyticsBucketV1{}, "Group"); err != nil {
+				return fmt.Errorf("add key analytics group column: %w", err)
+			}
+		}
+		if !locked.Migrator().HasIndex(&KeyUsageAnalyticsBucketV1{}, "Group") {
+			if err := locked.Migrator().CreateIndex(&KeyUsageAnalyticsBucketV1{}, "Group"); err != nil {
+				return fmt.Errorf("create key analytics group index: %w", err)
+			}
+		}
+		return verifyRouteAnalyticsSchema(locked)
+	}
+	switch db.Dialector.Name() {
+	case "mysql":
+		return db.Connection(func(locked *gorm.DB) error {
+			var acquired int
+			if err := locked.Raw("SELECT GET_LOCK(?, 30)", routeAnalyticsSchemaMySQLLockName).Scan(&acquired).Error; err != nil {
+				return fmt.Errorf("acquire route analytics schema lock: %w", err)
+			}
+			if acquired != 1 {
+				return errors.New("timed out acquiring route analytics schema lock")
+			}
+			defer func() {
+				var released int
+				_ = locked.Raw("SELECT RELEASE_LOCK(?)", routeAnalyticsSchemaMySQLLockName).Scan(&released).Error
+			}()
+			return migrate(locked)
+		})
+	case "postgres":
+		return db.Connection(func(locked *gorm.DB) error {
+			if err := locked.Exec("SELECT pg_advisory_lock(?)", routeAnalyticsSchemaPostgresLock).Error; err != nil {
+				return fmt.Errorf("acquire route analytics schema lock: %w", err)
+			}
+			defer func() { _ = locked.Exec("SELECT pg_advisory_unlock(?)", routeAnalyticsSchemaPostgresLock).Error }()
+			return migrate(locked)
+		})
+	case "sqlite":
+		return db.Transaction(migrate)
+	default:
+		return migrate(db)
+	}
+}
+
+func verifyRouteAnalyticsSchema(db *gorm.DB) error {
+	for _, item := range routeAnalyticsSchemaModels {
+		if !db.Migrator().HasTable(item) {
+			return errors.New("route analytics table is unavailable after migration")
+		}
+	}
+	if !db.Migrator().HasColumn(&KeyUsageAnalyticsBucketV1{}, "Group") {
+		return errors.New("key analytics group column is unavailable after migration")
+	}
+	return nil
+}

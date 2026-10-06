@@ -1,0 +1,28 @@
+package controller
+
+import (
+	"context"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestMediaProbeExecutorRejectsBeforeRelay(t *testing.T) {
+	for _, request := range []service.SmartRouteProbeExecutionRequest{
+		{CanonicalModel: "gpt-image-2", Endpoint: service.SmartEndpointResponses},
+		{CanonicalModel: "custom-alias", Endpoint: service.SmartEndpointChat, Route: smartrouter.CertifiedRoute{UpstreamModel: "gpt-image-2-chain"}},
+		{CanonicalModel: "veo-3", Endpoint: service.SmartEndpointMessages},
+		{CanonicalModel: "custom-video", Endpoint: service.SmartEndpointResponses, Route: smartrouter.CertifiedRoute{PassiveRecovery: true}},
+	} {
+		result := NewSmartRouteRelayProbeExecutor().ExecuteSmartRouteProbe(context.Background(), request)
+		require.Equal(t, smartrouter.OutcomeUserRejected, result.Outcome.Outcome)
+		require.False(t, result.Outcome.AffectsRouteHealth)
+		require.False(t, result.Completed)
+	}
+	for _, endpoint := range []string{service.SmartEndpointChat, service.SmartEndpointCompletions, service.SmartEndpointResponses, service.SmartEndpointMessages} {
+		_, _, payload, ok := smartRouteProbeContract(endpoint, "gpt-image-2")
+		require.False(t, ok)
+		require.Nil(t, payload)
+	}
+}

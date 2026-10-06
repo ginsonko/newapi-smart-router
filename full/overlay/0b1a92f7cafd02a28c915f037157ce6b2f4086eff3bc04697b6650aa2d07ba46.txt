@@ -1,0 +1,2179 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+const (
+	SmartRouteUserStatusSchemaVersion = 8
+	smartRouteStatusFreshMS           = int64(5 * time.Minute / time.Millisecond)
+	smartRouteStatusRecentMS          = int64(30 * time.Minute / time.Millisecond)
+	// The status model index is a single privacy-safe snapshot. A bounded
+	// 1000-row page covers the current catalog without frontend fan-out while
+	// remaining far below the physical-route count.
+	smartRouteStatusMaxPageSize = 1000
+)
+
+var (
+	ErrSmartRouteStatusModelRequired    = errors.New("smart router status requires a model")
+	ErrSmartRouteStatusEndpointRequired = errors.New("smart router status requires an endpoint when the model has multiple endpoint contracts")
+)
+
+type SmartRouteUserStatusRequest struct {
+	TokenID              int
+	UserGroup            string
+	Policy               smartrouter.Policy
+	Model                string
+	Endpoint             string
+	Group                string
+	Status               string
+	RequiredCapabilities uint64
+	EstimatedContext     int
+	DeadlineBudgetMS     int64
+	IncludeExcluded      bool
+	Page                 int
+	PageSize             int
+}
+
+type SmartRouteStatusAssumptions struct {
+	PreferenceSnapshot   bool   `json:"preference_snapshot"`
+	BasicRequestProfile  bool   `json:"basic_request_profile"`
+	NoSessionAffinity    bool   `json:"no_session_affinity"`
+	NoPreviousAttempts   bool   `json:"no_previous_attempts"`
+	CapacityPointInTime  bool   `json:"capacity_point_in_time"`
+	EndpointInferred     bool   `json:"endpoint_inferred"`
+	ReplayClass          string `json:"replay_class"`
+	RequiredCapabilities uint64 `json:"required_capabilities"`
+	EstimatedContext     int    `json:"estimated_context"`
+	DeadlineBudgetMS     int64  `json:"deadline_budget_ms"`
+}
+
+type SmartRouteStatusEffectivePolicy struct {
+	Strategy                     smartrouter.Strategy        `json:"strategy"`
+	RecoveryProfile              smartrouter.RecoveryProfile `json:"recovery_profile"`
+	MaxEffectiveRatioPPM         int64                       `json:"max_effective_ratio_ppm"`
+	FailureThreshold             int                         `json:"failure_threshold"`
+	AttemptLimitEnabled          bool                        `json:"attempt_limit_enabled"`
+	MaxAttempts                  int                         `json:"max_attempts"`
+	QueueMode                    smartrouter.QueueMode       `json:"queue_mode"`
+	TTFTEnabled                  bool                        `json:"ttft_enabled"`
+	AffinityEnabled              bool                        `json:"affinity_enabled"`
+	ActualInputCostRanking       bool                        `json:"actual_input_cost_ranking"`
+	ActualInputCostSnapshotReady bool                        `json:"actual_input_cost_snapshot_ready"`
+}
+
+// SmartRouteStatusRankingCost is a privacy-safe projection of the ordering
+// evidence used for one physical route. Hidden cold-start priors deliberately
+// omit numeric cache and cost fields.
+type SmartRouteStatusRankingCost struct {
+	RankingCostBasis                 string   `json:"ranking_cost_basis,omitempty"`
+	RankingCostSource                string   `json:"ranking_cost_source,omitempty"`
+	RankingCostUsed                  bool     `json:"ranking_cost_used"`
+	RankingCostComparison            string   `json:"ranking_cost_comparison,omitempty"`
+	RoutingCacheWeightPPM            *int64   `json:"routing_cache_weight_ppm,omitempty"`
+	PredictedInputCostPPM            *int64   `json:"predicted_input_cost_ppm,omitempty"`
+	PredictedInputUSDPerMillion      *float64 `json:"predicted_input_usd_per_million,omitempty"`
+	RecentCacheRatePPM               *int64   `json:"recent_cache_rate_ppm,omitempty"`
+	HistoricalCacheRatePPM           *int64   `json:"historical_cache_rate_ppm,omitempty"`
+	EstimatedInputCostPPM            *int64   `json:"estimated_input_cost_ppm,omitempty"`
+	EstimatedInputUSDPerMillion      *float64 `json:"estimated_input_usd_per_million,omitempty"`
+	ActualInputCostSamples           int64    `json:"actual_input_cost_samples,omitempty"`
+	ActualInputCostLastObservedAtMS  int64    `json:"actual_input_cost_last_observed_at_ms,omitempty"`
+	ActualInputCostHistoricalSamples int64    `json:"actual_input_cost_historical_samples,omitempty"`
+	ActualInputCostConfidencePPM     int64    `json:"actual_input_cost_confidence_ppm,omitempty"`
+	ActualInputCostEstimatorVersion  string   `json:"actual_input_cost_estimator_version,omitempty"`
+}
+
+type smartRouteStatusRankingEvidence struct {
+	SmartRouteStatusRankingCost
+	ScorePPM        int64
+	ComparisonClass string
+	Comparable      bool
+}
+
+type SmartRouteUserPreference struct {
+	SmartRouteStatusRankingCost
+	Group             string                    `json:"group"`
+	EffectiveRatioPPM int64                     `json:"effective_ratio_ppm"`
+	PriceKnown        bool                      `json:"price_known"`
+	Price             smartrouter.RoutePrice    `json:"price"`
+	Admission         smartrouter.AdmissionKind `json:"admission"`
+	DecisionReason    string                    `json:"decision_reason"`
+	PlanKind          smartrouter.PlanKind      `json:"plan_kind"`
+	rankingEvidence   smartRouteStatusRankingEvidence
+}
+
+type SmartRouteStatusCoverageCandidate struct {
+	SmartRouteStatusRankingCost
+	Position          int                       `json:"position"`
+	Group             string                    `json:"group"`
+	EffectiveRatioPPM int64                     `json:"effective_ratio_ppm"`
+	Price             smartrouter.RoutePrice    `json:"price"`
+	Admission         smartrouter.AdmissionKind `json:"admission"`
+	Selected          bool                      `json:"selected"`
+}
+
+// SmartRouteStatusCoverage is privacy-safe redundancy evidence for one
+// model-endpoint contract. It exposes only user-visible groups and aggregate
+// failure-domain counts; physical routes and upstream identities stay private.
+type SmartRouteStatusCoverage struct {
+	Target                 int                                 `json:"target"`
+	CandidateRoutes        int                                 `json:"candidate_routes"`
+	DistinctFailureDomains int                                 `json:"distinct_failure_domains"`
+	Missing                int                                 `json:"missing"`
+	Complete               bool                                `json:"complete"`
+	Candidates             []SmartRouteStatusCoverageCandidate `json:"candidates"`
+}
+
+type SmartRouteStatusSummary struct {
+	Groups                   int `json:"groups"`
+	CheaperGroups            int `json:"cheaper_groups"`
+	CheaperAvailableGroups   int `json:"cheaper_available_groups"`
+	CheaperRecoveringGroups  int `json:"cheaper_recovering_groups"`
+	CheaperNeedsReviewGroups int `json:"cheaper_needs_review_groups"`
+	HealthyGroups            int `json:"healthy_groups"`
+	RecoveringGroups         int `json:"recovering_groups"`
+	NeedsReviewGroups        int `json:"needs_review_groups"`
+	PendingSampleGroups      int `json:"pending_sample_groups"`
+}
+
+type SmartRouteStatusEvidence struct {
+	SuccessRate          *float64                   `json:"success_rate"`
+	TotalSuccesses       uint64                     `json:"total_successes"`
+	TotalHardFailures    uint64                     `json:"total_hard_failures"`
+	RealSuccesses        uint64                     `json:"real_successes"`
+	RealHardFailures     uint64                     `json:"real_hard_failures"`
+	ProbeSuccesses       uint64                     `json:"probe_successes"`
+	TotalProbeFailures   uint64                     `json:"total_probe_failures"`
+	CurrentProbeFailures int                        `json:"current_probe_failures"`
+	ReliabilityPPM       int64                      `json:"reliability_ppm"`
+	SampleCount          uint64                     `json:"sample_count"`
+	Freshness            string                     `json:"freshness"`
+	Confidence           string                     `json:"confidence"`
+	Historical           bool                       `json:"historical"`
+	LastObservedAtMS     int64                      `json:"last_observed_at_ms,omitempty"`
+	LastRealSuccessAtMS  int64                      `json:"last_real_success_at_ms,omitempty"`
+	LastRealFailureAtMS  int64                      `json:"last_real_failure_at_ms,omitempty"`
+	LastRealOutcome      smartrouter.QualityOutcome `json:"last_real_outcome,omitempty"`
+	LastProbeAtMS        int64                      `json:"last_probe_at_ms,omitempty"`
+	LastProbeOutcome     smartrouter.QualityOutcome `json:"last_probe_outcome,omitempty"`
+}
+
+type SmartRouteStatusRecovery struct {
+	ProbeState                   string `json:"probe_state"`
+	NextAction                   string `json:"next_action"`
+	NextActionActor              string `json:"next_action_actor"`
+	NextActionAtMS               int64  `json:"next_action_at_ms,omitempty"`
+	AutomaticCandidateReentry    string `json:"automatic_candidate_reentry"`
+	CanBecomePreferredAfterEntry string `json:"can_become_preferred_after_entry"`
+	RequiresAdminReview          bool   `json:"requires_admin_review"`
+}
+
+type SmartRouteStatusConstraints struct {
+	GroupAuthorized       bool `json:"group_authorized"`
+	GroupSelected         bool `json:"group_selected"`
+	WithinKeyPriceLimit   bool `json:"within_key_price_limit"`
+	RuntimeExcluded       bool `json:"runtime_excluded"`
+	EndpointSupported     bool `json:"endpoint_supported"`
+	CapabilitiesSupported bool `json:"capabilities_supported"`
+	ContextSupported      bool `json:"context_supported"`
+	TTFTAcceptable        bool `json:"ttft_acceptable"`
+}
+
+// SmartRouteUserStatusItem is one user-safe model + endpoint + group row. It
+// intentionally contains no channel, route, provider, upstream, credential,
+// or raw error identifiers.
+type SmartRouteUserStatusItem struct {
+	SmartRouteStatusRankingCost
+	DetailID                 string                      `json:"detail_id,omitempty"`
+	ContractID               string                      `json:"contract_id,omitempty"`
+	Model                    string                      `json:"model"`
+	Group                    string                      `json:"group"`
+	Endpoint                 string                      `json:"endpoint"`
+	EffectiveRatioPPM        int64                       `json:"effective_ratio_ppm"`
+	PriceKnown               bool                        `json:"price_known"`
+	ModelPriceKnown          bool                        `json:"model_price_known"`
+	Price                    *smartrouter.RoutePrice     `json:"price,omitempty"`
+	PriceComparison          string                      `json:"price_comparison,omitempty"`
+	PriceComparisonReason    string                      `json:"price_comparison_reason,omitempty"`
+	PrimaryState             string                      `json:"primary_state"`
+	HealthState              string                      `json:"health_state"`
+	Availability             string                      `json:"availability"`
+	Decision                 string                      `json:"decision"`
+	DispatchEligibility      string                      `json:"dispatch_eligibility"`
+	DispatchReason           string                      `json:"dispatch_reason"`
+	ReasonCode               string                      `json:"reason_code"`
+	SecondaryReasonCodes     []string                    `json:"secondary_reason_codes"`
+	Admission                smartrouter.AdmissionKind   `json:"admission,omitempty"`
+	CheaperThanPreference    bool                        `json:"cheaper_than_preference"`
+	MixedEvidence            bool                        `json:"mixed_evidence"`
+	Evidence                 SmartRouteStatusEvidence    `json:"evidence"`
+	Recovery                 SmartRouteStatusRecovery    `json:"recovery"`
+	Constraints              SmartRouteStatusConstraints `json:"constraints"`
+	CapacityLimited          bool                        `json:"capacity_limited"`
+	CapacityUntilMS          int64                       `json:"capacity_until_ms,omitempty"`
+	CredentialBlockedUntilMS int64                       `json:"credential_blocked_until_ms,omitempty"`
+	RuntimeExcludedUntilMS   int64                       `json:"runtime_excluded_until_ms,omitempty"`
+	Quarantined              bool                        `json:"quarantined"`
+	QuarantinedAtMS          int64                       `json:"quarantined_at_ms,omitempty"`
+	RequiresAdminReview      bool                        `json:"requires_admin_review"`
+	SelectionRank            int                         `json:"selection_rank,omitempty"`
+	Selected                 bool                        `json:"selected"`
+	SelectionReason          string                      `json:"selection_reason,omitempty"`
+	SkippedReason            string                      `json:"skipped_reason,omitempty"`
+
+	// Compatibility fields retained while the V4.3 frontend rolls out.
+	Phase                      smartrouter.QualityPhase   `json:"phase"`
+	Status                     string                     `json:"health_status"`
+	SuccessRate                *float64                   `json:"success_rate"`
+	TTFTP95MS                  int64                      `json:"ttft_p95_ms,omitempty"`
+	TTFTSamples                int                        `json:"ttft_samples,omitempty"`
+	RecentTTFTAverageMS        int64                      `json:"recent_ttft_average_ms,omitempty"`
+	RecentTTFTSamples          int                        `json:"recent_ttft_samples,omitempty"`
+	RecentTTFTSource           string                     `json:"recent_ttft_source,omitempty"`
+	RecentTTFTConfidencePPM    int64                      `json:"recent_ttft_confidence_ppm,omitempty"`
+	HistoricalTTFTSamples      int64                      `json:"historical_ttft_samples,omitempty"`
+	RecentUsageCount           int                        `json:"recent_usage_count,omitempty"`
+	RecentStabilityRate        *float64                   `json:"recent_stability_rate,omitempty"`
+	RecentStabilitySamples     int                        `json:"recent_stability_samples,omitempty"`
+	RecentStabilitySource      string                     `json:"recent_stability_source,omitempty"`
+	StabilityConfidencePPM     int64                      `json:"stability_confidence_ppm,omitempty"`
+	HistoricalStabilitySamples int64                      `json:"historical_stability_samples,omitempty"`
+	RecentMetricsObservedAt    int64                      `json:"recent_metrics_observed_at_ms,omitempty"`
+	ConsecutiveHardFailures    int                        `json:"consecutive_hard_failures"`
+	ProbeFailures              int                        `json:"probe_failures"`
+	LastObservedAtMS           int64                      `json:"last_observed_at_ms,omitempty"`
+	LastProbeAtMS              int64                      `json:"last_probe_at_ms,omitempty"`
+	LastProbeOutcome           smartrouter.QualityOutcome `json:"last_probe_outcome,omitempty"`
+	NextProbeAtMS              int64                      `json:"next_probe_at_ms,omitempty"`
+	SampleDueAtMS              int64                      `json:"sample_due_at_ms,omitempty"`
+	StableSinceMS              int64                      `json:"stable_since_ms,omitempty"`
+}
+
+type SmartRouteUserStatusReport struct {
+	SchemaVersion            int                             `json:"schema_version"`
+	Kind                     string                          `json:"kind"`
+	TokenID                  int                             `json:"token_id,omitempty"`
+	Model                    string                          `json:"model,omitempty"`
+	ContractID               string                          `json:"contract_id,omitempty"`
+	Endpoint                 string                          `json:"endpoint,omitempty"`
+	Strategy                 smartrouter.Strategy            `json:"strategy"`
+	RecoveryProfile          smartrouter.RecoveryProfile     `json:"recovery_profile"`
+	EffectivePolicy          SmartRouteStatusEffectivePolicy `json:"effective_policy"`
+	Assumptions              SmartRouteStatusAssumptions     `json:"assumptions"`
+	Preference               *SmartRouteUserPreference       `json:"preference"`
+	Coverage                 SmartRouteStatusCoverage        `json:"coverage"`
+	Summary                  SmartRouteStatusSummary         `json:"summary"`
+	Items                    []SmartRouteUserStatusItem      `json:"items"`
+	Total                    int                             `json:"total"`
+	Page                     int                             `json:"page"`
+	PageSize                 int                             `json:"page_size"`
+	UpdatedAtMS              int64                           `json:"updated_at_ms"`
+	FactSnapshotVersion      string                          `json:"fact_snapshot_version"`
+	SnapshotVersion          string                          `json:"snapshot_version"`
+	CatalogVersion           string                          `json:"catalog_version"`
+	PriceVersion             string                          `json:"price_version"`
+	BackgroundProbeAvailable bool                            `json:"background_probe_available"`
+	BackgroundProbeEnabled   bool                            `json:"background_probe_enabled"`
+	PlanErrorCode            string                          `json:"plan_error_code,omitempty"`
+}
+
+type SmartRouteUserModelIndexRequest struct {
+	TokenID   int
+	UserGroup string
+	Policy    smartrouter.Policy
+	Query     string
+	Page      int
+	PageSize  int
+}
+
+// SmartRouteGlobalLeaderboardStatusRequest is the site-wide, read-only
+// leaderboard contract. It deliberately has no token/key field: a user's
+// smart-key scope must never change the public comparison set.
+type SmartRouteGlobalLeaderboardStatusRequest struct {
+	UserGroup            string // Server-resolved account group; never a key's route group.
+	Model                string
+	Endpoint             string
+	Group                string
+	Status               string
+	RequiredCapabilities uint64
+	EstimatedContext     int
+	DeadlineBudgetMS     int64
+	IncludeExcluded      bool
+	Page                 int
+	PageSize             int
+}
+
+type SmartRouteGlobalLeaderboardModelIndexRequest struct {
+	UserGroup string
+	Query     string
+	Page      int
+	PageSize  int
+}
+
+func smartRouteGlobalLeaderboardPolicy(setting smartroutersetting.Setting) smartrouter.Policy {
+	policy := smartrouter.NormalizePolicy(setting.DefaultPolicy)
+	policy.Version = smartrouter.PolicyVersion
+	policy.Enabled = true
+	policy.Strategy = smartrouter.StrategyPrice
+	policy.OrderMode = smartrouter.OrderAutoPrice
+	policy.AllowFutureGroups = true
+	policy.AllowFutureCertifiedRoutes = true
+	policy.ManualGroupOrder = []string{}
+	policy.ExcludedGroups = []string{}
+	policy.ExcludedRoutes = []string{}
+	policy.ContractOverrides = map[string]smartrouter.ContractOverride{}
+	policy.MaxEffectiveRatioPPM = setting.AbsoluteMaxEffectiveRatioPPM
+	if policy.MaxEffectiveRatioPPM <= 0 {
+		policy.MaxEffectiveRatioPPM = setting.DefaultMaxEffectiveRatioPPM
+	}
+	return policy
+}
+
+// GlobalLeaderboardStatusReport projects one site-wide model/endpoint view.
+// It uses the viewer's authorized groups and corresponding price snapshot.
+// Key policy, token identity, and saved ranking weights do not narrow the
+// comparison set. Internal callers with no viewer retain the public scope.
+func (engine *SmartRouterEngine) GlobalLeaderboardStatusReport(
+	ctx context.Context,
+	request SmartRouteGlobalLeaderboardStatusRequest,
+) (SmartRouteUserStatusReport, error) {
+	if engine == nil || engine.Settings == nil {
+		return SmartRouteUserStatusReport{}, ErrNoCurrentSmartCatalog
+	}
+	setting := smartroutersetting.Normalize(engine.Settings())
+	return engine.UserDecisionStatusReport(ctx, SmartRouteUserStatusRequest{
+		UserGroup:            request.UserGroup,
+		Policy:               smartRouteGlobalLeaderboardPolicy(setting),
+		Model:                request.Model,
+		Endpoint:             request.Endpoint,
+		Group:                request.Group,
+		Status:               request.Status,
+		RequiredCapabilities: request.RequiredCapabilities,
+		EstimatedContext:     request.EstimatedContext,
+		DeadlineBudgetMS:     request.DeadlineBudgetMS,
+		IncludeExcluded:      request.IncludeExcluded,
+		Page:                 request.Page,
+		PageSize:             request.PageSize,
+	})
+}
+
+// GlobalLeaderboardModelIndex returns the matching site-wide model/endpoint
+// index in one snapshot. Its request intentionally has no token/key field.
+func (engine *SmartRouterEngine) GlobalLeaderboardModelIndex(
+	ctx context.Context,
+	request SmartRouteGlobalLeaderboardModelIndexRequest,
+) (SmartRouteUserModelIndexReport, error) {
+	if engine == nil || engine.Settings == nil {
+		return SmartRouteUserModelIndexReport{}, ErrNoCurrentSmartCatalog
+	}
+	setting := smartroutersetting.Normalize(engine.Settings())
+	return engine.UserStatusModelIndex(ctx, SmartRouteUserModelIndexRequest{
+		UserGroup: request.UserGroup,
+		Policy:    smartRouteGlobalLeaderboardPolicy(setting),
+		Query:     request.Query,
+		Page:      request.Page,
+		PageSize:  request.PageSize,
+	})
+}
+
+type SmartRouteUserModelIndexItem struct {
+	Model               string   `json:"model"`
+	DisplayName         string   `json:"display_name"`
+	Family              string   `json:"family"`
+	Modality            string   `json:"modality"`
+	SearchAliases       []string `json:"search_aliases"`
+	RecentUsageCount    int      `json:"recent_usage_count"`
+	ContractID          string   `json:"contract_id"`
+	Endpoint            string   `json:"endpoint"`
+	PrimaryState        string   `json:"primary_state"`
+	Groups              []string `json:"groups"`
+	GroupCount          int      `json:"group_count"`
+	InScopeGroupCount   int      `json:"in_scope_group_count"`
+	AvailableGroups     int      `json:"available_groups"`
+	DegradedGroups      int      `json:"degraded_groups"`
+	RecoveringGroups    int      `json:"recovering_groups"`
+	NeedsReviewGroups   int      `json:"needs_review_groups"`
+	PendingSampleGroups int      `json:"pending_sample_groups"`
+	// LowestRatioPPM and LowestEligibleRatioPPM are compatibility summaries of
+	// the Key admission-ceiling ratio. They are not model prices and must not be
+	// used to compare routes whose resolved price classes differ.
+	LowestRatioPPM          int64 `json:"lowest_ratio_ppm"`
+	LowestRatioKnown        bool  `json:"lowest_ratio_known"`
+	LowestEligibleRatioPPM  int64 `json:"lowest_eligible_ratio_ppm"`
+	LowestEligibleKnown     bool  `json:"lowest_eligible_known"`
+	HasAvailableCandidate   bool  `json:"has_available_candidate"`
+	HasConditionalCandidate bool  `json:"has_conditional_candidate"`
+	DispatchEligibleGroups  int   `json:"dispatch_eligible_groups"`
+	ConditionalGroups       int   `json:"conditional_groups"`
+}
+
+type SmartRouteUserModelIndexReport struct {
+	SchemaVersion            int                            `json:"schema_version"`
+	Kind                     string                         `json:"kind"`
+	TokenID                  int                            `json:"token_id,omitempty"`
+	Items                    []SmartRouteUserModelIndexItem `json:"items"`
+	Total                    int                            `json:"total"`
+	Page                     int                            `json:"page"`
+	PageSize                 int                            `json:"page_size"`
+	UpdatedAtMS              int64                          `json:"updated_at_ms"`
+	FactSnapshotVersion      string                         `json:"fact_snapshot_version"`
+	SnapshotVersion          string                         `json:"snapshot_version"`
+	CatalogVersion           string                         `json:"catalog_version"`
+	PriceVersion             string                         `json:"price_version"`
+	BackgroundProbeAvailable bool                           `json:"background_probe_available"`
+	BackgroundProbeEnabled   bool                           `json:"background_probe_enabled"`
+}
+
+type smartRouteUserStatusMetadata struct {
+	route       smartrouter.CertifiedRoute
+	contract    smartrouter.RouteContract
+	detailID    string
+	blockedAuto bool
+	blockedAtMS int64
+}
+
+type smartRouteUserStatusRoute struct {
+	meta                   smartRouteUserStatusMetadata
+	quality                smartrouter.QualityState
+	ttft                   smartrouter.TTFTState
+	recent                 SmartRouteRecentMetrics
+	capacity               smartrouter.CapacityState
+	credential             smartrouter.CredentialState
+	runtimeExcludedUntilMS int64
+	ratio                  int64
+	priced                 bool
+	price                  smartrouter.RoutePrice
+	modelPriceKnown        bool
+	candidate              *smartrouter.Candidate
+	rank                   int
+	rejection              smartrouter.RejectReason
+	selected               bool
+	ranking                smartRouteStatusRankingEvidence
+}
+
+type smartRouteUserStatusGroup struct {
+	contractID      string
+	model           string
+	endpoint        string
+	group           string
+	routes          []smartRouteUserStatusRoute
+	unsupported     bool
+	ratio           int64
+	priced          bool
+	price           smartrouter.RoutePrice
+	modelPriceKnown bool
+}
+
+type smartRouteUserModelContractGroup struct {
+	contract smartrouter.RouteContract
+	group    string
+	routes   []smartRouteUserStatusMetadata
+}
+
+// UserStatusReport preserves the pre-V4.3 call shape for internal callers.
+// It now delegates to the versioned preference-snapshot implementation.
+func (engine *SmartRouterEngine) UserStatusReport(
+	ctx context.Context,
+	userGroup string,
+	policy smartrouter.Policy,
+	modelFilter string,
+	endpointFilter string,
+) (SmartRouteUserStatusReport, error) {
+	return engine.UserDecisionStatusReport(ctx, SmartRouteUserStatusRequest{
+		UserGroup: userGroup, Policy: policy, Model: modelFilter, Endpoint: endpointFilter,
+		Page: 1, PageSize: smartRouteStatusMaxPageSize, IncludeExcluded: true,
+	})
+}
+
+// UserDecisionStatusReport produces a read-only preference snapshot from the
+// same Plan implementation used by relay. It does not acquire leases, publish
+// recovery hints, update affinity, or write health state.
+func (engine *SmartRouterEngine) UserDecisionStatusReport(
+	ctx context.Context,
+	request SmartRouteUserStatusRequest,
+) (SmartRouteUserStatusReport, error) {
+	if engine == nil || engine.Catalogs == nil || engine.Prices == nil || engine.State == nil || engine.Settings == nil {
+		return SmartRouteUserStatusReport{}, ErrNoCurrentSmartCatalog
+	}
+	request.Model = strings.TrimSpace(request.Model)
+	request.Endpoint = strings.TrimSpace(request.Endpoint)
+	request.Group = strings.TrimSpace(request.Group)
+	request.Status = strings.TrimSpace(request.Status)
+	if request.Model == "" {
+		return SmartRouteUserStatusReport{}, ErrSmartRouteStatusModelRequired
+	}
+	if request.EstimatedContext < 0 || request.DeadlineBudgetMS < 0 {
+		return SmartRouteUserStatusReport{}, errors.New("smart router status request limits cannot be negative")
+	}
+	setting := smartroutersetting.Normalize(engine.Settings())
+	policy := resolveSmartRoutePolicyLimits(smartrouter.NormalizePolicy(request.Policy), setting)
+	if err := policy.Validate(); err != nil {
+		return SmartRouteUserStatusReport{}, err
+	}
+
+	catalog, catalogErr := engine.Catalogs.RefreshIfDue(ctx)
+	if catalogErr != nil && !errors.Is(catalogErr, ErrNoCertifiedSmartRoutes) {
+		return SmartRouteUserStatusReport{}, catalogErr
+	}
+	buildReport, _ := engine.Catalogs.LastReport()
+	contract, activeContract, endpoint, endpointInferred, found, err := smartRouteStatusResolveContract(
+		catalog, buildReport, request.Model, request.Endpoint,
+	)
+	if err != nil {
+		return SmartRouteUserStatusReport{}, err
+	}
+	request.Endpoint = endpoint
+
+	nowMS := time.Now().UnixMilli()
+	actualInputCosts := engine.actualInputCostSnapshot()
+	_, workerAvailable := readSmartRouteWorkerStats(ctx)
+	coverageTarget := smartroutersetting.DefaultRecoveryCoverageTarget
+	report := SmartRouteUserStatusReport{
+		SchemaVersion:   SmartRouteUserStatusSchemaVersion,
+		Kind:            "preference_snapshot",
+		TokenID:         request.TokenID,
+		Model:           request.Model,
+		Endpoint:        request.Endpoint,
+		Strategy:        policy.EffectiveStrategy(),
+		RecoveryProfile: policy.RecoveryProfile,
+		EffectivePolicy: SmartRouteStatusEffectivePolicy{
+			Strategy: policy.EffectiveStrategy(), RecoveryProfile: policy.RecoveryProfile,
+			MaxEffectiveRatioPPM: policy.MaxEffectiveRatioPPM,
+			FailureThreshold:     policy.EffectiveFailureThreshold(),
+			AttemptLimitEnabled:  setting.AttemptLimitEnabled,
+			MaxAttempts:          strictSmartRouteAttemptLimit(setting.MaxAttempts, policy.EffectiveMaxAttempts()),
+			QueueMode:            policy.QueuePolicy.Mode, TTFTEnabled: policy.TTFTPolicy.Enabled,
+			AffinityEnabled:              policy.AffinityEnabled,
+			ActualInputCostRanking:       policy.EffectiveActualInputCostRanking(),
+			ActualInputCostSnapshotReady: actualInputCosts != nil,
+		},
+		Assumptions: SmartRouteStatusAssumptions{
+			PreferenceSnapshot: true, BasicRequestProfile: true, NoSessionAffinity: true,
+			NoPreviousAttempts: true, CapacityPointInTime: true, EndpointInferred: endpointInferred,
+			RequiredCapabilities: request.RequiredCapabilities, EstimatedContext: request.EstimatedContext,
+			DeadlineBudgetMS: request.DeadlineBudgetMS,
+		},
+		Coverage: SmartRouteStatusCoverage{
+			Target: coverageTarget, Missing: coverageTarget,
+			Candidates: []SmartRouteStatusCoverageCandidate{},
+		},
+		Items: []SmartRouteUserStatusItem{}, Page: normalizedSmartRouteStatusPage(request.Page),
+		PageSize: normalizedSmartRouteStatusPageSize(request.PageSize), UpdatedAtMS: nowMS,
+		CatalogVersion:           smartRouteStatusCatalogVersion(catalog),
+		BackgroundProbeAvailable: setting.Enabled && setting.BackgroundProbeEnabled && workerAvailable,
+		BackgroundProbeEnabled:   setting.BackgroundProbeEnabled,
+	}
+	if !found {
+		report.FactSnapshotVersion = engine.smartRouteStatusFactSnapshotVersion(
+			report.CatalogVersion, SmartRouteRuntimeSnapshot{},
+		)
+		report.SnapshotVersion = smartRouteStatusSnapshotVersion(
+			report.FactSnapshotVersion, report.PriceVersion,
+		)
+		return report, nil
+	}
+	report.ContractID = contract.ContractID
+
+	replayClass, baseCapabilities := smartRouteStatusRequestProfile(contract.Endpoint)
+	if request.RequiredCapabilities == 0 {
+		request.RequiredCapabilities = baseCapabilities
+		report.Assumptions.RequiredCapabilities = baseCapabilities
+	}
+	report.Assumptions.ReplayClass = replayClass.String()
+	// The public status snapshot must describe the same retry contract as the
+	// relay: ordinary safe text exhausts eligible physical routes even when an
+	// old site setting still exposes a numeric attempt toggle.
+	report.EffectivePolicy.AttemptLimitEnabled = setting.AttemptLimitEnabled && replayClass != smartrouter.ReplaySafeText
+
+	var prices *smartrouter.PriceSnapshot
+	if catalog != nil {
+		prices, err = engine.Prices.GetOrRefresh(ctx, request.UserGroup)
+		if err != nil && !errors.Is(err, ErrNoPricedSmartRoutes) && !errors.Is(err, ErrNoCurrentSmartCatalog) {
+			return SmartRouteUserStatusReport{}, err
+		}
+	}
+	if prices != nil {
+		report.PriceVersion = prices.Version
+	}
+
+	usableGroups := GetUserUsableGroups(request.UserGroup)
+	routes := smartRouteStatusCollectRoutes(activeContract, buildReport, contract, usableGroups)
+	routeAnalyticsDetailIDsV1(ctx, routes, prices)
+	stateRoutes := make([]smartrouter.CertifiedRoute, 0, len(routes))
+	for _, meta := range routes {
+		stateRoutes = append(stateRoutes, meta.route)
+	}
+	runtime := SmartRouteRuntimeSnapshot{}
+	if len(stateRoutes) > 0 {
+		runtime, err = engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: smartRouteStateRoutes(stateRoutes)})
+		if err != nil {
+			return SmartRouteUserStatusReport{}, err
+		}
+	}
+	report.FactSnapshotVersion = engine.smartRouteStatusFactSnapshotVersion(
+		report.CatalogVersion, runtime,
+	)
+	report.SnapshotVersion = smartRouteStatusSnapshotVersion(
+		report.FactSnapshotVersion, report.PriceVersion,
+	)
+	runtimeExcludedUntil := make(map[string]int64)
+	var automaticExcludedRoutes []string
+	if catalog != nil && catalog.Version != "" && len(stateRoutes) > 0 {
+		exclusions, exclusionErr := engine.State.RouteExclusions(ctx, SmartRouteExclusionRequest{
+			CatalogVersion: catalog.Version,
+			Routes:         smartRouteStateRoutes(stateRoutes),
+			FailureScopes:  []SmartRouteFailureScope{SmartFailureRouteModel, SmartFailureRouteContract},
+		})
+		if exclusionErr != nil {
+			return SmartRouteUserStatusReport{}, exclusionErr
+		}
+		automaticExcludedRoutes = exclusions.RouteIDs
+		for _, exclusion := range exclusions.Entries {
+			if exclusion.ExpiresAtMS > runtimeExcludedUntil[exclusion.RouteID] {
+				runtimeExcludedUntil[exclusion.RouteID] = exclusion.ExpiresAtMS
+			}
+		}
+	}
+
+	plan, planErr := smartRouteStatusExplainPlan(
+		request, policy, setting, catalog, prices, contract, activeContract, runtime, usableGroups,
+		replayClass, actualInputCosts, nowMS, automaticExcludedRoutes,
+	)
+	report.PlanErrorCode = smartRouteStatusPlanErrorCode(planErr, plan)
+	candidateByRoute := make(map[string]smartrouter.Candidate, len(plan.Candidates))
+	rankByRoute := make(map[string]int, len(plan.Candidates))
+	for index, candidate := range plan.Candidates {
+		candidateByRoute[candidate.Route.RouteID] = candidate
+		rankByRoute[candidate.Route.RouteID] = index + 1
+	}
+	rejectionByRoute := make(map[string]smartrouter.RejectReason, len(plan.Rejections))
+	for _, rejection := range plan.Rejections {
+		rejectionByRoute[rejection.RouteID] = rejection.Reason
+	}
+
+	groups := make(map[string]*smartRouteUserStatusGroup)
+	rankingByRoute := make(map[string]smartRouteStatusRankingEvidence, len(routes))
+	for _, meta := range routes {
+		route := meta.route
+		quality, ok := runtime.Quality.Routes[route.RouteID]
+		if !ok {
+			quality = smartrouter.InitialQuality(route.StableFallback)
+		}
+		ratio, priced, routePrice, modelPriceKnown := smartRouteStatusPrice(
+			prices, request.UserGroup, meta.contract, route,
+		)
+		entry := smartRouteUserStatusRoute{
+			meta: meta, quality: quality, ttft: runtime.TTFT.Routes[route.RouteID], recent: runtime.Recent.Routes[route.RouteID],
+			capacity:               runtime.Capacity.Domains[route.CapacityDomain],
+			credential:             runtime.Credentials.Domains[smartrouter.RouteCredentialDomain(route)],
+			runtimeExcludedUntilMS: runtimeExcludedUntil[route.RouteID],
+			ratio:                  ratio, priced: priced, price: routePrice, modelPriceKnown: modelPriceKnown,
+			rejection: rejectionByRoute[route.RouteID],
+			selected:  planErr == nil && plan.RouteID == route.RouteID,
+		}
+		if candidate, ok := candidateByRoute[route.RouteID]; ok {
+			copyCandidate := candidate
+			entry.candidate = &copyCandidate
+			entry.rank = rankByRoute[route.RouteID]
+			entry.price = candidate.Price
+			entry.modelPriceKnown = candidate.Price.BillingMode != ""
+		}
+		entry.ranking = smartRouteStatusRankingEvidenceAt(
+			route, contract.CanonicalModel, contract.Endpoint, entry.price, entry.modelPriceKnown,
+			actualInputCosts, nowMS, policy, entry.candidate,
+		)
+		rankingByRoute[route.RouteID] = entry.ranking
+		key := smartRouteStatusGroupKey(contract.CanonicalModel, contract.Endpoint, route.Group)
+		group := groups[key]
+		if group == nil {
+			group = &smartRouteUserStatusGroup{
+				contractID: contract.ContractID, model: contract.CanonicalModel,
+				endpoint: contract.Endpoint, group: route.Group,
+			}
+			groups[key] = group
+		}
+		group.routes = append(group.routes, entry)
+		if priced && (!group.priced || ratio < group.ratio) {
+			group.ratio, group.priced = ratio, true
+		}
+		if entry.modelPriceKnown {
+			if !group.modelPriceKnown {
+				group.price, group.modelPriceKnown = entry.price, true
+			} else if group.price != entry.price {
+				group.price = smartrouter.RoutePrice{
+					BillingMode: "mixed", BillingUnit: "mixed", Scope: "status_group",
+					IncomparableReason: "mixed_group_price_descriptors",
+				}
+			}
+		}
+	}
+	var preference *SmartRouteUserPreference
+	if planErr == nil && plan.RouteID != "" {
+		ranking := rankingByRoute[plan.RouteID]
+		ranking.RankingCostComparison = "equal"
+		preference = &SmartRouteUserPreference{
+			SmartRouteStatusRankingCost: ranking.SmartRouteStatusRankingCost,
+			Group:                       plan.Group, EffectiveRatioPPM: plan.RatioPPM, PriceKnown: true, Price: plan.Price,
+			Admission: plan.Admission, DecisionReason: smartRouteStatusSelectedReason(policy.EffectiveStrategy()),
+			PlanKind: plan.Kind, rankingEvidence: ranking,
+		}
+	}
+	report.Preference = preference
+	report.Coverage = smartRouteStatusCoverage(plan, coverageTarget, rankingByRoute, preference)
+
+	items := make([]SmartRouteUserStatusItem, 0, len(groups))
+	for _, group := range groups {
+		item := smartRouteStatusAggregateGroup(
+			*group, request, policy, preference, report.BackgroundProbeAvailable, replayClass, nowMS,
+		)
+		if request.Group != "" && item.Group != request.Group {
+			continue
+		}
+		if request.Status != "" && item.PrimaryState != request.Status && item.Availability != request.Status {
+			continue
+		}
+		items = append(items, item)
+	}
+	sort.SliceStable(items, func(left, right int) bool {
+		return smartRouteStatusItemLess(items[left], items[right], preference)
+	})
+	report.Summary = smartRouteStatusSummary(items)
+	report.Total = len(items)
+	start := (report.Page - 1) * report.PageSize
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + report.PageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	report.Items = items[start:end]
+	return report, nil
+}
+
+func smartRouteStatusCoverage(
+	plan smartrouter.PlanResult,
+	target int,
+	rankingByRoute map[string]smartRouteStatusRankingEvidence,
+	preference *SmartRouteUserPreference,
+) SmartRouteStatusCoverage {
+	if target < 1 {
+		target = 1
+	}
+	ranked := make([]smartrouter.CertifiedRoute, 0, len(plan.Candidates))
+	candidatesByRoute := make(map[string]smartrouter.Candidate, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		if candidate.Route.RouteID == "" {
+			continue
+		}
+		ranked = append(ranked, candidate.Route)
+		candidatesByRoute[candidate.Route.RouteID] = candidate
+	}
+	selection := smartrouter.SelectCoverage(ranked, target)
+	result := SmartRouteStatusCoverage{
+		Target: target, CandidateRoutes: len(selection.Routes),
+		DistinctFailureDomains: selection.DistinctDomains,
+		Missing:                target - len(selection.Routes),
+		Complete:               selection.Complete,
+		Candidates:             make([]SmartRouteStatusCoverageCandidate, 0, len(selection.Routes)),
+	}
+	if result.Missing < 0 {
+		result.Missing = 0
+	}
+	for index, route := range selection.Routes {
+		candidate, exists := candidatesByRoute[route.RouteID]
+		if !exists {
+			continue
+		}
+		ranking := rankingByRoute[route.RouteID]
+		if preference != nil {
+			ranking.RankingCostComparison = smartRouteStatusRankingCostComparison(
+				ranking, preference.rankingEvidence,
+			)
+		}
+		result.Candidates = append(result.Candidates, SmartRouteStatusCoverageCandidate{
+			SmartRouteStatusRankingCost: ranking.SmartRouteStatusRankingCost,
+			Position:                    index + 1, Group: route.Group,
+			EffectiveRatioPPM: candidate.RatioPPM, Price: candidate.Price, Admission: candidate.Admission,
+			Selected: route.RouteID == plan.RouteID,
+		})
+	}
+	return result
+}
+
+// UserStatusModelIndex returns one privacy-safe row per model + endpoint. It
+// takes exactly one catalog/price/state snapshot for the whole page; it never
+// invokes the per-contract detail path in a loop.
+func (engine *SmartRouterEngine) UserStatusModelIndex(
+	ctx context.Context,
+	request SmartRouteUserModelIndexRequest,
+) (SmartRouteUserModelIndexReport, error) {
+	if engine == nil || engine.Catalogs == nil || engine.Prices == nil || engine.State == nil || engine.Settings == nil {
+		return SmartRouteUserModelIndexReport{}, ErrNoCurrentSmartCatalog
+	}
+	setting := smartroutersetting.Normalize(engine.Settings())
+	policy := resolveSmartRoutePolicyLimits(smartrouter.NormalizePolicy(request.Policy), setting)
+	if err := policy.Validate(); err != nil {
+		return SmartRouteUserModelIndexReport{}, err
+	}
+	request.Query = strings.ToLower(strings.TrimSpace(request.Query))
+	page := normalizedSmartRouteStatusPage(request.Page)
+	pageSize := normalizedSmartRouteStatusPageSize(request.PageSize)
+	nowMS := time.Now().UnixMilli()
+	_, workerAvailable := readSmartRouteWorkerStats(ctx)
+	report := SmartRouteUserModelIndexReport{
+		SchemaVersion: SmartRouteUserStatusSchemaVersion, Kind: "model_endpoint_index",
+		TokenID: request.TokenID, Items: []SmartRouteUserModelIndexItem{}, Page: page, PageSize: pageSize,
+		UpdatedAtMS: nowMS, BackgroundProbeAvailable: setting.Enabled && setting.BackgroundProbeEnabled && workerAvailable,
+		BackgroundProbeEnabled: setting.BackgroundProbeEnabled,
+	}
+
+	catalog, catalogErr := engine.Catalogs.RefreshIfDue(ctx)
+	if catalogErr != nil && !errors.Is(catalogErr, ErrNoCertifiedSmartRoutes) {
+		return SmartRouteUserModelIndexReport{}, catalogErr
+	}
+	report.CatalogVersion = smartRouteStatusCatalogVersion(catalog)
+	buildReport, _ := engine.Catalogs.LastReport()
+	var prices *smartrouter.PriceSnapshot
+	var err error
+	if catalog != nil {
+		prices, err = engine.Prices.GetOrRefresh(ctx, request.UserGroup)
+		if err != nil && !errors.Is(err, ErrNoPricedSmartRoutes) && !errors.Is(err, ErrNoCurrentSmartCatalog) {
+			return SmartRouteUserModelIndexReport{}, err
+		}
+	}
+	if prices != nil {
+		report.PriceVersion = prices.Version
+	}
+
+	usableGroups := GetUserUsableGroups(request.UserGroup)
+	contractByID := make(map[string]smartrouter.RouteContract)
+	groups := make(map[string]*smartRouteUserModelContractGroup)
+	seenRoutes := make(map[string]struct{})
+	addRoute := func(contract smartrouter.RouteContract, route smartrouter.CertifiedRoute, blocked bool, blockedAtMS int64) {
+		if _, authorized := usableGroups[route.Group]; !authorized {
+			return
+		}
+		if _, duplicate := seenRoutes[route.RouteID]; duplicate {
+			return
+		}
+		seenRoutes[route.RouteID] = struct{}{}
+		contractByID[contract.ContractID] = contract
+		key := smartRouteStatusGroupKey(contract.CanonicalModel, contract.Endpoint, route.Group)
+		entry := groups[key]
+		if entry == nil {
+			entry = &smartRouteUserModelContractGroup{contract: contract, group: route.Group}
+			groups[key] = entry
+		}
+		entry.routes = append(entry.routes, smartRouteUserStatusMetadata{
+			route: route, contract: contract, blockedAuto: blocked, blockedAtMS: blockedAtMS,
+		})
+	}
+	if catalog != nil {
+		for _, entry := range catalog.Contracts {
+			if pool, ok := entry.Pools[smartrouter.AutomaticPoolID]; ok {
+				for _, route := range pool.Candidates {
+					addRoute(entry.Contract, route, false, 0)
+				}
+			}
+		}
+	}
+	for _, blocked := range buildReport.BlockedRoutes {
+		if blocked.Source == SmartRouteBlockSourceAutoHealth {
+			addRoute(blocked.Contract, blocked.Route, true, blocked.CreatedAt*1_000)
+		}
+	}
+	if len(groups) == 0 {
+		report.FactSnapshotVersion = engine.smartRouteStatusFactSnapshotVersion(
+			report.CatalogVersion, SmartRouteRuntimeSnapshot{},
+		)
+		report.SnapshotVersion = smartRouteStatusSnapshotVersion(
+			report.FactSnapshotVersion, report.PriceVersion,
+		)
+		return report, nil
+	}
+
+	stateRoutes := make([]smartrouter.CertifiedRoute, 0, len(seenRoutes))
+	for _, entry := range groups {
+		for _, meta := range entry.routes {
+			stateRoutes = append(stateRoutes, meta.route)
+		}
+	}
+	sort.Slice(stateRoutes, func(left, right int) bool { return stateRoutes[left].RouteID < stateRoutes[right].RouteID })
+	runtime, err := engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: smartRouteStateRoutes(stateRoutes)})
+	if err != nil {
+		return SmartRouteUserModelIndexReport{}, err
+	}
+	runtimeExcluded := make(map[string]bool)
+	if catalog != nil && catalog.Version != "" {
+		exclusions, exclusionErr := engine.State.RouteExclusions(ctx, SmartRouteExclusionRequest{
+			CatalogVersion: catalog.Version,
+			Routes:         smartRouteStateRoutes(stateRoutes),
+			FailureScopes:  []SmartRouteFailureScope{SmartFailureRouteModel, SmartFailureRouteContract},
+		})
+		if exclusionErr != nil {
+			return SmartRouteUserModelIndexReport{}, exclusionErr
+		}
+		for _, routeID := range exclusions.RouteIDs {
+			runtimeExcluded[routeID] = true
+		}
+	}
+	actualInputCosts := engine.actualInputCostSnapshot()
+	report.FactSnapshotVersion = engine.smartRouteStatusFactSnapshotVersion(
+		report.CatalogVersion, runtime,
+	)
+	report.SnapshotVersion = smartRouteStatusSnapshotVersion(
+		report.FactSnapshotVersion, report.PriceVersion,
+	)
+	planCandidatesByContract := make(map[string]map[string]smartrouter.AdmissionKind, len(contractByID))
+	planPolicy := policy
+	automaticExcludedRoutes := make([]string, 0, len(runtimeExcluded))
+	for routeID := range runtimeExcluded {
+		automaticExcludedRoutes = append(automaticExcludedRoutes, routeID)
+	}
+	if catalog != nil {
+		for contractID, contract := range contractByID {
+			activeEntry, active := catalog.Contracts[contractID]
+			if !active {
+				continue
+			}
+			activeCopy := activeEntry
+			replayClass, capabilities := smartRouteStatusRequestProfile(contract.Endpoint)
+			plan, _ := smartRouteStatusExplainPlan(
+				SmartRouteUserStatusRequest{
+					TokenID: request.TokenID, UserGroup: request.UserGroup,
+					Model: contract.CanonicalModel, Endpoint: contract.Endpoint,
+					RequiredCapabilities: capabilities,
+				},
+				planPolicy, setting, catalog, prices, contract, &activeCopy, runtime,
+				usableGroups, replayClass, actualInputCosts, nowMS, automaticExcludedRoutes,
+			)
+			candidates := make(map[string]smartrouter.AdmissionKind, len(plan.Candidates))
+			for _, candidate := range plan.Candidates {
+				candidates[candidate.Route.RouteID] = candidate.Admission
+			}
+			planCandidatesByContract[contractID] = candidates
+		}
+	}
+
+	type contractAggregate struct {
+		item             SmartRouteUserModelIndexItem
+		groupState       map[string]string
+		groupCandidate   map[string]bool
+		groupConditional map[string]bool
+		usageSeen        map[string]struct{}
+	}
+	contracts := make(map[string]*contractAggregate, len(contractByID))
+	for _, group := range groups {
+		contractKey := group.contract.ContractID
+		aggregate := contracts[contractKey]
+		if aggregate == nil {
+			displayName, family, modality, aliases := smartRouteModelCatalogMetadataV1(
+				group.contract.CanonicalModel,
+				group.contract.Endpoint,
+			)
+			aggregate = &contractAggregate{
+				item: SmartRouteUserModelIndexItem{
+					Model: group.contract.CanonicalModel, ContractID: group.contract.ContractID,
+					Endpoint: group.contract.Endpoint, DisplayName: displayName, Family: family,
+					Modality: modality, SearchAliases: aliases,
+				},
+				groupState:       make(map[string]string),
+				groupCandidate:   make(map[string]bool),
+				groupConditional: make(map[string]bool),
+				usageSeen:        make(map[string]struct{}),
+			}
+			contracts[contractKey] = aggregate
+		}
+		bestPrimary := "telemetry_unavailable"
+		bestRank := smartRouteStatusPrimaryRank(bestPrimary)
+		groupPriced := false
+		groupRatio := int64(0)
+		inScope := false
+		currentlyEligible := false
+		groupHasCandidate := false
+		groupHasConditional := false
+		for _, meta := range group.routes {
+			route := meta.route
+			physicalDigest := routeAnalyticsPhysicalDigestV1(smartRouteBackfillCatalogRoute{
+				contract: meta.contract,
+				route:    route,
+			})
+			if _, counted := aggregate.usageSeen[physicalDigest]; !counted {
+				aggregate.usageSeen[physicalDigest] = struct{}{}
+				aggregate.item.RecentUsageCount += runtime.Recent.Routes[route.RouteID].RecentUsageCount
+			}
+			quality, ok := runtime.Quality.Routes[route.RouteID]
+			if !ok {
+				quality = smartrouter.InitialQuality(route.StableFallback)
+			}
+			ratio, priced := smartRouteStatusRatio(prices, request.UserGroup, route)
+			if priced && (!groupPriced || ratio < groupRatio) {
+				groupPriced, groupRatio = true, ratio
+			}
+			routeInScope := priced && ratio <= policy.MaxEffectiveRatioPPM && policy.AllowsGroup(route.Group) &&
+				!containsSmartRouteStatusString(policy.ExcludedGroups, route.Group) && !meta.blockedAuto
+			if routeInScope {
+				inScope = true
+				if !runtimeExcluded[route.RouteID] {
+					currentlyEligible = true
+				}
+			}
+			statusRoute := smartRouteUserStatusRoute{
+				meta: meta, quality: quality, capacity: runtime.Capacity.Domains[route.CapacityDomain],
+				credential: runtime.Credentials.Domains[smartrouter.RouteCredentialDomain(route)],
+				ratio:      ratio, priced: priced,
+			}
+			primary, availability := smartRouteStatusRouteState(statusRoute, policy, nowMS)
+			admission, plannedCandidate := planCandidatesByContract[group.contract.ContractID][route.RouteID]
+			if routeInScope {
+				switch {
+				case runtimeExcluded[route.RouteID]:
+					groupHasConditional = true
+				case plannedCandidate && availability == "capacity_busy":
+					groupHasConditional = true
+				case plannedCandidate:
+					groupHasCandidate = true
+					if admission == smartrouter.AdmissionLastResort || primary == "unavailable" {
+						groupHasConditional = true
+					}
+				case availability == "capacity_busy", primary == "unavailable":
+					groupHasConditional = true
+				}
+			}
+			if rank := smartRouteStatusPrimaryRank(primary); rank < bestRank {
+				bestPrimary, bestRank = primary, rank
+			}
+		}
+		aggregate.groupState[group.group] = bestPrimary
+		aggregate.groupCandidate[group.group] = groupHasCandidate
+		aggregate.groupConditional[group.group] = groupHasConditional
+		aggregate.item.Groups = append(aggregate.item.Groups, group.group)
+		aggregate.item.GroupCount++
+		if inScope {
+			aggregate.item.InScopeGroupCount++
+		}
+		if groupPriced && (!aggregate.item.LowestRatioKnown || groupRatio < aggregate.item.LowestRatioPPM) {
+			aggregate.item.LowestRatioKnown = true
+			aggregate.item.LowestRatioPPM = groupRatio
+		}
+		if currentlyEligible && groupPriced && (!aggregate.item.LowestEligibleKnown || groupRatio < aggregate.item.LowestEligibleRatioPPM) {
+			aggregate.item.LowestEligibleKnown = true
+			aggregate.item.LowestEligibleRatioPPM = groupRatio
+		}
+	}
+
+	items := make([]SmartRouteUserModelIndexItem, 0, len(contracts))
+	for _, aggregate := range contracts {
+		sort.Strings(aggregate.item.Groups)
+		availableInScope := 0
+		conditionalInScope := 0
+		for group, primary := range aggregate.groupState {
+			if aggregate.groupCandidate[group] {
+				availableInScope++
+			}
+			if aggregate.groupConditional[group] {
+				conditionalInScope++
+			}
+			switch primary {
+			case "healthy":
+				aggregate.item.AvailableGroups++
+			case "unknown":
+				aggregate.item.AvailableGroups++
+				aggregate.item.PendingSampleGroups++
+			case "unavailable":
+				aggregate.item.RecoveringGroups++
+			case "needs_review":
+				aggregate.item.NeedsReviewGroups++
+			case "pending_sample":
+				aggregate.item.PendingSampleGroups++
+			}
+		}
+		aggregate.item.HasAvailableCandidate = availableInScope > 0
+		aggregate.item.HasConditionalCandidate = conditionalInScope > 0
+		aggregate.item.DispatchEligibleGroups = availableInScope
+		aggregate.item.ConditionalGroups = conditionalInScope
+		switch {
+		case !aggregate.item.HasAvailableCandidate && aggregate.item.NeedsReviewGroups > 0:
+			aggregate.item.PrimaryState = "needs_review"
+		case !aggregate.item.HasAvailableCandidate && aggregate.item.RecoveringGroups > 0:
+			aggregate.item.PrimaryState = "no_available_candidate"
+		case aggregate.item.NeedsReviewGroups > 0 || aggregate.item.RecoveringGroups > 0 || aggregate.item.DegradedGroups > 0:
+			aggregate.item.PrimaryState = "serving_with_recovery"
+		case aggregate.item.HasAvailableCandidate && aggregate.item.PendingSampleGroups == aggregate.item.AvailableGroups:
+			aggregate.item.PrimaryState = "pending_sample"
+		case aggregate.item.HasAvailableCandidate:
+			aggregate.item.PrimaryState = "healthy"
+		case aggregate.item.PendingSampleGroups > 0:
+			aggregate.item.PrimaryState = "pending_sample"
+		default:
+			aggregate.item.PrimaryState = "no_available_candidate"
+		}
+		if request.Query != "" {
+			haystack := strings.ToLower(aggregate.item.Model + " " + aggregate.item.Endpoint)
+			if !strings.Contains(haystack, request.Query) {
+				continue
+			}
+		}
+		items = append(items, aggregate.item)
+	}
+	sort.SliceStable(items, func(left, right int) bool {
+		leftRank := smartRouteStatusModelIndexRank(items[left].PrimaryState)
+		rightRank := smartRouteStatusModelIndexRank(items[right].PrimaryState)
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		if items[left].Model != items[right].Model {
+			return items[left].Model < items[right].Model
+		}
+		return items[left].Endpoint < items[right].Endpoint
+	})
+	report.Total = len(items)
+	start := (page - 1) * pageSize
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	report.Items = items[start:end]
+	return report, nil
+}
+
+func smartRouteStatusResolveContract(
+	catalog *smartrouter.CertifiedRouteCatalog,
+	buildReport CatalogBuildReport,
+	model string,
+	requestedEndpoint string,
+) (smartrouter.RouteContract, *smartrouter.ContractCatalog, string, bool, bool, error) {
+	contracts := make(map[string]smartrouter.RouteContract)
+	active := make(map[string]smartrouter.ContractCatalog)
+	if catalog != nil {
+		for contractID, entry := range catalog.Contracts {
+			if entry.Contract.CanonicalModel != model {
+				continue
+			}
+			contracts[entry.Contract.Endpoint] = entry.Contract
+			active[contractID] = entry
+		}
+	}
+	for _, blocked := range buildReport.BlockedRoutes {
+		if blocked.Source != SmartRouteBlockSourceAutoHealth || blocked.Contract.CanonicalModel != model {
+			continue
+		}
+		if _, exists := contracts[blocked.Contract.Endpoint]; !exists {
+			contracts[blocked.Contract.Endpoint] = blocked.Contract
+		}
+	}
+	endpoint := requestedEndpoint
+	inferred := false
+	if endpoint == "" {
+		if len(contracts) > 1 {
+			return smartrouter.RouteContract{}, nil, "", false, false, ErrSmartRouteStatusEndpointRequired
+		}
+		for value := range contracts {
+			endpoint = value
+			inferred = true
+		}
+	}
+	contract, found := contracts[endpoint]
+	if !found {
+		return smartrouter.RouteContract{}, nil, endpoint, inferred, false, nil
+	}
+	var activeContract *smartrouter.ContractCatalog
+	if entry, exists := active[contract.ContractID]; exists {
+		copyEntry := entry
+		activeContract = &copyEntry
+	}
+	return contract, activeContract, endpoint, inferred, true, nil
+}
+
+func smartRouteStatusCollectRoutes(
+	active *smartrouter.ContractCatalog,
+	buildReport CatalogBuildReport,
+	contract smartrouter.RouteContract,
+	usableGroups map[string]string,
+) []smartRouteUserStatusMetadata {
+	result := make([]smartRouteUserStatusMetadata, 0)
+	seen := make(map[string]struct{})
+	if active != nil {
+		if pool, ok := active.Pools[smartrouter.AutomaticPoolID]; ok {
+			for _, route := range pool.Candidates {
+				if _, authorized := usableGroups[route.Group]; !authorized {
+					continue
+				}
+				seen[route.RouteID] = struct{}{}
+				result = append(result, smartRouteUserStatusMetadata{route: route, contract: contract})
+			}
+		}
+	}
+	for _, blocked := range buildReport.BlockedRoutes {
+		if blocked.Source != SmartRouteBlockSourceAutoHealth || blocked.Contract.ContractID != contract.ContractID {
+			continue
+		}
+		if _, authorized := usableGroups[blocked.Route.Group]; !authorized {
+			continue
+		}
+		if _, exists := seen[blocked.Route.RouteID]; exists {
+			continue
+		}
+		seen[blocked.Route.RouteID] = struct{}{}
+		result = append(result, smartRouteUserStatusMetadata{
+			route: blocked.Route, contract: blocked.Contract, blockedAuto: true,
+			blockedAtMS: blocked.CreatedAt * 1_000,
+		})
+	}
+	return result
+}
+
+func smartRouteStatusExplainPlan(
+	request SmartRouteUserStatusRequest,
+	policy smartrouter.Policy,
+	setting smartroutersetting.Setting,
+	catalog *smartrouter.CertifiedRouteCatalog,
+	prices *smartrouter.PriceSnapshot,
+	contract smartrouter.RouteContract,
+	activeContract *smartrouter.ContractCatalog,
+	runtime SmartRouteRuntimeSnapshot,
+	usableGroups map[string]string,
+	replayClass smartrouter.ReplayClass,
+	actualInputCosts smartrouter.ActualInputCostSnapshot,
+	nowMS int64,
+	automaticExcludedRoutes []string,
+) (smartrouter.PlanResult, error) {
+	if catalog == nil || activeContract == nil {
+		return smartrouter.PlanResult{}, smartrouter.ErrNoCandidate
+	}
+	priceSnapshot := smartrouter.PriceSnapshot{Version: "status-price-unavailable", RatiosPPM: map[string]int64{}}
+	if prices != nil {
+		priceSnapshot = *prices
+	}
+	allowed := make([]string, 0, len(usableGroups))
+	for group := range usableGroups {
+		allowed = append(allowed, group)
+	}
+	sort.Strings(allowed)
+	routeRequest := smartrouter.RouteRequest{
+		ContractID: contract.ContractID, CanonicalModel: contract.CanonicalModel,
+		Endpoint: contract.Endpoint, CapabilityFingerprint: contract.CapabilityFingerprint,
+		RequiredCapabilities: request.RequiredCapabilities, EstimatedContext: request.EstimatedContext,
+		ReplayClass: replayClass,
+	}
+	routeRequest.AdmissionKey = ensureSmartRouteAdmissionKey(request.TokenID, routeRequest)
+	if request.DeadlineBudgetMS > 0 {
+		routeRequest.DeadlineMS = nowMS + request.DeadlineBudgetMS
+	}
+	return smartrouter.ExplainPlan(smartrouter.PlanInput{
+		RecoveryFallbackEnabled:  setting.RecoveryFallbackAllowed(),
+		AutomaticExcludedRoutes:  automaticExcludedRoutes,
+		TextRecoveryProbeAfterMS: setting.TextProbeDelayMS(),
+		NowMS:                    nowMS, Request: routeRequest, Policy: policy, Catalog: *catalog,
+		Prices: priceSnapshot, Quality: runtime.Quality, TTFT: runtime.TTFT,
+		Capacity: runtime.Capacity, Credentials: runtime.Credentials,
+		AllowedGroups: allowed, Affinity: nil, ActualInputCosts: actualInputCosts,
+		WeakAffinityTolerancePPM: smartRouteWeakAffinityTolerancePPM,
+		RecoveryEvidenceTTLMS:    int64(setting.RecoveryBackupEvidenceTTLSeconds) * 1_000,
+		Attempt: smartrouter.AttemptState{
+			MaxAttempts:             strictSmartRouteAttemptLimit(setting.MaxAttempts, policy.EffectiveMaxAttempts()),
+			ExhaustEligibleChannels: replayClass == smartrouter.ReplaySafeText,
+		},
+		BackgroundRecovery: setting.TextProbeDelayMS() == 0 && setting.BackgroundProbeEnabled && smartrouter.IsSyntheticProbeSafe(replayClass),
+	})
+}
+
+func smartRouteStatusRankingEvidenceAt(
+	route smartrouter.CertifiedRoute,
+	model string,
+	endpoint string,
+	price smartrouter.RoutePrice,
+	priceKnown bool,
+	snapshot smartrouter.ActualInputCostSnapshot,
+	nowMS int64,
+	policy smartrouter.Policy,
+	candidate *smartrouter.Candidate,
+) smartRouteStatusRankingEvidence {
+	result := smartRouteStatusRankingEvidence{
+		SmartRouteStatusRankingCost: SmartRouteStatusRankingCost{
+			RankingCostBasis: "static_price", RankingCostSource: "not_applicable",
+		},
+	}
+	strategy := policy.EffectiveStrategy()
+	if strategy == smartrouter.StrategyManual {
+		result.RankingCostBasis = "manual_order"
+	}
+	if !priceKnown || price.BillingMode == "" {
+		return result
+	}
+
+	estimate, estimatedUSD, observed := smartRouteActualInputCostEstimateAt(
+		route, model, endpoint, price, snapshot, nowMS,
+	)
+	result.HistoricalCacheRatePPM = estimate.HistoricalCacheReadRatePPM
+	result.ActualInputCostHistoricalSamples = estimate.HistoricalSamples
+	result.ActualInputCostConfidencePPM = estimate.ConfidencePPM
+	result.ActualInputCostEstimatorVersion = estimate.EstimatorVersion
+	if estimate.Source == "" {
+		estimate.Source = smartrouter.ActualInputCostUnobservable
+	}
+	// The planner candidate is built from the same snapshot, but it only carries
+	// a compact ordering projection. Do not merge individual candidate fields
+	// into this richer status estimate: doing so can pair an EffectivePPM from
+	// one snapshot with cache/sample metadata from another. The estimate above
+	// is the single canonical calculation for all fields rendered below; the
+	// candidate remains authoritative only for planner ordering itself.
+	result.RankingCostSource = estimate.Source
+
+	if estimate.Comparable {
+		cacheWeight := estimate.CacheReadRatePPM
+		predictedCost := estimate.EffectivePPM
+		predictedUSD := float64(estimate.EffectivePPM) * 2 / 1_000_000
+		result.RoutingCacheWeightPPM = &cacheWeight
+		result.PredictedInputCostPPM = &predictedCost
+		result.PredictedInputUSDPerMillion = &predictedUSD
+	}
+	if policy.EffectiveActualInputCostRanking() && strategy != smartrouter.StrategyManual &&
+		estimate.Comparable {
+		result.RankingCostBasis = "recent_actual_input_cost"
+		result.RankingCostUsed = true
+		result.ScorePPM = estimate.EffectivePPM
+		result.ComparisonClass = price.ActualInputComparisonClass
+		result.Comparable = result.ComparisonClass != ""
+	} else if strategy != smartrouter.StrategyManual {
+		// The cache estimator could not produce a usable rate/price contract.
+		result.ScorePPM = 0
+		result.ComparisonClass = ""
+		result.Comparable = false
+	}
+
+	if estimate.HasRealEvidence && estimate.ObservedCacheReadRatePPM != nil {
+		cacheRate := estimate.CacheReadRatePPM
+		result.RecentCacheRatePPM = &cacheRate
+		result.ActualInputCostSamples = estimate.Samples
+		result.ActualInputCostLastObservedAtMS = estimate.LastObservedAtMS
+	}
+	if observed && estimate.Comparable {
+		effectivePPM := estimate.EffectivePPM
+		usd := estimatedUSD
+		result.EstimatedInputCostPPM = &effectivePPM
+		result.EstimatedInputUSDPerMillion = &usd
+	}
+	return result
+}
+
+func smartRouteStatusRankingCostComparison(
+	left smartRouteStatusRankingEvidence,
+	right smartRouteStatusRankingEvidence,
+) string {
+	if left.ComparisonClass != "" && right.ComparisonClass != "" &&
+		left.ComparisonClass != right.ComparisonClass {
+		return "incomparable"
+	}
+	if !left.Comparable || !right.Comparable || left.ComparisonClass == "" {
+		return "unknown"
+	}
+	switch {
+	case left.ScorePPM < right.ScorePPM:
+		return "cheaper"
+	case left.ScorePPM > right.ScorePPM:
+		return "more_expensive"
+	default:
+		return "equal"
+	}
+}
+
+func smartRouteStatusAggregateGroup(
+	group smartRouteUserStatusGroup,
+	request SmartRouteUserStatusRequest,
+	policy smartrouter.Policy,
+	preference *SmartRouteUserPreference,
+	workerAvailable bool,
+	replayClass smartrouter.ReplayClass,
+	nowMS int64,
+) SmartRouteUserStatusItem {
+	if group.unsupported || len(group.routes) == 0 {
+		item := SmartRouteUserStatusItem{
+			ContractID: group.contractID, Model: group.model, Endpoint: group.endpoint, Group: group.group,
+			EffectiveRatioPPM: group.ratio, PriceKnown: group.priced,
+			PrimaryState: "telemetry_unavailable", HealthState: "telemetry_unavailable", Availability: "unsupported",
+			Decision: "rejected", DispatchEligibility: "ineligible", DispatchReason: "endpoint_unsupported", ReasonCode: "endpoint_unsupported",
+			SecondaryReasonCodes: []string{}, Status: "unknown", Phase: smartrouter.QualityUnknown,
+			Evidence: smartRouteStatusEvidence(smartrouter.QualityState{}, nowMS),
+			Constraints: SmartRouteStatusConstraints{
+				GroupAuthorized: true, GroupSelected: policy.AllowsGroup(group.group),
+				WithinKeyPriceLimit: !group.priced || group.ratio <= policy.MaxEffectiveRatioPPM,
+				EndpointSupported:   false, CapabilitiesSupported: false,
+				ContextSupported: false, TTFTAcceptable: true,
+			},
+		}
+		item.Recovery = smartRouteStatusRecovery(item, smartrouter.QualityState{}, workerAvailable, replayClass, nowMS)
+		return item
+	}
+
+	sort.SliceStable(group.routes, func(left, right int) bool {
+		return smartRouteStatusRouteLess(group.routes[left], group.routes[right], policy, nowMS)
+	})
+	representative := group.routes[0]
+	primary, availability := smartRouteStatusRouteState(representative, policy, nowMS)
+	if representative.runtimeExcludedUntilMS > nowMS {
+		availability = "runtime_excluded"
+	}
+	reason := smartRouteStatusRouteReason(representative, policy, nowMS)
+	selected := representative.selected
+	for _, route := range group.routes {
+		if route.selected {
+			representative = route
+			primary, availability = smartRouteStatusRouteState(route, policy, nowMS)
+			if route.runtimeExcludedUntilMS > nowMS {
+				availability = "runtime_excluded"
+			}
+			reason = smartRouteStatusSelectedReason(policy.EffectiveStrategy())
+			selected = true
+			break
+		}
+	}
+	mixed := false
+	secondarySet := make(map[string]struct{})
+	for _, route := range group.routes {
+		otherPrimary, _ := smartRouteStatusRouteState(route, policy, nowMS)
+		if otherPrimary != primary {
+			mixed = true
+		}
+		otherReason := smartRouteStatusRouteReason(route, policy, nowMS)
+		if otherReason != "" && otherReason != reason {
+			secondarySet[otherReason] = struct{}{}
+		}
+	}
+	secondary := make([]string, 0, len(secondarySet))
+	for value := range secondarySet {
+		secondary = append(secondary, value)
+	}
+	sort.Strings(secondary)
+
+	ratio, priced := group.ratio, group.priced
+	price, modelPriceKnown := group.price, group.modelPriceKnown
+	if representative.priced {
+		ratio, priced = representative.ratio, true
+	}
+	if representative.modelPriceKnown {
+		price, modelPriceKnown = representative.price, true
+	}
+	rawQuality := representative.quality
+	quality, _ := smartrouter.NormalizeAutomaticRecoveryState(rawQuality, nowMS)
+	phase := quality.Phase
+	if representative.meta.blockedAuto || rawQuality.Phase == smartrouter.QualityQuarantined {
+		phase = smartrouter.QualityQuarantined
+	}
+	legacyStatus := smartRouteStatusLegacyStatus(representative, primary, nowMS)
+	successRate := smartRouteSuccessRate(rawQuality)
+	var recentStabilityRate *float64
+	if representative.recent.StabilitySamples > 0 {
+		value := representative.recent.StabilityRate
+		recentStabilityRate = &value
+	}
+	item := SmartRouteUserStatusItem{
+		SmartRouteStatusRankingCost: representative.ranking.SmartRouteStatusRankingCost,
+		DetailID:                    representative.meta.detailID,
+		ContractID:                  group.contractID, Model: group.model, Group: group.group, Endpoint: group.endpoint,
+		EffectiveRatioPPM: ratio, PriceKnown: priced, ModelPriceKnown: modelPriceKnown,
+		Price: smartRouteStatusPricePointer(price, modelPriceKnown), PrimaryState: primary, HealthState: primary,
+		Availability: availability, Decision: "rejected", DispatchEligibility: "ineligible", DispatchReason: reason, ReasonCode: reason,
+		SecondaryReasonCodes: secondary, MixedEvidence: mixed,
+		Evidence:                 smartRouteStatusEvidence(rawQuality, nowMS),
+		CapacityLimited:          representative.capacity.BlockedUntilMS > nowMS,
+		CapacityUntilMS:          representative.capacity.BlockedUntilMS,
+		CredentialBlockedUntilMS: representative.credential.BlockedUntilMS,
+		RuntimeExcludedUntilMS:   representative.runtimeExcludedUntilMS,
+		Quarantined:              representative.meta.blockedAuto || rawQuality.Phase == smartrouter.QualityQuarantined,
+		QuarantinedAtMS:          representative.meta.blockedAtMS,
+		RequiresAdminReview:      representative.meta.blockedAuto || rawQuality.Phase == smartrouter.QualityQuarantined,
+		Phase:                    phase, Status: legacyStatus, SuccessRate: successRate,
+		TTFTP95MS:                  representative.ttft.P95MS,
+		TTFTSamples:                representative.ttft.Samples,
+		RecentTTFTAverageMS:        representative.recent.TTFTAverageMS,
+		RecentTTFTSamples:          representative.recent.TTFTSamples,
+		RecentTTFTSource:           representative.recent.TTFTSource,
+		RecentTTFTConfidencePPM:    representative.recent.TTFTConfidencePPM,
+		HistoricalTTFTSamples:      representative.recent.TTFTHistoricalSamples,
+		RecentUsageCount:           representative.recent.RecentUsageCount,
+		RecentStabilityRate:        recentStabilityRate,
+		RecentStabilitySamples:     representative.recent.StabilitySamples,
+		RecentStabilitySource:      representative.recent.StabilitySource,
+		StabilityConfidencePPM:     representative.recent.StabilityConfidencePPM,
+		HistoricalStabilitySamples: representative.recent.StabilityHistoricalSamples,
+		RecentMetricsObservedAt:    representative.recent.LastObservedAtMS,
+		ConsecutiveHardFailures:    quality.ConsecutiveHardFailures, ProbeFailures: quality.ProbeFailures,
+		LastObservedAtMS: smartRouteStatusEvidence(rawQuality, nowMS).LastObservedAtMS,
+		LastProbeAtMS:    rawQuality.LastProbeAtMS, LastProbeOutcome: rawQuality.LastProbeOutcome,
+		NextProbeAtMS: quality.NextProbeAtMS, SampleDueAtMS: quality.SampleDueAtMS,
+		StableSinceMS: quality.StableSinceMS,
+		Constraints:   smartRouteStatusConstraints(representative, request, policy),
+	}
+	if representative.candidate != nil {
+		item.Admission = representative.candidate.Admission
+		item.SelectionRank = representative.rank
+		item.Decision = "eligible"
+		item.DispatchEligibility = "eligible"
+		item.DispatchReason = "planner_candidate"
+		if representative.candidate.Admission == smartrouter.AdmissionLastResort || primary == "unavailable" {
+			item.Decision = "conditional"
+			item.DispatchEligibility = "safe_last_resort"
+			item.DispatchReason = "health_abnormal_but_safe_text_fallback"
+			if representative.candidate.RecoveryFallback {
+				item.DispatchReason = "automatic_recovery_fallback"
+			}
+		} else if availability == "warming_canary" || availability == "emergency_only" || availability == "capacity_busy" {
+			item.Decision = "conditional"
+			item.DispatchEligibility = "conditional"
+			item.DispatchReason = availability
+		}
+	}
+	if selected {
+		item.Selected = true
+		item.Decision = "selected"
+		item.SelectionReason = reason
+	} else {
+		item.SkippedReason = reason
+	}
+	if preference != nil {
+		comparison, reason := smartRouteStatusPriceComparison(item.Price, &preference.Price)
+		item.PriceComparison = comparison
+		item.PriceComparisonReason = reason
+		item.CheaperThanPreference = comparison == "cheaper"
+		item.RankingCostComparison = smartRouteStatusRankingCostComparison(
+			representative.ranking, preference.rankingEvidence,
+		)
+	}
+	item.Recovery = smartRouteStatusRecovery(item, quality, workerAvailable, replayClass, nowMS)
+	if item.Recovery.NextAction == "natural_traffic" {
+		item.NextProbeAtMS = 0
+		item.SampleDueAtMS = 0
+	}
+	return item
+}
+
+func smartRouteStatusRouteLess(left, right smartRouteUserStatusRoute, policy smartrouter.Policy, nowMS int64) bool {
+	if left.selected != right.selected {
+		return left.selected
+	}
+	leftCandidate, rightCandidate := left.candidate != nil, right.candidate != nil
+	if leftCandidate != rightCandidate {
+		return leftCandidate
+	}
+	if leftCandidate && left.rank != right.rank {
+		return left.rank < right.rank
+	}
+	leftPrimary, _ := smartRouteStatusRouteState(left, policy, nowMS)
+	rightPrimary, _ := smartRouteStatusRouteState(right, policy, nowMS)
+	leftRank, rightRank := smartRouteStatusPrimaryRank(leftPrimary), smartRouteStatusPrimaryRank(rightPrimary)
+	if leftRank != rightRank {
+		return leftRank < rightRank
+	}
+	if left.priced != right.priced {
+		return left.priced
+	}
+	if left.modelPriceKnown != right.modelPriceKnown {
+		return left.modelPriceKnown
+	}
+	if left.modelPriceKnown && left.price.ComparableWith(right.price) && left.price.ScorePPM != right.price.ScorePPM {
+		return left.price.ScorePPM < right.price.ScorePPM
+	}
+	if left.ratio != right.ratio {
+		return left.ratio < right.ratio
+	}
+	return left.meta.route.RouteID < right.meta.route.RouteID
+}
+
+func smartRouteStatusRouteState(route smartRouteUserStatusRoute, _ smartrouter.Policy, nowMS int64) (string, string) {
+	rawQuality := route.quality
+	if route.meta.blockedAuto || rawQuality.Phase == smartrouter.QualityQuarantined {
+		return "needs_review", "quarantined"
+	}
+	quality, _ := smartrouter.NormalizeAutomaticRecoveryState(rawQuality, nowMS)
+	if route.credential.BlockedUntilMS > nowMS {
+		return "unavailable", "credential_blocked"
+	}
+	if quality.Phase == smartrouter.QualityHalfOpen {
+		return "unavailable", "probe_running"
+	}
+	if quality.Phase == smartrouter.QualityOpen {
+		if quality.NextProbeAtMS > 0 && quality.NextProbeAtMS <= nowMS {
+			return "unavailable", "probe_due"
+		}
+		return "unavailable", "open_waiting"
+	}
+	if quality.Phase == smartrouter.QualityDegraded {
+		return "degraded_usable", "available_degraded"
+	}
+	if quality.Phase == smartrouter.QualityHealthy {
+		if route.capacity.BlockedUntilMS > nowMS || (route.capacity.Known && route.capacity.MaxInflight > 0 && route.capacity.Inflight >= route.capacity.MaxInflight) {
+			return "healthy", "capacity_busy"
+		}
+		return "healthy", "available"
+	}
+	if quality.Phase == smartrouter.QualityUnknown || quality.Phase == smartrouter.QualityBootstrap || quality.Phase == "" {
+		// Unknown means unobserved, not unavailable. A certified route with a
+		// real endpoint and price is a valid safe-text candidate and will obtain
+		// its first sample through ordinary traffic.
+		return "unknown", "available_unproven"
+	}
+	return "telemetry_unavailable", "telemetry_unavailable"
+}
+
+func smartRouteStatusRouteReason(route smartRouteUserStatusRoute, policy smartrouter.Policy, nowMS int64) string {
+	if route.meta.blockedAuto || route.quality.Phase == smartrouter.QualityQuarantined {
+		return "waiting_for_admin_review"
+	}
+	if route.rejection != "" {
+		return string(route.rejection)
+	}
+	if route.candidate == nil {
+		_, availability := smartRouteStatusRouteState(route, policy, nowMS)
+		return availability
+	}
+	if route.capacity.BlockedUntilMS > nowMS || (route.capacity.Known && route.capacity.MaxInflight > 0 && route.capacity.Inflight >= route.capacity.MaxInflight) {
+		return "capacity_busy"
+	}
+	return "available_after_selected_route"
+}
+
+func smartRouteStatusConstraints(
+	route smartRouteUserStatusRoute,
+	request SmartRouteUserStatusRequest,
+	policy smartrouter.Policy,
+) SmartRouteStatusConstraints {
+	reason := route.rejection
+	return SmartRouteStatusConstraints{
+		GroupAuthorized:       true,
+		GroupSelected:         policy.AllowsGroup(route.meta.route.Group) && !containsSmartRouteStatusString(policy.ExcludedGroups, route.meta.route.Group),
+		WithinKeyPriceLimit:   route.priced && route.ratio <= policy.MaxEffectiveRatioPPM,
+		RuntimeExcluded:       route.runtimeExcludedUntilMS > 0,
+		EndpointSupported:     route.meta.contract.Endpoint == request.Endpoint,
+		CapabilitiesSupported: reason != smartrouter.RejectCapabilityMismatch,
+		ContextSupported:      reason != smartrouter.RejectContextTooLarge,
+		TTFTAcceptable:        reason != smartrouter.RejectTTFTSlow,
+	}
+}
+
+func smartRouteStatusEvidence(quality smartrouter.QualityState, nowMS int64) SmartRouteStatusEvidence {
+	samples := quality.TotalSuccesses + quality.TotalHardFailures
+	lastObserved := maxSmartRouteInt64(
+		quality.LastUpdatedMS,
+		maxSmartRouteInt64(quality.LastProbeAtMS, maxSmartRouteInt64(quality.LastSuccessMS, quality.LastFailureMS)),
+	)
+	freshness := "none"
+	if lastObserved > 0 {
+		age := nowMS - lastObserved
+		switch {
+		case age <= smartRouteStatusFreshMS:
+			freshness = "fresh"
+		case age <= smartRouteStatusRecentMS:
+			freshness = "recent"
+		default:
+			freshness = "stale"
+		}
+	}
+	confidence := "none"
+	switch {
+	case samples >= 20:
+		confidence = "high"
+	case samples >= 5:
+		confidence = "medium"
+	case samples > 0:
+		confidence = "low"
+	}
+	return SmartRouteStatusEvidence{
+		SuccessRate:    smartRouteSuccessRate(quality),
+		TotalSuccesses: quality.TotalSuccesses, TotalHardFailures: quality.TotalHardFailures,
+		RealSuccesses: quality.RealSuccesses, RealHardFailures: quality.RealHardFailures,
+		ProbeSuccesses: quality.ProbeSuccesses, TotalProbeFailures: quality.TotalProbeFailures,
+		CurrentProbeFailures: quality.ProbeFailures,
+		ReliabilityPPM:       quality.ReliabilityPPM, SampleCount: samples,
+		Freshness: freshness, Confidence: confidence, Historical: freshness == "stale",
+		LastObservedAtMS: lastObserved, LastRealSuccessAtMS: quality.LastRealSuccessMS,
+		LastRealFailureAtMS: quality.LastRealFailureMS, LastRealOutcome: quality.LastRealOutcome,
+		LastProbeAtMS: quality.LastProbeAtMS, LastProbeOutcome: quality.LastProbeOutcome,
+	}
+}
+
+func smartRouteStatusRecovery(
+	item SmartRouteUserStatusItem,
+	quality smartrouter.QualityState,
+	workerAvailable bool,
+	replayClass smartrouter.ReplayClass,
+	nowMS int64,
+) SmartRouteStatusRecovery {
+	recovery := SmartRouteStatusRecovery{
+		ProbeState: "none", NextAction: "none", NextActionActor: "none",
+		AutomaticCandidateReentry: "not_needed", CanBecomePreferredAfterEntry: "not_applicable",
+		RequiresAdminReview: item.RequiresAdminReview,
+	}
+	if item.ReasonCode == "endpoint_unsupported" || item.ReasonCode == string(smartrouter.RejectCapabilityMismatch) ||
+		item.ReasonCode == string(smartrouter.RejectContextTooLarge) {
+		recovery.NextAction = "change_request_profile"
+		recovery.NextActionActor = "request"
+		recovery.AutomaticCandidateReentry = "no"
+		return recovery
+	}
+	if item.ReasonCode == string(smartrouter.RejectGroupNotSelected) || item.ReasonCode == string(smartrouter.RejectGroupExcluded) ||
+		item.ReasonCode == string(smartrouter.RejectAbovePriceLimit) {
+		recovery.NextAction = "change_key_policy"
+		recovery.NextActionActor = "user"
+		recovery.AutomaticCandidateReentry = "no"
+		return recovery
+	}
+	if item.ReasonCode == string(smartrouter.RejectRouteExcluded) {
+		if item.RuntimeExcludedUntilMS > nowMS {
+			recovery.NextAction = "runtime_quarantine_expiry"
+			recovery.NextActionActor = "system"
+			recovery.NextActionAtMS = item.RuntimeExcludedUntilMS
+			recovery.AutomaticCandidateReentry = "yes"
+			recovery.CanBecomePreferredAfterEntry = "conditional"
+		} else {
+			recovery.NextAction = "change_key_policy"
+			recovery.NextActionActor = "user"
+			recovery.AutomaticCandidateReentry = "no"
+		}
+		return recovery
+	}
+	if item.ReasonCode == string(smartrouter.RejectPriceMissing) || !item.PriceKnown {
+		recovery.NextAction = "synchronize_price"
+		recovery.NextActionActor = "admin"
+		recovery.AutomaticCandidateReentry = "conditional"
+		return recovery
+	}
+	if item.RequiresAdminReview || item.PrimaryState == "needs_review" {
+		recovery.ProbeState = "stopped"
+		recovery.NextAction = "admin_reset"
+		recovery.NextActionActor = "admin"
+		recovery.AutomaticCandidateReentry = "no"
+		recovery.CanBecomePreferredAfterEntry = "conditional"
+		return recovery
+	}
+	if item.CapacityLimited || item.Availability == "capacity_busy" {
+		recovery.NextAction = "capacity_release"
+		recovery.NextActionActor = "capacity_release"
+		recovery.NextActionAtMS = item.CapacityUntilMS
+		recovery.AutomaticCandidateReentry = "yes"
+		recovery.CanBecomePreferredAfterEntry = "conditional"
+		return recovery
+	}
+	if item.CredentialBlockedUntilMS > nowMS {
+		recovery.ProbeState = "scheduled"
+		recovery.NextAction = "credential_backoff_expiry"
+		recovery.NextActionActor = "worker_or_next_request"
+		recovery.NextActionAtMS = item.CredentialBlockedUntilMS
+		recovery.AutomaticCandidateReentry = "conditional"
+		recovery.CanBecomePreferredAfterEntry = "conditional"
+		return recovery
+	}
+	if quality.Phase == smartrouter.QualityHalfOpen {
+		recovery.ProbeState = "running"
+		recovery.NextAction = "complete_probe"
+		recovery.NextActionActor = "worker"
+		recovery.AutomaticCandidateReentry = "conditional"
+		recovery.CanBecomePreferredAfterEntry = "conditional"
+		return recovery
+	}
+	if quality.Phase == smartrouter.QualityUnknown {
+		recovery.ProbeState = "not_needed"
+		recovery.NextAction = "natural_traffic"
+		recovery.NextActionActor = "next_request"
+		recovery.AutomaticCandidateReentry = "not_needed"
+		recovery.CanBecomePreferredAfterEntry = "yes"
+		return recovery
+	}
+	if quality.Phase == smartrouter.QualityOpen {
+		if smartrouter.IsSyntheticProbeSafe(replayClass) {
+			if workerAvailable {
+				recovery.ProbeState = "scheduled"
+				recovery.NextActionActor = "worker"
+			} else {
+				recovery.ProbeState = "overdue"
+				recovery.NextActionActor = "worker_restart_or_next_request"
+			}
+			recovery.NextAction = "recovery_probe"
+		} else {
+			recovery.ProbeState = "natural_traffic"
+			recovery.NextAction = "matching_real_request"
+			recovery.NextActionActor = "next_request"
+		}
+		recovery.NextActionAtMS = quality.NextProbeAtMS
+		recovery.AutomaticCandidateReentry = "yes"
+		recovery.CanBecomePreferredAfterEntry = "conditional"
+		return recovery
+	}
+	return recovery
+}
+
+func smartRouteStatusSummary(items []SmartRouteUserStatusItem) SmartRouteStatusSummary {
+	result := SmartRouteStatusSummary{Groups: len(items)}
+	for _, item := range items {
+		if item.CheaperThanPreference {
+			result.CheaperGroups++
+			switch item.Availability {
+			case "available", "available_unproven":
+				result.CheaperAvailableGroups++
+			case "warming_canary", "open_waiting", "probe_due", "probe_running", "emergency_only", "recovery_cooling", "runtime_excluded":
+				result.CheaperRecoveringGroups++
+			case "quarantined":
+				result.CheaperNeedsReviewGroups++
+			}
+		}
+		switch item.PrimaryState {
+		case "healthy":
+			result.HealthyGroups++
+		case "unavailable":
+			result.RecoveringGroups++
+		case "unknown":
+			result.PendingSampleGroups++
+		case "needs_review":
+			result.NeedsReviewGroups++
+		case "pending_sample":
+			result.PendingSampleGroups++
+		}
+	}
+	return result
+}
+
+func smartRouteStatusItemLess(left, right SmartRouteUserStatusItem, preference *SmartRouteUserPreference) bool {
+	leftRanked, rightRanked := left.SelectionRank > 0, right.SelectionRank > 0
+	if leftRanked != rightRanked {
+		return leftRanked
+	}
+	if leftRanked && left.SelectionRank != right.SelectionRank {
+		return left.SelectionRank < right.SelectionRank
+	}
+	if left.Selected != right.Selected {
+		return left.Selected
+	}
+	leftRankingCheaper := left.RankingCostComparison == "cheaper"
+	rightRankingCheaper := right.RankingCostComparison == "cheaper"
+	if leftRankingCheaper != rightRankingCheaper {
+		return leftRankingCheaper
+	}
+	if left.CheaperThanPreference != right.CheaperThanPreference {
+		return left.CheaperThanPreference
+	}
+	leftDecision, rightDecision := smartRouteStatusDecisionRank(left), smartRouteStatusDecisionRank(right)
+	if leftDecision != rightDecision {
+		return leftDecision < rightDecision
+	}
+	if left.PriceKnown != right.PriceKnown {
+		return left.PriceKnown
+	}
+	if left.ModelPriceKnown != right.ModelPriceKnown {
+		return left.ModelPriceKnown
+	}
+	if left.Price != nil && right.Price != nil && left.Price.ComparableWith(*right.Price) && left.Price.ScorePPM != right.Price.ScorePPM {
+		return left.Price.ScorePPM < right.Price.ScorePPM
+	}
+	if left.Price == nil && right.Price == nil && left.EffectiveRatioPPM != right.EffectiveRatioPPM {
+		return left.EffectiveRatioPPM < right.EffectiveRatioPPM
+	}
+	return left.Group < right.Group
+}
+
+func smartRouteStatusDecisionRank(item SmartRouteUserStatusItem) int {
+	switch item.PrimaryState {
+	case "needs_review":
+		return 1
+	case "unavailable":
+		return 2
+	case "healthy":
+		return 3
+	case "degraded_usable":
+		return 4
+	case "unknown", "pending_sample":
+		return 5
+	default:
+		return 6
+	}
+}
+
+func smartRouteStatusModelIndexRank(state string) int {
+	switch state {
+	case "no_available_candidate":
+		return 0
+	case "needs_review":
+		return 1
+	case "serving_with_recovery":
+		return 2
+	case "healthy":
+		return 3
+	case "pending_sample":
+		return 4
+	default:
+		return 5
+	}
+}
+
+func smartRouteStatusPrimaryRank(value string) int {
+	switch value {
+	case "healthy":
+		return 0
+	case "degraded_usable":
+		return 1
+	case "unknown":
+		return 2
+	case "unavailable":
+		return 3
+	case "needs_review":
+		return 4
+	default:
+		return 7
+	}
+}
+
+func smartRouteStatusSelectedReason(strategy smartrouter.Strategy) string {
+	switch strategy {
+	case smartrouter.StrategyStability:
+		return "selected_best_stability"
+	case smartrouter.StrategyLatency:
+		return "selected_best_latency"
+	case smartrouter.StrategyBalanced:
+		return "selected_best_balanced_score"
+	case smartrouter.StrategyCustomWeighted:
+		return "selected_best_custom_weighted_score"
+	case smartrouter.StrategyManual:
+		return "selected_by_manual_order"
+	default:
+		return "selected_lowest_price_available"
+	}
+}
+
+func smartRouteStatusLegacyStatus(route smartRouteUserStatusRoute, primary string, nowMS int64) string {
+	if route.meta.blockedAuto || primary == "needs_review" {
+		return "quarantined"
+	}
+	if route.credential.BlockedUntilMS > nowMS {
+		return "credential_blocked"
+	}
+	if route.capacity.BlockedUntilMS > nowMS {
+		return "capacity_limited"
+	}
+	quality, _ := smartrouter.NormalizeAutomaticRecoveryState(route.quality, nowMS)
+	return string(quality.Phase)
+}
+
+func smartRouteStatusRequestProfile(endpoint string) (smartrouter.ReplayClass, uint64) {
+	switch endpoint {
+	case SmartEndpointImages:
+		return smartrouter.ReplaySafeImage, SmartCapabilityImageGeneration
+	case SmartEndpointVideos, SmartEndpointVideoTasks:
+		return smartrouter.ReplaySafeVideo, SmartCapabilityVideoGeneration | SmartCapabilityAsyncTask
+	default:
+		return smartrouter.ReplaySafeText, SmartCapabilityText
+	}
+}
+
+func smartRouteSuccessRate(quality smartrouter.QualityState) *float64 {
+	total := quality.TotalSuccesses + quality.TotalHardFailures
+	if total == 0 {
+		return nil
+	}
+	value := float64(quality.TotalSuccesses) / float64(total)
+	return &value
+}
+
+func smartRouteStatusPrice(
+	prices *smartrouter.PriceSnapshot,
+	userGroup string,
+	contract smartrouter.RouteContract,
+	route smartrouter.CertifiedRoute,
+) (int64, bool, smartrouter.RoutePrice, bool) {
+	if prices != nil {
+		if ratio, ok := prices.RatiosPPM[route.RouteID]; ok {
+			if price, exists := prices.RoutePrices[route.RouteID]; exists {
+				return ratio, true, price, true
+			}
+			return ratio, true, smartrouter.LegacyRoutePrice(ratio), true
+		}
+	}
+	source := NewAPIRouteRatioSource{}
+	ratio, priced := source.RouteRatioPPM(userGroup, route.Group)
+	if !priced {
+		return 0, false, smartrouter.RoutePrice{}, false
+	}
+	price, err := source.RoutePriceDescriptor(contract.CanonicalModel, route.Group, ratio)
+	if err != nil {
+		return ratio, true, smartrouter.RoutePrice{
+			BillingMode: "unknown", BillingUnit: "unknown", Scope: "status_fallback",
+			IncomparableReason: "price_descriptor_resolution_failed",
+		}, true
+	}
+	return ratio, true, price, true
+}
+
+func smartRouteStatusPricePointer(price smartrouter.RoutePrice, known bool) *smartrouter.RoutePrice {
+	if !known {
+		return nil
+	}
+	copyPrice := price
+	return &copyPrice
+}
+
+func smartRouteStatusPriceComparison(
+	price *smartrouter.RoutePrice,
+	preference *smartrouter.RoutePrice,
+) (string, string) {
+	if price == nil || preference == nil {
+		return "unknown", "price_descriptor_missing"
+	}
+	if !price.StaticComparable {
+		reason := price.IncomparableReason
+		if reason == "" {
+			reason = "candidate_price_incomparable"
+		}
+		return "incomparable", reason
+	}
+	if !preference.StaticComparable {
+		reason := preference.IncomparableReason
+		if reason == "" {
+			reason = "preference_price_incomparable"
+		}
+		return "incomparable", reason
+	}
+	if price.ComparisonClass != preference.ComparisonClass {
+		return "incomparable", "different_comparison_class"
+	}
+	switch {
+	case price.ScorePPM < preference.ScorePPM:
+		return "cheaper", ""
+	case price.ScorePPM > preference.ScorePPM:
+		return "more_expensive", ""
+	default:
+		return "equal", ""
+	}
+}
+
+func smartRouteStatusRatio(
+	prices *smartrouter.PriceSnapshot,
+	userGroup string,
+	route smartrouter.CertifiedRoute,
+) (int64, bool) {
+	if prices != nil {
+		if ratio, ok := prices.RatiosPPM[route.RouteID]; ok {
+			return ratio, true
+		}
+	}
+	return (NewAPIRouteRatioSource{}).RouteRatioPPM(userGroup, route.Group)
+}
+
+func smartRouteStatusCatalogVersion(catalog *smartrouter.CertifiedRouteCatalog) string {
+	if catalog == nil {
+		return ""
+	}
+	return catalog.Version
+}
+
+// smartRouteStatusFactSnapshotVersion fingerprints only site-wide evidence.
+// Token identity, policy, ordering and affinity are deliberately excluded so
+// callers can prove that global and Key views read the same underlying facts.
+func (engine *SmartRouterEngine) smartRouteStatusFactSnapshotVersion(
+	catalogVersion string,
+	runtime SmartRouteRuntimeSnapshot,
+) string {
+	actual := SmartRouteActualInputCostStatus{}
+	if engine != nil && engine.ActualInputCosts != nil {
+		actual = engine.ActualInputCosts.Status()
+	}
+	payload := fmt.Sprintf(
+		"schema=%d\x00catalog=%s\x00quality=%s\x00ttft=%s\x00recent=%s\x00capacity=%s\x00credential=%s\x00fail_closed=%t\x00actual_feature=%s\x00actual_estimator=%s\x00actual_ready=%t\x00actual_profiles=%d\x00actual_processed=%d\x00actual_updated=%d",
+		SmartRouteUserStatusSchemaVersion,
+		catalogVersion,
+		runtime.Quality.Version,
+		runtime.TTFT.Version,
+		runtime.Recent.Version,
+		runtime.Capacity.Version,
+		runtime.Credentials.Version,
+		runtime.FailClosed,
+		actual.FeatureVersion,
+		actual.EstimatorVersion,
+		actual.EvidenceReady,
+		actual.Profiles,
+		actual.Processed,
+		actual.LastUpdateMS,
+	)
+	digest := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("facts-%x", digest[:])
+}
+
+// SnapshotVersion adds the price projection used by this view. A Key can have
+// a different price/policy overlay while FactSnapshotVersion remains shared.
+func smartRouteStatusSnapshotVersion(factVersion, priceVersion string) string {
+	digest := sha256.Sum256([]byte(factVersion + "\x00" + priceVersion))
+	return fmt.Sprintf("snapshot-%x", digest[:])
+}
+
+func smartRouteStatusPlanErrorCode(err error, plan smartrouter.PlanResult) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, smartrouter.ErrNoCandidate):
+		return "no_candidate"
+	case errors.Is(err, smartrouter.ErrPriceUnavailable):
+		return "price_unavailable"
+	case len(plan.Candidates) > 0:
+		return "capacity_constrained"
+	default:
+		return "preference_unavailable"
+	}
+}
+
+func smartRouteStatusGroupKey(model, endpoint, group string) string {
+	return model + "\x00" + endpoint + "\x00" + group
+}
+
+func normalizedSmartRouteStatusPage(value int) int {
+	if value < 1 {
+		return 1
+	}
+	return value
+}
+
+func normalizedSmartRouteStatusPageSize(value int) int {
+	if value < 1 {
+		return 50
+	}
+	if value > smartRouteStatusMaxPageSize {
+		return smartRouteStatusMaxPageSize
+	}
+	return value
+}
+
+func containsSmartRouteStatusString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeSmartRouteStatusExcludedRoutes(configured, runtime []string) []string {
+	set := make(map[string]struct{}, len(configured)+len(runtime))
+	for _, routeID := range append(append([]string(nil), configured...), runtime...) {
+		routeID = strings.TrimSpace(routeID)
+		if routeID != "" {
+			set[routeID] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(set))
+	for routeID := range set {
+		result = append(result, routeID)
+	}
+	sort.Strings(result)
+	return result
+}

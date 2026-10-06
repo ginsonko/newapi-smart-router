@@ -1,0 +1,260 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func seedRouteAnalyticsCoverageV1(t *testing.T, startMS int64, endMS int64) {
+	t.Helper()
+	require.NoError(t, model.DB.Create(&model.RouteAnalyticsWorkerStateV1{
+		ID: model.RouteAnalyticsWorkerStateGlobalID, WatermarkEventTimeMS: endMS,
+		CoverageStartMS: startMS, CoverageEndMS: endMS, FreshnessAtMS: endMS,
+	}).Error)
+}
+
+func TestRouteAnalyticsDetailReportUsesRealBucketsAndFixedPoints(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	_, route := routeAnalyticsProjectionTestCatalog(t)
+	spec, err := routeAnalyticsDetailRangeSpecV1("24h")
+	require.NoError(t, err)
+	startMS, endMS := analyticsAlignedRangeV1(now, spec)
+	pointStartMS := endMS - 15*time.Minute.Milliseconds()
+	logs := []*model.Log{
+		routeAnalyticsProjectionTestLog(t, (pointStartMS+time.Minute.Milliseconds())/1_000, model.LogTypeConsume,
+			"route-detail-a", routeAnalyticsProjectionTestAttempts(route, true)),
+		routeAnalyticsProjectionTestLog(t, (pointStartMS+6*time.Minute.Milliseconds())/1_000, model.LogTypeConsume,
+			"route-detail-b", routeAnalyticsProjectionTestAttempts(route, true)),
+	}
+	processed, err := worker.processLogsV1(context.Background(), logs)
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	seedRouteAnalyticsCoverageV1(t, startMS, now.Add(-routeAnalyticsSafeDelayV1).UnixMilli())
+
+	var dimension model.RouteAnalyticsDimensionV1
+	require.NoError(t, model.DB.First(&dimension).Error)
+	report, err := GetRouteAnalyticsDetailReportV1(context.Background(), dimension.DetailID, "24h", now)
+	require.NoError(t, err)
+	assert.Equal(t, RouteAnalyticsQuerySchemaVersionV1, report.SchemaVersion)
+	assert.Equal(t, "24h", report.Range)
+	assert.Equal(t, int64(15*time.Minute/time.Millisecond), report.PointWidthMS)
+	require.Len(t, report.Points, 96)
+	assert.Equal(t, int64(2), report.Summary.LogicalRequests)
+	assert.Equal(t, int64(2), report.Summary.FinalSuccesses)
+	assert.Equal(t, int64(2), report.Summary.RetryRecoveries)
+	require.NotNil(t, report.Summary.FinalAvailabilityRatePPM)
+	assert.Equal(t, int64(1_000_000), *report.Summary.FinalAvailabilityRatePPM)
+	require.NotNil(t, report.Summary.CacheRatePPM)
+	assert.Equal(t, int64(900_000), *report.Summary.CacheRatePPM)
+	require.NotNil(t, report.Summary.TTFTAverageMS)
+	assert.Equal(t, int64(2_000), *report.Summary.TTFTAverageMS)
+	require.NotNil(t, report.Summary.PredictedInputCostPPM)
+	assert.Equal(t, int64(190_000), *report.Summary.PredictedInputCostPPM)
+	assert.Equal(t, int64(2_000), report.Summary.PredictedInputTokens)
+	assert.Equal(t, 1, report.Summary.CoveragePoints)
+
+	last := report.Points[len(report.Points)-1]
+	assert.Equal(t, int64(2), last.LogicalRequests)
+	assert.True(t, last.HasSamples)
+	unknown := report.Points[0]
+	assert.False(t, unknown.HasSamples)
+	assert.Nil(t, unknown.FinalAvailabilityRatePPM)
+	assert.Nil(t, unknown.CacheRatePPM)
+	assert.Nil(t, unknown.TTFTAverageMS)
+	assert.Nil(t, unknown.PredictedInputCostPPM)
+}
+
+func TestRouteAnalyticsDetailDistinguishesNoSamplesFromRealZeroAvailability(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	_, route := routeAnalyticsProjectionTestCatalog(t)
+	spec, err := routeAnalyticsDetailRangeSpecV1("1h")
+	require.NoError(t, err)
+	startMS, endMS := analyticsAlignedRangeV1(now, spec)
+	failure := routeAnalyticsProjectionTestLog(
+		t, (endMS-2*time.Minute.Milliseconds())/1_000, model.LogTypeError,
+		"route-real-failure", routeAnalyticsProjectionTestAttempts(route, false),
+	)
+	processed, err := worker.processLogsV1(context.Background(), []*model.Log{failure})
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	seedRouteAnalyticsCoverageV1(t, startMS, now.Add(-routeAnalyticsSafeDelayV1).UnixMilli())
+
+	var dimension model.RouteAnalyticsDimensionV1
+	require.NoError(t, model.DB.First(&dimension).Error)
+	report, err := GetRouteAnalyticsDetailReportV1(context.Background(), dimension.DetailID, "1h", now)
+	require.NoError(t, err)
+	require.NotNil(t, report.Summary.FinalAvailabilityRatePPM)
+	assert.Zero(t, *report.Summary.FinalAvailabilityRatePPM)
+	assert.Equal(t, int64(1), report.Summary.LogicalRequests)
+	assert.Equal(t, int64(1), report.Summary.ConfirmedFailures)
+
+	require.NoError(t, model.DB.Where("detail_id = ?", dimension.DetailID).Delete(&model.RouteAnalyticsBucketV1{}).Error)
+	empty, err := GetRouteAnalyticsDetailReportV1(context.Background(), dimension.DetailID, "1h", now)
+	require.NoError(t, err)
+	assert.Zero(t, empty.Summary.LogicalRequests)
+	assert.Nil(t, empty.Summary.FinalAvailabilityRatePPM)
+	assert.Equal(t, "no_samples", empty.Coverage.MissingReason)
+}
+
+func TestKeyUsageAnalyticsReportAggregatesNetQuotaByOwnedKeyAndModel(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	_, route := routeAnalyticsProjectionTestCatalog(t)
+	spec, err := keyUsageAnalyticsRangeSpecV1("1h")
+	require.NoError(t, err)
+	startMS, endMS := analyticsAlignedRangeV1(now, spec)
+	consume := routeAnalyticsProjectionTestLog(
+		t, (endMS-8*time.Minute.Milliseconds())/1_000, model.LogTypeConsume,
+		"key-success", routeAnalyticsProjectionTestAttempts(route, true),
+	)
+	failure := routeAnalyticsProjectionTestLog(
+		t, (endMS-3*time.Minute.Milliseconds())/1_000, model.LogTypeError,
+		"key-failure", routeAnalyticsProjectionTestAttempts(route, false),
+	)
+	refund := routeAnalyticsProjectionTestLog(
+		t, (endMS-2*time.Minute.Milliseconds())/1_000, model.LogTypeRefund,
+		"key-refund", nil,
+	)
+	refund.Quota = 100
+	processed, err := worker.processLogsV1(context.Background(), []*model.Log{consume, failure, refund})
+	require.NoError(t, err)
+	assert.Greater(t, processed.Applied, 0)
+	seedRouteAnalyticsCoverageV1(t, startMS, now.Add(-routeAnalyticsSafeDelayV1).UnixMilli())
+
+	report, err := GetKeyUsageAnalyticsReportV1(context.Background(), 7, 42, "1h", "", now)
+	require.NoError(t, err)
+	require.Len(t, report.Points, 12)
+	assert.Equal(t, int64(2), report.Summary.LogicalRequests)
+	assert.Equal(t, int64(1), report.Summary.Successes)
+	assert.Equal(t, int64(1), report.Summary.Failures)
+	require.NotNil(t, report.Summary.SuccessRatePPM)
+	assert.Equal(t, int64(500_000), *report.Summary.SuccessRatePPM)
+	assert.Equal(t, int64(500), report.Summary.PositiveQuota)
+	assert.Equal(t, int64(100), report.Summary.RefundQuota)
+	assert.Equal(t, int64(400), report.Summary.NetQuota)
+	require.NotNil(t, report.Summary.CacheRatePPM)
+	assert.Equal(t, int64(900_000), *report.Summary.CacheRatePPM)
+	require.NotNil(t, report.Summary.NetQuotaPer100MInput)
+	assert.InDelta(t, 40_000_000, *report.Summary.NetQuotaPer100MInput, 0.0001)
+	require.Len(t, report.Models, 1)
+	assert.Equal(t, "gpt-5.6-sol", report.Models[0].Model)
+	assert.Equal(t, report.Summary.NetQuota, report.Models[0].Summary.NetQuota)
+	require.Len(t, report.Groups, 1)
+	assert.Equal(t, "Example Discount  GPT", report.Groups[0].Group)
+	assert.Equal(t, report.Summary.NetQuota, report.Groups[0].Summary.NetQuota)
+
+	otherUser, err := GetKeyUsageAnalyticsReportV1(context.Background(), 8, 42, "1h", "", now)
+	require.NoError(t, err)
+	assert.Zero(t, otherUser.Summary.LogicalRequests)
+	assert.Zero(t, otherUser.Summary.NetQuota)
+	assert.Nil(t, otherUser.Summary.SuccessRatePPM)
+	assert.Nil(t, otherUser.Summary.CacheRatePPM)
+}
+
+func TestRouteAnalyticsRangeContractsRejectArbitraryExpensiveWindows(t *testing.T) {
+	_, err := routeAnalyticsDetailRangeSpecV1("30d")
+	assert.ErrorIs(t, err, ErrRouteAnalyticsRangeV1)
+	_, err = keyUsageAnalyticsRangeSpecV1("30d")
+	assert.ErrorIs(t, err, ErrRouteAnalyticsRangeV1)
+}
+
+func TestUserUsageAnalyticsAggregatesAllOwnedKeysAndExcludesOtherUsers(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	setupRouteAnalyticsProjectionTestDB(t)
+	spec, err := userUsageAnalyticsRangeSpecV1("24h")
+	require.NoError(t, err)
+	startMS, endMS := analyticsAlignedRangeV1(now, spec)
+	rows := []model.KeyUsageAnalyticsBucketV1{
+		{BucketKey: "user-key-a", UserID: 7, TokenID: 10, BucketStartMS: endMS - 5*time.Minute.Milliseconds(), Granularity: model.RouteAnalyticsGranularity5m, Model: "gpt-a", Endpoint: "/v1/responses", Group: "cheap", LogicalRequests: 1, Successes: 1, PositiveQuota: 100, InputTokens: 10, TTFTHistogramJSON: "[]"},
+		{BucketKey: "user-key-b", UserID: 7, TokenID: 11, BucketStartMS: endMS - 5*time.Minute.Milliseconds(), Granularity: model.RouteAnalyticsGranularity5m, Model: "gpt-b", Endpoint: "/v1/chat/completions", Group: "pro", LogicalRequests: 1, Failures: 1, PositiveQuota: 200, RefundQuota: 50, InputTokens: 20, TTFTHistogramJSON: "[]"},
+		{BucketKey: "other-user", UserID: 8, TokenID: 10, BucketStartMS: endMS - 5*time.Minute.Milliseconds(), Granularity: model.RouteAnalyticsGranularity5m, Model: "gpt-a", Endpoint: "/v1/responses", Group: "cheap", LogicalRequests: 9, PositiveQuota: 900, InputTokens: 90, TTFTHistogramJSON: "[]"},
+	}
+	require.NoError(t, model.DB.Create(&rows).Error)
+	seedRouteAnalyticsCoverageV1(t, startMS, now.Add(-routeAnalyticsSafeDelayV1).UnixMilli())
+	report, err := GetUserUsageAnalyticsReportV1(context.Background(), 7, "24h", now)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), report.Summary.LogicalRequests)
+	assert.Equal(t, int64(250), report.Summary.NetQuota)
+	assert.Len(t, report.Models, 2)
+	assert.Len(t, report.Groups, 2)
+	assert.Len(t, report.Points, 96)
+	assert.Equal(t, "owned-account-key-usage-buckets-v1", report.DataSource)
+	payload, err := common.Marshal(report)
+	require.NoError(t, err)
+	assert.NotContains(t, string(payload), "token_id")
+	_, err = GetUserUsageAnalyticsReportV1(context.Background(), 7, "1h", now)
+	assert.ErrorIs(t, err, ErrRouteAnalyticsRangeV1)
+}
+
+func TestUserUsageAnalyticsThirtyDaysUsesBoundedHourlyBuckets(t *testing.T) {
+	spec, err := userUsageAnalyticsRangeSpecV1("30d")
+	require.NoError(t, err)
+	assert.Equal(t, model.RouteAnalyticsGranularity1h, spec.sourceGranularity)
+	assert.Equal(t, time.Hour, spec.pointWidth)
+	assert.Equal(t, 720, spec.pointCount)
+}
+
+func TestUserUsageAnalyticsNaturalDayBoundsUseBeijingCalendar(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	require.NoError(t, err)
+	now := time.Date(2026, time.January, 8, 3, 7, 0, 0, location)
+	today, err := userUsageAnalyticsRangeSpecV1("today")
+	require.NoError(t, err)
+	start, queryEnd, windowStart, windowEnd := userUsageAnalyticsBoundsV1(now, today)
+	expectedStart := time.Date(2026, time.January, 8, 0, 0, 0, 0, location).UnixMilli()
+	assert.Equal(t, expectedStart, start)
+	assert.Equal(t, expectedStart, windowStart)
+	assert.Equal(t, now.UnixMilli(), windowEnd)
+	assert.GreaterOrEqual(t, queryEnd, windowEnd)
+	assert.Equal(t, 13, int((queryEnd-start)/today.pointWidth.Milliseconds()))
+
+	complete, err := userUsageAnalyticsRangeSpecV1("7d_complete")
+	require.NoError(t, err)
+	completeStart, completeEnd, actualStart, actualEnd := userUsageAnalyticsBoundsV1(now, complete)
+	assert.Equal(t, time.Date(2026, time.January, 1, 0, 0, 0, 0, location).UnixMilli(), completeStart)
+	assert.Equal(t, expectedStart, completeEnd)
+	assert.Equal(t, completeStart, actualStart)
+	assert.Equal(t, completeEnd, actualEnd)
+}
+
+func TestRouteAnalyticsDetailIDEnrichmentIsOpaqueAndBestEffort(t *testing.T) {
+	setupRouteAnalyticsProjectionTestDB(t)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	var contract smartrouter.ContractCatalog
+	for _, current := range catalog.Contracts {
+		contract = current
+	}
+	identity := smartRouteBackfillCatalogRoute{contract: contract.Contract, route: route}
+	fingerprint := routeAnalyticsPhysicalDigestV1(identity)
+	routes := []smartRouteUserStatusMetadata{{route: route, contract: contract.Contract}}
+	prices := &smartrouter.PriceSnapshot{RatiosPPM: map[string]int64{route.RouteID: 55_000}}
+	routeAnalyticsDetailIDsV1(context.Background(), routes, prices)
+	require.NotEmpty(t, routes[0].detailID)
+	dimension, err := model.GetRouteAnalyticsDimensionByDetailIDV1(context.Background(), routes[0].detailID)
+	require.NoError(t, err)
+	assert.Equal(t, fingerprint, dimension.RouteFingerprintDigest)
+	assert.Equal(t, int64(55_000), dimension.GroupRatioPPM)
+	assert.NotEqual(t, fmt.Sprintf("%d", route.ChannelID), routes[0].detailID)
+	assert.NotContains(t, routes[0].detailID, route.RouteID)
+	firstDetailID := routes[0].detailID
+	routes[0].detailID = ""
+	routeAnalyticsDetailIDsV1(context.Background(), routes, prices)
+	assert.Equal(t, firstDetailID, routes[0].detailID)
+
+	previousDB := model.DB
+	model.DB = nil
+	routes[0].detailID = ""
+	routeAnalyticsDetailIDsV1(context.Background(), routes, prices)
+	model.DB = previousDB
+	assert.Empty(t, routes[0].detailID, "analytics failure must not block or mutate the current leaderboard")
+}

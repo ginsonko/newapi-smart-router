@@ -1,0 +1,4 @@
+package common
+
+// MaxTaskDurationSeconds is shared by video validation and exact billing.
+const MaxTaskDurationSeconds = 3600

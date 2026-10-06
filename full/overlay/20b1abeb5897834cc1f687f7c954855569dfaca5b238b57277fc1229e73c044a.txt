@@ -1,0 +1,59 @@
+package model
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestEnsureMediaStorageSchemaAddsOnlyMissingFieldsAndIsIdempotent(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:media-schema-additive?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE media_storage_states (
+		id integer primary key, used_bytes integer not null default 0, reserved_bytes integer not null default 0
+	)`).Error)
+	require.NoError(t, db.Exec(`INSERT INTO media_storage_states (id, used_bytes, reserved_bytes) VALUES (1, 123, 7)`).Error)
+
+	require.NoError(t, EnsureMediaStorageSchema(db))
+	require.NoError(t, EnsureMediaStorageSchema(db))
+	require.NoError(t, verifyMediaStorageSchema(db))
+
+	var state MediaStorageState
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.Equal(t, int64(123), state.UsedBytes)
+	assert.Equal(t, int64(7), state.ReservedBytes)
+	assert.True(t, db.Migrator().HasColumn(&MediaStorageState{}, "LastScanError"))
+	assert.True(t, db.Migrator().HasColumn(&MediaStorageState{}, "PhysicalUsedBytes"))
+	assert.True(t, db.Migrator().HasTable(&MediaStorageReservation{}))
+}
+
+func TestEnsureMediaStorageSchemaSerializesConcurrentStartup(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:media-schema-concurrent?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(8)
+
+	var wait sync.WaitGroup
+	errorsByWorker := make(chan error, 8)
+	for worker := 0; worker < 8; worker++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			if migrateErr := EnsureMediaStorageSchema(db); migrateErr != nil {
+				errorsByWorker <- fmt.Errorf("worker %d: %w", index, migrateErr)
+			}
+		}(worker)
+	}
+	wait.Wait()
+	close(errorsByWorker)
+	for migrateErr := range errorsByWorker {
+		require.NoError(t, migrateErr)
+	}
+	require.NoError(t, verifyMediaStorageSchema(db))
+}

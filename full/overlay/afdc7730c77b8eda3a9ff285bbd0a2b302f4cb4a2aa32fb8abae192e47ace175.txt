@@ -1,0 +1,329 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  FileAudioIcon,
+  FilePlus2Icon,
+  ImagePlusIcon,
+  VideoIcon,
+  XIcon,
+} from 'lucide-react'
+import { useRef } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+
+import { promptReferenceTokens } from '../parameter-capability'
+import type { MediaCapabilities, StudioMode, StudioReference } from '../types'
+
+type ReferenceInputProps = {
+  mode: StudioMode
+  references: StudioReference[]
+  capabilities?: MediaCapabilities
+  onAdd: (files: File[]) => void
+  onRoleChange: (id: string, role: string) => void
+  onRemove: (id: string) => void
+  onInsert: (token: string) => void
+}
+
+const DEFAULT_ROLES = {
+  image: ['reference', 'first_frame', 'last_frame'],
+  video: ['reference', 'source'],
+  audio: ['reference', 'driving_audio'],
+} as const
+
+const REFERENCE_TYPE_LABELS = {
+  image: 'Images',
+  video: 'Videos',
+  audio: 'Audio',
+} as const
+
+const REFERENCE_TYPE_ICONS = {
+  image: ImagePlusIcon,
+  video: VideoIcon,
+  audio: FileAudioIcon,
+} as const
+
+export function ReferenceInput(props: ReferenceInputProps) {
+  const { t } = useTranslation()
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  const videoInputRef = useRef<HTMLInputElement>(null)
+  const audioInputRef = useRef<HTMLInputElement>(null)
+  const imageOnly = props.mode === 'image-edits'
+  const capability = props.capabilities?.available
+  const tokens = new Map(
+    promptReferenceTokens(capability, props.references).map((entry) => [
+      entry.id,
+      entry.token,
+    ])
+  )
+  const allowedTypes: Array<'image' | 'video' | 'audio'> = imageOnly
+    ? ['image']
+    : [
+        ...(capability?.reference_image ? (['image'] as const) : []),
+        ...(capability?.reference_video ? (['video'] as const) : []),
+        ...(capability?.reference_audio ? (['audio'] as const) : []),
+      ]
+  const unsupportedTypes =
+    imageOnly || !capability
+      ? []
+      : (['image', 'video', 'audio'] as const).filter(
+          (type) => !allowedTypes.includes(type)
+        )
+  const counts = props.references.reduce(
+    (result, reference) => {
+      result[reference.type] += 1
+      return result
+    },
+    { image: 0, video: 0, audio: 0 }
+  )
+  const maxima = {
+    image: capability?.max_images ?? 0,
+    video: capability?.max_videos ?? 0,
+    audio: capability?.max_audios ?? 0,
+  }
+  const canAddType = (type: 'image' | 'video' | 'audio') =>
+    allowedTypes.includes(type) &&
+    (maxima[type] === 0 || counts[type] < maxima[type]) &&
+    (!capability?.max_total_references ||
+      props.references.length < capability.max_total_references)
+  const canAdd = allowedTypes.some(canAddType)
+  const inputRefs = {
+    image: imageInputRef,
+    video: videoInputRef,
+    audio: audioInputRef,
+  }
+
+  const addFiles = (
+    type: 'image' | 'video' | 'audio',
+    files: FileList | null
+  ) => {
+    let remaining = maxima[type] > 0 ? maxima[type] - counts[type] : Infinity
+    if (capability?.max_total_references) {
+      remaining = Math.min(
+        remaining,
+        capability.max_total_references - props.references.length
+      )
+    }
+    const selected = [...(files ?? [])]
+    const maxBytes = {
+      image: capability?.max_image_bytes,
+      video: capability?.max_video_bytes,
+      audio: capability?.max_audio_bytes,
+    }[type]
+    const allowedMime =
+      type === 'image' ? capability?.image_mime_types : undefined
+    if (
+      (type === 'image' &&
+        capability?.max_total_image_bytes !== undefined &&
+        selected.reduce((sum, file) => sum + file.size, 0) +
+          props.references
+            .filter((reference) => reference.type === 'image')
+            .reduce((sum, reference) => sum + (reference.file?.size ?? 0), 0) >
+          capability.max_total_image_bytes) ||
+      selected.length > Math.max(0, remaining) ||
+      selected.some(
+        (file) =>
+          !file.type.startsWith(`${type}/`) ||
+          (allowedMime?.length && !allowedMime.includes(file.type)) ||
+          (maxBytes !== undefined && file.size > maxBytes)
+      )
+    ) {
+      toast.error(
+        t('The selected files exceed this model contract. No files were added.')
+      )
+      return
+    }
+    if (
+      capability?.mixed_references === false &&
+      props.references.some((reference) => reference.type !== type)
+    ) {
+      toast.error(t('This model does not support mixed reference types'))
+      return
+    }
+    props.onAdd(selected)
+  }
+
+  const getConfiguredRoles = (reference: StudioReference) => {
+    const available = props.capabilities?.available
+    if (reference.type === 'image' && available?.image_roles?.length) {
+      return available.image_roles
+    }
+    if (reference.type === 'video' && available?.video_roles?.length) {
+      return available.video_roles
+    }
+    if (reference.type === 'audio' && available?.audio_roles?.length) {
+      return available.audio_roles
+    }
+    return DEFAULT_ROLES[reference.type]
+  }
+
+  const getRoles = (reference: StudioReference) =>
+    getConfiguredRoles(reference).filter(
+      (role) => !capability?.forbidden_roles?.includes(role)
+    )
+
+  return (
+    <div className='space-y-2'>
+      <div className='space-y-2'>
+        <label className='text-sm font-medium'>
+          {t('Reference materials')}
+        </label>
+        <div className='grid grid-cols-3 gap-2'>
+          {allowedTypes.map((type) => (
+            <Button
+              disabled={!canAddType(type)}
+              key={type}
+              onClick={() => inputRefs[type].current?.click()}
+              size='sm'
+              type='button'
+              variant='outline'
+            >
+              {(() => {
+                const Icon = REFERENCE_TYPE_ICONS[type]
+                return <Icon aria-hidden='true' />
+              })()}
+              <span className='truncate'>{t(REFERENCE_TYPE_LABELS[type])}</span>
+              <span className='text-muted-foreground tabular-nums'>
+                {counts[type]}/{maxima[type] || '∞'}
+              </span>
+            </Button>
+          ))}
+        </div>
+        {unsupportedTypes.length > 0 && (
+          <p className='text-muted-foreground text-xs'>
+            {t('This model does not accept {{types}} references', {
+              types: unsupportedTypes
+                .map((type) => t(REFERENCE_TYPE_LABELS[type]))
+                .join(' / '),
+            })}
+          </p>
+        )}
+        {capability?.image_mime_types?.length ? (
+          <p className='text-muted-foreground text-xs'>
+            {t('Accepted image types')}:{' '}
+            {capability.image_mime_types.join(', ')}
+          </p>
+        ) : null}
+        {allowedTypes.map((type) => (
+          <input
+            accept={
+              type === 'image' && capability?.image_mime_types?.length
+                ? capability.image_mime_types.join(',')
+                : `${type}/*`
+            }
+            className='sr-only'
+            key={type}
+            multiple
+            onChange={(event) => {
+              addFiles(type, event.target.files)
+              event.target.value = ''
+            }}
+            ref={inputRefs[type]}
+            type='file'
+          />
+        ))}
+      </div>
+      {props.references.length === 0 ? (
+        <button
+          className='text-muted-foreground hover:border-primary/50 hover:text-foreground flex min-h-24 w-full flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-4 text-xs transition-colors'
+          onClick={() => {
+            const preferred = allowedTypes.find(canAddType)
+            if (preferred) inputRefs[preferred].current?.click()
+          }}
+          disabled={!canAdd}
+          type='button'
+        >
+          <FilePlus2Icon aria-hidden='true' className='size-5' />
+          {allowedTypes.length > 0
+            ? t('Add reference materials supported by this route')
+            : t('This route does not accept reference materials')}
+        </button>
+      ) : (
+        <div className='space-y-2'>
+          {props.references.map((reference) => (
+            <div
+              className='bg-muted/30 flex min-w-0 items-center gap-2 rounded-lg border p-2'
+              key={reference.id}
+            >
+              {reference.previewUrl && reference.type === 'image' ? (
+                <img
+                  alt=''
+                  className='size-10 shrink-0 rounded object-cover'
+                  src={reference.previewUrl}
+                />
+              ) : (
+                <div className='bg-muted text-muted-foreground flex size-10 shrink-0 items-center justify-center rounded text-[10px] font-medium uppercase'>
+                  {reference.type}
+                </div>
+              )}
+              <div className='min-w-0 flex-1'>
+                <p className='truncate text-xs font-medium'>{reference.name}</p>
+                <NativeSelect
+                  aria-label={t('Reference role')}
+                  className='mt-1 w-full'
+                  onChange={(event) =>
+                    props.onRoleChange(reference.id, event.target.value)
+                  }
+                  size='sm'
+                  value={reference.role}
+                >
+                  {!getRoles(reference).includes(reference.role) && (
+                    <NativeSelectOption value={reference.role} disabled>
+                      {t(reference.role)}
+                    </NativeSelectOption>
+                  )}
+                  {getRoles(reference).map((role) => (
+                    <NativeSelectOption key={role} value={role}>
+                      {t(role)}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+                {tokens.get(reference.id) && (
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='ghost'
+                    onClick={() => {
+                      const token = tokens.get(reference.id)
+                      if (token) props.onInsert(token)
+                    }}
+                  >
+                    {t('Insert reference')}{' '}
+                    <code>{tokens.get(reference.id)}</code>
+                  </Button>
+                )}
+              </div>
+              <Button
+                aria-label={t('Remove reference')}
+                onClick={() => props.onRemove(reference.id)}
+                size='icon-sm'
+                type='button'
+                variant='ghost'
+              >
+                <XIcon aria-hidden='true' />
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}

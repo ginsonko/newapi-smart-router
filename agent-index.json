@@ -1,8 +1,8 @@
 {
   "index_schema_version": "agent-index-v1",
-  "index_version": "3.0.0-alpha.1",
+  "index_version": "4.0.0-alpha.1",
   "project": "NewAPI Smart Router",
-  "status": "public_alpha_v0_3_candidate",
+  "status": "public_alpha_v0_4_candidate",
   "runnable": false,
   "warning": "Development design index. It is not an installer and does not prove host parity.",
   "recommended_entry": "parts/docs/agent-context.md",

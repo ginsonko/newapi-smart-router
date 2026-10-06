@@ -1,0 +1,74 @@
+package helper
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func parameterTestPrice() *types.ParameterPriceSnapshot {
+	return &types.ParameterPriceSnapshot{Revision: "sale-r1", RuleID: "sale-rule", Group: "g", Model: "model", ChannelID: 1, UpstreamModel: "upstream", Unit: "per_second", Currency: "USD", UnitPrice: "0.996", Quantity: "10", Amount: "9.96", Quota: 4980000, SourceUnitPrice: "0.83", SourceAmount: "8.3", Parameters: map[string]string{"resolution": "720p", "count": "1", "duration_seconds": "10"}}
+}
+func TestParameterCommitmentKeepsSaleAndRefreshesSupply(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/videos", nil)
+	original := parameterTestPrice()
+	FreezeParameterCommitment(c, original)
+	next := parameterTestPrice()
+	next.Group = "authorized-fallback"
+	next.ChannelID = 2
+	next.Revision = "supply-r2"
+	next.RuleID = "supply-rule"
+	next.UnitPrice = ".9"
+	next.Amount = "9"
+	next.Quota = 4500000
+	next.SourceUnitPrice = ".7"
+	next.SourceAmount = "7"
+	bound, err := bindParameterCommitment(c, next)
+	require.NoError(t, err)
+	require.Equal(t, "g", bound.Group)
+	require.Equal(t, "authorized-fallback", bound.SupplyGroup)
+	require.Equal(t, "9.96", bound.Amount)
+	require.Equal(t, "sale-r1", bound.Revision)
+	require.Equal(t, "supply-r2", bound.SupplyRevision)
+	require.Equal(t, "supply-rule", bound.SupplyRuleID)
+	require.Equal(t, "7", bound.SourceAmount)
+	tooHigh := parameterTestPrice()
+	tooHigh.Amount = "9.96000001"
+	_, err = bindParameterCommitment(c, tooHigh)
+	require.Error(t, err)
+	wrong := parameterTestPrice()
+	wrong.Parameters["resolution"] = "1080p"
+	_, err = bindParameterCommitment(c, wrong)
+	require.Error(t, err)
+	original.Parameters["resolution"] = "changed"
+	saved, _ := c.Get(types.ParameterCommitmentContextKey)
+	require.Equal(t, "720p", saved.(*types.ParameterPriceSnapshot).Parameters["resolution"])
+	raw, err := json.Marshal(bound.ConsumerOffer())
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "source")
+	require.NotContains(t, string(raw), "channel")
+}
+
+func TestParameterQuoteCannotBeSilentlyIgnored(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/images/generations", nil)
+	c.Request.Header.Set(types.ParameterQuoteHeader, "fake")
+	_, err := bindParameterCommitment(c, nil)
+	require.Error(t, err)
+	_, err = bindParameterCommitment(c, parameterTestPrice())
+	require.Error(t, err)
+}
+
+func TestParameterImageWireBlocksPricingOverrides(t *testing.T) {
+	q := parameterTestPrice()
+	q.Parameters = map[string]string{"count": "1", "resolution": "1024x1024", "quality": "standard"}
+	require.NoError(t, ValidateParameterImageWire(q, []byte(`{"model":"upstream","n":1,"size":"1024x1024","quality":"standard"}`)))
+	for _, raw := range []string{`{"model":"upstream","n":2,"size":"1024x1024","quality":"standard"}`, `{"model":"upstream","n":1,"size":"2048x2048","quality":"standard"}`, `{"model":"other","n":1,"size":"1024x1024","quality":"standard"}`, `{"model":"upstream","n":1,"size":"1024x1024","quality":"hd"}`} {
+		require.Error(t, ValidateParameterImageWire(q, []byte(raw)))
+	}
+}

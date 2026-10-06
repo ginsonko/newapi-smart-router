@@ -1,0 +1,72 @@
+package openai
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+func TestLateSearchCandidateActualHandlers(t *testing.T) {
+	searchOne := `{"type":"web_search_call","id":"search-one","status":"completed"}`
+	searchTwo := `{"type":"web_search_call","id":"search-two","status":"completed"}`
+	function := `{"type":"function_call","id":"function-one","status":"completed"}`
+	itemDone := `{"type":"response.output_item.done","output_index":0,"item":` + searchOne + `}`
+	terminal := func(eventType, output string) string {
+		return `{"type":"` + eventType + `","response":{"status":"completed","output":` + output + `,"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}`
+	}
+	for _, toolType := range []string{"web_search", "web_search_preview"} {
+		for _, example := range []struct {
+			name   string
+			stream bool
+			output string
+			events []string
+			want   int
+		}{
+			{name: "nonstream_declared_unused", output: `[]`, want: 0},
+			{name: "nonstream_two_actual_calls", output: `[` + searchOne + `,` + searchTwo + `]`, want: 2},
+			{name: "stream_repeated_item_done", stream: true, events: []string{itemDone, itemDone, terminal("response.completed", `[`+searchOne+`]`)}, want: 1},
+			{name: "stream_terminal_output_only", stream: true, events: []string{terminal("response.completed", `[`+searchOne+`,`+searchTwo+`]`)}, want: 2},
+			{name: "stream_done_completed_overlap", stream: true, events: []string{itemDone, terminal("response.completed", `[`+searchOne+`]`), terminal("response.done", `[`+searchOne+`]`)}, want: 1},
+			{name: "stream_function_is_not_search", stream: true, events: []string{`{"type":"response.output_item.done","output_index":0,"item":` + function + `}`, terminal("response.completed", `[`+function+`]`)}, want: 0},
+		} {
+			t.Run(toolType+"/"+example.name, func(test *testing.T) {
+				context, _ := gin.CreateTestContext(httptest.NewRecorder())
+				context.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				info := &relaycommon.RelayInfo{
+					ChannelMeta:        &relaycommon.ChannelMeta{UpstreamModelName: "gpt-test"},
+					IsStream:           example.stream,
+					RelayFormat:        types.RelayFormatOpenAI,
+					ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{toolType: {ToolName: toolType}}},
+				}
+				body := fmt.Sprintf(`{"status":"completed","tools":[{"type":%q}],"output":%s,"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}`, toolType, example.output)
+				contentType := "application/json"
+				if example.stream {
+					body = "data: " + strings.Join(example.events, "\n\ndata: ") + "\n\n"
+					contentType = "text/event-stream"
+				}
+				response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(body))}
+				if example.stream {
+					_, apiError := OaiResponsesStreamHandler(context, info, response)
+					if apiError != nil {
+						test.Fatalf("stream handler failed: %v", apiError)
+					}
+				} else {
+					_, apiError := OaiResponsesHandler(context, info, response)
+					if apiError != nil {
+						test.Fatalf("nonstream handler failed: %v", apiError)
+					}
+				}
+				if actual := info.ResponsesUsageInfo.BuiltInTools[toolType].CallCount; actual != example.want {
+					test.Fatalf("actual tool calls: got %d, want %d", actual, example.want)
+				}
+			})
+		}
+	}
+}

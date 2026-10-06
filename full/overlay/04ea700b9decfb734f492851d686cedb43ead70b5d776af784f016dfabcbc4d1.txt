@@ -1,0 +1,120 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	"gorm.io/gorm"
+)
+
+const (
+	mediaSchemaMySQLLockName = "newapi_media_storage_schema_v1"
+	mediaSchemaPostgresLock  = int64(0x4e4150494d454449)
+)
+
+var mediaSchemaProcessLock sync.Mutex
+
+type additiveMediaModel struct {
+	model  any
+	fields []string
+}
+
+var additiveMediaModels = []additiveMediaModel{
+	{
+		model: &MediaStorageState{},
+		fields: []string{
+			"ID", "UsedBytes", "ReservedBytes", "PhysicalUsedBytes", "LedgerBytesAtScan",
+			"UntrackedBytes", "TemporaryBytes", "PhysicalFileCount", "UntrackedFileCount",
+			"TemporaryFileCount", "LastScannedAt", "LastScanError", "CleanupLeaseOwner",
+			"CleanupLeaseUntil", "UpdatedAt",
+		},
+	},
+	{
+		model: &MediaStorageReservation{},
+		fields: []string{
+			"ID", "Token", "UserID", "Bytes", "State", "ExpiresAt", "CreatedAt", "UpdatedAt",
+		},
+	},
+}
+
+// EnsureMediaStorageSchema performs the media subsystem's narrow, additive
+// migration on every process role. Production Web and Worker processes run as
+// slave nodes and intentionally skip the legacy global AutoMigrate path, so
+// media readiness cannot depend on common.IsMasterNode.
+//
+// Existing columns are never altered or removed. Database-native locks fence
+// concurrent Web/Worker startup on MySQL/PostgreSQL; the process lock and the
+// SQLite write transaction cover local and test deployments.
+func EnsureMediaStorageSchema(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("media schema migration requires a database")
+	}
+	mediaSchemaProcessLock.Lock()
+	defer mediaSchemaProcessLock.Unlock()
+
+	migrate := func(locked *gorm.DB) error {
+		for _, item := range additiveMediaModels {
+			if !locked.Migrator().HasTable(item.model) {
+				if err := locked.Migrator().CreateTable(item.model); err != nil {
+					return fmt.Errorf("create media storage table: %w", err)
+				}
+			}
+			for _, field := range item.fields {
+				if locked.Migrator().HasColumn(item.model, field) {
+					continue
+				}
+				if err := locked.Migrator().AddColumn(item.model, field); err != nil {
+					return fmt.Errorf("add media storage field %s: %w", field, err)
+				}
+			}
+		}
+		return verifyMediaStorageSchema(locked)
+	}
+
+	switch db.Dialector.Name() {
+	case "mysql":
+		return db.Connection(func(locked *gorm.DB) error {
+			var acquired int
+			if err := locked.Raw("SELECT GET_LOCK(?, 30)", mediaSchemaMySQLLockName).Scan(&acquired).Error; err != nil {
+				return fmt.Errorf("acquire media schema lock: %w", err)
+			}
+			if acquired != 1 {
+				return errors.New("timed out acquiring media schema lock")
+			}
+			defer func() {
+				var released int
+				_ = locked.Raw("SELECT RELEASE_LOCK(?)", mediaSchemaMySQLLockName).Scan(&released).Error
+			}()
+			return migrate(locked)
+		})
+	case "postgres":
+		return db.Connection(func(locked *gorm.DB) error {
+			if err := locked.Exec("SELECT pg_advisory_lock(?)", mediaSchemaPostgresLock).Error; err != nil {
+				return fmt.Errorf("acquire media schema lock: %w", err)
+			}
+			defer func() {
+				_ = locked.Exec("SELECT pg_advisory_unlock(?)", mediaSchemaPostgresLock).Error
+			}()
+			return migrate(locked)
+		})
+	case "sqlite":
+		return db.Transaction(migrate)
+	default:
+		return migrate(db)
+	}
+}
+
+func verifyMediaStorageSchema(db *gorm.DB) error {
+	for _, item := range additiveMediaModels {
+		if !db.Migrator().HasTable(item.model) {
+			return errors.New("media storage table is unavailable after migration")
+		}
+		for _, field := range item.fields {
+			if !db.Migrator().HasColumn(item.model, field) {
+				return fmt.Errorf("media storage field %s is unavailable after migration", field)
+			}
+		}
+	}
+	return nil
+}

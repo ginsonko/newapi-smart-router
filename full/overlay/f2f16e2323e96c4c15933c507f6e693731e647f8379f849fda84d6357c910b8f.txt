@@ -1,0 +1,180 @@
+package relay
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+// smartRouteStreamGuard promotes an abnormal upstream stream termination to
+// the smart-router retry/commit boundary before usage is settled. Fixed keys
+// retain the upstream project's existing stream semantics.
+func smartRouteStreamGuard(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if c == nil || info == nil || !info.IsStream || info.StreamStatus == nil {
+		return nil
+	}
+	if _, smart := common.GetContextKey(c, constant.ContextKeyTokenRoutingPolicy); !smart {
+		return nil
+	}
+	status := info.StreamStatus
+	// A protocol terminal remains authoritative even when downstream closes in
+	// the same scheduling window. This does not relax a bare client_gone: only
+	// a completed Chat/Claude/Responses terminal makes it neutral.
+	if status.EndReason == relaycommon.StreamEndReasonClientGone &&
+		status.HasTerminal() && !status.HasErrors() {
+		return nil
+	}
+	// Once the provider has emitted response.completed, a later client
+	// disconnect is not an upstream failure and must not turn a successful
+	// response into a second route attempt or a synthetic 502.
+	if status.EndReason == relaycommon.StreamEndReasonClientGone &&
+		openaichannel.SmartResponsesCompletedSeen(c) {
+		return nil
+	}
+	// The generic scanner treats EOF as a legacy-normal end because several
+	// providers legitimately omit [DONE]. Responses has an explicit terminal
+	// contract, so EOF is normal only after a completed/terminal event was
+	// actually observed by the Responses handler.
+	if openaichannel.SmartResponsesSemanticBoundaryActive(c) &&
+		status.EndReason == relaycommon.StreamEndReasonEOF &&
+		!openaichannel.SmartResponsesTerminalSeen(c) {
+		streamErr := status.EndError
+		if streamErr == nil {
+			streamErr = fmt.Errorf("Responses stream ended before a terminal event")
+		}
+		return openaichannel.PreserveSmartResponsesSingleRouteError(
+			c,
+			openaichannel.MarkSmartResponsesUpstreamError(c,
+				types.NewErrorWithStatusCode(streamErr, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway)),
+		)
+	}
+	// Chat/Claude SSE streams have their own explicit terminal event. Treat a
+	// bare transport EOF as an incomplete response for smart keys; fixed keys
+	// retain the legacy compatibility path above this guard.
+	if status.EndReason == relaycommon.StreamEndReasonEOF && !status.HasTerminal() {
+		streamErr := status.EndError
+		if streamErr == nil {
+			streamErr = fmt.Errorf("stream ended before provider terminal event")
+		}
+		return openaichannel.PreserveSmartResponsesSingleRouteError(
+			c,
+			openaichannel.MarkSmartResponsesUpstreamError(c,
+				types.NewErrorWithStatusCode(streamErr, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway)),
+		)
+	}
+	if status.IsNormalEnd() && !status.HasErrors() {
+		return nil
+	}
+
+	streamErr := status.EndError
+	if streamErr == nil {
+		streamErr = fmt.Errorf("upstream stream ended abnormally: %s", status.Summary())
+	}
+	statusCode := http.StatusBadGateway
+	errorCode := types.ErrorCodeReadResponseBodyFailed
+	if status.EndReason == relaycommon.StreamEndReasonTimeout {
+		statusCode = http.StatusGatewayTimeout
+		errorCode = types.ErrorCodeChannelResponseTimeExceeded
+	}
+	if status.EndReason == relaycommon.StreamEndReasonClientGone {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			streamErr = errors.Join(streamErr, c.Request.Context().Err())
+		}
+		errorCode = types.ErrorCodeDoRequestFailed
+	}
+	apiErr := types.NewErrorWithStatusCode(streamErr, errorCode, statusCode)
+	if status.EndReason != relaycommon.StreamEndReasonClientGone {
+		apiErr = openaichannel.MarkSmartResponsesUpstreamError(c, apiErr)
+	}
+	return openaichannel.PreserveSmartResponsesSingleRouteError(
+		c,
+		apiErr,
+	)
+}
+
+// EmitSmartStreamTermination sends one protocol-level error event after a
+// smart-routed stream has already committed semantic output. The controller
+// deliberately does not dispatch a second route in this state, so the client
+// receives an explicit, parseable end instead of a silent HTTP 200 truncation.
+// It is idempotent per request/attempt and never writes after the downstream
+// context has been cancelled.
+func EmitSmartStreamTermination(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
+	_ = emitSmartStreamTermination(c, info, apiErr)
+}
+
+func emitSmartStreamTermination(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) error {
+	if c == nil || info == nil || !info.IsStream || apiErr == nil || c.Writer == nil {
+		return nil
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return nil
+	}
+	if c.GetBool(string(constant.ContextKeySmartStreamErrorSent)) {
+		return nil
+	}
+	c.Set(string(constant.ContextKeySmartStreamErrorSent), true)
+
+	openAIError := apiErr.ToOpenAIError()
+	openAIError.Message = smartStreamTerminationMessage(c, apiErr, openAIError.Message)
+	if strings.TrimSpace(openAIError.Type) == "" {
+		openAIError.Type = string(types.ErrorCodeBadResponse)
+	}
+
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAIResponses, types.RelayFormatOpenAIResponsesCompaction:
+		event := dto.ResponsesStreamResponse{Type: "error", Error: openAIError}
+		data, err := common.Marshal(event)
+		if err != nil {
+			return err
+		}
+		return helper.ResponseChunkData(c, event, string(data))
+	case types.RelayFormatClaude:
+		claudeError := apiErr.ToClaudeError()
+		claudeError.Message = openAIError.Message
+		return helper.ClaudeData(c, dto.ClaudeResponse{
+			Type:  "error",
+			Error: claudeError,
+		})
+	case types.RelayFormatGemini:
+		// Gemini-compatible callers consume the same SSE envelope as the
+		// OpenAI-compatible relay; keep the error object machine-readable.
+		return helper.ObjectData(c, struct {
+			Error types.OpenAIError `json:"error"`
+		}{Error: openAIError})
+	default:
+		if err := helper.ObjectData(c, struct {
+			Error types.OpenAIError `json:"error"`
+		}{Error: openAIError}); err != nil {
+			return err
+		}
+		return helper.StringData(c, "[DONE]")
+	}
+}
+
+func smartStreamTerminationMessage(c *gin.Context, apiErr *types.NewAPIError, original string) string {
+	message := strings.TrimSpace(original)
+	lower := strings.ToLower(message)
+	if message == "" || strings.Contains(lower, "context canceled") ||
+		strings.Contains(lower, "unexpected eof") || strings.Contains(lower, "stream ended abnormally") {
+		message = "本次响应在完成前连接中断，已发送的内容无法在当前连接中替换，请重新连接后继续"
+	} else {
+		message = "本次响应在完成前异常结束：" + message + "。已发送的内容无法在当前连接中替换，请重新连接后继续"
+	}
+	if c != nil {
+		if requestID := strings.TrimSpace(c.GetString(common.RequestIdKey)); requestID != "" {
+			message += " 请求 ID：" + requestID
+		}
+	}
+	return message
+}

@@ -1,0 +1,788 @@
+package media
+
+import (
+	"fmt"
+	"net/url"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+)
+
+const (
+	ReferenceTypeImage = "image"
+	ReferenceTypeVideo = "video"
+	ReferenceTypeAudio = "audio"
+)
+
+type ReferenceDescriptor struct {
+	Type            string
+	Role            string
+	SizeBytes       int64
+	DurationSeconds float64
+	MetadataTrusted bool
+}
+
+type DurationCapability struct {
+	Mode    string `json:"mode,omitempty"`
+	Min     int    `json:"min,omitempty"`
+	Max     int    `json:"max,omitempty"`
+	Step    int    `json:"step,omitempty"`
+	Default int    `json:"default,omitempty"`
+	Fixed   int    `json:"fixed,omitempty"`
+}
+
+type OutputCountCapability struct {
+	Min     int `json:"min,omitempty"`
+	Max     int `json:"max,omitempty"`
+	Default int `json:"default,omitempty"`
+}
+
+// Capability is the effective, route-local media input contract. It is
+// resolved before price/stability ranking and validated again after a concrete
+// route is selected so unsupported inputs can never be silently discarded.
+type Capability struct {
+	ReferenceDurationField       string                           `json:"reference_duration_field,omitempty"`
+	DurationsByResolution        map[string][]int                 `json:"durations_by_resolution,omitempty"`
+	SubmitIdempotency            bool                             `json:"submit_idempotency,omitempty"`
+	ReferenceImage               bool                             `json:"reference_image"`
+	ReferenceVideo               bool                             `json:"reference_video"`
+	ReferenceAudio               bool                             `json:"reference_audio"`
+	ImageRoles                   []string                         `json:"image_roles"`
+	VideoRoles                   []string                         `json:"video_roles"`
+	AudioRoles                   []string                         `json:"audio_roles"`
+	MinImages                    int                              `json:"min_images,omitempty"`
+	MinVisual                    int                              `json:"min_visual,omitempty"`
+	MaxImages                    int                              `json:"max_images"`
+	MaxVideos                    int                              `json:"max_videos"`
+	MaxAudios                    int                              `json:"max_audios"`
+	MaxTotalReferences           int                              `json:"max_total_references,omitempty"`
+	MaxImageBytes                int64                            `json:"max_image_bytes,omitempty"`
+	MaxVideoBytes                int64                            `json:"max_video_bytes,omitempty"`
+	MaxAudioBytes                int64                            `json:"max_audio_bytes,omitempty"`
+	MaxRemoteImageBytes          int64                            `json:"max_remote_image_bytes,omitempty"`
+	MaxTotalImageBytes           int64                            `json:"max_total_image_bytes,omitempty"`
+	MaxRemoteVideoBytes          int64                            `json:"max_remote_video_bytes,omitempty"`
+	MaxTotalVideoBytes           int64                            `json:"max_total_video_bytes,omitempty"`
+	MaxRemoteAudioBytes          int64                            `json:"max_remote_audio_bytes,omitempty"`
+	MaxTotalAudioBytes           int64                            `json:"max_total_audio_bytes,omitempty"`
+	ImageMIMETypes               []string                         `json:"image_mime_types,omitempty"`
+	VideoMIMETypes               []string                         `json:"video_mime_types,omitempty"`
+	AudioMIMETypes               []string                         `json:"audio_mime_types,omitempty"`
+	MinReferenceVideoSeconds     int                              `json:"min_reference_video_seconds,omitempty"`
+	MaxReferenceVideoSeconds     int                              `json:"max_reference_video_seconds,omitempty"`
+	MaxTotalReferenceVideoSecond int                              `json:"max_total_reference_video_seconds,omitempty"`
+	AspectRatios                 []string                         `json:"aspect_ratios,omitempty"`
+	Resolutions                  []string                         `json:"resolutions,omitempty"`
+	Duration                     DurationCapability               `json:"duration,omitempty"`
+	OutputCount                  OutputCountCapability            `json:"output_count,omitempty"`
+	ProviderContract             string                           `json:"provider_contract,omitempty"`
+	BillingUnit                  string                           `json:"billing_unit,omitempty"`
+	PricingRevision              string                           `json:"pricing_revision,omitempty"`
+	ContractRevision             string                           `json:"contract_revision,omitempty"`
+	RuntimeEnforced              bool                             `json:"runtime_enforced,omitempty"`
+	SizeAspectRatios             map[string]string                `json:"size_aspect_ratios,omitempty"`
+	ResolutionAliases            map[string]string                `json:"resolution_aliases,omitempty"`
+	DefaultResolution            string                           `json:"default_resolution,omitempty"`
+	RequireResolution            bool                             `json:"require_resolution,omitempty"`
+	AllowedModes                 []string                         `json:"allowed_modes,omitempty"`
+	ForbiddenModes               []string                         `json:"forbidden_modes,omitempty"`
+	ForbiddenRoles               []string                         `json:"forbidden_roles,omitempty"`
+	MixedReferences              *bool                            `json:"mixed_references,omitempty"`
+	NativeHumanImages            *bool                            `json:"native_human_images,omitempty"`
+	PromptMaxChars               int                              `json:"prompt_max_chars,omitempty"`
+	PromptReference              *model.CapabilityPromptReference `json:"prompt_reference,omitempty"`
+	ReferenceEncoding            map[string]string                `json:"reference_encoding,omitempty"`
+	GenerationFields             map[string]string                `json:"generation_fields,omitempty"`
+	ReferenceFields              map[string]string                `json:"reference_fields,omitempty"`
+	ReferenceURLField            string                           `json:"reference_url_field,omitempty"`
+	MaxRequestBytes              int64                            `json:"max_request_bytes,omitempty"`
+}
+
+// ResolveCapabilityForRequest joins the managed catalog to the concrete route.
+// Descriptive legacy contracts remain advisory until explicitly enabled.
+func ResolveCapabilityForRequest(channelID, channelType int, requestedModel, upstreamModel, group, endpoint, baseURL string) (Capability, error) {
+	fallback := ResolveCapabilityForRoute(channelID, channelType, upstreamModel, endpoint, baseURL)
+	bundle, err := model.GetActiveModelCapabilityBundle()
+	if err != nil {
+		return Capability{}, fmt.Errorf("active media capability contract is unavailable: %w", err)
+	}
+	for _, contract := range bundle.Contracts {
+		if contract.Target.Group != group || contract.Target.Model != requestedModel || !contract.RuntimeEnforced {
+			continue
+		}
+		if len(contract.Source.ChannelIDs) > 0 {
+			matched := false
+			for _, allowedID := range contract.Source.ChannelIDs {
+				matched = matched || allowedID == channelID
+			}
+			if !matched {
+				return Capability{}, fmt.Errorf("selected route is outside the model's configured capability source")
+			}
+		}
+		if contract.Source.Model != "" && contract.Source.Model != upstreamModel {
+			return Capability{}, fmt.Errorf("selected upstream model does not match the capability contract")
+		}
+		if len(contract.Provider.EndpointTypes) > 0 && !containsFold(contract.Provider.EndpointTypes, endpoint) {
+			return Capability{}, fmt.Errorf("endpoint %q is not supported by the model capability contract", endpoint)
+		}
+		return CapabilityFromModelContract(contract), nil
+	}
+	return fallback, nil
+}
+
+// CapabilityFromModelContract contains no commercial/source data and can also
+// be used by quote and candidate selection code without reading media bodies.
+func CapabilityFromModelContract(contract model.ModelCapabilityContract) Capability {
+	refs, generation := contract.References, contract.Generation
+	capability := Capability{
+		SubmitIdempotency: contract.Provider.SubmitIdempotency, MinImages: refs.MinImages, MinVisual: refs.MinVisual,
+		ReferenceImage: true, ReferenceVideo: true, ReferenceAudio: true,
+		ImageRoles: refs.Images.Roles, VideoRoles: refs.Videos.Roles, AudioRoles: refs.Audios.Roles,
+		MaxImages: refs.Images.Max, MaxVideos: refs.Videos.Max, MaxAudios: refs.Audios.Max,
+		MaxTotalReferences: refs.MaxTotal,
+		MaxImageBytes:      refs.Images.MaxBytes, MaxVideoBytes: refs.Videos.MaxBytes, MaxAudioBytes: refs.Audios.MaxBytes,
+		MaxRemoteImageBytes: refs.Images.MaxRemoteBytes, MaxTotalImageBytes: refs.Images.MaxTotalBytes,
+		MaxRemoteVideoBytes: refs.Videos.MaxRemoteBytes, MaxTotalVideoBytes: refs.Videos.MaxTotalBytes,
+		MaxRemoteAudioBytes: refs.Audios.MaxRemoteBytes, MaxTotalAudioBytes: refs.Audios.MaxTotalBytes,
+		ImageMIMETypes: refs.Images.MIMETypes, VideoMIMETypes: refs.Videos.MIMETypes, AudioMIMETypes: refs.Audios.MIMETypes,
+		MinReferenceVideoSeconds: refs.Videos.MinDurationSeconds, MaxReferenceVideoSeconds: refs.Videos.MaxDurationSeconds,
+		MaxTotalReferenceVideoSecond: refs.Videos.MaxTotalDurationSeconds,
+		AspectRatios:                 generation.AspectRatios, Resolutions: generation.Resolutions,
+		Duration:         DurationCapability{Mode: generation.Duration.Mode, Min: generation.Duration.Min, Max: generation.Duration.Max, Step: generation.Duration.Step, Fixed: generation.Duration.Fixed, Default: generation.Duration.Default},
+		ProviderContract: contract.Provider.Contract, ContractRevision: contract.Revision,
+		RuntimeEnforced: contract.RuntimeEnforced, ResolutionAliases: generation.ResolutionAliases, SizeAspectRatios: generation.SizeAspectRatios,
+		DefaultResolution: generation.DefaultResolution, RequireResolution: generation.RequireResolution,
+		AllowedModes: generation.AllowedModes, ForbiddenModes: generation.ForbiddenModes,
+		ForbiddenRoles: refs.ForbiddenRoles, MixedReferences: refs.Mixed, NativeHumanImages: refs.NativeHumanImages,
+		PromptMaxChars: refs.PromptMaxChars, PromptReference: refs.PromptReference,
+		ReferenceDurationField: contract.Provider.ReferenceDurationField, DurationsByResolution: generation.DurationsByResolution,
+		ReferenceEncoding: contract.Provider.ReferenceEncoding, GenerationFields: contract.Provider.GenerationFields,
+		ReferenceFields: contract.Provider.ReferenceFields, ReferenceURLField: contract.Provider.ReferenceURLField,
+		MaxRequestBytes: contract.Provider.MaxRequestBytes,
+	}
+	if refs.Images.Enabled != nil {
+		capability.ReferenceImage = *refs.Images.Enabled
+	}
+	if refs.Videos.Enabled != nil {
+		capability.ReferenceVideo = *refs.Videos.Enabled
+	}
+	if refs.Audios.Enabled != nil {
+		capability.ReferenceAudio = *refs.Audios.Enabled
+	}
+	if capability.Duration.Mode == "free" && (capability.Duration.Min > 0 || capability.Duration.Max > 0) {
+		capability.Duration.Mode = "range"
+	}
+	return normalizeCapability(capability)
+}
+
+func ResolveCapability(channelID, channelType int, model, endpoint string) Capability {
+	return ResolveCapabilityForRoute(channelID, channelType, model, endpoint, "")
+}
+
+func ResolveCapabilityForRoute(channelID, channelType int, model, endpoint, baseURL string) Capability {
+	capability := builtInCapability(channelType, model, endpoint)
+	applyProviderCapability(&capability, baseURL, model, endpoint)
+	applyImageDimensionDefaults(&capability, model, endpoint)
+	type matchedOverride struct {
+		score    int
+		override mediasetting.CapabilityOverride
+	}
+	matches := make([]matchedOverride, 0)
+	for _, override := range mediasetting.Get().CapabilityOverrides {
+		if override.ChannelID != 0 && override.ChannelID != channelID {
+			continue
+		}
+		if override.Endpoint != "" && override.Endpoint != endpoint {
+			continue
+		}
+		if override.Model != "" && !matchesModelPattern(override.Model, model) {
+			continue
+		}
+		score := 0
+		if override.ChannelID != 0 {
+			score += 4
+		}
+		if override.Model != "" {
+			score += 2
+		}
+		if override.Endpoint != "" {
+			score++
+		}
+		matches = append(matches, matchedOverride{score: score, override: override})
+	}
+	sort.SliceStable(matches, func(i, j int) bool { return matches[i].score < matches[j].score })
+	for _, match := range matches {
+		applyCapabilityOverride(&capability, match.override)
+	}
+	if strings.Contains(endpoint, "video") && capability.ProviderContract == "" && len(matches) == 0 {
+		capability = Capability{
+			ReferenceImage: true,
+			ReferenceVideo: true,
+			ReferenceAudio: true,
+		}
+	}
+	return normalizeCapability(capability)
+}
+
+func HasCapabilityOverride(channelID int, model, endpoint string) bool {
+	for _, override := range mediasetting.Get().CapabilityOverrides {
+		if override.ChannelID != 0 && override.ChannelID != channelID {
+			continue
+		}
+		if override.Endpoint != "" && override.Endpoint != endpoint {
+			continue
+		}
+		if override.Model != "" && !matchesModelPattern(override.Model, model) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (capability Capability) Validate(references []ReferenceDescriptor) error {
+	counts := map[string]int{}
+	totalReferenceVideoSeconds := 0.0
+	for index, reference := range references {
+		referenceType := strings.ToLower(strings.TrimSpace(reference.Type))
+		role := strings.ToLower(strings.TrimSpace(reference.Role))
+		if role == "" {
+			role = "reference"
+		}
+		if containsFold(capability.ForbiddenRoles, role) {
+			return fmt.Errorf("reference role %q is forbidden by this route", role)
+		}
+		counts[referenceType]++
+		switch referenceType {
+		case ReferenceTypeImage:
+			if !capability.ReferenceImage {
+				return fmt.Errorf("reference image %d is not supported by this route", index+1)
+			}
+			if !roleAllowed(role, capability.ImageRoles) {
+				return fmt.Errorf("reference image role %q is not supported by this route", role)
+			}
+			if capability.MaxImageBytes > 0 && reference.MetadataTrusted && reference.SizeBytes > capability.MaxImageBytes {
+				return fmt.Errorf("reference image %d exceeds this route's %d byte limit", index+1, capability.MaxImageBytes)
+			}
+		case ReferenceTypeVideo:
+			if !capability.ReferenceVideo {
+				return fmt.Errorf("reference video %d is not supported by this route", index+1)
+			}
+			if !roleAllowed(role, capability.VideoRoles) {
+				return fmt.Errorf("reference video role %q is not supported by this route", role)
+			}
+			if capability.MaxVideoBytes > 0 && reference.MetadataTrusted && reference.SizeBytes > capability.MaxVideoBytes {
+				return fmt.Errorf("reference video %d exceeds this route's %d byte limit", index+1, capability.MaxVideoBytes)
+			}
+			if reference.MetadataTrusted && (capability.MinReferenceVideoSeconds > 0 || capability.MaxReferenceVideoSeconds > 0 || capability.MaxTotalReferenceVideoSecond > 0) {
+				if reference.DurationSeconds <= 0 {
+					return fmt.Errorf("reference video %d duration could not be verified; upload the file again before submitting", index+1)
+				}
+				if capability.MinReferenceVideoSeconds > 0 && reference.DurationSeconds < float64(capability.MinReferenceVideoSeconds) {
+					return fmt.Errorf("reference video %d must be at least %d seconds", index+1, capability.MinReferenceVideoSeconds)
+				}
+				if capability.MaxReferenceVideoSeconds > 0 && reference.DurationSeconds > float64(capability.MaxReferenceVideoSeconds) {
+					return fmt.Errorf("reference video %d must be at most %d seconds", index+1, capability.MaxReferenceVideoSeconds)
+				}
+				totalReferenceVideoSeconds += reference.DurationSeconds
+			}
+		case ReferenceTypeAudio:
+			if !capability.ReferenceAudio {
+				return fmt.Errorf("reference audio %d is not supported by this route", index+1)
+			}
+			if !roleAllowed(role, capability.AudioRoles) {
+				return fmt.Errorf("reference audio role %q is not supported by this route", role)
+			}
+			if capability.MaxAudioBytes > 0 && reference.MetadataTrusted && reference.SizeBytes > capability.MaxAudioBytes {
+				return fmt.Errorf("reference audio %d exceeds this route's %d byte limit", index+1, capability.MaxAudioBytes)
+			}
+		default:
+			return fmt.Errorf("unsupported reference type %q", reference.Type)
+		}
+	}
+	if capability.MaxImages > 0 && counts[ReferenceTypeImage] > capability.MaxImages {
+		return fmt.Errorf("this route supports at most %d reference images", capability.MaxImages)
+	}
+	if capability.MaxVideos > 0 && counts[ReferenceTypeVideo] > capability.MaxVideos {
+		return fmt.Errorf("this route supports at most %d reference videos", capability.MaxVideos)
+	}
+	if capability.MaxAudios > 0 && counts[ReferenceTypeAudio] > capability.MaxAudios {
+		return fmt.Errorf("this route supports at most %d reference audio files", capability.MaxAudios)
+	}
+	if counts[ReferenceTypeImage] < capability.MinImages {
+		return fmt.Errorf("此模型至少需要 %d 张参考图片，请先添加图片", capability.MinImages)
+	}
+	visualCount := counts[ReferenceTypeImage] + counts[ReferenceTypeVideo]
+	if capability.MinVisual > 0 && visualCount < capability.MinVisual {
+		return fmt.Errorf("此模型至少需要 %d 张参考图片或参考视频，请先添加素材", capability.MinVisual)
+	}
+	if capability.MaxTotalReferences > 0 && len(references) > capability.MaxTotalReferences {
+		return fmt.Errorf("this route supports at most %d reference files in total", capability.MaxTotalReferences)
+	}
+	if capability.MixedReferences != nil && !*capability.MixedReferences && len(counts) > 1 {
+		return fmt.Errorf("mixed reference media types are not supported by this route")
+	}
+	if capability.MaxTotalReferenceVideoSecond > 0 && totalReferenceVideoSeconds > float64(capability.MaxTotalReferenceVideoSecond) {
+		return fmt.Errorf("reference videos may total at most %d seconds", capability.MaxTotalReferenceVideoSecond)
+	}
+	return nil
+}
+
+func (capability Capability) ValidateGeneration(duration int, aspectRatio, resolution string) error {
+	if capability.RuntimeEnforced && duration < 0 {
+		return fmt.Errorf("generation duration cannot be negative")
+	}
+	if duration <= 0 {
+		duration = capability.Duration.Default
+	}
+	switch capability.Duration.Mode {
+	case "fixed":
+		legacySentinel := duration == 1 && (!capability.RuntimeEnforced || capability.ProviderContract == "aizzz-video-v1")
+		if duration != capability.Duration.Fixed && !legacySentinel {
+			return fmt.Errorf("this route has a fixed duration of %d seconds", capability.Duration.Fixed)
+		}
+	case "range":
+		if duration < capability.Duration.Min || (capability.Duration.Max > 0 && duration > capability.Duration.Max) {
+			return fmt.Errorf("this route supports durations from %d to %d seconds", capability.Duration.Min, capability.Duration.Max)
+		}
+		if capability.Duration.Step > 1 && (duration-capability.Duration.Min)%capability.Duration.Step != 0 {
+			return fmt.Errorf("this route requires duration steps of %d seconds", capability.Duration.Step)
+		}
+	}
+	aspectRatio = strings.ToLower(strings.TrimSpace(aspectRatio))
+	if aspectRatio != "" && len(capability.AspectRatios) > 0 && !containsFold(capability.AspectRatios, aspectRatio) {
+		return fmt.Errorf("aspect ratio %q is not supported by this route", aspectRatio)
+	}
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	if allowed := capability.DurationsByResolution[resolution]; len(allowed) > 0 {
+		found := false
+		for _, seconds := range allowed {
+			found = found || seconds == duration
+		}
+		if !found {
+			return fmt.Errorf("duration %d is not available at %s; supported: %v", duration, resolution, allowed)
+		}
+	}
+	if capability.RequireResolution && resolution == "" {
+		return fmt.Errorf("resolution is required by this route")
+	}
+	if resolution != "" && len(capability.Resolutions) > 0 && !containsFold(capability.Resolutions, resolution) {
+		return fmt.Errorf("resolution %q is not supported by this route", resolution)
+	}
+	return nil
+}
+
+// NormalizeResolution is shared with pricing. A pixel size is mapped only by
+// the explicitly configured aliases; no aspect ratio or model-name guess is used.
+func (capability Capability) NormalizeResolution(resolution, size string) (string, error) {
+	resolution, size = strings.ToLower(strings.TrimSpace(resolution)), strings.ToLower(strings.TrimSpace(size))
+	aliases := make(map[string]string, len(capability.ResolutionAliases))
+	for alias, value := range capability.ResolutionAliases {
+		aliases[strings.ToLower(strings.TrimSpace(alias))] = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := aliases[resolution]; ok {
+		resolution = value
+	}
+	if size != "" {
+		mapped, ok := aliases[size]
+		if !ok && containsFold(capability.Resolutions, size) {
+			mapped, ok = size, true
+		}
+		if !ok && (len(capability.ResolutionAliases) > 0 || len(capability.Resolutions) > 0) {
+			if !capability.RuntimeEnforced && len(capability.ResolutionAliases) > 0 && resolution == "" {
+				return size, nil
+			}
+			return "", fmt.Errorf("size %q has no configured resolution mapping", size)
+		}
+		if ok {
+			if resolution != "" && resolution != mapped {
+				return "", fmt.Errorf("size and resolution select different configured resolution tiers")
+			}
+			resolution = mapped
+		}
+	}
+	if resolution == "" {
+		resolution = strings.ToLower(strings.TrimSpace(capability.DefaultResolution))
+	}
+	if capability.RequireResolution && resolution == "" {
+		return "", fmt.Errorf("resolution is required by this route")
+	}
+	if resolution != "" && len(capability.Resolutions) > 0 && !containsFold(capability.Resolutions, resolution) {
+		return "", fmt.Errorf("resolution %q is not supported by this route", resolution)
+	}
+	return resolution, nil
+}
+
+func (capability Capability) ValidateMode(mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return nil
+	}
+	if containsFold(capability.ForbiddenModes, mode) || (len(capability.AllowedModes) > 0 && !containsFold(capability.AllowedModes, mode)) {
+		return fmt.Errorf("generation mode %q is not supported by this route", mode)
+	}
+	return nil
+}
+
+func (capability Capability) ValidatePromptReferences(prompt string, references []ReferenceDescriptor) error {
+	if capability.PromptMaxChars > 0 && utf8.RuneCountInString(prompt) > capability.PromptMaxChars {
+		return fmt.Errorf("prompt exceeds this route's %d character limit", capability.PromptMaxChars)
+	}
+	rule := capability.PromptReference
+	if rule == nil || !rule.Required || len(references) == 0 {
+		return nil
+	}
+	counts := make(map[string]int)
+	for position, reference := range references {
+		kind := strings.ToLower(strings.TrimSpace(reference.Type))
+		template := rule.Templates[kind]
+		if template == "" {
+			return fmt.Errorf("prompt reference syntax for %s is not configured in the capability contract", kind)
+		}
+		index := counts[kind] + rule.IndexBase
+		if rule.IndexScope == "global" {
+			index = position + rule.IndexBase
+		}
+		counts[kind]++
+		token := strings.ReplaceAll(template, "{index}", strconv.Itoa(index))
+		if !containsPromptReferenceToken(prompt, token) {
+			return fmt.Errorf("reference %d (%s) must be cited in the prompt using %q", position+1, kind, token)
+		}
+	}
+	return nil
+}
+
+func containsPromptReferenceToken(prompt, token string) bool {
+	for offset := 0; offset <= len(prompt)-len(token); {
+		index := strings.Index(prompt[offset:], token)
+		if index < 0 {
+			return false
+		}
+		start, end := offset+index, offset+index+len(token)
+		leftOK := token[0] < '0' || token[0] > '9' || start == 0 || prompt[start-1] < '0' || prompt[start-1] > '9'
+		last := token[len(token)-1]
+		rightOK := last < '0' || last > '9' || end == len(prompt) || prompt[end] < '0' || prompt[end] > '9'
+		if leftOK && rightOK {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
+}
+
+func builtInCapability(channelType int, model, endpoint string) Capability {
+	imageRoles := []string{"reference", "first_frame", "last_frame", "subject", "style", "identity"}
+	result := Capability{}
+	if strings.Contains(endpoint, "images-edits") {
+		result.ReferenceImage = true
+		result.ImageRoles = []string{"reference", "mask"}
+		result.MaxImages = 16
+		return result
+	}
+	if !strings.Contains(endpoint, "video") {
+		return result
+	}
+	result.AspectRatios = []string{"16:9", "9:16", "1:1", "4:3", "3:4"}
+	result.Duration = DurationCapability{Mode: "range", Min: 1, Max: 3600, Step: 1, Default: 5}
+	result.OutputCount = OutputCountCapability{Min: 1, Max: 1, Default: 1}
+
+	switch channelType {
+	case constant.ChannelTypeAli:
+		result.ReferenceImage = true
+		result.ReferenceAudio = true
+		result.ImageRoles = imageRoles
+		result.AudioRoles = []string{"reference", "driving_audio"}
+		result.MaxImages = 2
+		result.MaxAudios = 1
+	case constant.ChannelTypeDoubaoVideo, constant.ChannelTypeVolcEngine:
+		result.ReferenceImage = true
+		result.ReferenceVideo = true
+		result.ReferenceAudio = true
+		result.ImageRoles = imageRoles
+		result.VideoRoles = []string{"reference", "source", "control"}
+		result.AudioRoles = []string{"reference", "driving_audio"}
+		result.MaxImages = 16
+		result.MaxVideos = 4
+		result.MaxAudios = 4
+	case constant.ChannelTypeMiniMax:
+		result.ReferenceImage = true
+		result.ImageRoles = imageRoles
+		result.MaxImages = 2
+	case constant.ChannelTypeKling:
+		result.ReferenceImage = true
+		result.ImageRoles = []string{"reference", "first_frame", "last_frame"}
+		result.MaxImages = 2
+	case constant.ChannelTypeJimeng:
+		result.ReferenceImage = true
+		result.ImageRoles = []string{"reference", "first_frame", "last_frame"}
+		result.MaxImages = 2
+	case constant.ChannelTypeVidu:
+		result.ReferenceImage = true
+		result.ImageRoles = []string{"reference", "first_frame", "last_frame"}
+		result.MaxImages = 7
+	case constant.ChannelTypeGemini, constant.ChannelTypeVertexAi:
+		result.ReferenceImage = true
+		result.ImageRoles = []string{"reference", "first_frame"}
+		result.MaxImages = 1
+	case constant.ChannelTypeOpenAI, constant.ChannelTypeOpenAIMax, constant.ChannelTypeSora:
+		result.ReferenceImage = true
+		result.ImageRoles = []string{"reference", "first_frame"}
+		result.MaxImages = 1
+	}
+
+	// Known model families are more reliable than a generic channel type when
+	// one gateway exposes several provider adapters through a common channel.
+	lowerModel := strings.ToLower(model)
+	if strings.Contains(lowerModel, "hailuo") || strings.HasPrefix(lowerModel, "i2v-") || strings.HasPrefix(lowerModel, "s2v-") {
+		result.ReferenceImage = true
+		result.ImageRoles = imageRoles
+		result.MaxImages = 2
+	}
+	return result
+}
+
+type providerCapabilityProfile struct {
+	maxImages     int
+	maxVideos     int
+	maxAudios     int
+	minImages     int
+	resolution    string
+	fixedDuration int
+	maxDuration   int
+}
+
+var aizzzVideoProfiles = map[string]providerCapabilityProfile{
+	"cc-seedance2.0 480p-fast-nsp":     {maxImages: 9, maxAudios: 3, resolution: "480p"},
+	"cc-seedance2.0 480p-nsp":          {maxImages: 9, maxAudios: 3, resolution: "480p"},
+	"mg-seedance2.0 -480p":             {maxImages: 4, maxVideos: 3, maxAudios: 1, resolution: "480p"},
+	"mg-seedance2.0 -480p fast":        {maxImages: 4, maxVideos: 3, maxAudios: 1, resolution: "480p"},
+	"mg-seedance2.0 -480p mini":        {maxImages: 4, maxVideos: 3, maxAudios: 1, resolution: "480p"},
+	"mg-seedance2.0 -720p fast":        {maxImages: 4, maxVideos: 3, maxAudios: 1, resolution: "720p"},
+	"mg-seedance2.0 -720p mini":        {maxImages: 4, maxVideos: 3, maxAudios: 1, resolution: "720p"},
+	"mg-seedance2.0 -720p pro":         {maxImages: 4, maxVideos: 3, maxAudios: 1, resolution: "720p"},
+	"mg-seedance2.0 -480p-fast-gz-15s": {maxImages: 9, maxVideos: 3, maxAudios: 3, resolution: "480p", fixedDuration: 15},
+	"mg-seedance2.0 -480p-gz-15s":      {maxImages: 9, maxVideos: 3, maxAudios: 3, resolution: "480p", fixedDuration: 15},
+	"mg-seedance2.0 -720p-fast-gz-15s": {maxImages: 9, maxVideos: 3, maxAudios: 3, resolution: "720p", fixedDuration: 15},
+	"mg-seedance2.0 -720p-gz-15s":      {maxImages: 9, maxVideos: 3, maxAudios: 3, resolution: "720p", fixedDuration: 15},
+	"mg-seedance2.0 -720p-mini-gz-15s": {maxImages: 9, maxVideos: 3, maxAudios: 3, resolution: "720p", fixedDuration: 15},
+	"xx-seedance 1080p-pro-nyp-15s":    {maxImages: 9, maxVideos: 3, resolution: "1080p", fixedDuration: 15},
+	"xx-seedance 720p-fast-nyp-15s":    {maxImages: 9, maxVideos: 3, resolution: "720p", fixedDuration: 15},
+	"xx-seedance 720p-mini-nyp-15s":    {maxImages: 9, maxVideos: 3, resolution: "720p", fixedDuration: 15},
+	"xx-seedance 720p-pro-nyp-15s":     {maxImages: 9, maxVideos: 3, resolution: "720p", fixedDuration: 15},
+	"破甲seedance 720p-fast":             {maxImages: 9, maxVideos: 3, maxAudios: 3, resolution: "720p"},
+}
+
+func applyProviderCapability(capability *Capability, baseURL, model, endpoint string) {
+	if capability == nil || !strings.Contains(endpoint, "video") || !isAIZZZBaseURL(baseURL) {
+		return
+	}
+	profile, ok := aizzzVideoProfiles[strings.ToLower(strings.TrimSpace(model))]
+	if !ok {
+		return
+	}
+	capability.ProviderContract = "aizzz-video-v1"
+	capability.ReferenceImage = profile.maxImages > 0
+	capability.ReferenceVideo = profile.maxVideos > 0
+	capability.ReferenceAudio = profile.maxAudios > 0
+	capability.MinImages = profile.minImages
+	capability.MaxImages = profile.maxImages
+	capability.MaxVideos = profile.maxVideos
+	capability.MaxAudios = profile.maxAudios
+	capability.MaxTotalReferences = 15
+	capability.MaxImageBytes = 30 << 20
+	capability.MaxVideoBytes = 50 << 20
+	capability.MaxAudioBytes = 15 << 20
+	capability.MinReferenceVideoSeconds = 2
+	capability.MaxReferenceVideoSeconds = 15
+	capability.MaxTotalReferenceVideoSecond = 15
+	capability.ImageRoles = []string{"reference"}
+	capability.VideoRoles = []string{"reference"}
+	capability.AudioRoles = []string{"reference"}
+	capability.AspectRatios = []string{"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"}
+	capability.Resolutions = []string{profile.resolution}
+	capability.OutputCount = OutputCountCapability{Min: 1, Max: 1, Default: 1}
+	if profile.fixedDuration > 0 {
+		capability.Duration = DurationCapability{Mode: "fixed", Fixed: profile.fixedDuration, Default: profile.fixedDuration}
+	} else {
+		maxDuration := profile.maxDuration
+		if maxDuration <= 0 {
+			maxDuration = 15
+		}
+		capability.Duration = DurationCapability{Mode: "range", Min: 5, Max: maxDuration, Step: 1, Default: 5}
+	}
+}
+
+func isAIZZZBaseURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && strings.EqualFold(parsed.Hostname(), "api.aizzz.xyz")
+}
+
+func applyCapabilityOverride(capability *Capability, override mediasetting.CapabilityOverride) {
+	if override.ReferenceImage != nil {
+		capability.ReferenceImage = *override.ReferenceImage
+	}
+	if override.ReferenceVideo != nil {
+		capability.ReferenceVideo = *override.ReferenceVideo
+	}
+	if override.ReferenceAudio != nil {
+		capability.ReferenceAudio = *override.ReferenceAudio
+	}
+	if override.ImageRoles != nil {
+		capability.ImageRoles = append([]string(nil), override.ImageRoles...)
+	}
+	if override.VideoRoles != nil {
+		capability.VideoRoles = append([]string(nil), override.VideoRoles...)
+	}
+	if override.AudioRoles != nil {
+		capability.AudioRoles = append([]string(nil), override.AudioRoles...)
+	}
+	if override.MaxImages > 0 {
+		capability.MaxImages = override.MaxImages
+	}
+	if override.MaxVideos > 0 {
+		capability.MaxVideos = override.MaxVideos
+	}
+	if override.MaxAudios > 0 {
+		capability.MaxAudios = override.MaxAudios
+	}
+	if override.MinImages != nil {
+		capability.MinImages = *override.MinImages
+	}
+	if override.MaxTotalReferences > 0 {
+		capability.MaxTotalReferences = override.MaxTotalReferences
+	}
+	if override.MaxImageBytes > 0 {
+		capability.MaxImageBytes = override.MaxImageBytes
+	}
+	if override.MaxVideoBytes > 0 {
+		capability.MaxVideoBytes = override.MaxVideoBytes
+	}
+	if override.MaxAudioBytes > 0 {
+		capability.MaxAudioBytes = override.MaxAudioBytes
+	}
+	if override.MinReferenceVideoSeconds > 0 {
+		capability.MinReferenceVideoSeconds = override.MinReferenceVideoSeconds
+	}
+	if override.MaxReferenceVideoSeconds > 0 {
+		capability.MaxReferenceVideoSeconds = override.MaxReferenceVideoSeconds
+	}
+	if override.MaxTotalReferenceVideoSeconds > 0 {
+		capability.MaxTotalReferenceVideoSecond = override.MaxTotalReferenceVideoSeconds
+	}
+	if override.AspectRatios != nil {
+		capability.AspectRatios = append([]string(nil), override.AspectRatios...)
+	}
+	if override.Resolutions != nil {
+		capability.Resolutions = append([]string(nil), override.Resolutions...)
+	}
+	if override.SizeAspectRatios != nil {
+		capability.SizeAspectRatios = make(map[string]string, len(override.SizeAspectRatios))
+		for size, ratio := range override.SizeAspectRatios {
+			capability.SizeAspectRatios[size] = ratio
+		}
+	}
+	if override.ResolutionAliases != nil {
+		capability.ResolutionAliases = make(map[string]string)
+		for size, resolution := range override.ResolutionAliases {
+			capability.ResolutionAliases[size] = resolution
+		}
+	}
+	if override.DurationMode != "" {
+		capability.Duration = DurationCapability{Mode: override.DurationMode, Min: override.DurationMin, Max: override.DurationMax, Step: override.DurationStep, Default: override.DurationDefault, Fixed: override.FixedDurationSeconds}
+	}
+	if override.OutputCountMax > 0 {
+		capability.OutputCount = OutputCountCapability{Min: max(1, override.OutputCountMin), Max: override.OutputCountMax, Default: max(1, override.OutputCountDefault)}
+	}
+	if override.ProviderContract != "" {
+		capability.ProviderContract = override.ProviderContract
+	}
+}
+
+func normalizeCapability(capability Capability) Capability {
+	capability.ImageRoles = normalizedRoles(capability.ImageRoles)
+	capability.VideoRoles = normalizedRoles(capability.VideoRoles)
+	capability.AudioRoles = normalizedRoles(capability.AudioRoles)
+	capability.AspectRatios = normalizedRoles(capability.AspectRatios)
+	capability.Resolutions = normalizedRoles(capability.Resolutions)
+	if !capability.ReferenceImage {
+		capability.ImageRoles = nil
+		capability.MaxImages = 0
+	}
+	if !capability.ReferenceVideo {
+		capability.VideoRoles = nil
+		capability.MaxVideos = 0
+	}
+	if !capability.ReferenceAudio {
+		capability.AudioRoles = nil
+		capability.MaxAudios = 0
+	}
+	if capability.Duration.Step <= 0 && !capability.RuntimeEnforced {
+		capability.Duration.Step = 1
+	}
+	if capability.OutputCount.Min > 0 || capability.OutputCount.Max > 0 || capability.OutputCount.Default > 0 {
+		if capability.OutputCount.Min <= 0 {
+			capability.OutputCount.Min = 1
+		}
+		if capability.OutputCount.Max <= 0 {
+			capability.OutputCount.Max = capability.OutputCount.Min
+		}
+		if capability.OutputCount.Default < capability.OutputCount.Min || capability.OutputCount.Default > capability.OutputCount.Max {
+			capability.OutputCount.Default = capability.OutputCount.Min
+		}
+	}
+	return capability
+}
+
+func normalizedRoles(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func roleAllowed(role string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, candidate := range allowed {
+		if candidate == role {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(target)) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesModelPattern(pattern, model string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" || pattern == "*" {
+		return true
+	}
+	matched, err := path.Match(pattern, model)
+	return err == nil && matched
+}

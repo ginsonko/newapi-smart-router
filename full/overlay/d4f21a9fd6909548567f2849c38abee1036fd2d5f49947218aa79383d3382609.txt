@@ -1,0 +1,260 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type routeAnalyticsWorkerScanCallV1 struct {
+	startSec      int64
+	endSec        int64
+	batchLimit    int
+	boundaryLimit int
+}
+
+func newRouteAnalyticsWorkerTestV1(t *testing.T, now time.Time) (*RouteAnalyticsWorkerV1, model.RouteAnalyticsWorkerStateV1) {
+	t.Helper()
+	setupRouteAnalyticsProjectionTestDB(t)
+	catalog, _ := routeAnalyticsProjectionTestCatalog(t)
+	catalogs := &CatalogManager{settings: func() smartroutersetting.Setting {
+		return smartroutersetting.Setting{Enabled: true, CatalogRefreshSeconds: 3_600}
+	}}
+	catalogs.current.Store(&catalog)
+	catalogs.lastRefresh.Store(time.Now().Unix())
+	catalogs.dirty.Store(false)
+
+	worker, err := NewRouteAnalyticsWorkerV1(&SmartRouterEngine{Catalogs: catalogs})
+	require.NoError(t, err)
+	worker.owner = "route-analytics-test-worker"
+	worker.clock = func() time.Time { return now }
+	worker.load = func() common.SystemStatus { return common.SystemStatus{} }
+	worker.config.LeaseDuration = time.Minute
+	t.Cleanup(worker.Close)
+	return worker, model.RouteAnalyticsWorkerStateV1{ID: model.RouteAnalyticsWorkerStateGlobalID}
+}
+
+func TestRouteAnalyticsWorkerScansLiveOverlapThenBackfillsHourly(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	calls := make([]routeAnalyticsWorkerScanCallV1, 0, 4)
+	worker.scan = func(
+		_ context.Context,
+		startSec int64,
+		endSec int64,
+		batchLimit int,
+		boundaryLimit int,
+	) (model.RouteAnalyticsLogBatchV1, error) {
+		calls = append(calls, routeAnalyticsWorkerScanCallV1{
+			startSec: startSec, endSec: endSec, batchLimit: batchLimit, boundaryLimit: boundaryLimit,
+		})
+		return model.RouteAnalyticsLogBatchV1{CompleteThroughSec: endSec}, nil
+	}
+
+	require.NoError(t, worker.RunOnceV1(context.Background()))
+	require.Len(t, calls, 2)
+	safeEndSec := now.Add(-routeAnalyticsSafeDelayV1).Unix()
+	assert.Equal(t, safeEndSec-int64(routeAnalyticsInitialWindowV1/time.Second)+1, calls[0].startSec)
+	assert.Equal(t, safeEndSec, calls[0].endSec)
+	assert.Equal(t, calls[0].startSec-int64(routeAnalyticsBackfillChunkV1/time.Second), calls[1].startSec)
+	assert.Equal(t, calls[0].startSec-1, calls[1].endSec)
+	assert.Equal(t, worker.config.BatchLimit, calls[0].batchLimit)
+	assert.Equal(t, worker.config.BoundaryLimit, calls[0].boundaryLimit)
+
+	state, err := model.GetRouteAnalyticsWorkerStateV1(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, safeEndSec*1_000, state.WatermarkEventTimeMS)
+	assert.Equal(t, calls[1].startSec*1_000, state.CoverageStartMS)
+	assert.Equal(t, safeEndSec*1_000, state.CoverageEndMS)
+	assert.False(t, state.BackfillInProgress)
+
+	require.NoError(t, worker.RunOnceV1(context.Background()))
+	require.Len(t, calls, 4)
+	assert.Equal(t, safeEndSec-int64(routeAnalyticsOverlapV1/time.Second), calls[2].startSec)
+	assert.Equal(t, safeEndSec, calls[2].endSec)
+	assert.Equal(t, calls[1].startSec-int64(routeAnalyticsBackfillChunkV1/time.Second), calls[3].startSec)
+	assert.Equal(t, calls[1].startSec-1, calls[3].endSec)
+}
+
+func TestRouteAnalyticsWorkerOverloadDefersWithoutScanning(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	worker.load = func() common.SystemStatus {
+		return common.SystemStatus{CPUUsage: worker.config.CPUThreshold + 1}
+	}
+	scanCalls := 0
+	worker.scan = func(context.Context, int64, int64, int, int) (model.RouteAnalyticsLogBatchV1, error) {
+		scanCalls++
+		return model.RouteAnalyticsLogBatchV1{}, nil
+	}
+
+	require.NoError(t, worker.RunOnceV1(context.Background()))
+	assert.Zero(t, scanCalls)
+	status := worker.Status()
+	assert.Equal(t, int64(1), status.DeferredRuns)
+	assert.Contains(t, status.LastError, "CPU")
+
+	state, err := model.GetRouteAnalyticsWorkerStateV1(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, now.Add(30*time.Second).UnixMilli(), state.PausedUntilMS)
+	assert.Contains(t, state.LastError, "CPU")
+}
+
+func TestRouteAnalyticsWorkerScanFailurePersistsBoundedBackoff(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	scanErr := errors.New("log source unavailable")
+	worker.scan = func(context.Context, int64, int64, int, int) (model.RouteAnalyticsLogBatchV1, error) {
+		return model.RouteAnalyticsLogBatchV1{}, scanErr
+	}
+
+	err := worker.RunOnceV1(context.Background())
+	assert.ErrorIs(t, err, scanErr)
+	status := worker.Status()
+	assert.Equal(t, int64(1), status.FailedRuns)
+	assert.Equal(t, scanErr.Error(), status.LastError)
+
+	state, stateErr := model.GetRouteAnalyticsWorkerStateV1(context.Background())
+	require.NoError(t, stateErr)
+	assert.Equal(t, 1, state.ConsecutiveFailures)
+	assert.Equal(t, now.Add(5*time.Second).UnixMilli(), state.PausedUntilMS)
+	assert.Equal(t, scanErr.Error(), state.LastError)
+}
+
+func TestRouteAnalyticsWorkerRunWithTimeoutRecoversPanicAndContinues(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	panicErr := errors.New("malformed historical projection")
+	shouldPanic := true
+	worker.scan = func(context.Context, int64, int64, int, int) (model.RouteAnalyticsLogBatchV1, error) {
+		if shouldPanic {
+			panic(panicErr)
+		}
+		return model.RouteAnalyticsLogBatchV1{}, nil
+	}
+
+	assert.NotPanics(t, worker.runWithTimeoutV1)
+	status := worker.Status()
+	assert.Equal(t, int64(1), status.FailedRuns)
+	assert.Contains(t, status.LastError, "route analytics worker panic recovered")
+	assert.Contains(t, status.LastError, panicErr.Error())
+
+	// The recovered panic must not terminate the long-lived loop. Once the
+	// malformed row is no longer present, a later bounded run can proceed.
+	shouldPanic = false
+	assert.NotPanics(t, worker.runWithTimeoutV1)
+	status = worker.Status()
+	assert.Equal(t, int64(1), status.FailedRuns)
+	assert.Empty(t, status.LastError)
+	assert.Greater(t, status.LastSuccessAtMS, int64(0))
+}
+
+func TestRouteAnalyticsWorkerFreshnessWatchdogUsesBoundedStaleHeartbeat(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	worker.config.Interval = 15 * time.Second
+	worker.config.RunTimeout = 10 * time.Second
+	worker.config.LeaseDuration = 45 * time.Second
+	worker.startedAtMS.Store(now.UnixMilli())
+	worker.heartbeatMS.Store(now.Add(-1 * time.Minute).UnixMilli())
+
+	assert.Equal(t, 135*time.Second, worker.watchdogThresholdV1())
+	assert.False(t, worker.watchdogStaleV1(now.Add(1*time.Minute)))
+	assert.True(t, worker.watchdogStaleV1(now.Add(3*time.Minute)))
+	assert.True(t, worker.watchdogCheckV1(now.Add(3*time.Minute)))
+	assert.Contains(t, worker.Status().LastError, "freshness watchdog")
+}
+
+func TestRouteAnalyticsWorkerFreshnessWatchdogUsesStartupGraceBeforeFirstHeartbeat(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	worker.startedAtMS.Store(now.UnixMilli())
+	assert.False(t, worker.watchdogStaleV1(now.Add(worker.watchdogThresholdV1())))
+	assert.True(t, worker.watchdogStaleV1(now.Add(worker.watchdogThresholdV1()+time.Millisecond)))
+	worker.heartbeatMS.Store(now.Add(-time.Minute).UnixMilli())
+	assert.False(t, worker.watchdogStaleV1(now.Add(time.Minute)))
+}
+
+func TestRouteAnalyticsWorkerReplayAcrossLeaseHandoffCountsOnce(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	workerA, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	catalog, route := routeAnalyticsProjectionTestCatalog(t)
+	logRow := routeAnalyticsProjectionTestLog(
+		t,
+		now.Add(-10*time.Minute).Unix(),
+		model.LogTypeConsume,
+		"worker-lease-handoff-request",
+		routeAnalyticsProjectionTestAttempts(route, true),
+	)
+	workerA.engine.Catalogs.current.Store(&catalog)
+	workerA.scan = func(_ context.Context, startSec int64, endSec int64, _ int, _ int) (model.RouteAnalyticsLogBatchV1, error) {
+		logs := []*model.Log(nil)
+		if logRow.CreatedAt >= startSec && logRow.CreatedAt <= endSec {
+			logs = []*model.Log{logRow}
+		}
+		return model.RouteAnalyticsLogBatchV1{Logs: logs, CompleteThroughSec: endSec}, nil
+	}
+	require.NoError(t, workerA.RunOnceV1(context.Background()))
+
+	workerB, err := NewRouteAnalyticsWorkerV1(workerA.engine)
+	require.NoError(t, err)
+	workerB.owner = "route-analytics-test-worker-b"
+	workerB.clock = func() time.Time { return now.Add(workerA.config.LeaseDuration + time.Second) }
+	workerB.load = func() common.SystemStatus { return common.SystemStatus{} }
+	workerB.scan = workerA.scan
+	workerB.config = workerA.config
+	t.Cleanup(workerB.Close)
+	require.NoError(t, workerB.RunOnceV1(context.Background()))
+
+	var routeBucket model.RouteAnalyticsBucketV1
+	require.NoError(t, model.DB.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&routeBucket).Error)
+	assert.Equal(t, int64(1), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+	assert.Equal(t, int64(1), routeBucket.RetryRecoveries)
+
+	var keyBucket model.KeyUsageAnalyticsBucketV1
+	require.NoError(t, model.DB.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&keyBucket).Error)
+	assert.Equal(t, int64(1), keyBucket.LogicalRequests)
+	assert.Equal(t, int64(1), keyBucket.Successes)
+	assert.Equal(t, int64(500), keyBucket.PositiveQuota)
+}
+
+func TestRouteAnalyticsWorkerReplayAfterProjectionCommitBeforeCursorCountsOnce(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	worker, _ := newRouteAnalyticsWorkerTestV1(t, now)
+	_, route := routeAnalyticsProjectionTestCatalog(t)
+	logRow := routeAnalyticsProjectionTestLog(
+		t,
+		now.Add(-10*time.Minute).Unix(),
+		model.LogTypeConsume,
+		"worker-crash-window-request",
+		routeAnalyticsProjectionTestAttempts(route, true),
+	)
+
+	committed, err := worker.processLogsV1(context.Background(), []*model.Log{logRow})
+	require.NoError(t, err)
+	assert.Greater(t, committed.Applied, 0)
+	var committedObservationCount int64
+	require.NoError(t, model.DB.Model(&model.RouteAnalyticsObservationV1{}).Count(&committedObservationCount).Error)
+	assert.Greater(t, committedObservationCount, int64(0))
+	worker.scan = func(_ context.Context, _ int64, endSec int64, _ int, _ int) (model.RouteAnalyticsLogBatchV1, error) {
+		return model.RouteAnalyticsLogBatchV1{Logs: []*model.Log{logRow}, CompleteThroughSec: endSec}, nil
+	}
+	require.NoError(t, worker.RunOnceV1(context.Background()))
+
+	var routeBucket model.RouteAnalyticsBucketV1
+	require.NoError(t, model.DB.Where("granularity = ?", model.RouteAnalyticsGranularity5m).First(&routeBucket).Error)
+	assert.Equal(t, int64(1), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+	var observationCount int64
+	require.NoError(t, model.DB.Model(&model.RouteAnalyticsObservationV1{}).Count(&observationCount).Error)
+	assert.Equal(t, committedObservationCount, observationCount,
+		"replaying after bucket commit and before cursor persistence must not add observations")
+}

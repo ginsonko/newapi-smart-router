@@ -1,0 +1,23 @@
+package relayconvert
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/stretchr/testify/require"
+)
+
+func TestClaudeNativeChannelNeverUsesChatResponsesShortcut(t *testing.T) {
+	for _, policy := range []model_setting.ChatCompletionsToResponsesPolicy{
+		{Enabled: true, AllChannels: true, ModelPatterns: []string{".*"}},
+		{Enabled: true, ChannelIDs: []int{169}, ModelPatterns: []string{".*"}},
+		{Enabled: true, ChannelTypes: []int{constant.ChannelTypeAnthropic}, ModelPatterns: []string{".*"}},
+	} {
+		require.False(t, ShouldClaudeUseResponsesPolicy(policy, 169, constant.ChannelTypeAnthropic, "claude-opus-5-5"))
+	}
+	policy := model_setting.ChatCompletionsToResponsesPolicy{Enabled: true, AllChannels: true, ModelPatterns: []string{".*"}}
+	require.True(t, ShouldClaudeUseResponsesPolicy(policy, 169, constant.ChannelTypeOpenAI, "claude-opus-5-5"))
+	require.False(t, ShouldClaudeUseResponsesPolicy(policy, 169, constant.ChannelTypeAdvancedCustom, "claude-opus-5-5"))
+	require.False(t, ShouldChatCompletionsUseResponsesPolicy(policy, 169, constant.ChannelTypeAdvancedCustom, "claude-opus-5-5"))
+}

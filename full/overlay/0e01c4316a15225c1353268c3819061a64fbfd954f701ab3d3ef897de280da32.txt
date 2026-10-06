@@ -1,0 +1,37 @@
+import type { PricingModel } from '@/features/pricing/types'
+
+export function indexGroupModels(models: PricingModel[]) {
+  const result = new Map<string, string[]>()
+  for (const model of models) {
+    for (const group of model.enable_groups) {
+      const names = result.get(group) ?? []
+      names.push(model.model_name)
+      result.set(group, names)
+    }
+  }
+  for (const [group, names] of result) {
+    result.set(group, [...new Set(names)].sort())
+  }
+  return result
+}
+
+export function filterRoutingGroups<T extends { group: string }>(
+  groups: T[],
+  models: Map<string, string[]>,
+  query: string
+) {
+  const text = query.trim().toLowerCase()
+  if (!text) return groups
+  // An exact model name is a precise support filter, even if a group name matches.
+  const exact = [...models.values()].some((names) =>
+    names.some((name) => name.toLowerCase() === text)
+  )
+  return groups.filter((group) => {
+    const names = models.get(group.group) ?? []
+    if (exact) return names.some((name) => name.toLowerCase() === text)
+    return (
+      group.group.toLowerCase().includes(text) ||
+      names.some((name) => name.toLowerCase().includes(text))
+    )
+  })
+}

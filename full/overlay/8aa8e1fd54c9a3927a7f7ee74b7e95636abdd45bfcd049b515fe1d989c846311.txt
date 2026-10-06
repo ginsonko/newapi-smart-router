@@ -1,0 +1,153 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useTranslation } from 'react-i18next'
+
+import type { SmartRouterStatusItem } from './types'
+
+function reasonLabelKey(reason?: string) {
+  switch (reason) {
+    case 'available_after_selected_route':
+      return 'Another eligible group currently ranks ahead'
+    case 'above_price_limit':
+      return 'Above this key group-ratio limit'
+    case 'group_not_selected':
+    case 'key_scope_excluded':
+      return 'Outside this key selected group scope'
+    case 'health_unavailable':
+    case 'key_suppressed':
+      return 'This route recently failed and is waiting for a background recovery check'
+    case 'recovery_cooling':
+      return 'Waiting for the next recovery check'
+    case 'probe_due':
+      return 'Waiting for the next recovery check'
+    case 'quarantined':
+      return 'Long-term isolated by health checks'
+    case 'credential_blocked':
+    case 'credential_temporarily_blocked':
+      return 'Credential is temporarily unavailable'
+    case 'capacity_limited':
+    case 'capacity_busy':
+      return 'Capacity is currently full'
+    case 'health_gate':
+      return 'Waiting for fresh health evidence'
+    case 'waiting_for_admin_review':
+      return 'Waiting for administrator review'
+    case 'temporarily_isolated':
+      return 'Temporarily isolated by recent health checks'
+    case 'waiting_for_recovery_probe':
+      return 'Waiting for the next recovery check'
+    case 'price_missing':
+      return 'Price is temporarily unavailable'
+    case 'capability_mismatch':
+      return 'This group does not support the requested capabilities'
+    case 'endpoint_unsupported':
+      return 'This group does not support this endpoint contract'
+    case 'context_too_large':
+      return 'Context is larger than this group supports'
+    case 'ttft_slow':
+      return 'First-token latency is above this key limit'
+    case 'manual_order':
+      return 'Your manual group order ranks another group first'
+    case 'stability_preferred':
+      return 'Your stability strategy ranks another group first'
+    case 'latency_preferred':
+      return 'Your latency strategy ranks another group first'
+    case 'affinity_preferred':
+      return 'Recent request affinity is being preserved within your limit'
+    case 'already_attempted':
+    case 'channel_already_attempted':
+      return 'Already tried for this request'
+    default:
+      return 'This key strategy currently ranks another group first'
+  }
+}
+
+function selectionLabelKey(reason?: string) {
+  switch (reason) {
+    case 'selected_lowest_price_healthy':
+      return 'Lowest priced eligible group'
+    case 'selected_best_stability':
+      return 'Best recent stability'
+    case 'selected_available_recovery_route':
+      return 'Best group currently admitted by this key'
+    case 'selected_best_latency':
+      return 'Best recent first-token latency'
+    case 'selected_balanced':
+    case 'selected_best_balanced_score':
+      return 'Best combined price, stability, and latency score'
+    case 'selected_best_custom_weighted_score':
+      return 'Best score using this key custom ranking weights'
+    case 'selected_manual_order':
+      return 'First eligible group in your manual order'
+    default:
+      return 'Preferred by this key strategy'
+  }
+}
+
+function nextActionLabelKey(action?: string) {
+  switch (action) {
+    case 'automatic_candidate_reentry':
+    case 'automatic_reentry':
+      return 'It will automatically re-enter candidate ordering after recovery'
+    case 'background_probe':
+    case 'probe':
+      return 'A background recovery check will run without delaying requests'
+    case 'natural_traffic':
+      return 'Recovery will be sampled from bounded natural traffic'
+    case 'administrator_review':
+      return 'An administrator needs to review this group before it can rejoin'
+    case 'price_refresh':
+      return 'It will be reconsidered after the next price synchronization'
+    default:
+      return null
+  }
+}
+
+export function RouteReason(props: {
+  item: SmartRouterStatusItem
+  preferred?: boolean
+}) {
+  const { t } = useTranslation()
+  const reason =
+    props.item.decision_reason_code ||
+    (props.preferred ? props.item.selection_reason : props.item.skipped_reason)
+  const nextAction = nextActionLabelKey(props.item.next_action)
+
+  return (
+    <div className='text-muted-foreground space-y-1 text-xs leading-relaxed'>
+      <p>
+        {props.preferred
+          ? t('Why selected for the next request: {{reason}}', {
+              reason: t(selectionLabelKey(reason)),
+            })
+          : t('Why not preferred: {{reason}}', {
+              reason: t(reasonLabelKey(reason)),
+            })}
+      </p>
+      {nextAction ? <p>{t(nextAction)}</p> : null}
+      {!nextAction && props.item.automatically_rejoins ? (
+        <p>
+          {t(
+            'It will automatically re-enter candidate ordering after recovery'
+          )}
+        </p>
+      ) : null}
+    </div>
+  )
+}

@@ -1,0 +1,265 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { MoreHorizontalIcon } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Skeleton } from '@/components/ui/skeleton'
+import { cn } from '@/lib/utils'
+
+import { downloadMediaAsset } from '../asset-delivery'
+import { formatBytes, formatMediaDate } from '../lib'
+import type { MediaAsset } from '../types'
+import { AssetPreview } from './asset-preview'
+import { MediaQueryError } from './query-error'
+
+type AssetGridProps = {
+  assets: MediaAsset[]
+  loading?: boolean
+  error?: boolean
+  admin?: boolean
+  onPreview: (asset: MediaAsset) => void
+  onReuse?: (asset: MediaAsset) => void
+  onDelete?: (asset: MediaAsset) => void
+  onModerate?: (asset: MediaAsset, action: string) => void
+  selectedIds?: ReadonlySet<string>
+  onSelectionChange?: (asset: MediaAsset, selected: boolean) => void
+  onRetry?: () => void
+}
+
+const ASSET_SKELETON_KEYS = Array.from(
+  { length: 10 },
+  (_, index) => `asset-skeleton-${index}`
+)
+
+function ModerationBadge(props: { asset: MediaAsset }) {
+  const { t } = useTranslation()
+  if (props.asset.status === 'failed') {
+    return null
+  }
+  if (props.asset.moderation_status === 'violation') {
+    return <Badge variant='destructive'>{t('Violation')}</Badge>
+  }
+  if (props.asset.moderation_status === 'approved') {
+    return <Badge variant='secondary'>{t('Approved')}</Badge>
+  }
+  return <Badge variant='outline'>{t('Unreviewed')}</Badge>
+}
+
+export function AssetGrid(props: AssetGridProps) {
+  const { t } = useTranslation()
+
+  if (props.loading) {
+    return (
+      <div className='grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5'>
+        {ASSET_SKELETON_KEYS.map((key) => (
+          <Skeleton className='aspect-[4/5] rounded-lg' key={key} />
+        ))}
+      </div>
+    )
+  }
+
+  if (props.error && props.onRetry) {
+    return <MediaQueryError onRetry={props.onRetry} />
+  }
+
+  if (props.assets.length === 0) {
+    return (
+      <div className='text-muted-foreground flex min-h-64 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm'>
+        {t('No media assets match the current filters.')}
+      </div>
+    )
+  }
+
+  return (
+    <div className='grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5'>
+      {props.assets.map((asset) => (
+        <article
+          className='bg-card group relative min-w-0 overflow-hidden rounded-lg border shadow-xs transition-shadow hover:shadow-sm'
+          key={asset.id}
+        >
+          {props.onSelectionChange && (
+            <div className='absolute z-10 p-2'>
+              <Checkbox
+                aria-label={t('Select {{name}}', { name: asset.filename })}
+                checked={props.selectedIds?.has(asset.id) ?? false}
+                onCheckedChange={(checked) =>
+                  props.onSelectionChange?.(asset, checked === true)
+                }
+                onClick={(event) => event.stopPropagation()}
+              />
+            </div>
+          )}
+          <button
+            className={cn(
+              'bg-muted/30 relative block w-full min-w-0 overflow-hidden focus-visible:ring-2 focus-visible:outline-none focus-visible:ring-inset',
+              asset.type === 'video' ? 'aspect-video' : 'aspect-square'
+            )}
+            disabled={asset.availability_status === 'unavailable'}
+            onClick={() => props.onPreview(asset)}
+            type='button'
+          >
+            <AssetPreview
+              admin={props.admin}
+              asset={asset}
+              className={cn(
+                'transition-transform duration-200 group-hover:scale-[1.015]',
+                asset.type === 'image' ? 'object-cover' : undefined
+              )}
+              controls={false}
+            />
+            <span className='sr-only'>
+              {t('Preview {{name}}', { name: asset.filename })}
+            </span>
+          </button>
+          <div className='space-y-2 p-3'>
+            <div className='flex min-w-0 items-start gap-2'>
+              <div className='min-w-0 flex-1'>
+                <h3 className='truncate text-sm font-medium'>
+                  {asset.filename}
+                </h3>
+                <p className='text-muted-foreground mt-0.5 truncate text-xs'>
+                  {props.admin && asset.username
+                    ? `${asset.username} · ${asset.model || t('Uploaded file')}`
+                    : asset.model || t('Uploaded file')}
+                </p>
+              </div>
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger
+                  render={
+                    <Button
+                      aria-label={t('Asset actions')}
+                      className='size-7 shrink-0'
+                      size='icon-sm'
+                      variant='ghost'
+                    />
+                  }
+                >
+                  <MoreHorizontalIcon aria-hidden='true' />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align='end'>
+                  <DropdownMenuItem
+                    disabled={asset.availability_status === 'unavailable'}
+                    onClick={() => props.onPreview(asset)}
+                  >
+                    {t('Preview')}
+                  </DropdownMenuItem>
+                  {props.onReuse && (
+                    <DropdownMenuItem
+                      disabled={asset.availability_status === 'unavailable'}
+                      onClick={() => props.onReuse?.(asset)}
+                    >
+                      {t('Use as reference')}
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem
+                    disabled={asset.availability_status === 'unavailable'}
+                    onClick={() =>
+                      void downloadMediaAsset(asset, props.admin).catch(() =>
+                        toast.error(t('Request failed'))
+                      )
+                    }
+                  >
+                    {t('Download')}
+                  </DropdownMenuItem>
+                  {(props.onDelete || props.onModerate) && (
+                    <DropdownMenuSeparator />
+                  )}
+                  {props.admin && props.onModerate && (
+                    <>
+                      <DropdownMenuItem
+                        onClick={() => props.onModerate?.(asset, 'approve')}
+                      >
+                        {t('Approve')}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() =>
+                          props.onModerate?.(
+                            asset,
+                            asset.admin_hold ? 'unhold' : 'hold'
+                          )
+                        }
+                      >
+                        {asset.admin_hold
+                          ? t('Release retention')
+                          : t('Retain for review')}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => props.onModerate?.(asset, 'violation')}
+                        variant='destructive'
+                      >
+                        {t('Mark as violation')}
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                  {props.onDelete && (
+                    <DropdownMenuItem
+                      onClick={() => props.onDelete?.(asset)}
+                      variant='destructive'
+                    >
+                      {t('Delete')}
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+            <div className='flex items-center justify-between gap-2'>
+              {props.admin ? (
+                <div className='flex min-w-0 flex-wrap gap-1'>
+                  <ModerationBadge asset={asset} />
+                  {asset.status === 'failed' && (
+                    <Badge variant='destructive'>{t('Archive failed')}</Badge>
+                  )}
+                  {asset.availability_status === 'unavailable' && (
+                    <Badge variant='destructive'>{t('File unavailable')}</Badge>
+                  )}
+                  {asset.admin_hold && (
+                    <Badge variant='outline'>{t('Retained')}</Badge>
+                  )}
+                  {asset.status === 'failed' &&
+                    asset.materialize_last_error && (
+                      <p className='text-destructive basis-full text-xs break-words'>
+                        {t(asset.materialize_last_error)}
+                      </p>
+                    )}
+                </div>
+              ) : (
+                <Badge variant='outline'>{t(asset.type)}</Badge>
+              )}
+              <span className='text-muted-foreground truncate text-[11px]'>
+                {formatBytes(asset.size_bytes)} ·{' '}
+                {formatMediaDate(asset.created_at)}
+              </span>
+            </div>
+          </div>
+        </article>
+      ))}
+    </div>
+  )
+}

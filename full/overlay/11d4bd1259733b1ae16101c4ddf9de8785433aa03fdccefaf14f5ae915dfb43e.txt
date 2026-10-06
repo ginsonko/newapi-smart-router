@@ -1,0 +1,921 @@
+package model
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+// TenantCostProductSlot is the per-downstream public catalog authority. Route
+// profiles and credentials are attached to a registered slot, but physical
+// candidates and secrets never live in this table.
+type TenantCostProductSlot struct {
+	ID            int64  `json:"id" gorm:"primaryKey"`
+	TenantID      string `json:"tenant_id" gorm:"type:varchar(64);index;uniqueIndex:idx_tenant_product_slot;not null"`
+	ProductPoolID string `json:"product_pool_id" gorm:"type:varchar(64);index;uniqueIndex:idx_tenant_product_slot;not null"`
+	ProductFamily string `json:"product_family" gorm:"type:varchar(64);not null"`
+	ServiceTier   string `json:"service_tier" gorm:"type:varchar(32);index;uniqueIndex:idx_tenant_product_slot;not null"`
+	PublicLabel   string `json:"public_label" gorm:"type:varchar(64);not null"`
+	SortOrder     int    `json:"sort_order" gorm:"not null"`
+	CreatedAt     int64  `json:"created_at" gorm:"type:bigint;not null"`
+	UpdatedAt     int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostProductSlot) TableName() string { return "tenant_cost_product_slots" }
+
+// TenantCostKeyRotationReceipt prevents a retried side-effecting request from
+// rotating a key twice. It stores only an operator request ID and safe identity
+// metadata; the full secret is never persisted.
+type TenantCostKeyRotationReceipt struct {
+	ID            int64  `json:"id" gorm:"primaryKey"`
+	TenantID      string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	BindingID     int64  `json:"binding_id" gorm:"index;not null"`
+	RequestID     string `json:"request_id" gorm:"type:varchar(96);uniqueIndex:idx_tenant_key_rotation_request;not null"`
+	TokenID       int    `json:"token_id" gorm:"index;not null"`
+	KeyID         string `json:"key_id" gorm:"type:varchar(128);not null"`
+	KeySuffix     string `json:"key_suffix" gorm:"type:varchar(8);not null"`
+	BindingStatus string `json:"binding_status" gorm:"type:varchar(24);not null"`
+	CreatedAt     int64  `json:"created_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostKeyRotationReceipt) TableName() string {
+	return "tenant_cost_key_rotation_receipts"
+}
+
+// TenantCostSlotProvisionReceipt is the durable idempotency record for one
+// provisioning request.  RequestID is intentionally globally unique: an
+// operator retry must never be able to make the same side effect appear under
+// another downstream.  Only safe identities and an input fingerprint are
+// retained; no token secret is ever persisted here.
+type TenantCostSlotProvisionReceipt struct {
+	ID                   int64  `json:"id" gorm:"primaryKey"`
+	TenantID             string `json:"tenant_id" gorm:"type:varchar(64);index;not null"`
+	RequestID            string `json:"request_id" gorm:"type:varchar(96);uniqueIndex:idx_tenant_cost_provision_request;not null"`
+	InputFingerprint     string `json:"input_fingerprint" gorm:"type:char(64);index;not null"`
+	SlotID               int64  `json:"slot_id" gorm:"index;not null"`
+	ProductPoolID        string `json:"product_pool_id" gorm:"type:varchar(64);not null"`
+	ProductFamily        string `json:"product_family" gorm:"type:varchar(64);not null"`
+	ServiceTier          string `json:"service_tier" gorm:"type:varchar(32);not null"`
+	PublicLabel          string `json:"public_label" gorm:"type:varchar(64);not null"`
+	SortOrder            int    `json:"sort_order" gorm:"not null"`
+	ProfileID            string `json:"profile_id" gorm:"type:varchar(128);not null"`
+	ProfileRevision      string `json:"profile_revision" gorm:"type:varchar(96);not null"`
+	ProfileStatus        string `json:"profile_status" gorm:"type:varchar(24);not null"`
+	ModelCatalogRevision string `json:"model_catalog_revision" gorm:"type:varchar(96);not null"`
+	BindingID            int64  `json:"binding_id" gorm:"index;not null"`
+	TokenID              int    `json:"token_id" gorm:"index;not null"`
+	BindingCreated       bool   `json:"binding_created" gorm:"not null"`
+	KeyID                string `json:"key_id" gorm:"type:varchar(128)"`
+	KeySuffix            string `json:"key_suffix" gorm:"type:varchar(8)"`
+	BindingStatus        string `json:"binding_status" gorm:"type:varchar(24)"`
+	CreatedAt            int64  `json:"created_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostSlotProvisionReceipt) TableName() string {
+	return "tenant_cost_slot_provision_receipts"
+}
+
+type TenantCostSlotProvisionSpec struct {
+	// RequestID is an operator-supplied idempotency key.  Empty preserves the
+	// legacy model-call behaviour for old internal callers; HTTP mutations are
+	// expected to require it before reaching this function.
+	RequestID            string
+	TenantID             string
+	ProductPoolID        string
+	ProductFamily        string
+	ServiceTier          string
+	PublicLabel          string
+	SortOrder            int
+	ProfileID            string
+	ProfileRevision      string
+	ModelSelector        string
+	MinRatioPPM          int64
+	MaxRatioPPM          int64
+	ProviderClass        string
+	CandidateSpec        string
+	CapabilitySpec       string
+	ProfileStatus        string
+	DisabledReason       string
+	TokenID              int
+	ModelCatalogRevision string
+	BindingStatus        string
+}
+
+type TenantCostSlotProvisionResult struct {
+	Slot           TenantCostProductSlot
+	Profile        TenantRouteProfile
+	Binding        *TenantCredentialBinding
+	BindingCreated bool
+	Secret         string
+	Replayed       bool
+}
+
+type TenantCostKeyRotationResult struct {
+	Binding        TenantCredentialBinding `json:"binding"`
+	Secret         string                  `json:"secret,omitempty"`
+	AlreadyRotated bool                    `json:"already_rotated"`
+	CacheWarning   string                  `json:"cache_warning,omitempty"`
+}
+
+// tenantCostSlotProvisionFingerprint hashes every normalized, caller-visible
+// provisioning input except RequestID itself.  A deterministic struct JSON is
+// used instead of map iteration so the same logical retry has the same bytes
+// across Go versions and database backends.
+func tenantCostSlotProvisionFingerprint(spec TenantCostSlotProvisionSpec) (string, error) {
+	canonical := struct {
+		TenantID             string `json:"tenant_id"`
+		ProductPoolID        string `json:"product_pool_id"`
+		ProductFamily        string `json:"product_family"`
+		ServiceTier          string `json:"service_tier"`
+		PublicLabel          string `json:"public_label"`
+		SortOrder            int    `json:"sort_order"`
+		ProfileID            string `json:"profile_id"`
+		ProfileRevision      string `json:"profile_revision"`
+		ModelSelector        string `json:"model_selector"`
+		MinRatioPPM          int64  `json:"min_ratio_ppm"`
+		MaxRatioPPM          int64  `json:"max_ratio_ppm"`
+		ProviderClass        string `json:"provider_class"`
+		CandidateSpec        string `json:"candidate_spec"`
+		CapabilitySpec       string `json:"capability_spec"`
+		ProfileStatus        string `json:"profile_status"`
+		DisabledReason       string `json:"disabled_reason"`
+		TokenID              int    `json:"token_id"`
+		ModelCatalogRevision string `json:"model_catalog_revision"`
+		BindingStatus        string `json:"binding_status"`
+	}{
+		TenantID: spec.TenantID, ProductPoolID: spec.ProductPoolID, ProductFamily: spec.ProductFamily,
+		ServiceTier: spec.ServiceTier, PublicLabel: spec.PublicLabel, SortOrder: spec.SortOrder,
+		ProfileID: spec.ProfileID, ProfileRevision: spec.ProfileRevision, ModelSelector: spec.ModelSelector,
+		MinRatioPPM: spec.MinRatioPPM, MaxRatioPPM: spec.MaxRatioPPM, ProviderClass: spec.ProviderClass,
+		CandidateSpec: spec.CandidateSpec, CapabilitySpec: spec.CapabilitySpec, ProfileStatus: spec.ProfileStatus,
+		DisabledReason: spec.DisabledReason, TokenID: spec.TokenID, ModelCatalogRevision: spec.ModelCatalogRevision,
+		BindingStatus: spec.BindingStatus,
+	}
+	payload, err := common.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func validTenantCostVisibleLabel(value string, maxLength int) bool {
+	value = strings.TrimSpace(value)
+	lowerValue := strings.ToLower(value)
+	if value == "" || len([]rune(value)) > maxLength || containsTenantCostSecretMarker(lowerValue) ||
+		strings.Contains(lowerValue, "://") {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeTenantCostProductSlot(slot *TenantCostProductSlot) error {
+	if slot == nil {
+		return ErrTenantCostInvalidInput
+	}
+	slot.TenantID = strings.TrimSpace(slot.TenantID)
+	slot.ProductPoolID = strings.TrimSpace(slot.ProductPoolID)
+	slot.ProductFamily = strings.TrimSpace(slot.ProductFamily)
+	slot.ServiceTier = strings.TrimSpace(slot.ServiceTier)
+	slot.PublicLabel = strings.TrimSpace(slot.PublicLabel)
+	if slot.ProductFamily == "" {
+		slot.ProductFamily = slot.ProductPoolID
+	}
+	if !IsValidTenantCostTenantID(slot.TenantID) || !validTenantCostProductPool(slot.ProductPoolID) ||
+		!validTenantCostPublicIdentifier(slot.ProductFamily, 64) || !validTenantCostServiceTier(slot.ServiceTier) ||
+		!validTenantCostVisibleLabel(slot.PublicLabel, 64) || slot.SortOrder < 0 || slot.SortOrder > 1_000_000 {
+		return ErrTenantCostInvalidInput
+	}
+	return nil
+}
+
+func ListTenantCostProductSlotsForTenant(tenantID string, limit int) ([]TenantCostProductSlot, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	var rows []TenantCostProductSlot
+	err := DB.Where("tenant_id = ?", tenantID).
+		Order("sort_order asc, product_pool_id asc, service_tier asc, id asc").
+		Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func upsertTenantCostProductSlotTx(tx *gorm.DB, slot *TenantCostProductSlot, now int64) error {
+	if tx == nil || normalizeTenantCostProductSlot(slot) != nil {
+		return ErrTenantCostInvalidInput
+	}
+	var existing TenantCostProductSlot
+	err := lockForUpdate(tx).Where(
+		"tenant_id = ? AND product_pool_id = ? AND service_tier = ?",
+		slot.TenantID, slot.ProductPoolID, slot.ServiceTier,
+	).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		slot.CreatedAt, slot.UpdatedAt = now, now
+		return tx.Create(slot).Error
+	}
+	if err != nil {
+		return err
+	}
+	var enabledBindings int64
+	if err := tx.Model(&TenantCredentialBinding{}).Where(
+		"tenant_id = ? AND product_pool_id = ? AND service_tier = ? AND binding_status = ?",
+		slot.TenantID, slot.ProductPoolID, slot.ServiceTier, TenantBindingEnabled,
+	).Count(&enabledBindings).Error; err != nil {
+		return err
+	}
+	if enabledBindings > 0 && (existing.ProductFamily != slot.ProductFamily || existing.PublicLabel != slot.PublicLabel) {
+		return fmt.Errorf("enabled binding requires an immutable public slot identity")
+	}
+	slot.ID, slot.CreatedAt, slot.UpdatedAt = existing.ID, existing.CreatedAt, now
+	return tx.Save(slot).Error
+}
+
+func upsertProvisionedTenantRouteProfileTx(tx *gorm.DB, slot *TenantCostProductSlot, profile *TenantRouteProfile, now int64) error {
+	if tx == nil || slot == nil || profile == nil || ValidateTenantRouteProfile(profile) != nil {
+		return ErrTenantCostInvalidInput
+	}
+	if profile.TenantID != slot.TenantID || profile.ProductPoolID != slot.ProductPoolID ||
+		profile.ServiceTier != slot.ServiceTier || profile.PublicLabel != slot.PublicLabel {
+		return ErrTenantCostInvalidInput
+	}
+	var existing TenantRouteProfile
+	err := lockForUpdate(tx).Where("tenant_id = ? AND profile_id = ?", profile.TenantID, profile.ProfileID).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		profile.CreatedAt, profile.UpdatedAt = now, now
+		return tx.Create(profile).Error
+	}
+	if err != nil {
+		return err
+	}
+	if existing.ProductPoolID != profile.ProductPoolID || existing.ServiceTier != profile.ServiceTier {
+		return ErrTenantCostConflict
+	}
+	if existing.Status == TenantBindingRevoked && profile.Status != TenantBindingRevoked {
+		return fmt.Errorf("revoked route profile cannot be re-enabled")
+	}
+	var enabledBindings int64
+	if err := tx.Model(&TenantCredentialBinding{}).Where(
+		"tenant_id = ? AND route_profile_id = ? AND binding_status = ?",
+		profile.TenantID, profile.ProfileID, TenantBindingEnabled,
+	).Count(&enabledBindings).Error; err != nil {
+		return err
+	}
+	if enabledBindings > 0 && (profile.Status != TenantBindingEnabled || existing.Revision != profile.Revision ||
+		existing.PublicLabel != profile.PublicLabel || existing.ModelSelector != profile.ModelSelector ||
+		existing.MinRatioPPM != profile.MinRatioPPM || existing.MaxRatioPPM != profile.MaxRatioPPM ||
+		existing.ProviderClass != profile.ProviderClass || existing.CandidateSpec != profile.CandidateSpec ||
+		existing.CapabilitySpec != profile.CapabilitySpec) {
+		return fmt.Errorf("enabled bindings require an immutable enabled route profile revision")
+	}
+	profile.ID, profile.CreatedAt, profile.UpdatedAt = existing.ID, existing.CreatedAt, now
+	return tx.Save(profile).Error
+}
+
+func tenantCostDerivedKeyID(tokenID int) string {
+	return "token:" + strconv.Itoa(tokenID)
+}
+
+func tenantCostKeySuffix(rawKey string) (string, error) {
+	rawKey = strings.TrimSpace(rawKey)
+	if len(rawKey) < 4 {
+		return "", ErrTenantCostInvalidInput
+	}
+	return rawKey[len(rawKey)-4:], nil
+}
+
+func tenantCostFullKey(rawKey string) string {
+	rawKey = strings.TrimSpace(rawKey)
+	if strings.HasPrefix(rawKey, "sk-") {
+		return rawKey
+	}
+	return "sk-" + rawKey
+}
+
+func bindExistingTenantTokenTx(tx *gorm.DB, spec TenantCostSlotProvisionSpec, profile *TenantRouteProfile, now int64) (*TenantCredentialBinding, bool, string, error) {
+	if tx == nil || profile == nil || spec.TokenID <= 0 || !validTenantCostPublicIdentifier(spec.ModelCatalogRevision, 96) {
+		return nil, false, "", ErrTenantCostInvalidInput
+	}
+	status := strings.TrimSpace(spec.BindingStatus)
+	if status == "" {
+		status = TenantBindingPending
+	}
+	if !validTenantBindingStatus(status) || status == TenantBindingRevoked {
+		return nil, false, "", ErrTenantCostInvalidInput
+	}
+	var token Token
+	if err := lockForUpdate(tx).Where("id = ?", spec.TokenID).First(&token).Error; err != nil {
+		return nil, false, "", err
+	}
+	suffix, err := tenantCostKeySuffix(token.Key)
+	if err != nil {
+		return nil, false, "", err
+	}
+	keyID := tenantCostDerivedKeyID(token.Id)
+	if status == TenantBindingEnabled {
+		if profile.Status != TenantBindingEnabled || token.Status != common.TokenStatusEnabled {
+			return nil, false, "", ErrTenantCostBindingUnavailable
+		}
+	}
+	var existingByToken TenantCredentialBinding
+	err = lockForUpdate(tx).Where("token_id = ?", token.Id).First(&existingByToken).Error
+	if err == nil {
+		if existingByToken.TenantID != spec.TenantID || existingByToken.ProductPoolID != spec.ProductPoolID ||
+			existingByToken.ServiceTier != spec.ServiceTier || existingByToken.RouteProfileID != spec.ProfileID ||
+			existingByToken.ProfileRevision != spec.ProfileRevision || existingByToken.ModelCatalogRevision != spec.ModelCatalogRevision ||
+			existingByToken.KeyID != keyID || existingByToken.KeySuffix != suffix || existingByToken.BindingStatus != status {
+			return nil, false, "", ErrTenantCostConflict
+		}
+		if token.TenantCostBindingID != 0 && token.TenantCostBindingID != existingByToken.ID {
+			return nil, false, "", ErrTenantCostConflict
+		}
+		if token.TenantCostBindingID == 0 {
+			if err := tx.Model(&Token{}).Where("id = ? AND tenant_cost_binding_id = 0", token.Id).
+				Update("tenant_cost_binding_id", existingByToken.ID).Error; err != nil {
+				return nil, false, "", err
+			}
+		}
+		return &existingByToken, false, "", nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, "", err
+	}
+	if token.TenantCostBindingID != 0 {
+		return nil, false, "", ErrTenantCostConflict
+	}
+	var existingBySlot TenantCredentialBinding
+	err = lockForUpdate(tx).Where(
+		"tenant_id = ? AND product_pool_id = ? AND service_tier = ?",
+		spec.TenantID, spec.ProductPoolID, spec.ServiceTier,
+	).First(&existingBySlot).Error
+	if err == nil {
+		return nil, false, "", ErrTenantCostConflict
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, "", err
+	}
+	binding := TenantCredentialBinding{
+		TokenID: token.Id, TenantID: spec.TenantID, CredentialPurpose: TenantCredentialPurposeDataPlane,
+		KeyID: keyID, KeySuffix: suffix, ProductPoolID: spec.ProductPoolID, ServiceTier: spec.ServiceTier,
+		RouteProfileID: spec.ProfileID, ProfileRevision: spec.ProfileRevision,
+		ModelCatalogRevision: spec.ModelCatalogRevision, BindingStatus: status, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := tx.Create(&binding).Error; err != nil {
+		return nil, false, "", err
+	}
+	result := tx.Model(&Token{}).Where("id = ? AND tenant_cost_binding_id = 0", token.Id).
+		Update("tenant_cost_binding_id", binding.ID)
+	if result.Error != nil {
+		return nil, false, "", result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, false, "", ErrTenantCostConflict
+	}
+	return &binding, true, tenantCostFullKey(token.Key), nil
+}
+
+// tenantCostProvisionSpecFromRows reconstructs the caller-visible portion of
+// a provisioning request from its durable rows.  It is used only while
+// validating a replay receipt; the full token secret is deliberately never
+// part of the reconstructed spec or receipt.
+func tenantCostProvisionSpecFromRows(slot TenantCostProductSlot, profile TenantRouteProfile, binding *TenantCredentialBinding, receipt TenantCostSlotProvisionReceipt) TenantCostSlotProvisionSpec {
+	spec := TenantCostSlotProvisionSpec{
+		RequestID: receipt.RequestID, TenantID: slot.TenantID,
+		ProductPoolID: slot.ProductPoolID, ProductFamily: slot.ProductFamily,
+		ServiceTier: slot.ServiceTier, PublicLabel: slot.PublicLabel, SortOrder: slot.SortOrder,
+		ProfileID: profile.ProfileID, ProfileRevision: profile.Revision, ModelSelector: profile.ModelSelector,
+		MinRatioPPM: profile.MinRatioPPM, MaxRatioPPM: profile.MaxRatioPPM,
+		ProviderClass: profile.ProviderClass, CandidateSpec: profile.CandidateSpec,
+		CapabilitySpec: profile.CapabilitySpec, ProfileStatus: profile.Status,
+		DisabledReason: profile.DisabledReason, ModelCatalogRevision: "", BindingStatus: "",
+	}
+	if binding != nil {
+		spec.TokenID = binding.TokenID
+		spec.ModelCatalogRevision = binding.ModelCatalogRevision
+		spec.BindingStatus = binding.BindingStatus
+	}
+	return spec
+}
+
+// loadTenantCostProvisionReplayTx verifies every identity referenced by a
+// provisioning receipt before returning a replay result.  A receipt is not a
+// success marker by itself: any drift in the slot, route profile, binding,
+// token marker, key suffix, or input fingerprint fails closed.
+func loadTenantCostProvisionReplayTx(tx *gorm.DB, spec TenantCostSlotProvisionSpec, fingerprint string, receipt *TenantCostSlotProvisionReceipt) (*TenantCostSlotProvisionResult, error) {
+	if tx == nil || receipt == nil || receipt.RequestID != spec.RequestID || receipt.TenantID != spec.TenantID ||
+		receipt.InputFingerprint == "" || receipt.InputFingerprint != fingerprint || receipt.SlotID <= 0 ||
+		!validTenantCostPublicIdentifier(receipt.ProductPoolID, 64) || !validTenantCostServiceTier(receipt.ServiceTier) ||
+		!validTenantCostVisibleLabel(receipt.PublicLabel, 64) || !validTenantCostPublicIdentifier(receipt.ProfileID, 128) ||
+		!validTenantCostPublicIdentifier(receipt.ProfileRevision, 96) || !validTenantBindingStatus(receipt.ProfileStatus) {
+		return nil, ErrTenantCostConflict
+	}
+	var slot TenantCostProductSlot
+	if err := lockForUpdate(tx).Where("id = ? AND tenant_id = ?", receipt.SlotID, spec.TenantID).First(&slot).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostConflict
+		}
+		return nil, err
+	}
+	if slot.ProductPoolID != receipt.ProductPoolID || slot.ProductFamily != receipt.ProductFamily ||
+		slot.ServiceTier != receipt.ServiceTier || slot.PublicLabel != receipt.PublicLabel ||
+		slot.SortOrder != receipt.SortOrder {
+		return nil, ErrTenantCostConflict
+	}
+	var profile TenantRouteProfile
+	if err := lockForUpdate(tx).Where("tenant_id = ? AND profile_id = ?", spec.TenantID, receipt.ProfileID).First(&profile).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostConflict
+		}
+		return nil, err
+	}
+	if profile.ProductPoolID != slot.ProductPoolID || profile.ServiceTier != slot.ServiceTier ||
+		profile.PublicLabel != slot.PublicLabel || profile.Revision != receipt.ProfileRevision ||
+		profile.Status != receipt.ProfileStatus || ValidateTenantRouteProfile(&profile) != nil {
+		return nil, ErrTenantCostConflict
+	}
+
+	var binding *TenantCredentialBinding
+	if receipt.BindingID == 0 || receipt.TokenID == 0 {
+		if receipt.BindingID != 0 || receipt.TokenID != 0 || receipt.BindingCreated || receipt.KeyID != "" ||
+			receipt.KeySuffix != "" || receipt.ModelCatalogRevision != "" || receipt.BindingStatus != "" {
+			return nil, ErrTenantCostConflict
+		}
+		// A later binding on the same slot changes the meaning of the original
+		// no-token outcome. Do not silently present that state as a safe replay.
+		var later TenantCredentialBinding
+		err := lockForUpdate(tx).Where("tenant_id = ? AND product_pool_id = ? AND service_tier = ?",
+			spec.TenantID, receipt.ProductPoolID, receipt.ServiceTier).First(&later).Error
+		if err == nil {
+			return nil, ErrTenantCostConflict
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	} else {
+		var row TenantCredentialBinding
+		if err := lockForUpdate(tx).Where("id = ? AND tenant_id = ? AND token_id = ? AND credential_purpose = ?",
+			receipt.BindingID, spec.TenantID, receipt.TokenID, TenantCredentialPurposeDataPlane).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrTenantCostConflict
+			}
+			return nil, err
+		}
+		if !validTenantBindingStatus(row.BindingStatus) || row.BindingStatus != receipt.BindingStatus ||
+			row.ProductPoolID != receipt.ProductPoolID || row.ServiceTier != receipt.ServiceTier ||
+			row.RouteProfileID != receipt.ProfileID || row.ProfileRevision != receipt.ProfileRevision ||
+			row.ModelCatalogRevision != receipt.ModelCatalogRevision || row.KeyID != receipt.KeyID ||
+			row.KeySuffix != receipt.KeySuffix || row.CredentialPurpose != TenantCredentialPurposeDataPlane {
+			return nil, ErrTenantCostConflict
+		}
+		var token Token
+		if err := lockForUpdate(tx).Where("id = ?", receipt.TokenID).First(&token).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrTenantCostConflict
+			}
+			return nil, err
+		}
+		if token.TenantCostBindingID != row.ID || row.KeyID != tenantCostDerivedKeyID(token.Id) {
+			return nil, ErrTenantCostConflict
+		}
+		suffix, err := tenantCostKeySuffix(token.Key)
+		if err != nil || suffix != row.KeySuffix || suffix != receipt.KeySuffix {
+			return nil, ErrTenantCostConflict
+		}
+		binding = &row
+	}
+
+	persistedSpec := tenantCostProvisionSpecFromRows(slot, profile, binding, *receipt)
+	persistedFingerprint, err := tenantCostSlotProvisionFingerprint(persistedSpec)
+	if err != nil || persistedFingerprint != receipt.InputFingerprint || persistedFingerprint != fingerprint {
+		return nil, ErrTenantCostConflict
+	}
+	return &TenantCostSlotProvisionResult{
+		Slot: slot, Profile: profile, Binding: binding,
+		BindingCreated: receipt.BindingCreated, Secret: "", Replayed: true,
+	}, nil
+}
+
+// replayTenantCostProvisionAfterFailure performs the required post-rollback
+// read in a fresh transaction.  It returns found=false when the original
+// error was unrelated to a concurrent receipt winner.
+func replayTenantCostProvisionAfterFailure(spec TenantCostSlotProvisionSpec, fingerprint string) (*TenantCostSlotProvisionResult, error, bool) {
+	if DB == nil || spec.RequestID == "" {
+		return nil, nil, false
+	}
+	var result *TenantCostSlotProvisionResult
+	found := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, spec.TenantID, false); err != nil {
+			return err
+		}
+		var receipt TenantCostSlotProvisionReceipt
+		err := lockForUpdate(tx).Where("request_id = ?", spec.RequestID).First(&receipt).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		result, err = loadTenantCostProvisionReplayTx(tx, spec, fingerprint, &receipt)
+		return err
+	})
+	if err != nil {
+		return nil, err, found
+	}
+	return result, nil, found
+}
+
+// loadTenantCostRotationReplayTx performs a fail-closed read of a committed
+// rotation receipt. It intentionally returns no secret: the secret is only
+// available in the first successful response and is never reconstructable.
+func loadTenantCostRotationReplayTx(tx *gorm.DB, tenantID string, bindingID int64, requestID string, receipt *TenantCostKeyRotationReceipt) (*TenantCostKeyRotationResult, error) {
+	if tx == nil || receipt == nil || receipt.TenantID != tenantID || receipt.BindingID != bindingID ||
+		receipt.RequestID != requestID || receipt.TokenID <= 0 ||
+		!validTenantCostPublicIdentifier(receipt.KeyID, 128) || !validTenantCostKeySuffix(receipt.KeySuffix) ||
+		!validTenantBindingStatus(receipt.BindingStatus) || receipt.BindingStatus == TenantBindingRevoked {
+		return nil, ErrTenantCostConflict
+	}
+	var binding TenantCredentialBinding
+	if err := lockForUpdate(tx).Where("id = ? AND tenant_id = ? AND credential_purpose = ?",
+		bindingID, tenantID, TenantCredentialPurposeDataPlane).First(&binding).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostConflict
+		}
+		return nil, err
+	}
+	if binding.TokenID != receipt.TokenID || binding.KeyID != receipt.KeyID || binding.KeySuffix != receipt.KeySuffix ||
+		binding.BindingStatus != receipt.BindingStatus || !validTenantBindingStatus(binding.BindingStatus) ||
+		binding.BindingStatus == TenantBindingRevoked || binding.KeyID != tenantCostDerivedKeyID(binding.TokenID) {
+		return nil, ErrTenantCostConflict
+	}
+	var token Token
+	if err := lockForUpdate(tx.Unscoped()).Where("id = ?", receipt.TokenID).First(&token).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostConflict
+		}
+		return nil, err
+	}
+	if token.DeletedAt.Valid || token.TenantCostBindingID != binding.ID || binding.KeyID != tenantCostDerivedKeyID(token.Id) {
+		return nil, ErrTenantCostConflict
+	}
+	suffix, err := tenantCostKeySuffix(token.Key)
+	if err != nil || suffix != binding.KeySuffix || suffix != receipt.KeySuffix {
+		return nil, ErrTenantCostConflict
+	}
+	return &TenantCostKeyRotationResult{Binding: binding, AlreadyRotated: true}, nil
+}
+
+func replayTenantCostRotationAfterFailure(tenantID string, bindingID int64, requestID string) (*TenantCostKeyRotationResult, error, bool) {
+	if DB == nil || requestID == "" {
+		return nil, nil, false
+	}
+	var result *TenantCostKeyRotationResult
+	found := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, tenantID, false); err != nil {
+			return err
+		}
+		var receipt TenantCostKeyRotationReceipt
+		err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&receipt).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		result, err = loadTenantCostRotationReplayTx(tx, tenantID, bindingID, requestID, &receipt)
+		return err
+	})
+	if err != nil {
+		return nil, err, found
+	}
+	return result, nil, found
+}
+
+func ProvisionTenantCostSlot(spec TenantCostSlotProvisionSpec, actorUserID int) (*TenantCostSlotProvisionResult, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return nil, err
+	}
+	spec.TenantID = strings.TrimSpace(spec.TenantID)
+	spec.ProductPoolID = strings.TrimSpace(spec.ProductPoolID)
+	spec.ProductFamily = strings.TrimSpace(spec.ProductFamily)
+	spec.ServiceTier = strings.TrimSpace(spec.ServiceTier)
+	spec.PublicLabel = strings.TrimSpace(spec.PublicLabel)
+	spec.ProfileID = strings.TrimSpace(spec.ProfileID)
+	spec.ProfileRevision = strings.TrimSpace(spec.ProfileRevision)
+	spec.ModelSelector = strings.TrimSpace(spec.ModelSelector)
+	spec.ProviderClass = strings.TrimSpace(spec.ProviderClass)
+	spec.CandidateSpec = strings.TrimSpace(spec.CandidateSpec)
+	spec.CapabilitySpec = strings.TrimSpace(spec.CapabilitySpec)
+	spec.ProfileStatus = strings.TrimSpace(spec.ProfileStatus)
+	spec.DisabledReason = strings.TrimSpace(spec.DisabledReason)
+	spec.ModelCatalogRevision = strings.TrimSpace(spec.ModelCatalogRevision)
+	spec.BindingStatus = strings.TrimSpace(spec.BindingStatus)
+	if spec.ProfileStatus == "" {
+		spec.ProfileStatus = TenantBindingPending
+	}
+	slot := TenantCostProductSlot{
+		TenantID: spec.TenantID, ProductPoolID: spec.ProductPoolID, ProductFamily: spec.ProductFamily,
+		ServiceTier: spec.ServiceTier, PublicLabel: spec.PublicLabel, SortOrder: spec.SortOrder,
+	}
+	if err := normalizeTenantCostProductSlot(&slot); err != nil {
+		return nil, err
+	}
+	// Slot normalization supplies the public family default. Include that
+	// effective value in the idempotency fingerprint so a retry with an omitted
+	// family is equivalent to the original request.
+	spec.ProductFamily = slot.ProductFamily
+	if spec.TokenID > 0 && spec.BindingStatus == "" {
+		spec.BindingStatus = TenantBindingPending
+	}
+	profile := TenantRouteProfile{
+		TenantID: spec.TenantID, ProfileID: spec.ProfileID, Revision: spec.ProfileRevision,
+		ProductPoolID: spec.ProductPoolID, ServiceTier: spec.ServiceTier, PublicLabel: spec.PublicLabel,
+		ModelSelector: spec.ModelSelector, MinRatioPPM: spec.MinRatioPPM, MaxRatioPPM: spec.MaxRatioPPM,
+		ProviderClass: spec.ProviderClass, CandidateSpec: spec.CandidateSpec, CapabilitySpec: spec.CapabilitySpec,
+		Status: spec.ProfileStatus, DisabledReason: spec.DisabledReason,
+	}
+	if err := ValidateTenantRouteProfile(&profile); err != nil {
+		return nil, err
+	}
+	if spec.TokenID == 0 && (spec.ModelCatalogRevision != "" || spec.BindingStatus != "") {
+		return nil, ErrTenantCostInvalidInput
+	}
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	fingerprint, err := tenantCostSlotProvisionFingerprint(spec)
+	if err != nil {
+		return nil, err
+	}
+	result := &TenantCostSlotProvisionResult{}
+	now := common.GetTimestamp()
+	cacheKeys := make([]string, 0, 1)
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		// Read the tenant row without requiring active status first. An existing
+		// receipt is an immutable fact and must remain safely replayable after an
+		// operator disables the downstream; only a genuinely new mutation needs
+		// the active-state gate below.
+		if _, err := requireTenantCostDownstreamTx(tx, spec.TenantID, false); err != nil {
+			return err
+		}
+		if spec.RequestID != "" {
+			var receipt TenantCostSlotProvisionReceipt
+			err := lockForUpdate(tx).Where("request_id = ?", spec.RequestID).First(&receipt).Error
+			if err == nil {
+				replayed, replayErr := loadTenantCostProvisionReplayTx(tx, spec, fingerprint, &receipt)
+				if replayErr != nil {
+					return replayErr
+				}
+				*result = *replayed
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		active := profile.Status == TenantBindingEnabled || spec.BindingStatus == TenantBindingEnabled
+		if _, err := requireTenantCostDownstreamTx(tx, spec.TenantID, active); err != nil {
+			return err
+		}
+		if err := upsertTenantCostProductSlotTx(tx, &slot, now); err != nil {
+			return err
+		}
+		if err := upsertProvisionedTenantRouteProfileTx(tx, &slot, &profile, now); err != nil {
+			return err
+		}
+		var binding *TenantCredentialBinding
+		bindingCreated := false
+		secret := ""
+		if spec.TokenID > 0 {
+			var err error
+			binding, bindingCreated, secret, err = bindExistingTenantTokenTx(tx, spec, &profile, now)
+			if err != nil {
+				return err
+			}
+		}
+		details := fmt.Sprintf("slot=%s/%s profile=%s profile_status=%s", slot.ProductPoolID, slot.ServiceTier, profile.ProfileID, profile.Status)
+		if binding != nil {
+			details += fmt.Sprintf(" token_id=%d key_id=%s suffix=%s binding_status=%s", binding.TokenID, binding.KeyID, binding.KeySuffix, binding.BindingStatus)
+			// The marker is written in the same transaction as the binding.  The
+			// old token cache must be invalidated only after commit, otherwise a
+			// concurrent request could repopulate a legacy view from stale data.
+			var tokenForCache Token
+			if err := tx.Where("id = ?", binding.TokenID).First(&tokenForCache).Error; err != nil {
+				return err
+			}
+			cacheKeys = append(cacheKeys, tokenForCache.Key)
+		}
+		if err := appendTenantCostAuditEventForTenantTx(tx, spec.TenantID, actorUserID,
+			"tenant_slot_provisioned", slot.ProductPoolID+"/"+slot.ServiceTier, details, now); err != nil {
+			return err
+		}
+		if spec.RequestID != "" {
+			receipt := TenantCostSlotProvisionReceipt{
+				TenantID: spec.TenantID, RequestID: spec.RequestID, InputFingerprint: fingerprint,
+				SlotID: slot.ID, ProductPoolID: slot.ProductPoolID, ProductFamily: slot.ProductFamily,
+				ServiceTier: slot.ServiceTier, PublicLabel: slot.PublicLabel, SortOrder: slot.SortOrder,
+				ProfileID: profile.ProfileID, ProfileRevision: profile.Revision, ProfileStatus: profile.Status,
+				ModelCatalogRevision: "", BindingID: 0, TokenID: 0, BindingCreated: bindingCreated,
+				CreatedAt: now,
+			}
+			if binding != nil {
+				receipt.ModelCatalogRevision = binding.ModelCatalogRevision
+				receipt.BindingID, receipt.TokenID = binding.ID, binding.TokenID
+				receipt.KeyID, receipt.KeySuffix = binding.KeyID, binding.KeySuffix
+				receipt.BindingStatus = binding.BindingStatus
+			}
+			if err := tx.Create(&receipt).Error; err != nil {
+				return err
+			}
+		}
+		result.Slot, result.Profile = slot, profile
+		result.Binding, result.BindingCreated, result.Secret = binding, bindingCreated, secret
+		return nil
+	})
+	if err != nil {
+		if spec.RequestID != "" {
+			if replayed, replayErr, found := replayTenantCostProvisionAfterFailure(spec, fingerprint); found {
+				if replayErr != nil {
+					return nil, replayErr
+				}
+				return replayed, nil
+			}
+		}
+		return nil, err
+	}
+	for _, key := range cacheKeys {
+		if result.Binding != nil {
+			if err := fenceTenantCostTokenCacheAfterCommit(key, result.Binding.ID); err != nil {
+				common.SysError("tenant slot provisioning cache fence failed: " + err.Error())
+			}
+			continue
+		}
+		if err := invalidateTenantCostTokenCache(key); err != nil {
+			// DB is authoritative.  Do not report provisioning as rolled back
+			// after commit; surface an observable warning to the operator.
+			common.SysError("tenant slot provisioning cache invalidation failed: " + err.Error())
+		}
+	}
+	return result, nil
+}
+
+func RotateTenantCostBindingKeyForTenant(tenantID string, bindingID int64, requestID string, actorUserID int) (*TenantCostKeyRotationResult, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return nil, err
+	}
+	tenantID, requestID = strings.TrimSpace(tenantID), strings.TrimSpace(requestID)
+	if bindingID <= 0 || !validTenantCostPublicIdentifier(requestID, 96) || DB == nil {
+		return nil, ErrTenantCostInvalidInput
+	}
+	now := common.GetTimestamp()
+	result := &TenantCostKeyRotationResult{}
+	var rotatedBinding TenantCredentialBinding
+	var originalToken Token
+	var rotatedToken Token
+	cacheFenced := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, tenantID, false); err != nil {
+			return err
+		}
+		var duplicate TenantCostKeyRotationReceipt
+		// Request IDs are a global idempotency namespace.  Check before key
+		// generation so a retry can never mint a second secret.  A request ID
+		// reused by another tenant or binding is an explicit conflict.
+		if err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&duplicate).Error; err == nil {
+			replayed, replayErr := loadTenantCostRotationReplayTx(tx, tenantID, bindingID, requestID, &duplicate)
+			if replayErr != nil {
+				return replayErr
+			}
+			*result = *replayed
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := lockForUpdate(tx).Where(
+			"id = ? AND tenant_id = ? AND credential_purpose = ?",
+			bindingID, tenantID, TenantCredentialPurposeDataPlane,
+		).First(&rotatedBinding).Error; err != nil {
+			return err
+		}
+		if rotatedBinding.BindingStatus == TenantBindingRevoked {
+			return fmt.Errorf("revoked binding cannot rotate its key")
+		}
+		if err := lockForUpdate(tx).Where("id = ?", rotatedBinding.TokenID).First(&originalToken).Error; err != nil {
+			return err
+		}
+		if originalToken.TenantCostBindingID != rotatedBinding.ID || rotatedBinding.KeyID != tenantCostDerivedKeyID(originalToken.Id) {
+			return ErrTenantCostConflict
+		}
+		oldSuffix, err := tenantCostKeySuffix(originalToken.Key)
+		if err != nil || oldSuffix != rotatedBinding.KeySuffix {
+			return ErrTenantCostConflict
+		}
+		// Generate the replacement only after the idempotency check and all
+		// identity checks have passed.
+		newRawKey, err := common.GenerateKey()
+		if err != nil {
+			return err
+		}
+		newSuffix, err := tenantCostKeySuffix(newRawKey)
+		if err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			if common.RDB == nil {
+				return errors.New("redis is enabled but the client is unavailable")
+			}
+			if err := cacheFenceAndDeleteToken(originalToken.Key, tokenCacheFenceRotated); err != nil {
+				return fmt.Errorf("failed to fence old token cache: %w", err)
+			}
+			cacheFenced = true
+		}
+		if err := tx.Model(&Token{}).Where("id = ? AND tenant_cost_binding_id = ?", originalToken.Id, rotatedBinding.ID).
+			Update("key", newRawKey).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&TenantCredentialBinding{}).Where("id = ? AND tenant_id = ?", rotatedBinding.ID, tenantID).
+			Updates(map[string]interface{}{"key_suffix": newSuffix, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&TenantCostKeyRotationReceipt{
+			TenantID: tenantID, BindingID: rotatedBinding.ID, RequestID: requestID,
+			TokenID: originalToken.Id, KeyID: rotatedBinding.KeyID, KeySuffix: newSuffix,
+			BindingStatus: rotatedBinding.BindingStatus, CreatedAt: now,
+		}).Error; err != nil {
+			return err
+		}
+		if err := appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID,
+			"tenant_binding_key_rotated", fmt.Sprintf("binding:%d", rotatedBinding.ID),
+			fmt.Sprintf("token_id=%d key_id=%s suffix=%s request_id=%s", originalToken.Id, rotatedBinding.KeyID, newSuffix, requestID), now); err != nil {
+			return err
+		}
+		rotatedBinding.KeySuffix, rotatedBinding.UpdatedAt = newSuffix, now
+		rotatedToken = originalToken
+		rotatedToken.Key = newRawKey
+		result.Binding = rotatedBinding
+		result.Secret = tenantCostFullKey(newRawKey)
+		return nil
+	})
+	if err != nil {
+		if replayed, replayErr, found := replayTenantCostRotationAfterFailure(tenantID, bindingID, requestID); found {
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			return replayed, nil
+		}
+		if cacheFenced {
+			// Keep the safety fence on rollback. Re-populating the old enabled
+			// snapshot would allow an in-flight writer to resurrect it; the DB
+			// path remains authoritative and will repopulate only after an
+			// explicit, audited fence clear.
+			common.SysError("tenant binding rotation rolled back after cache fence; old key remains fenced")
+		}
+		return nil, err
+	}
+	if result.AlreadyRotated {
+		// The original secret is intentionally unrecoverable.  Returning only
+		// safe binding metadata makes a retry harmless even after the first
+		// response was lost.
+		return result, nil
+	}
+	if common.RedisEnabled {
+		// The old cache entry is already disabled, so cleanup failures cannot
+		// make the old secret usable. The new key can still fall through to DB.
+		if common.RDB == nil {
+			result.CacheWarning = "redis client unavailable after commit; database remains authoritative"
+			common.SysError("tenant binding rotation committed while Redis client was unavailable")
+		} else {
+			warnings := make([]string, 0, 2)
+			if cacheErr := cacheDeleteToken(originalToken.Key); cacheErr != nil {
+				warnings = append(warnings, "old cache invalidation failed")
+				common.SysError("tenant binding rotation old cache invalidation failed: " + cacheErr.Error())
+			}
+			if cacheErr := cacheSetToken(rotatedToken); cacheErr != nil {
+				warnings = append(warnings, "new cache refresh failed")
+				common.SysError("tenant binding rotation new cache refresh failed: " + cacheErr.Error())
+			}
+			if len(warnings) > 0 {
+				result.CacheWarning = strings.Join(warnings, "; ")
+			}
+		}
+	}
+	return result, nil
+}

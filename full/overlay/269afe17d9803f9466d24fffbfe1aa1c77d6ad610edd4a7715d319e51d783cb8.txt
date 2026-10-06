@@ -1,0 +1,352 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  completeStudioConfirmation,
+  applyStudioProgressEvent,
+  createStudioPlaceholders,
+  createMultipartStudioRequest,
+  expireStudioConfirmation,
+  hasExpectedStudioAssets,
+  mediaCapabilitySupportsReferences,
+  mediaCapabilitySupportsOutput,
+  isImage2ModelName,
+  normalizeImageSize,
+  pendingStudioOperationID,
+  runBoundedBatch,
+  STUDIO_BATCH_CONCURRENCY,
+  STUDIO_BATCH_MAX_COUNT,
+  studioBatchIndexes,
+  validateStudioBatchCount,
+  StudioRequestDispatchedError,
+  studioConfirmationExpired,
+  studioConfirmationPollDelay,
+  studioMultipartResponseFormat,
+  studioRoutingParams,
+  unwrapStudioRequestError,
+} from './lib.ts'
+import type {
+  MediaAsset,
+  MediaCapabilityContract,
+  StudioOutput,
+  StudioReference,
+} from './types.ts'
+
+describe('media studio response format contracts', () => {
+  test('keeps image and audio multipart response formats mode-specific', () => {
+    assert.equal(studioMultipartResponseFormat('image-edits'), 'url')
+    assert.equal(studioMultipartResponseFormat('transcriptions'), 'json')
+    assert.equal(studioMultipartResponseFormat('translations'), 'json')
+    assert.equal(studioMultipartResponseFormat('speech'), undefined)
+    assert.equal(studioMultipartResponseFormat('images'), undefined)
+    assert.equal(studioMultipartResponseFormat('videos'), undefined)
+  })
+
+  test('normalizes image ratio aliases without changing explicit sizes', () => {
+    assert.equal(normalizeImageSize('2:3'), '1024x1536')
+    assert.equal(normalizeImageSize(' 3 : 2 '), '1536x1024')
+    assert.equal(normalizeImageSize('720x1280'), '720x1280')
+  })
+
+  test('image edit multipart requests carry the normalized size', () => {
+    const form = createMultipartStudioRequest({
+      mode: 'image-edits',
+      group: 'test',
+      model: 'gpt-image-2',
+      prompt: 'edit',
+      size: '2:3',
+      aspectRatio: '16:9',
+      resolution: '720p',
+      duration: 5,
+      count: 1,
+      quality: 'standard',
+      voice: 'alloy',
+      responseFormat: 'mp3',
+      references: [],
+    })
+    assert.equal(form.get('size'), '1024x1536')
+    assert.equal(form.get('response_format'), 'url')
+  })
+})
+
+describe('media studio bounded batch contract', () => {
+  test('accepts only the bounded 1..16 child count', () => {
+    assert.doesNotThrow(() => validateStudioBatchCount(1))
+    assert.doesNotThrow(() => validateStudioBatchCount(STUDIO_BATCH_MAX_COUNT))
+    for (const value of [0, 17, 128, 1.5, Number.NaN]) {
+      assert.throws(() => validateStudioBatchCount(value))
+    }
+  })
+
+  test('turns count two into two independent child indexes', () => {
+    assert.deepEqual(studioBatchIndexes(2), [0, 1])
+  })
+
+  test('runs children with bounded concurrency and preserves partial failures', async () => {
+    let active = 0
+    let peak = 0
+    const result = await runBoundedBatch(
+      [0, 1, 2, 3, 4],
+      async (index) => {
+        active += 1
+        peak = Math.max(peak, active)
+        await new Promise((resolve) => setTimeout(resolve, 1))
+        active -= 1
+        if (index === 2) throw new Error('child failed')
+        return `child-${index}`
+      },
+      STUDIO_BATCH_CONCURRENCY
+    )
+    assert.ok(peak <= STUDIO_BATCH_CONCURRENCY)
+    assert.deepEqual(
+      result.map((item) => item.index),
+      [0, 1, 2, 3, 4]
+    )
+    assert.equal(result[2]?.error instanceof Error, true)
+    assert.equal(result[4]?.value, 'child-4')
+  })
+})
+
+describe('media studio visible submission progress', () => {
+  const value = {
+    mode: 'image-edits' as const,
+    group: 'image2-low-price',
+    model: 'gpt-image-2',
+    prompt: 'edit this',
+    size: '1024x1024',
+    aspectRatio: '1:1',
+    resolution: '2k',
+    duration: 5,
+    count: 2,
+    quality: 'standard',
+    voice: 'alloy',
+    responseFormat: 'png',
+    references: [] as StudioReference[],
+  }
+
+  test('creates one immediate placeholder for every requested child', () => {
+    const outputs = createStudioPlaceholders(
+      value,
+      ['studio_child_1', 'studio_child_2'],
+      1_000
+    )
+    assert.equal(outputs.length, 2)
+    assert.deepEqual(
+      outputs.map((output) => output.operationId),
+      ['studio_child_1', 'studio_child_2']
+    )
+    assert.ok(outputs.every((output) => output.stage === 'preparing_input'))
+  })
+
+  test('updates the original placeholder and keeps exact upload progress truthful', () => {
+    const outputs = createStudioPlaceholders(
+      { ...value, count: 1 },
+      ['studio_child_1'],
+      1_000
+    )
+    const updated = applyStudioProgressEvent(outputs, {
+      operationId: 'studio_child_1',
+      stage: 'uploading_reference',
+      progress: 37,
+    })
+    assert.equal(updated[0]?.requestId, outputs[0]?.requestId)
+    assert.equal(updated[0]?.stage, 'uploading_reference')
+    assert.equal(updated[0]?.progress, '37')
+
+    const waiting = applyStudioProgressEvent(updated, {
+      operationId: 'studio_child_1',
+      stage: 'upstream_generating',
+    })
+    assert.equal(waiting[0]?.progress, undefined)
+  })
+})
+
+describe('media studio fallback capability contract', () => {
+  test('submits one ordered server-owned fallback scope instead of browser retries', () => {
+    const value = {
+      mode: 'images' as const,
+      group: 'primary',
+      model: 'gpt-image-2',
+      prompt: 'draw this',
+      size: '1024x1024',
+      aspectRatio: '1:1',
+      resolution: '2k',
+      duration: 5,
+      count: 1,
+      quality: 'standard',
+      voice: 'alloy',
+      responseFormat: 'png',
+      references: [] as StudioReference[],
+      fallbackEnabled: true,
+      fallbackGroups: ['cheap', 'plus', 'cheap'],
+    }
+    assert.deepEqual(studioRoutingParams(value), {
+      group: 'cheap',
+      fallback_groups: JSON.stringify(['cheap', 'plus', 'primary']),
+    })
+    assert.deepEqual(
+      studioRoutingParams({ ...value, fallbackEnabled: false }),
+      { group: 'primary', fallback_groups: undefined }
+    )
+  })
+
+  test('recognizes deployed image2 aliases without matching unrelated models', () => {
+    assert.equal(isImage2ModelName('image2'), true)
+    assert.equal(isImage2ModelName('gpt-image-2'), true)
+    assert.equal(isImage2ModelName('gpt-image-1'), false)
+  })
+
+  test('excludes only explicitly incompatible output sizes', () => {
+    const explicit: MediaCapabilityContract = {
+      reference_image: true,
+      reference_video: false,
+      reference_audio: false,
+      resolutions: ['2k'],
+    }
+    assert.equal(
+      mediaCapabilitySupportsOutput(explicit, 'image-edits', '4k', '1:1', ''),
+      false
+    )
+    const unknown = { ...explicit, resolutions: undefined }
+    assert.equal(
+      mediaCapabilitySupportsOutput(unknown, 'image-edits', '4k', '1:1', ''),
+      true
+    )
+  })
+})
+
+describe('media capability unknown-field compatibility', () => {
+  test('treats empty role lists and zero maxima as permissive', () => {
+    const capability: MediaCapabilityContract = {
+      reference_image: true,
+      reference_video: true,
+      reference_audio: true,
+      image_roles: [],
+      video_roles: [],
+      audio_roles: [],
+      max_images: 0,
+      max_videos: 0,
+      max_audios: 0,
+    }
+    const references: StudioReference[] = [
+      {
+        id: 'image-1',
+        type: 'image',
+        role: 'future-image-role',
+        name: 'image-1.png',
+      },
+      {
+        id: 'image-2',
+        type: 'image',
+        role: 'another-image-role',
+        name: 'image-2.png',
+      },
+      {
+        id: 'video-1',
+        type: 'video',
+        role: 'future-video-role',
+        name: 'video-1.mp4',
+      },
+      {
+        id: 'audio-1',
+        type: 'audio',
+        role: 'future-audio-role',
+        name: 'audio-1.mp3',
+      },
+    ]
+    assert.equal(
+      mediaCapabilitySupportsReferences(capability, references),
+      true
+    )
+  })
+})
+
+describe('media studio disconnected-result confirmation', () => {
+  const operationId = 'studio_3f37de08-c768-4ab8-a2ec-fd33d6f4d5ee'
+  const output: StudioOutput = {
+    requestId: `operation-${operationId}`,
+    operationId,
+    expectedAssetCount: 2,
+    confirmationStartedAt: 1_000,
+    mode: 'images',
+    status: 'confirming',
+    assets: [],
+    createdAt: 1_000,
+  }
+  const assets: MediaAsset[] = [
+    {
+      id: 'asset-1',
+      type: 'image',
+      role: 'primary',
+      filename: 'one.png',
+      mime_type: 'image/png',
+      size_bytes: 1,
+      status: 'ready',
+      moderation_status: 'unreviewed',
+      created_at: 1,
+      content_url: '/one',
+      download_url: '/one',
+    },
+    {
+      id: 'asset-2',
+      type: 'image',
+      role: 'secondary',
+      filename: 'two.png',
+      mime_type: 'image/png',
+      size_bytes: 1,
+      status: 'ready',
+      moderation_status: 'unreviewed',
+      created_at: 1,
+      content_url: '/two',
+      download_url: '/two',
+    },
+  ]
+
+  test('confirms only a dispatched request without an HTTP response', () => {
+    const networkError = new Error('Network Error')
+    const pending = new StudioRequestDispatchedError(operationId, networkError)
+    assert.equal(pendingStudioOperationID(pending), operationId)
+    assert.equal(unwrapStudioRequestError(pending), networkError)
+
+    const upstreamError = new StudioRequestDispatchedError(operationId, {
+      message: 'Bad Gateway',
+      response: { status: 502 },
+    })
+    assert.equal(pendingStudioOperationID(upstreamError), undefined)
+  })
+
+  test('waits for the expected asset set and preserves a non-failure timeout', () => {
+    assert.equal(hasExpectedStudioAssets(output, assets.slice(0, 1)), false)
+    assert.equal(hasExpectedStudioAssets(output, assets), true)
+    assert.equal(completeStudioConfirmation(output, assets).status, 'succeeded')
+    assert.equal(expireStudioConfirmation(output).status, 'unconfirmed')
+  })
+
+  test('uses bounded low-frequency polling', () => {
+    assert.equal(studioConfirmationPollDelay(59_999), 5_000)
+    assert.equal(studioConfirmationPollDelay(60_000), 15_000)
+    assert.equal(studioConfirmationExpired(1_000, 1_001), false)
+    assert.equal(
+      studioConfirmationExpired(1_000, 1_000 + 30 * 60 * 1_000),
+      true
+    )
+  })
+})

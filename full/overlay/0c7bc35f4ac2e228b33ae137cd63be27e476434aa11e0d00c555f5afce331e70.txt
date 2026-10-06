@@ -1,0 +1,694 @@
+package model
+
+// Root-only control-plane operations for the Downstream cost projection.  The
+// functions in this file mutate only the partner binding/outbox control
+// tables; they never touch user balance, quota reservations, or immutable
+// cost events.
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+const (
+	TenantCostAdminDefaultTokenTTL = 30 * 24 * time.Hour
+	TenantCostAdminMaxTokenTTL     = 366 * 24 * time.Hour
+	TenantCostAdminMaxReplay       = 500
+)
+
+type TenantCostWorkerControl struct {
+	TenantID  string `json:"tenant_id" gorm:"primaryKey;type:varchar(64)"`
+	Paused    bool   `json:"paused" gorm:"not null"`
+	UpdatedBy int    `json:"updated_by" gorm:"not null"`
+	UpdatedAt int64  `json:"updated_at" gorm:"type:bigint;not null"`
+}
+
+func (TenantCostWorkerControl) TableName() string { return "tenant_cost_worker_controls" }
+
+type TenantReportingTokenView struct {
+	ID         int64  `json:"id"`
+	TenantID   string `json:"tenant_id"`
+	TokenID    string `json:"token_id"`
+	Permission string `json:"permission"`
+	ExpiresAt  int64  `json:"expires_at"`
+	RevokedAt  int64  `json:"revoked_at"`
+	LastUsedAt int64  `json:"last_used_at"`
+	CreatedAt  int64  `json:"created_at"`
+}
+
+// TenantReportingTokenMutationResult is the safe result of a reporting-token
+// create/rotate operation. Secret is populated only for the first committed
+// request; a replay deliberately returns an empty Secret.
+type TenantReportingTokenMutationResult struct {
+	Token    *TenantReportingToken `json:"token"`
+	Secret   string                `json:"-"`
+	Replayed bool                  `json:"replayed"`
+}
+
+const (
+	tenantReportingTokenOperationCreate = "create"
+	tenantReportingTokenOperationRotate = "rotate"
+)
+
+type TenantCostOutboxReplaySelector struct {
+	EventIDs     []string
+	FromSequence int64
+	ToSequence   int64
+	Limit        int
+}
+
+func normalizeTenantCostTokenExpiry(expiresAt int64, now int64) (int64, error) {
+	if now <= 0 {
+		now = time.Now().UTC().Unix()
+	}
+	if expiresAt == 0 {
+		expiresAt = now + int64(TenantCostAdminDefaultTokenTTL/time.Second)
+	}
+	max := now + int64(TenantCostAdminMaxTokenTTL/time.Second)
+	if expiresAt <= now || expiresAt > max {
+		return 0, fmt.Errorf("reporting token expiry must be within %s", TenantCostAdminMaxTokenTTL)
+	}
+	return expiresAt, nil
+}
+
+func normalizeTenantReportingRequestID(requestID string) (string, error) {
+	requestID = strings.TrimSpace(requestID)
+	if !validTenantCostPublicIdentifier(requestID, 96) {
+		return "", ErrTenantCostInvalidInput
+	}
+	return requestID, nil
+}
+
+func tenantReportingTokenMutationFingerprint(operation, tenantID, targetTokenID, permission string, expiresAt int64) (string, error) {
+	canonical := struct {
+		Operation     string `json:"operation"`
+		TenantID      string `json:"tenant_id"`
+		TargetTokenID string `json:"target_token_id"`
+		Permission    string `json:"permission"`
+		ExpiresAt     int64  `json:"expires_at"`
+	}{
+		Operation: operation, TenantID: strings.TrimSpace(tenantID),
+		TargetTokenID: strings.TrimSpace(targetTokenID), Permission: strings.TrimSpace(permission),
+		ExpiresAt: expiresAt,
+	}
+	payload, err := common.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// normalizeTenantReportingMutationExpiry returns both the effective expiry
+// written to the token row and the canonical value used for idempotency. A
+// zero request means "default TTL"; retaining zero as the canonical policy
+// marker makes a retry made a few seconds later equivalent to the original
+// request even though its computed expiry is necessarily later.
+func normalizeTenantReportingMutationExpiry(expiresAt, now int64) (effective, canonical int64, err error) {
+	effective, err = normalizeTenantCostTokenExpiry(expiresAt, now)
+	if err != nil {
+		return 0, 0, err
+	}
+	return effective, expiresAt, nil
+}
+
+func reportingTokenView(row *TenantReportingToken) *TenantReportingToken {
+	if row == nil {
+		return nil
+	}
+	copy := *row
+	copy.TokenHash = ""
+	return &copy
+}
+
+// loadTenantReportingTokenReplayTx verifies the durable receipt and the
+// referenced token row before treating a request as replayed. A receipt alone
+// is not sufficient: deletion, cross-tenant drift, a changed expiry, or a
+// later revocation all fail closed rather than silently returning a stale
+// success.
+func loadTenantReportingTokenReplayTx(tx *gorm.DB, operation, tenantID, targetTokenID, permission string, canonicalExpiry int64, fingerprint string, receipt *TenantReportingTokenReceipt) (*TenantReportingTokenMutationResult, error) {
+	if tx == nil || receipt == nil || receipt.RequestID == "" ||
+		receipt.Operation != operation || receipt.TenantID != tenantID ||
+		receipt.TargetTokenID != targetTokenID || receipt.Permission != permission ||
+		receipt.RequestedExpiresAt != canonicalExpiry || receipt.InputFingerprint != fingerprint ||
+		receipt.ResultTokenID == "" || receipt.ExpiresAt <= 0 {
+		return nil, ErrTenantCostConflict
+	}
+	var row TenantReportingToken
+	if err := lockForUpdate(tx).Where("tenant_id = ? AND token_id = ?", tenantID, receipt.ResultTokenID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTenantCostConflict
+		}
+		return nil, err
+	}
+	if row.Permission != permission || row.ExpiresAt != receipt.ExpiresAt || row.RevokedAt != 0 {
+		return nil, ErrTenantCostConflict
+	}
+	if operation == tenantReportingTokenOperationRotate {
+		if targetTokenID == "" || targetTokenID == receipt.ResultTokenID {
+			return nil, ErrTenantCostConflict
+		}
+		var old TenantReportingToken
+		if err := lockForUpdate(tx).Where("tenant_id = ? AND token_id = ?", tenantID, targetTokenID).First(&old).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrTenantCostConflict
+			}
+			return nil, err
+		}
+		if old.RevokedAt == 0 {
+			return nil, ErrTenantCostConflict
+		}
+	} else if operation != tenantReportingTokenOperationCreate || targetTokenID != "" {
+		return nil, ErrTenantCostConflict
+	}
+	return &TenantReportingTokenMutationResult{Token: reportingTokenView(&row), Replayed: true}, nil
+}
+
+func replayTenantReportingTokenAfterFailure(operation, tenantID, targetTokenID, permission string, canonicalExpiry int64, fingerprint, requestID string) (*TenantReportingTokenMutationResult, error, bool) {
+	if DB == nil || requestID == "" {
+		return nil, nil, false
+	}
+	var result *TenantReportingTokenMutationResult
+	found := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, tenantID, false); err != nil {
+			return err
+		}
+		var receipt TenantReportingTokenReceipt
+		err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&receipt).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		result, err = loadTenantReportingTokenReplayTx(tx, operation, tenantID, targetTokenID, permission, canonicalExpiry, fingerprint, &receipt)
+		return err
+	})
+	if err != nil {
+		return nil, err, found
+	}
+	return result, nil, found
+}
+
+func createTenantReportingTokenTx(tx *gorm.DB, tenantID, permission string, expiresAt, now int64) (*TenantReportingToken, string, error) {
+	if strings.TrimSpace(permission) != TenantCostReportingPermission {
+		return nil, "", ErrTenantCostScope
+	}
+	if _, err := requireTenantCostDownstreamTx(tx, tenantID, true); err != nil {
+		return nil, "", err
+	}
+	secret, err := GenerateTenantReportingToken()
+	if err != nil {
+		return nil, "", err
+	}
+	row := &TenantReportingToken{
+		TenantID: tenantID, TokenID: "trt_" + newTenantCostPublicID(),
+		TokenHash: HashTenantReportingToken(secret), Permission: permission,
+		ExpiresAt: expiresAt, CreatedAt: now,
+	}
+	if err := tx.Create(row).Error; err != nil {
+		return nil, "", err
+	}
+	return row, secret, nil
+}
+
+// newTenantCostPublicID is intentionally not a UUID dependency for admin
+// operations; UUID-like entropy is supplied by GenerateTenantReportingToken,
+// while the token ID itself is only an operator-facing handle.
+func newTenantCostPublicID() string {
+	secret, err := GenerateTenantReportingToken()
+	if err != nil || len(secret) < 20 {
+		return fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+	}
+	return strings.TrimPrefix(secret, "tvr_")[:24]
+}
+
+func appendTenantCostAuditEventTx(tx *gorm.DB, actorUserID int, action, subjectID, details string, now int64) error {
+	return appendTenantCostAuditEventForTenantTx(tx, DefaultTenantCostTenantID, actorUserID, action, subjectID, details, now)
+}
+
+func appendTenantCostAuditEventForTenantTx(tx *gorm.DB, tenantID string, actorUserID int, action, subjectID, details string, now int64) error {
+	tenantID = strings.TrimSpace(tenantID)
+	if actorUserID <= 0 || strings.TrimSpace(action) == "" {
+		return ErrTenantCostInvalidInput
+	}
+	if _, err := requireTenantCostDownstreamTx(tx, tenantID, false); err != nil {
+		return err
+	}
+	if len(details) > 8192 {
+		details = details[:8192]
+	}
+	return tx.Create(&TenantCostAuditEvent{TenantID: strings.TrimSpace(tenantID), ActorUserID: actorUserID,
+		Action: strings.TrimSpace(action), SubjectID: strings.TrimSpace(subjectID), Details: details, CreatedAt: now}).Error
+}
+
+func normalizeTenantCostAdminActor(actorUserID int) error {
+	if actorUserID <= 0 {
+		return ErrTenantCostInvalidInput
+	}
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	return nil
+}
+
+func CreateTenantReportingTokenWithAudit(tenantID, permission string, expiresAt int64, actorUserID int) (*TenantReportingToken, string, error) {
+	return createTenantReportingTokenWithAuditForTenant(tenantID, permission, expiresAt, actorUserID)
+}
+
+// CreateTenantReportingTokenWithAuditRequest is the request-id aware variant
+// used by HTTP callers. A committed request can be replayed safely; the
+// one-time secret is never returned on replay.
+func CreateTenantReportingTokenWithAuditRequest(tenantID, permission string, expiresAt int64, requestID string, actorUserID int) (*TenantReportingTokenMutationResult, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return nil, err
+	}
+	requestID, err := normalizeTenantReportingRequestID(requestID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC().Unix()
+	effective, canonical, err := normalizeTenantReportingMutationExpiry(expiresAt, now)
+	if err != nil {
+		return nil, err
+	}
+	fingerprint, err := tenantReportingTokenMutationFingerprint(tenantReportingTokenOperationCreate, tenantID, "", permission, canonical)
+	if err != nil {
+		return nil, err
+	}
+	var result *TenantReportingTokenMutationResult
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, tenantID, true); err != nil {
+			return err
+		}
+		var receipt TenantReportingTokenReceipt
+		if err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&receipt).Error; err == nil {
+			var e error
+			result, e = loadTenantReportingTokenReplayTx(tx, tenantReportingTokenOperationCreate, tenantID, "", permission, canonical, fingerprint, &receipt)
+			return e
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		row, secret, err := createTenantReportingTokenTx(tx, tenantID, permission, effective, now)
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(&TenantReportingTokenReceipt{RequestID: requestID, Operation: tenantReportingTokenOperationCreate, TenantID: tenantID, TargetTokenID: "", InputFingerprint: fingerprint, ResultTokenID: row.TokenID, Permission: permission, RequestedExpiresAt: canonical, ExpiresAt: effective, CreatedAt: now}).Error; err != nil {
+			return err
+		}
+		if err := appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "reporting_token_created", row.TokenID, "token created; secret returned once", now); err != nil {
+			return err
+		}
+		result = &TenantReportingTokenMutationResult{Token: reportingTokenView(row), Secret: secret}
+		return nil
+	})
+	if err != nil {
+		if replayed, replayErr, found := replayTenantReportingTokenAfterFailure(tenantReportingTokenOperationCreate, tenantID, "", permission, canonical, fingerprint, requestID); found {
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			return replayed, nil
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
+func createTenantReportingTokenWithAuditForTenant(tenantID, permission string, expiresAt int64, actorUserID int) (*TenantReportingToken, string, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return nil, "", err
+	}
+	now := time.Now().UTC().Unix()
+	normalizedExpiry, err := normalizeTenantCostTokenExpiry(expiresAt, now)
+	if err != nil {
+		return nil, "", err
+	}
+	var row *TenantReportingToken
+	var secret string
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var createErr error
+		row, secret, createErr = createTenantReportingTokenTx(tx, tenantID, permission, normalizedExpiry, now)
+		if createErr != nil {
+			return createErr
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "reporting_token_created", row.TokenID, "token created; secret returned once", now)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return row, secret, nil
+}
+
+func ListTenantReportingTokens(limit int) ([]TenantReportingTokenView, error) {
+	return ListTenantReportingTokensForTenant(DefaultTenantCostTenantID, limit)
+}
+
+func ListTenantReportingTokensForTenant(tenantID string, limit int) ([]TenantReportingTokenView, error) {
+	if DB == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > TenantCostAdminMaxReplay {
+		limit = 100
+	}
+	var rows []TenantReportingToken
+	if err := DB.Where("tenant_id = ?", tenantID).Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	views := make([]TenantReportingTokenView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, TenantReportingTokenView{ID: row.ID, TenantID: row.TenantID, TokenID: row.TokenID,
+			Permission: row.Permission, ExpiresAt: row.ExpiresAt, RevokedAt: row.RevokedAt,
+			LastUsedAt: row.LastUsedAt, CreatedAt: row.CreatedAt})
+	}
+	return views, nil
+}
+
+func RevokeTenantReportingToken(tokenID string, actorUserID int) error {
+	return RevokeTenantReportingTokenForTenant(DefaultTenantCostTenantID, tokenID, actorUserID)
+}
+
+func RevokeTenantReportingTokenForTenant(tenantID, tokenID string, actorUserID int) error {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return err
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" || len(tokenID) > 128 {
+		return ErrTenantCostInvalidInput
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Unix()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var row TenantReportingToken
+		if err := lockForUpdate(tx).Where("tenant_id = ? AND token_id = ?", tenantID, tokenID).First(&row).Error; err != nil {
+			return err
+		}
+		if row.RevokedAt == 0 {
+			if err := tx.Model(&TenantReportingToken{}).Where("id = ? AND revoked_at = 0", row.ID).Update("revoked_at", now).Error; err != nil {
+				return err
+			}
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "reporting_token_revoked", row.TokenID, "token revoked", now)
+	})
+}
+
+func RotateTenantReportingToken(tokenID string, expiresAt int64, actorUserID int) (*TenantReportingToken, string, error) {
+	return RotateTenantReportingTokenForTenant(DefaultTenantCostTenantID, tokenID, expiresAt, actorUserID)
+}
+
+func RotateTenantReportingTokenForTenant(tenantID, tokenID string, expiresAt int64, actorUserID int) (*TenantReportingToken, string, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return nil, "", err
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" || len(tokenID) > 128 {
+		return nil, "", ErrTenantCostInvalidInput
+	}
+	if _, err := RequireActiveTenantCostDownstream(tenantID); err != nil {
+		return nil, "", err
+	}
+	now := time.Now().UTC().Unix()
+	normalizedExpiry, err := normalizeTenantCostTokenExpiry(expiresAt, now)
+	if err != nil {
+		return nil, "", err
+	}
+	var created *TenantReportingToken
+	var secret string
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var old TenantReportingToken
+		if err := lockForUpdate(tx).Where("tenant_id = ? AND token_id = ?", tenantID, tokenID).First(&old).Error; err != nil {
+			return err
+		}
+		if old.RevokedAt == 0 {
+			if err := tx.Model(&TenantReportingToken{}).Where("id = ? AND revoked_at = 0", old.ID).Update("revoked_at", now).Error; err != nil {
+				return err
+			}
+		}
+		var createErr error
+		created, secret, createErr = createTenantReportingTokenTx(tx, tenantID, TenantCostReportingPermission, normalizedExpiry, now)
+		if createErr != nil {
+			return createErr
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "reporting_token_rotated", old.TokenID, "old token revoked and replacement returned once", now)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return created, secret, nil
+}
+
+func RotateTenantReportingTokenForTenantWithRequest(tenantID, tokenID string, expiresAt int64, requestID string, actorUserID int) (*TenantReportingTokenMutationResult, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return nil, err
+	}
+	requestID, err := normalizeTenantReportingRequestID(requestID)
+	if err != nil {
+		return nil, err
+	}
+	tenantID, tokenID = strings.TrimSpace(tenantID), strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return nil, ErrTenantCostInvalidInput
+	}
+	now := time.Now().UTC().Unix()
+	effective, canonical, err := normalizeTenantReportingMutationExpiry(expiresAt, now)
+	if err != nil {
+		return nil, err
+	}
+	fingerprint, err := tenantReportingTokenMutationFingerprint(tenantReportingTokenOperationRotate, tenantID, tokenID, TenantCostReportingPermission, canonical)
+	if err != nil {
+		return nil, err
+	}
+	var result *TenantReportingTokenMutationResult
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := requireTenantCostDownstreamTx(tx, tenantID, true); err != nil {
+			return err
+		}
+		var receipt TenantReportingTokenReceipt
+		if err := lockForUpdate(tx).Where("request_id = ?", requestID).First(&receipt).Error; err == nil {
+			var e error
+			result, e = loadTenantReportingTokenReplayTx(tx, tenantReportingTokenOperationRotate, tenantID, tokenID, TenantCostReportingPermission, canonical, fingerprint, &receipt)
+			return e
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		var old TenantReportingToken
+		if err := lockForUpdate(tx).Where("tenant_id = ? AND token_id = ?", tenantID, tokenID).First(&old).Error; err != nil {
+			return err
+		}
+		if old.RevokedAt == 0 {
+			if err := tx.Model(&TenantReportingToken{}).Where("id = ? AND revoked_at = 0", old.ID).Update("revoked_at", now).Error; err != nil {
+				return err
+			}
+		}
+		row, secret, err := createTenantReportingTokenTx(tx, tenantID, TenantCostReportingPermission, effective, now)
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(&TenantReportingTokenReceipt{RequestID: requestID, Operation: tenantReportingTokenOperationRotate, TenantID: tenantID, TargetTokenID: tokenID, InputFingerprint: fingerprint, ResultTokenID: row.TokenID, Permission: TenantCostReportingPermission, RequestedExpiresAt: canonical, ExpiresAt: effective, CreatedAt: now}).Error; err != nil {
+			return err
+		}
+		if err := appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "reporting_token_rotated", old.TokenID, "old token revoked and replacement returned once", now); err != nil {
+			return err
+		}
+		result = &TenantReportingTokenMutationResult{Token: reportingTokenView(row), Secret: secret}
+		return nil
+	})
+	if err != nil {
+		if replayed, replayErr, found := replayTenantReportingTokenAfterFailure(tenantReportingTokenOperationRotate, tenantID, tokenID, TenantCostReportingPermission, canonical, fingerprint, requestID); found {
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			return replayed, nil
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
+func SetTenantCredentialBindingStatus(bindingID int64, status string, actorUserID int) error {
+	return SetTenantCredentialBindingStatusForTenant(DefaultTenantCostTenantID, bindingID, status, actorUserID)
+}
+
+func SetTenantCredentialBindingStatusForTenant(tenantID string, bindingID int64, status string, actorUserID int) error {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return err
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	status = strings.TrimSpace(status)
+	if bindingID <= 0 || !validTenantBindingStatus(status) {
+		return ErrTenantCostInvalidInput
+	}
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	if status == TenantBindingEnabled {
+		if _, err := RequireActiveTenantCostDownstream(tenantID); err != nil {
+			return err
+		}
+	}
+	now := common.GetTimestamp()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var binding TenantCredentialBinding
+		if err := lockForUpdate(tx).Where("id = ? AND tenant_id = ? AND credential_purpose = ?", bindingID, tenantID, TenantCredentialPurposeDataPlane).First(&binding).Error; err != nil {
+			return err
+		}
+		if binding.BindingStatus == TenantBindingRevoked && status != TenantBindingRevoked {
+			return fmt.Errorf("revoked binding cannot be re-enabled")
+		}
+		if status == TenantBindingEnabled {
+			var profile TenantRouteProfile
+			if err := tx.Where("tenant_id = ? AND profile_id = ?", tenantID, binding.RouteProfileID).First(&profile).Error; err != nil {
+				return ErrTenantCostBindingUnavailable
+			}
+			if profile.Status != TenantBindingEnabled {
+				return fmt.Errorf("route profile is not enabled")
+			}
+		}
+		updates := map[string]interface{}{"binding_status": status, "updated_at": now}
+		if status == TenantBindingRevoked {
+			updates["revoked_at"] = now
+		}
+		if err := tx.Model(&TenantCredentialBinding{}).Where("id = ? AND tenant_id = ?", bindingID, tenantID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "tenant_binding_status_changed", fmt.Sprintf("binding:%d", bindingID), "status="+status, now)
+	})
+}
+
+func ReplayTenantCostOutbox(selector TenantCostOutboxReplaySelector, actorUserID int) (int, error) {
+	return ReplayTenantCostOutboxForTenant(DefaultTenantCostTenantID, selector, actorUserID)
+}
+
+func ReplayTenantCostOutboxForTenant(tenantID string, selector TenantCostOutboxReplaySelector, actorUserID int) (int, error) {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return 0, err
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return 0, err
+	}
+	if selector.Limit <= 0 {
+		selector.Limit = 100
+	}
+	if selector.Limit > TenantCostAdminMaxReplay {
+		return 0, fmt.Errorf("replay limit exceeds %d", TenantCostAdminMaxReplay)
+	}
+	ids := make([]string, 0, len(selector.EventIDs))
+	seen := make(map[string]struct{}, len(selector.EventIDs))
+	for _, eventID := range selector.EventIDs {
+		eventID = strings.TrimSpace(eventID)
+		if eventID == "" || len(eventID) > 128 {
+			return 0, ErrTenantCostInvalidInput
+		}
+		if _, ok := seen[eventID]; !ok {
+			seen[eventID] = struct{}{}
+			ids = append(ids, eventID)
+		}
+	}
+	if len(ids) == 0 && (selector.FromSequence <= 0 || selector.ToSequence < selector.FromSequence) {
+		return 0, fmt.Errorf("replay requires event_ids or a positive sequence range")
+	}
+	now := time.Now().UTC().UnixNano()
+	count := 0
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		query := lockForUpdate(tx).Where("tenant_id = ?", tenantID)
+		if len(ids) > 0 {
+			query = query.Where("event_id IN ?", ids)
+		} else {
+			query = query.Where("event_id IN (SELECT event_id FROM tenant_cost_events WHERE tenant_id = ? AND sequence >= ? AND sequence <= ?)", tenantID, selector.FromSequence, selector.ToSequence)
+		}
+		var rows []TenantCostOutbox
+		if err := query.Order("id asc").Limit(selector.Limit).Find(&rows).Error; err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if err := tx.Model(&TenantCostOutbox{}).Where("id = ? AND tenant_id = ?", row.ID, tenantID).Updates(map[string]interface{}{
+				"state": TenantOutboxReady, "next_attempt_at": now, "last_error": "", "updated_at": now,
+			}).Error; err != nil {
+				return err
+			}
+			count++
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, "tenant_cost_outbox_replayed", fmt.Sprintf("count:%d", count), "bounded replay", now)
+	})
+	return count, err
+}
+
+func SetTenantCostWorkerPaused(paused bool, actorUserID int) error {
+	return SetTenantCostWorkerPausedForTenant(DefaultTenantCostTenantID, paused, actorUserID)
+}
+
+func SetTenantCostWorkerPausedForTenant(tenantID string, paused bool, actorUserID int) error {
+	if err := normalizeTenantCostAdminActor(actorUserID); err != nil {
+		return err
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return err
+	}
+	now := common.GetTimestamp()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var control TenantCostWorkerControl
+		err := lockForUpdate(tx).Where("tenant_id = ?", tenantID).First(&control).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			control = TenantCostWorkerControl{TenantID: tenantID, Paused: paused, UpdatedBy: actorUserID, UpdatedAt: now}
+			if err := tx.Create(&control).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		} else if err := tx.Model(&TenantCostWorkerControl{}).Where("tenant_id = ?", tenantID).Updates(map[string]interface{}{"paused": paused, "updated_by": actorUserID, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		action := "tenant_cost_worker_resumed"
+		if paused {
+			action = "tenant_cost_worker_paused"
+		}
+		return appendTenantCostAuditEventForTenantTx(tx, tenantID, actorUserID, action, tenantID, "worker control changed", now)
+	})
+}
+
+func GetTenantCostWorkerControl() (TenantCostWorkerControl, error) {
+	return GetTenantCostWorkerControlForTenant(DefaultTenantCostTenantID)
+}
+
+func GetTenantCostWorkerControlForTenant(tenantID string) (TenantCostWorkerControl, error) {
+	if DB == nil {
+		return TenantCostWorkerControl{}, errors.New("database is not initialized")
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := RequireRegisteredTenantCostDownstream(tenantID); err != nil {
+		return TenantCostWorkerControl{}, err
+	}
+	var control TenantCostWorkerControl
+	err := DB.Where("tenant_id = ?", tenantID).First(&control).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return TenantCostWorkerControl{TenantID: tenantID, Paused: false}, nil
+	}
+	return control, err
+}
+
+func IsTenantCostWorkerPaused() (bool, error) {
+	return IsTenantCostWorkerPausedForTenant(DefaultTenantCostTenantID)
+}
+
+func IsTenantCostWorkerPausedForTenant(tenantID string) (bool, error) {
+	control, err := GetTenantCostWorkerControlForTenant(tenantID)
+	return control.Paused, err
+}

@@ -1,0 +1,218 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
+  diffParameterPricingContracts,
+  importParameterPricingContract,
+  multiplyParameterPrice,
+  parameterPricingContractsEqual,
+  parameterPricingFormToRule,
+  parameterPricingRuleToForm,
+  rebaseParameterPricingContract,
+  type ParameterPricingContract,
+  type ParameterPricingRule,
+} from './parameter-pricing-contract'
+
+const rule: ParameterPricingRule = {
+  id: 'video-hd',
+  group: 'video',
+  model: 'example-model',
+  channel_id: 7,
+  conditions: { resolution: '720p', quality: 'standard' },
+  unit: 'per_second',
+  unit_price: '0.996',
+  currency: 'USD',
+  source_unit_price: '0.83',
+  source_currency: 'USD',
+  source: 'supplier-catalog',
+  source_revision: 'v1',
+}
+const contract = (
+  rules: ParameterPricingRule[],
+  revision = 'base'
+): ParameterPricingContract => ({ schema_version: 1, revision, rules })
+
+describe('parameter pricing administrator contract', () => {
+  test('markup uses decimal arithmetic without early rounding', () => {
+    assert.equal(multiplyParameterPrice('0.83', '1.2'), '0.996')
+    assert.equal(multiplyParameterPrice('0.83', '1.5'), '1.245')
+    assert.equal(
+      multiplyParameterPrice('0.000000000000000001', '1'),
+      '0.000000000000000001'
+    )
+    assert.throws(() =>
+      multiplyParameterPrice('0.000000000000000001', '1.000000000000000001')
+    )
+    assert.equal(
+      multiplyParameterPrice('9999999999999999.99', '100'),
+      '999999999999999999'
+    )
+    assert.equal(multiplyParameterPrice('0', '1.5'), '0')
+    for (const invalid of ['-1', 'NaN', 'Infinity', '1e9', '1,2', '']) {
+      assert.throws(() => multiplyParameterPrice(invalid, '1'))
+    }
+  })
+
+  test('import and form editing preserve exact prices, source fields and all supported conditions', () => {
+    const input = contract([{ ...rule, unit_price: '0.996000000000000001' }])
+    const imported = importParameterPricingContract({
+      success: true,
+      data: { contract: input },
+    })
+    assert.deepEqual(
+      parameterPricingFormToRule(parameterPricingRuleToForm(imported.rules[0])),
+      input.rules[0]
+    )
+    assert.deepEqual(importParameterPricingContract({ contract: input }), input)
+    const exportedJSON = JSON.stringify(imported)
+    assert.deepEqual(
+      importParameterPricingContract(JSON.parse(exportedJSON)),
+      input
+    )
+  })
+
+  test('import rejects unsupported data instead of dropping fields, currencies, dimensions or numeric prices', () => {
+    for (const invalid of [
+      { ...contract([rule]), schema_version: 2 },
+      { ...contract([rule]), unsupported: 'do not lose' },
+      contract([{ ...rule, future_price: '2' } as ParameterPricingRule]),
+      contract([
+        {
+          ...rule,
+          conditions: { quality: 'high', duration: '5' },
+        } as ParameterPricingRule,
+      ]),
+      contract([
+        { ...rule, currency: 'EUR' } as unknown as ParameterPricingRule,
+      ]),
+      contract([
+        { ...rule, unit_price: 0.996 } as unknown as ParameterPricingRule,
+      ]),
+      contract([{ ...rule, unit_price: '0.1234567890123456789' }]),
+      contract([rule, { ...rule }]),
+    ]) {
+      assert.throws(() => importParameterPricingContract(invalid))
+    }
+  })
+
+  test('fixed duration is explicit and channel identifiers cannot be rounded or silently changed', () => {
+    const form = parameterPricingRuleToForm(rule)
+    assert.throws(() => parameterPricingFormToRule({ ...form, channel_id: '' }))
+    assert.throws(() =>
+      parameterPricingFormToRule({ ...form, channel_id: '7.5' })
+    )
+    assert.throws(() =>
+      parameterPricingFormToRule({ ...form, channel_id: '9007199254740993' })
+    )
+    assert.throws(() =>
+      parameterPricingFormToRule({
+        ...form,
+        unit: 'fixed_duration',
+        fixed_duration_seconds: '',
+      })
+    )
+    assert.equal(
+      parameterPricingFormToRule({
+        ...form,
+        unit: 'fixed_duration',
+        fixed_duration_seconds: '5',
+      }).fixed_duration_seconds,
+      5
+    )
+    assert.equal(
+      parameterPricingFormToRule({ ...form, fixed_duration_seconds: '5' })
+        .fixed_duration_seconds,
+      undefined
+    )
+  })
+
+  test('rule order and JSON field order do not create false pricing differences', () => {
+    const other = { ...rule, id: 'other', model: 'another-model' }
+    const reordered = {
+      ...rule,
+      conditions: { quality: 'standard', resolution: '720p' },
+    }
+    assert.equal(
+      parameterPricingContractsEqual(
+        contract([rule, other]),
+        contract([other, reordered], 'new-revision')
+      ),
+      true
+    )
+    assert.deepEqual(
+      diffParameterPricingContracts(contract([rule]), contract([reordered])),
+      { added: 0, updated: 0, removed: 0 }
+    )
+  })
+
+  test('disjoint concurrent changes preserve both administrators edits', () => {
+    const base = contract([rule])
+    const local = contract([{ ...rule, unit_price: '1.245' }])
+    const remoteRule = { ...rule, id: 'other', model: 'another-model' }
+    const latest = contract([rule, remoteRule], 'server-v2')
+    const result = rebaseParameterPricingContract(base, local, latest)
+    assert.deepEqual(result.conflicts, [])
+    assert.equal(result.contract.revision, 'server-v2')
+    assert.equal(
+      result.contract.rules.find((entry) => entry.id === rule.id)?.unit_price,
+      '1.245'
+    )
+    assert.deepEqual(
+      result.contract.rules.find((entry) => entry.id === 'other'),
+      remoteRule
+    )
+  })
+
+  test('conflicting price edits retain both versions for explicit resolution', () => {
+    const localRule = { ...rule, unit_price: '1.245' }
+    const remoteRule = { ...rule, unit_price: '1.66' }
+    const result = rebaseParameterPricingContract(
+      contract([rule]),
+      contract([localRule]),
+      contract([remoteRule], 'server-v2')
+    )
+    assert.deepEqual(result.conflicts, [
+      { id: rule.id, local: localRule, remote: remoteRule },
+    ])
+    assert.deepEqual(result.contract.rules, [localRule])
+  })
+
+  test('concurrent delete versus edit is a conflict, while matching changes are not', () => {
+    const remoteRule = { ...rule, unit_price: '1.66' }
+    const result = rebaseParameterPricingContract(
+      contract([rule]),
+      contract([]),
+      contract([remoteRule], 'server-v2')
+    )
+    assert.deepEqual(result.conflicts, [
+      { id: rule.id, local: undefined, remote: remoteRule },
+    ])
+    assert.deepEqual(result.contract.rules, [])
+    assert.deepEqual(
+      rebaseParameterPricingContract(
+        contract([rule]),
+        contract([remoteRule]),
+        contract([remoteRule])
+      ).conflicts,
+      []
+    )
+  })
+})

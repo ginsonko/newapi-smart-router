@@ -1,0 +1,1909 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import { AxiosError } from 'axios'
+import {
+  Activity,
+  BadgeCheck,
+  Ban,
+  ChevronDown,
+  CircleAlert,
+  CircleX,
+  Clock3,
+  DatabaseZap,
+  Gauge,
+  LoaderCircle,
+  MoreHorizontal,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  ShieldAlert,
+  Stethoscope,
+  TimerReset,
+  Waves,
+  X,
+  type LucideIcon,
+} from 'lucide-react'
+import { useMemo, useState, type ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  createSmartRouterBlock,
+  getAllSmartRouterHealth,
+  probeSmartRouterRoute,
+  resetAllSmartRouterAutomaticHealth,
+  scheduleAllSmartRouterRecoveries,
+  SmartRouterCacheEconomyStatusPanel,
+  type SmartRouterBulkRecoveryResponse,
+  type SmartRouterHealthActionResponse,
+  type SmartRouterHealthRoute,
+  type SmartRouterResetAllAutomaticHealthResponse,
+  type SmartRouterActualInputCostStatus,
+  type SmartRouterPrimaryState,
+} from '@/features/smart-routing'
+import {
+  canonicalHealthState,
+  compareSmartRouterEndpoints,
+  evidenceConfidence,
+  evidenceConfidenceLabelKey,
+  evidenceFreshness,
+  evidenceFreshnessLabelKey,
+  formatSmartRouterInputCostUSD,
+  formatSmartRouterRoutePrice,
+  formatSmartRouterTimestamp,
+  healthSortRank,
+  healthStateBadgeVariant,
+  healthStateLabelKey,
+  isCapacityBusy,
+  isMediaRoute,
+  latestEvidenceAt,
+  ratioText,
+  routeSuccessRate,
+  smartRouterEndpointLabelKey,
+  supportsSyntheticProbe,
+} from '@/features/smart-routing/health-view-model'
+import { cn } from '@/lib/utils'
+
+const HEALTH_QUERY_KEY = ['smart-router-health'] as const
+const HEALTH_PAGE_SIZE = 100
+
+type HealthMeta = {
+  total?: number
+  page?: number
+  page_size?: number
+  updated_at_ms?: number
+  snapshot_version?: string
+  stale?: boolean
+  shared_state_backend?: string
+  background_probe_available?: boolean
+  background_probe_enabled?: boolean
+  snapshot?: {
+    id?: string
+    generated_at_ms?: number
+    stale?: boolean
+  }
+  probe_worker?: {
+    heartbeat_at_ms: number
+    queued: number
+    running: number
+    limit: number
+    budget_per_minute: number
+    succeeded: number
+    failed: number
+    deferred: number
+    dropped: number
+    last_defer_reason?: string
+    last_ttfe_ms?: number
+    last_ttft_ms?: number
+    last_run_at_ms: number
+    online?: boolean
+    waiting_for_budget?: number
+    queue_capacity?: number
+  }
+  actual_input_cost_status?: SmartRouterActualInputCostStatus
+}
+
+type AdminStateFilter =
+  | 'all'
+  | 'evidence_all'
+  | 'review_all'
+  | 'recovering_all'
+  | SmartRouterPrimaryState
+type AdminProbeFilter = 'all' | 'due' | 'active' | 'natural'
+
+type ProbeNotice = {
+  tone: 'success' | 'info' | 'warning' | 'error'
+  labelKey: string
+}
+
+type BulkRecoveryNotice = ProbeNotice & {
+  values?: Record<string, number>
+}
+
+type AdminSummaryCardProps = {
+  label: string
+  value: number
+  icon: LucideIcon
+  active: boolean
+  tone: string
+  onClick: () => void
+}
+
+function AdminSummaryCard(props: AdminSummaryCardProps) {
+  const Icon = props.icon
+  return (
+    <button
+      type='button'
+      aria-pressed={props.active}
+      onClick={props.onClick}
+      className={cn(
+        'bg-background flex min-w-0 items-center gap-2.5 rounded-lg border px-3 py-2.5 text-left shadow-xs transition-colors',
+        'hover:bg-muted/30 focus-visible:ring-ring/50 focus-visible:ring-[3px] focus-visible:outline-none',
+        props.active && 'border-primary/40 bg-primary/[0.04]'
+      )}
+    >
+      <span
+        className={cn(
+          'flex size-8 shrink-0 items-center justify-center rounded-md',
+          props.tone
+        )}
+      >
+        <Icon className='size-4' aria-hidden='true' />
+      </span>
+      <span className='min-w-0'>
+        <span
+          className='text-muted-foreground block truncate text-[11px] leading-4'
+          title={props.label}
+        >
+          {props.label}
+        </span>
+        <span className='block text-lg leading-5 font-semibold tabular-nums'>
+          {props.value}
+        </span>
+      </span>
+    </button>
+  )
+}
+
+function normalizeHealth(data: unknown) {
+  if (Array.isArray(data)) return data as SmartRouterHealthRoute[]
+  if (data && typeof data === 'object' && 'items' in data) {
+    const items = (data as { items?: unknown }).items
+    return Array.isArray(items) ? (items as SmartRouterHealthRoute[]) : []
+  }
+  return []
+}
+
+function normalizeMeta(data: unknown): HealthMeta | undefined {
+  if (!data || Array.isArray(data) || typeof data !== 'object') return undefined
+  const meta = data as HealthMeta
+  return {
+    ...meta,
+    updated_at_ms: meta.updated_at_ms ?? meta.snapshot?.generated_at_ms,
+    snapshot_version: meta.snapshot_version ?? meta.snapshot?.id,
+    stale: meta.stale ?? meta.snapshot?.stale,
+  }
+}
+
+function formatActualInputCacheRate(rate?: number) {
+  if (
+    typeof rate !== 'number' ||
+    !Number.isFinite(rate) ||
+    rate < 0 ||
+    rate > 1_000_000
+  ) {
+    return ''
+  }
+  return `${new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 1,
+  }).format(rate / 10_000)}%`
+}
+
+function probeState(route: SmartRouterHealthRoute) {
+  if (route.probe_state) return route.probe_state.toLowerCase()
+  const state = canonicalHealthState(route)
+  if (state === 'probing') return 'active'
+  if (route.probe_overdue) return 'due'
+  return 'idle'
+}
+
+function routeMatchesSearch(route: SmartRouterHealthRoute, search: string) {
+  const query = search.trim().toLowerCase()
+  if (!query) return true
+  return [
+    route.model,
+    route.group,
+    route.endpoint,
+    route.channel_id,
+    route.route_id,
+    route.contract_id,
+    route.sanitized_error,
+    route.last_error,
+    route.last_probe_error,
+  ].some((value) =>
+    String(value ?? '')
+      .toLowerCase()
+      .includes(query)
+  )
+}
+
+function routeMatchesProbeFilter(
+  route: SmartRouterHealthRoute,
+  filter: AdminProbeFilter
+) {
+  if (filter === 'all') return true
+  if (filter === 'due') {
+    return route.probe_overdue || probeState(route) === 'due'
+  }
+  if (filter === 'active') {
+    const state = probeState(route)
+    return state === 'active' || state === 'queued' || state === 'running'
+  }
+  return isMediaRoute(route)
+}
+
+function routeNeedsAdministratorAction(route: SmartRouterHealthRoute) {
+  return (
+    route.requires_admin_review === true ||
+    canonicalHealthState(route) === 'needs_review'
+  )
+}
+
+function routeMatchesStateFilter(
+  route: SmartRouterHealthRoute,
+  filter: AdminStateFilter
+) {
+  if (filter === 'all') return true
+  const state = canonicalHealthState(route)
+  if (filter === 'evidence_all') {
+    return state === 'pending_sample' || state === 'telemetry_unavailable'
+  }
+  if (filter === 'review_all') {
+    return routeNeedsAdministratorAction(route)
+  }
+  if (filter === 'recovering_all') {
+    return state === 'unavailable'
+  }
+  return state === filter
+}
+
+function adminHealthStateLabelKey(state: SmartRouterPrimaryState) {
+  if (state === 'telemetry_unavailable') return 'Health data unavailable'
+  return healthStateLabelKey(state)
+}
+
+function adminHealthStateBadgeVariant(state: SmartRouterPrimaryState) {
+  if (state === 'telemetry_unavailable') return 'outline' as const
+  return healthStateBadgeVariant(state)
+}
+
+function probeOutcomeLabelKey(outcome?: string) {
+  if (!outcome) return null
+  if (outcome === 'success') return 'Probe succeeded'
+  if (
+    outcome === 'infrastructure_failure' ||
+    outcome === 'credential_failure'
+  ) {
+    return 'Probe needs another check'
+  }
+  return 'Probe completed with a non-success result'
+}
+
+function probeDisposition(response?: SmartRouterHealthActionResponse) {
+  return String(
+    response?.data?.disposition ?? response?.data?.status ?? ''
+  ).toLowerCase()
+}
+
+function probeNotice(
+  disposition: string,
+  requestSucceeded: boolean
+): ProbeNotice {
+  if (disposition === 'queued') {
+    return { tone: 'success', labelKey: 'Recovery check queued' }
+  }
+  if (
+    disposition === 'duplicate' ||
+    disposition === 'already_queued' ||
+    disposition === 'already_running'
+  ) {
+    return { tone: 'info', labelKey: 'Recovery check queued' }
+  }
+  if (
+    disposition === 'cooldown' ||
+    disposition === 'not_due' ||
+    disposition === 'scheduled'
+  ) {
+    return { tone: 'info', labelKey: 'Next check scheduled' }
+  }
+  if (disposition === 'waiting_for_budget') {
+    return { tone: 'info', labelKey: 'Waiting for budget' }
+  }
+  if (disposition === 'natural_traffic_only') {
+    return {
+      tone: 'info',
+      labelKey: 'Media recovery uses bounded natural traffic',
+    }
+  }
+  if (disposition === 'healthy' || disposition === 'already_healthy') {
+    return { tone: 'info', labelKey: 'Healthy' }
+  }
+  if (disposition === 'queue_full') {
+    return {
+      tone: 'warning',
+      labelKey: 'Recovery queue is full; automatic checks will continue',
+    }
+  }
+  if (disposition === 'worker_unavailable') {
+    return {
+      tone: 'warning',
+      labelKey: 'Background recovery is temporarily unavailable',
+    }
+  }
+  if (disposition === 'requires_reset') {
+    return {
+      tone: 'warning',
+      labelKey: 'Release this route before requesting a check',
+    }
+  }
+  if (requestSucceeded) {
+    return { tone: 'success', labelKey: 'Recovery check queued' }
+  }
+  return { tone: 'error', labelKey: 'Unable to queue recovery check' }
+}
+
+function bulkRecoveryNotice(
+  response?: SmartRouterBulkRecoveryResponse
+): BulkRecoveryNotice {
+  const status = response?.data?.status
+  const values = {
+    queued: response?.data?.queued ?? 0,
+    existing: response?.data?.already_queued ?? 0,
+    full: response?.data?.queue_full ?? 0,
+  }
+  if (status === 'queued') {
+    return {
+      tone: 'success',
+      labelKey:
+        'Recovery tasks requeued: {{queued}} new, {{existing}} already queued',
+      values,
+    }
+  }
+  if (status === 'partially_queued') {
+    return {
+      tone: 'warning',
+      labelKey:
+        'Recovery tasks partially requeued: {{queued}} new, {{existing}} already queued, {{full}} waiting for space',
+      values,
+    }
+  }
+  if (status === 'already_queued' || status === 'already_scheduled') {
+    return {
+      tone: 'info',
+      labelKey: 'All automatic recovery tasks are already queued',
+    }
+  }
+  if (status === 'nothing_to_requeue') {
+    return {
+      tone: 'info',
+      labelKey: 'No automatic recovery tasks need requeueing',
+    }
+  }
+  if (status === 'queue_full') {
+    return {
+      tone: 'warning',
+      labelKey: 'Recovery queue is full; automatic checks will continue',
+    }
+  }
+  if (status === 'worker_unavailable') {
+    return {
+      tone: 'warning',
+      labelKey: 'Background recovery is temporarily unavailable',
+    }
+  }
+  if (status === 'recovery_disabled') {
+    return {
+      tone: 'warning',
+      labelKey: 'Background probes are currently disabled in site settings.',
+    }
+  }
+  if (status === 'catalog_unavailable') {
+    return { tone: 'warning', labelKey: 'Catalog not ready' }
+  }
+  if (status === 'timeout' || status === 'canceled') {
+    return {
+      tone: 'warning',
+      labelKey:
+        'Recovery scheduling did not finish; accepted tasks stay queued',
+    }
+  }
+  return {
+    tone: response?.success ? 'info' : 'error',
+    labelKey: 'Unable to requeue automatic recovery tasks',
+  }
+}
+
+function backgroundProbeMessage(meta?: HealthMeta) {
+  if (!meta?.shared_state_backend) return null
+  if (meta.shared_state_backend !== 'redis') {
+    return 'Background probes are unavailable without a shared multi-node lease backend.'
+  }
+  if (!meta.background_probe_enabled) {
+    return 'Background probes are currently disabled in site settings.'
+  }
+  if (meta.background_probe_available === false) {
+    return 'Background recovery worker is not connected.'
+  }
+  return null
+}
+
+function GroupDisclosure(props: {
+  label: ReactNode
+  meta?: ReactNode
+  defaultOpen: boolean
+  forceOpen?: boolean
+  level: 'model' | 'endpoint' | 'group'
+  children: ReactNode
+}) {
+  const [open, setOpen] = useState(props.defaultOpen)
+  const actualOpen = props.forceOpen || open
+  return (
+    <Collapsible open={actualOpen} onOpenChange={setOpen}>
+      <CollapsibleTrigger
+        className={cn(
+          'hover:bg-muted/30 flex w-full min-w-0 items-center gap-2 text-left transition-colors',
+          props.level === 'model' && 'px-3 py-3',
+          props.level === 'endpoint' && 'border-t px-3 py-2.5 sm:pl-5',
+          props.level === 'group' && 'border-t px-3 py-2 sm:pl-8'
+        )}
+      >
+        <div className='min-w-0 flex-1'>{props.label}</div>
+        {props.meta}
+        <ChevronDown
+          className={cn(
+            'text-muted-foreground size-4 shrink-0 transition-transform',
+            actualOpen && 'rotate-180'
+          )}
+          aria-hidden='true'
+        />
+      </CollapsibleTrigger>
+      <CollapsibleContent>{props.children}</CollapsibleContent>
+    </Collapsible>
+  )
+}
+
+function WorkerStatus(props: { meta?: HealthMeta }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const worker = props.meta?.probe_worker
+  if (!worker) return null
+  const heartbeatMS =
+    worker.heartbeat_at_ms > 10_000_000_000
+      ? worker.heartbeat_at_ms
+      : worker.heartbeat_at_ms * 1000
+  const online = worker.online ?? Date.now() - heartbeatMS < 30_000
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <div className='rounded-lg border'>
+        <CollapsibleTrigger className='hover:bg-muted/30 flex w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5 text-left transition-colors'>
+          <span className='text-sm font-medium'>{t('Background worker')}</span>
+          <Badge variant={online ? 'secondary' : 'destructive'}>
+            {online ? t('Online') : t('Heartbeat delayed')}
+          </Badge>
+          <span className='text-muted-foreground text-xs'>
+            {t('{{running}}/{{limit}} running, {{queued}} queued', {
+              running: worker.running,
+              limit: worker.limit,
+              queued: worker.queued,
+            })}
+          </span>
+          <span className='text-muted-foreground ml-auto text-xs'>
+            {t('Details')}
+          </span>
+          <ChevronDown
+            className={cn(
+              'text-muted-foreground size-4 transition-transform',
+              open && 'rotate-180'
+            )}
+          />
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className='grid grid-cols-2 gap-2 border-t p-3 sm:grid-cols-3 lg:grid-cols-6'>
+            {[
+              [t('Succeeded'), worker.succeeded],
+              [t('Failed'), worker.failed],
+              [t('Deferred'), worker.deferred],
+              [t('Dropped'), worker.dropped],
+              [t('Waiting for budget'), worker.waiting_for_budget ?? 0],
+              [t('Probe budget per minute'), worker.budget_per_minute],
+            ].map(([label, value]) => (
+              <div key={label} className='bg-muted/20 rounded-md px-2.5 py-2'>
+                <p className='text-muted-foreground text-xs'>{label}</p>
+                <p className='mt-0.5 font-medium tabular-nums'>{value}</p>
+              </div>
+            ))}
+          </div>
+          <div className='text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 border-t px-3 py-2 text-xs'>
+            <span>
+              {t('Last heartbeat {{time}}', {
+                time: formatSmartRouterTimestamp(worker.heartbeat_at_ms),
+              })}
+            </span>
+            {worker.last_ttfe_ms ? (
+              <span>
+                {t('Last TTFE {{ms}} ms', { ms: worker.last_ttfe_ms })}
+              </span>
+            ) : null}
+            {worker.last_ttft_ms ? (
+              <span>
+                {t('Last semantic TTFT {{ms}} ms', {
+                  ms: worker.last_ttft_ms,
+                })}
+              </span>
+            ) : null}
+            {worker.last_defer_reason ? (
+              <span>
+                {t('Last defer reason: {{reason}}', {
+                  reason: worker.last_defer_reason,
+                })}
+              </span>
+            ) : null}
+          </div>
+        </CollapsibleContent>
+      </div>
+    </Collapsible>
+  )
+}
+
+function ActualInputCostStatusPanel(props: {
+  routes: SmartRouterHealthRoute[]
+  status?: SmartRouterActualInputCostStatus
+}) {
+  const { t } = useTranslation()
+  const estimatedRoutes = props.routes.filter(
+    (route) => route.estimated_input_usd_per_million !== undefined
+  ).length
+  if (!props.status && estimatedRoutes === 0) return null
+  const status = props.status
+  const queue = status ? `${status.queue_depth}/${status.queue_capacity}` : '-'
+  const learning = status?.learning_enabled !== false
+  const evidenceReady = status?.evidence_ready !== false
+  let badge = t('Collecting samples')
+  if (status) {
+    if (!learning) {
+      badge = t('Learning paused')
+    } else if (evidenceReady) {
+      badge = t('Learning active')
+    }
+  }
+
+  return (
+    <section
+      className='rounded-lg border p-3'
+      aria-label={t('Recent actual input cost')}
+    >
+      <div className='flex min-w-0 flex-wrap items-start justify-between gap-2'>
+        <div className='min-w-0'>
+          <div className='flex items-center gap-2'>
+            <Gauge className='text-primary size-4 shrink-0' />
+            <h4 className='text-sm font-medium'>
+              {t('Recent actual input cost')}
+            </h4>
+            <Badge
+              variant={learning && evidenceReady ? 'secondary' : 'outline'}
+            >
+              {badge}
+            </Badge>
+          </div>
+          <p className='text-muted-foreground mt-1 max-w-3xl text-xs leading-relaxed'>
+            {t(
+              'The estimate combines recent normal input and cache traffic for route ordering. It is read-only and never changes billing, health, retry, or wallet behavior.'
+            )}
+          </p>
+        </div>
+        <span className='text-muted-foreground flex items-center gap-1.5 text-xs'>
+          <DatabaseZap className='size-3.5' />
+          {t('Updated {{time}}', {
+            time: formatSmartRouterTimestamp(status?.last_update_ms) || '-',
+          })}
+        </span>
+      </div>
+      <div className='mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4'>
+        <div className='bg-muted/20 rounded-lg border p-2.5'>
+          <p className='text-muted-foreground text-xs'>
+            {t('Estimated routes')}
+          </p>
+          <p className='mt-1 text-sm font-semibold tabular-nums'>
+            {estimatedRoutes}
+          </p>
+        </div>
+        <div className='bg-muted/20 rounded-lg border p-2.5'>
+          <p className='text-muted-foreground text-xs'>{t('Cost profiles')}</p>
+          <p className='mt-1 text-sm font-semibold tabular-nums'>
+            {status?.profiles ?? '-'}
+          </p>
+        </div>
+        <div className='bg-muted/20 rounded-lg border p-2.5'>
+          <p className='text-muted-foreground text-xs'>
+            {t('Processed samples')}
+          </p>
+          <p className='mt-1 text-sm font-semibold tabular-nums'>
+            {status?.processed ?? '-'}
+          </p>
+        </div>
+        <div className='bg-muted/20 rounded-lg border p-2.5'>
+          <p className='text-muted-foreground text-xs'>{t('Learning queue')}</p>
+          <p className='mt-1 text-sm font-semibold tabular-nums'>{queue}</p>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+type RouteActions = {
+  probe: (route: SmartRouterHealthRoute) => void
+  confirmBlock: (route: SmartRouterHealthRoute) => void
+  probePending: (routeID: string) => boolean
+  blockPending: (routeID: string) => boolean
+}
+
+function AdminRouteRow(props: {
+  route: SmartRouterHealthRoute
+  actions: RouteActions
+}) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const { route, actions } = props
+  const state = canonicalHealthState(route)
+  const successRate = routeSuccessRate(route)
+  const lastReal = formatSmartRouterTimestamp(
+    route.last_updated_ms ??
+      route.last_success_at_ms ??
+      route.last_failure_at_ms
+  )
+  const lastProbe = formatSmartRouterTimestamp(
+    route.last_probe_completed_at_ms ??
+      route.last_probe_at_ms ??
+      route.last_probe_started_at_ms
+  )
+  const nextProbe = formatSmartRouterTimestamp(
+    route.next_probe_at_ms ?? route.sample_due_at_ms
+  )
+  const confidenceKey = evidenceConfidenceLabelKey(evidenceConfidence(route))
+  const probeOutcomeKey = probeOutcomeLabelKey(route.last_probe_outcome)
+  const error = route.sanitized_error || route.last_error || route.last_outcome
+  const keyCeiling =
+    route.price_known === false
+      ? t('Price pending synchronization')
+      : ratioText(route.effective_ratio_ppm)
+  const modelPrice =
+    route.model_price_known === false
+      ? t('Price pending synchronization')
+      : formatSmartRouterRoutePrice(route.price, t)
+  const recentCacheRate = formatActualInputCacheRate(
+    route.recent_cache_rate_ppm
+  )
+  const estimatedInputPrice =
+    typeof route.estimated_input_usd_per_million === 'number' &&
+    Number.isFinite(route.estimated_input_usd_per_million) &&
+    route.estimated_input_usd_per_million >= 0
+      ? formatSmartRouterInputCostUSD(route.estimated_input_usd_per_million)
+      : ''
+  const probeRequestPending = actions.probePending(route.route_id)
+  const pending = probeRequestPending || actions.blockPending(route.route_id)
+  const canProbe =
+    supportsSyntheticProbe(route) &&
+    state !== 'healthy' &&
+    state !== 'needs_review'
+  const routeProbeState = probeState(route)
+  const probeRunning =
+    routeProbeState === 'active' || routeProbeState === 'running'
+  const probeQueued = routeProbeState === 'queued'
+  const probeActive = probeRunning || probeQueued
+  const probeDisabled = pending || probeActive
+  let probeControlLabel = t('Queue recovery probe')
+  if (probeRequestPending) {
+    probeControlLabel = t('Processing...')
+  } else if (probeRunning) {
+    probeControlLabel = t('Probe active')
+  } else if (probeQueued) {
+    probeControlLabel = t('Recovery check queued')
+  }
+  const probePromoted =
+    canProbe && (state === 'unavailable' || state === 'pending_sample')
+  let probeMenuItem: ReactNode = null
+  if (canProbe) {
+    probeMenuItem = (
+      <DropdownMenuItem
+        disabled={probeDisabled}
+        onClick={() => actions.probe(route)}
+      >
+        {probeRequestPending ? (
+          <LoaderCircle className='animate-spin' />
+        ) : (
+          <Stethoscope />
+        )}
+        {probeControlLabel}
+      </DropdownMenuItem>
+    )
+  } else if (isMediaRoute(route)) {
+    probeMenuItem = (
+      <DropdownMenuItem disabled>
+        {t('Media recovery uses bounded natural traffic')}
+      </DropdownMenuItem>
+    )
+  }
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <div className='relative border-t pl-2 first:border-t-0 sm:pl-5 lg:pl-10'>
+        <span
+          className={cn(
+            'absolute inset-y-2 left-0 w-0.5 rounded-full bg-border',
+            state === 'healthy' && 'bg-emerald-500',
+            (state === 'unavailable' || state === 'needs_review') &&
+              'bg-red-500',
+            state === 'telemetry_unavailable' && 'bg-slate-400'
+          )}
+          aria-hidden='true'
+        />
+        <div className='grid min-w-0 gap-2 px-3 py-2.5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center'>
+          <div className='min-w-0'>
+            <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
+              <Badge variant={adminHealthStateBadgeVariant(state)}>
+                {t(adminHealthStateLabelKey(state))}
+              </Badge>
+              <span className='text-muted-foreground text-xs'>
+                {t('Channel #{{id}}', { id: route.channel_id ?? '?' })}
+              </span>
+              {modelPrice ? (
+                <Badge variant='outline'>
+                  {t('Model price: {{price}}', { price: modelPrice })}
+                </Badge>
+              ) : null}
+              {recentCacheRate ? (
+                <Badge variant='outline'>
+                  {t('Recent cache {{rate}}', { rate: recentCacheRate })}
+                </Badge>
+              ) : null}
+              {estimatedInputPrice ? (
+                <Badge variant='outline'>
+                  {t('Estimated input {{price}} / 1M', {
+                    price: estimatedInputPrice,
+                  })}
+                </Badge>
+              ) : null}
+              {keyCeiling ? (
+                <Badge variant='outline'>
+                  {t('Key ceiling')}: {keyCeiling}
+                </Badge>
+              ) : null}
+              {isCapacityBusy(route) ? (
+                <Badge variant='outline'>{t('Temporarily busy')}</Badge>
+              ) : null}
+              {isMediaRoute(route) ? (
+                <Badge variant='outline'>{t('Natural traffic only')}</Badge>
+              ) : null}
+              {route.probe_overdue ? (
+                <Badge variant='outline'>{t('Probe overdue')}</Badge>
+              ) : null}
+              {probeActive ? (
+                <Badge variant='outline'>{probeControlLabel}</Badge>
+              ) : null}
+            </div>
+            <div className='text-muted-foreground mt-1 flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-xs'>
+              <span className='max-w-full truncate font-mono'>
+                {route.route_id}
+              </span>
+              <span>
+                {successRate === null
+                  ? t('No samples')
+                  : t('{{rate}} success', {
+                      rate: `${(successRate * 100).toFixed(1)}%`,
+                    })}
+              </span>
+              {lastReal ? (
+                <span>
+                  {t('Last real observation {{time}}', { time: lastReal })}
+                </span>
+              ) : null}
+              {lastProbe ? (
+                <span>
+                  {t('Last recovery probe {{time}}', { time: lastProbe })}
+                </span>
+              ) : null}
+              {nextProbe ? (
+                <span>
+                  {t('Next recovery check {{time}}', { time: nextProbe })}
+                </span>
+              ) : null}
+            </div>
+          </div>
+
+          <div className='flex flex-wrap items-center gap-1.5 lg:justify-end'>
+            {probePromoted ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                className='min-w-28'
+                disabled={probeDisabled}
+                onClick={() => actions.probe(route)}
+              >
+                {probeRequestPending ? (
+                  <LoaderCircle
+                    className='animate-spin'
+                    data-icon='inline-start'
+                  />
+                ) : (
+                  <Stethoscope data-icon='inline-start' />
+                )}
+                {probeDisabled ? probeControlLabel : t('Check now')}
+              </Button>
+            ) : null}
+            <CollapsibleTrigger
+              render={
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='ghost'
+                  disabled={pending}
+                />
+              }
+            >
+              {open ? t('Hide details') : t('Details')}
+            </CollapsibleTrigger>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button
+                    type='button'
+                    size='icon-sm'
+                    variant='ghost'
+                    disabled={pending}
+                    aria-label={t('Route actions')}
+                  />
+                }
+              >
+                <MoreHorizontal />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align='end'>
+                {probeMenuItem}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  variant='destructive'
+                  onClick={() => actions.confirmBlock(route)}
+                >
+                  <Ban />
+                  {t('Exclude route')}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+
+        <CollapsibleContent>
+          <div className='bg-muted/15 grid gap-x-6 gap-y-2 border-t px-3 py-3 text-xs sm:grid-cols-2 xl:grid-cols-3'>
+            <div>
+              <span className='text-muted-foreground'>{t('Route ID')}</span>
+              <p className='mt-0.5 font-mono break-all'>{route.route_id}</p>
+            </div>
+            <div>
+              <span className='text-muted-foreground'>{t('Contract ID')}</span>
+              <p className='mt-0.5 font-mono break-all'>
+                {route.contract_id || '-'}
+              </p>
+            </div>
+            <div>
+              <span className='text-muted-foreground'>{t('Evidence')}</span>
+              <p className='mt-0.5'>
+                {t(evidenceFreshnessLabelKey(evidenceFreshness(route)))}
+                {confidenceKey ? ` / ${t(confidenceKey)}` : ''}
+              </p>
+            </div>
+            {route.recent_cache_rate_ppm !== undefined ? (
+              <div>
+                <span className='text-muted-foreground'>
+                  {t('Recent actual input cost')}
+                </span>
+                <p className='mt-0.5'>
+                  {recentCacheRate || '-'}
+                  {estimatedInputPrice ? ` / ${estimatedInputPrice} / 1M` : ''}
+                </p>
+                <p className='text-muted-foreground/70 mt-0.5'>
+                  {t('{{count}} samples / {{source}}', {
+                    count: route.actual_input_cost_samples ?? 0,
+                    source:
+                      route.actual_input_cost_source === 'pooled_prior'
+                        ? t('Includes pooled prior')
+                        : t('Direct route evidence'),
+                  })}
+                </p>
+              </div>
+            ) : null}
+            {route.price?.revision ? (
+              <div>
+                <span className='text-muted-foreground'>
+                  {t('Model price contract revision')}
+                </span>
+                <p className='mt-0.5 font-mono break-all'>
+                  {route.price.revision}
+                </p>
+              </div>
+            ) : null}
+            <div>
+              <span className='text-muted-foreground'>
+                {t('Last real observation')}
+              </span>
+              <p className='mt-0.5'>
+                {lastReal || t('No real observation yet')}
+              </p>
+            </div>
+            <div>
+              <span className='text-muted-foreground'>
+                {t('Last recovery probe')}
+              </span>
+              <p className='mt-0.5'>
+                {lastProbe || t('No probe recorded yet')}
+              </p>
+            </div>
+            <div>
+              <span className='text-muted-foreground'>{t('Probe result')}</span>
+              <p className='mt-0.5'>
+                {probeOutcomeKey ? t(probeOutcomeKey) : '-'}
+              </p>
+            </div>
+            {route.ttft_p95_ms !== undefined ? (
+              <div>
+                <span className='text-muted-foreground'>{t('TTFT')}</span>
+                <p className='mt-0.5'>
+                  {t('P95 {{ms}} ms across {{count}} samples', {
+                    ms: route.ttft_p95_ms,
+                    count: route.ttft_samples ?? 0,
+                  })}
+                </p>
+              </div>
+            ) : null}
+            {error ? (
+              <div className='sm:col-span-2'>
+                <span className='text-muted-foreground'>
+                  {t('Sanitized error')}
+                </span>
+                <p className='mt-0.5 break-words'>
+                  {route.last_http_status
+                    ? `HTTP ${route.last_http_status} · `
+                    : ''}
+                  {error}
+                </p>
+              </div>
+            ) : null}
+          </div>
+        </CollapsibleContent>
+      </div>
+    </Collapsible>
+  )
+}
+
+function buildHierarchy(routes: SmartRouterHealthRoute[]) {
+  const models = new Map<
+    string,
+    Map<string, Map<string, SmartRouterHealthRoute[]>>
+  >()
+  for (const route of routes) {
+    const model = route.model || ''
+    const endpoint = route.endpoint || ''
+    const group = route.group || ''
+    let endpoints = models.get(model)
+    if (!endpoints) {
+      endpoints = new Map()
+      models.set(model, endpoints)
+    }
+    let groups = endpoints.get(endpoint)
+    if (!groups) {
+      groups = new Map()
+      endpoints.set(endpoint, groups)
+    }
+    const current = groups.get(group)
+    if (current) current.push(route)
+    else groups.set(group, [route])
+  }
+  return models
+}
+
+function worstState(routes: SmartRouterHealthRoute[]) {
+  return canonicalHealthState(
+    [...routes].sort(
+      (left, right) => healthSortRank(left) - healthSortRank(right)
+    )[0]
+  )
+}
+
+export function SmartRoutingHealth() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const [search, setSearch] = useState('')
+  const [stateFilter, setStateFilter] = useState<AdminStateFilter>('all')
+  const [probeFilter, setProbeFilter] = useState<AdminProbeFilter>('all')
+  const [endpointFilter, setEndpointFilter] = useState('')
+  const [groupFilter, setGroupFilter] = useState('')
+  const [reviewOnly, setReviewOnly] = useState(false)
+  const filterKey = `${search}\u0000${stateFilter}\u0000${probeFilter}\u0000${endpointFilter}\u0000${groupFilter}\u0000${reviewOnly}`
+  const [visibleState, setVisibleState] = useState({
+    filterKey,
+    limit: HEALTH_PAGE_SIZE,
+  })
+  const [confirmation, setConfirmation] = useState<{
+    kind: 'block' | 'reset-all'
+    route?: SmartRouterHealthRoute
+  } | null>(null)
+  const visibleLimit =
+    visibleState.filterKey === filterKey ? visibleState.limit : HEALTH_PAGE_SIZE
+
+  const query = useQuery({
+    queryKey: HEALTH_QUERY_KEY,
+    queryFn: getAllSmartRouterHealth,
+    staleTime: 10_000,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+    retry: 1,
+    placeholderData: keepPreviousData,
+  })
+  const routes = useMemo(
+    () => normalizeHealth(query.data?.data),
+    [query.data?.data]
+  )
+  const healthMeta = normalizeMeta(query.data?.data)
+  const endpoints = useMemo(
+    () =>
+      [
+        ...new Set(routes.map((route) => route.endpoint || '').filter(Boolean)),
+      ].sort(compareSmartRouterEndpoints),
+    [routes]
+  )
+  const groups = useMemo(
+    () =>
+      [
+        ...new Set(routes.map((route) => route.group || '').filter(Boolean)),
+      ].sort((a, b) => a.localeCompare(b)),
+    [routes]
+  )
+  const stats = useMemo(() => {
+    const values = {
+      total: routes.length,
+      healthy: 0,
+      unknown: 0,
+      recovering: 0,
+      unavailable: 0,
+      review: 0,
+      evidence: 0,
+      overdue: 0,
+      natural: 0,
+    }
+    for (const route of routes) {
+      const state = canonicalHealthState(route)
+      if (state === 'healthy') {
+        values.healthy++
+      } else if (state === 'unknown') {
+        values.unknown++
+      } else if (state === 'unavailable') {
+        values.recovering++
+        values.unavailable++
+      } else if (state === 'needs_review') {
+        values.review++
+      } else if (
+        state === 'pending_sample' ||
+        state === 'telemetry_unavailable'
+      ) {
+        values.evidence++
+      }
+      if (route.probe_overdue) {
+        values.overdue++
+      }
+      if (isMediaRoute(route)) {
+        values.natural++
+      }
+    }
+    return values
+  }, [routes])
+  const filteredRoutes = useMemo(
+    () =>
+      routes
+        .filter((route) => routeMatchesSearch(route, search))
+        .filter((route) => routeMatchesStateFilter(route, stateFilter))
+        .filter((route) => routeMatchesProbeFilter(route, probeFilter))
+        .filter((route) =>
+          endpointFilter ? route.endpoint === endpointFilter : true
+        )
+        .filter((route) => (groupFilter ? route.group === groupFilter : true))
+        .filter((route) =>
+          reviewOnly ? routeNeedsAdministratorAction(route) : true
+        )
+        .sort(
+          (left, right) =>
+            healthSortRank(left) - healthSortRank(right) ||
+            Number(Boolean(right.probe_overdue)) -
+              Number(Boolean(left.probe_overdue)) ||
+            (left.model || '').localeCompare(right.model || '') ||
+            compareSmartRouterEndpoints(
+              left.endpoint || '',
+              right.endpoint || ''
+            ) ||
+            (left.group || '').localeCompare(right.group || '') ||
+            latestEvidenceAt(right) - latestEvidenceAt(left)
+        ),
+    [
+      endpointFilter,
+      groupFilter,
+      probeFilter,
+      reviewOnly,
+      routes,
+      search,
+      stateFilter,
+    ]
+  )
+  const visibleRoutes = filteredRoutes.slice(0, visibleLimit)
+  const hierarchy = useMemo(
+    () => buildHierarchy(visibleRoutes),
+    [visibleRoutes]
+  )
+  const forceHierarchyOpen = Boolean(
+    search ||
+    endpointFilter ||
+    groupFilter ||
+    stateFilter !== 'all' ||
+    probeFilter !== 'all' ||
+    reviewOnly
+  )
+  const probeMessage = backgroundProbeMessage(healthMeta)
+  const hasActiveFilters = Boolean(
+    search ||
+    stateFilter !== 'all' ||
+    probeFilter !== 'all' ||
+    endpointFilter ||
+    groupFilter ||
+    reviewOnly
+  )
+
+  const notifyNotice = (notice: BulkRecoveryNotice) => {
+    const message = t(notice.labelKey, notice.values)
+    if (notice.tone === 'success') {
+      toast.success(message)
+    } else if (notice.tone === 'info') {
+      toast.info(message)
+    } else if (notice.tone === 'warning') {
+      toast.warning(message)
+    } else {
+      toast.error(message)
+    }
+  }
+
+  const refresh = async () => {
+    await Promise.all([
+      query.refetch(),
+      queryClient.invalidateQueries({ queryKey: HEALTH_QUERY_KEY }),
+      queryClient.invalidateQueries({ queryKey: ['smart-router-config'] }),
+      queryClient.invalidateQueries({ queryKey: ['smart-router-options'] }),
+      queryClient.invalidateQueries({ queryKey: ['smart-router-blocks'] }),
+    ])
+  }
+  const probeMutation = useMutation({
+    mutationFn: probeSmartRouterRoute,
+    onSuccess: async (response) => {
+      notifyNotice(probeNotice(probeDisposition(response), response.success))
+      await refresh()
+    },
+    onError: async (error) => {
+      const response =
+        error instanceof AxiosError
+          ? (error.response?.data as
+              | SmartRouterHealthActionResponse
+              | undefined)
+          : undefined
+      notifyNotice(probeNotice(probeDisposition(response), false))
+      await refresh()
+    },
+  })
+  const bulkRecoveryMutation = useMutation({
+    mutationFn: scheduleAllSmartRouterRecoveries,
+    onSuccess: async (response) => {
+      notifyNotice(bulkRecoveryNotice(response))
+      await refresh()
+    },
+    onError: async (error) => {
+      const response =
+        error instanceof AxiosError
+          ? (error.response?.data as
+              | SmartRouterBulkRecoveryResponse
+              | undefined)
+          : undefined
+      notifyNotice(bulkRecoveryNotice(response))
+      await refresh()
+    },
+  })
+  const resetAllMutation = useMutation({
+    mutationFn: resetAllSmartRouterAutomaticHealth,
+    onSuccess: async (response) => {
+      const data = response.data
+      if (response.success && data) {
+        toast.success(
+          t('Reset {{reset}} of {{total}} automatic route states to unknown', {
+            reset: data.reset,
+            total: data.physical_routes,
+          })
+        )
+      } else {
+        toast.error(
+          response.message || t('Failed to reset automatic route health')
+        )
+      }
+      await refresh()
+    },
+    onError: async (error) => {
+      const response =
+        error instanceof AxiosError
+          ? (error.response?.data as
+              | SmartRouterResetAllAutomaticHealthResponse
+              | undefined)
+          : undefined
+      toast.error(
+        response?.message || t('Failed to reset automatic route health')
+      )
+      await refresh()
+    },
+  })
+  const blockMutation = useMutation({
+    mutationFn: (routeID: string) =>
+      createSmartRouterBlock({
+        scope: 'route',
+        route_id: routeID,
+        reason: 'Excluded from the smart routing health console',
+      }),
+    onSuccess: async (response) => {
+      if (response.success) toast.success(t('Route added to exclusions'))
+      else toast.error(response.message || t('Failed to add exclusion'))
+      await refresh()
+    },
+    onError: () => toast.error(t('Failed to add exclusion')),
+  })
+  const routeActions: RouteActions = {
+    probe: (route) => probeMutation.mutate(route.route_id),
+    confirmBlock: (route) => setConfirmation({ kind: 'block', route }),
+    probePending: (routeID) =>
+      probeMutation.isPending && probeMutation.variables === routeID,
+    blockPending: (routeID) =>
+      blockMutation.isPending && blockMutation.variables === routeID,
+  }
+  const summaryCards: AdminSummaryCardProps[] = [
+    {
+      label: t('Routes'),
+      value: stats.total,
+      icon: Activity,
+      tone: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
+      active: !hasActiveFilters,
+      onClick: () => {
+        setSearch('')
+        setStateFilter('all')
+        setProbeFilter('all')
+        setEndpointFilter('')
+        setGroupFilter('')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Healthy'),
+      value: stats.healthy,
+      icon: BadgeCheck,
+      tone: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+      active: stateFilter === 'healthy' && probeFilter === 'all',
+      onClick: () => {
+        setStateFilter('healthy')
+        setProbeFilter('all')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Unknown'),
+      value: stats.unknown,
+      icon: Waves,
+      tone: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+      active: stateFilter === 'unknown' && probeFilter === 'all',
+      onClick: () => {
+        setStateFilter('unknown')
+        setProbeFilter('all')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Recovering'),
+      value: stats.recovering,
+      icon: RefreshCw,
+      tone: 'bg-indigo-500/10 text-indigo-700 dark:text-indigo-300',
+      active: stateFilter === 'recovering_all' && probeFilter === 'all',
+      onClick: () => {
+        setStateFilter('recovering_all')
+        setProbeFilter('all')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Unavailable'),
+      value: stats.unavailable,
+      icon: CircleX,
+      tone: 'bg-red-500/10 text-red-700 dark:text-red-300',
+      active: stateFilter === 'unavailable' && probeFilter === 'all',
+      onClick: () => {
+        setStateFilter('unavailable')
+        setProbeFilter('all')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Needs review'),
+      value: stats.review,
+      icon: ShieldAlert,
+      tone: 'bg-rose-500/10 text-rose-700 dark:text-rose-300',
+      active: stateFilter === 'review_all' && probeFilter === 'all',
+      onClick: () => {
+        setStateFilter('review_all')
+        setProbeFilter('all')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Awaiting health evidence'),
+      value: stats.evidence,
+      icon: Clock3,
+      tone: 'bg-muted text-muted-foreground',
+      active: stateFilter === 'evidence_all' && probeFilter === 'all',
+      onClick: () => {
+        setStateFilter('evidence_all')
+        setProbeFilter('all')
+        setReviewOnly(false)
+      },
+    },
+    {
+      label: t('Probe overdue'),
+      value: stats.overdue,
+      icon: TimerReset,
+      tone: 'bg-amber-500/10 text-amber-700 dark:text-amber-300',
+      active: probeFilter === 'due' && stateFilter === 'all',
+      onClick: () => {
+        setStateFilter('all')
+        setProbeFilter('due')
+        setReviewOnly(false)
+      },
+    },
+  ]
+
+  return (
+    <div className='flex min-w-0 flex-col gap-4 pb-[max(1rem,env(safe-area-inset-bottom))]'>
+      <div>
+        <div className='flex flex-wrap items-start justify-between gap-2'>
+          <div>
+            <div className='flex items-center gap-2'>
+              <Activity className='text-muted-foreground size-4' />
+              <h4 className='text-sm font-medium'>
+                {t('Global route health')}
+              </h4>
+            </div>
+            <p className='text-muted-foreground mt-1 max-w-3xl text-xs leading-relaxed'>
+              {t(
+                'Shared model-route evidence, recovery plans, and exact physical topology. This console never blocks user API requests.'
+              )}
+            </p>
+          </div>
+          <div className='flex flex-wrap items-center gap-2'>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() => setConfirmation({ kind: 'reset-all' })}
+              disabled={resetAllMutation.isPending}
+              title={t(
+                'Resets only automatic route health to unknown; manual and model-not-found exclusions remain unchanged'
+              )}
+            >
+              {resetAllMutation.isPending ? (
+                <LoaderCircle
+                  className='animate-spin'
+                  data-icon='inline-start'
+                />
+              ) : (
+                <TimerReset data-icon='inline-start' />
+              )}
+              {t('Reset all automatic health to unknown')}
+            </Button>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() => bulkRecoveryMutation.mutate()}
+              disabled={bulkRecoveryMutation.isPending}
+              title={t(
+                'Requeues text routes awaiting automatic recovery; image and video routes continue through natural traffic'
+              )}
+            >
+              {bulkRecoveryMutation.isPending ? (
+                <LoaderCircle
+                  className='animate-spin'
+                  data-icon='inline-start'
+                />
+              ) : (
+                <RotateCcw data-icon='inline-start' />
+              )}
+              {t('Requeue all safe background recovery tasks')}
+            </Button>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() => void refresh()}
+              disabled={query.isFetching}
+            >
+              <RefreshCw
+                data-icon='inline-start'
+                className={query.isFetching ? 'animate-spin' : undefined}
+              />
+              {t('Refresh')}
+            </Button>
+          </div>
+        </div>
+        <div className='text-muted-foreground mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs'>
+          <span>{t('Auto-refresh every 15 seconds')}</span>
+          <span>
+            {t('Updated {{time}}', {
+              time:
+                formatSmartRouterTimestamp(
+                  healthMeta?.updated_at_ms || query.dataUpdatedAt
+                ) || '-',
+            })}
+          </span>
+          {healthMeta?.snapshot_version ? (
+            <span>
+              {t('Snapshot {{version}}', {
+                version: healthMeta.snapshot_version,
+              })}
+            </span>
+          ) : null}
+          {healthMeta?.stale ? (
+            <Badge variant='outline'>{t('Snapshot is stale')}</Badge>
+          ) : null}
+        </div>
+      </div>
+
+      <div className='grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-8'>
+        {summaryCards.map((card) => (
+          <AdminSummaryCard key={card.label} {...card} />
+        ))}
+      </div>
+
+      {healthMeta?.shared_state_backend ? (
+        <div className='flex flex-wrap items-center gap-2 text-xs'>
+          <span className='text-muted-foreground'>{t('Shared state')}</span>
+          <Badge variant='outline'>{healthMeta.shared_state_backend}</Badge>
+          <span className='text-muted-foreground'>
+            {t('{{count}} natural-traffic-only routes', {
+              count: stats.natural,
+            })}
+          </span>
+          {probeMessage ? (
+            <span className='text-muted-foreground'>{t(probeMessage)}</span>
+          ) : null}
+        </div>
+      ) : null}
+
+      <WorkerStatus meta={healthMeta} />
+
+      <ActualInputCostStatusPanel
+        routes={routes}
+        status={healthMeta?.actual_input_cost_status}
+      />
+
+      <SmartRouterCacheEconomyStatusPanel />
+
+      <div className='bg-background sticky top-0 z-10 -mx-1 flex min-w-0 flex-wrap gap-2 border-y px-1 py-2'>
+        <div className='relative min-w-56 flex-1'>
+          <Search
+            className='text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2'
+            aria-hidden='true'
+          />
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder={t('Search model, group, channel, route, or error')}
+            className='pl-8'
+          />
+        </div>
+        <NativeSelect
+          value={stateFilter}
+          onChange={(event) =>
+            setStateFilter(event.target.value as AdminStateFilter)
+          }
+          aria-label={t('Health state')}
+          className='min-w-40 flex-1 sm:flex-none'
+        >
+          <NativeSelectOption value='all'>{t('All states')}</NativeSelectOption>
+          <NativeSelectOption value='recovering_all'>
+            {t('Recovery and fluctuation')}
+          </NativeSelectOption>
+          <NativeSelectOption value='review_all'>
+            {t('Needs review')}
+          </NativeSelectOption>
+          <NativeSelectOption value='evidence_all'>
+            {t('Awaiting health evidence')}
+          </NativeSelectOption>
+          {(
+            [
+              'needs_review',
+              'telemetry_unavailable',
+              'unavailable',
+              'unknown',
+              'probing',
+              'recovering',
+              'degraded_usable',
+              'healthy',
+              'pending_sample',
+            ] as SmartRouterPrimaryState[]
+          ).map((state) => (
+            <NativeSelectOption key={state} value={state}>
+              {t(adminHealthStateLabelKey(state))}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <NativeSelect
+          value={probeFilter}
+          onChange={(event) =>
+            setProbeFilter(event.target.value as AdminProbeFilter)
+          }
+          aria-label={t('Probe state')}
+          className='min-w-40 flex-1 sm:flex-none'
+        >
+          <NativeSelectOption value='all'>
+            {t('All probe states')}
+          </NativeSelectOption>
+          <NativeSelectOption value='due'>
+            {t('Probe overdue')}
+          </NativeSelectOption>
+          <NativeSelectOption value='active'>
+            {t('Probe active')}
+          </NativeSelectOption>
+          <NativeSelectOption value='natural'>
+            {t('Natural traffic only')}
+          </NativeSelectOption>
+        </NativeSelect>
+        <NativeSelect
+          value={endpointFilter}
+          onChange={(event) => setEndpointFilter(event.target.value)}
+          aria-label={t('Endpoint filter')}
+          className='min-w-40 flex-1 sm:flex-none'
+        >
+          <NativeSelectOption value=''>{t('All endpoints')}</NativeSelectOption>
+          {endpoints.map((endpoint) => (
+            <NativeSelectOption key={endpoint} value={endpoint}>
+              {t(smartRouterEndpointLabelKey(endpoint))}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <NativeSelect
+          value={groupFilter}
+          onChange={(event) => setGroupFilter(event.target.value)}
+          aria-label={t('Group filter')}
+          className='min-w-40 flex-1 sm:flex-none'
+        >
+          <NativeSelectOption value=''>{t('All groups')}</NativeSelectOption>
+          {groups.map((group) => (
+            <NativeSelectOption key={group} value={group}>
+              {group}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <Button
+          type='button'
+          variant={reviewOnly ? 'secondary' : 'outline'}
+          aria-pressed={reviewOnly}
+          onClick={() => setReviewOnly((current) => !current)}
+        >
+          {t('Only needs administrator action')}
+        </Button>
+        {hasActiveFilters ? (
+          <Button
+            type='button'
+            variant='ghost'
+            size='icon'
+            aria-label={t('Clear filters')}
+            title={t('Clear filters')}
+            onClick={() => {
+              setSearch('')
+              setStateFilter('all')
+              setProbeFilter('all')
+              setEndpointFilter('')
+              setGroupFilter('')
+              setReviewOnly(false)
+            }}
+          >
+            <X />
+          </Button>
+        ) : null}
+      </div>
+
+      {query.isError ? (
+        <Alert>
+          <CircleAlert />
+          <AlertTitle>{t('Unable to load route health')}</AlertTitle>
+          <AlertDescription>
+            {t(
+              'The health console is temporarily unavailable. API requests continue independently.'
+            )}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {!query.isError && routes.length === 0 ? (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-5 text-center text-sm'>
+          {t(
+            'No route health samples yet. Matching real requests will populate this view.'
+          )}
+        </div>
+      ) : null}
+
+      {routes.length > 0 && filteredRoutes.length === 0 ? (
+        <div className='text-muted-foreground rounded-lg border border-dashed p-5 text-center text-sm'>
+          {t('No physical routes match these filters.')}
+        </div>
+      ) : null}
+
+      {visibleRoutes.length > 0 ? (
+        <div className='space-y-2'>
+          <ScrollArea className='h-[min(68vh,48rem)] min-h-80 rounded-lg border'>
+            <div className='space-y-2 p-1 pr-3'>
+              {[...hierarchy.entries()].map(([model, endpointMap]) => {
+                const modelRoutes = [...endpointMap.values()].flatMap(
+                  (groupMap) => [...groupMap.values()].flat()
+                )
+                const modelState = worstState(modelRoutes)
+                return (
+                  <section
+                    key={model}
+                    className='overflow-hidden rounded-lg border'
+                  >
+                    <GroupDisclosure
+                      level='model'
+                      defaultOpen={modelState !== 'pending_sample'}
+                      forceOpen={forceHierarchyOpen}
+                      label={
+                        <div className='flex min-w-0 flex-wrap items-center gap-2'>
+                          <span className='min-w-0 truncate text-sm font-semibold'>
+                            {model || t('Unknown model')}
+                          </span>
+                          <Badge
+                            variant={adminHealthStateBadgeVariant(modelState)}
+                          >
+                            {t(adminHealthStateLabelKey(modelState))}
+                          </Badge>
+                        </div>
+                      }
+                      meta={
+                        <span className='text-muted-foreground text-xs'>
+                          {t('{{count}} routes', { count: modelRoutes.length })}
+                        </span>
+                      }
+                    >
+                      {[...endpointMap.entries()]
+                        .sort(([left], [right]) =>
+                          compareSmartRouterEndpoints(left, right)
+                        )
+                        .map(([endpoint, groupMap]) => {
+                          const endpointRoutes = [...groupMap.values()].flat()
+                          const endpointState = worstState(endpointRoutes)
+                          return (
+                            <GroupDisclosure
+                              key={endpoint}
+                              level='endpoint'
+                              defaultOpen={endpointState !== 'pending_sample'}
+                              forceOpen={forceHierarchyOpen}
+                              label={
+                                <div className='flex flex-wrap items-center gap-2'>
+                                  <Badge variant='outline'>
+                                    {t(smartRouterEndpointLabelKey(endpoint))}
+                                  </Badge>
+                                  <span className='text-muted-foreground text-xs'>
+                                    {t('{{count}} groups', {
+                                      count: groupMap.size,
+                                    })}
+                                  </span>
+                                </div>
+                              }
+                            >
+                              {[...groupMap.entries()].map(
+                                ([group, groupRoutes]) => {
+                                  const groupState = worstState(groupRoutes)
+                                  return (
+                                    <GroupDisclosure
+                                      key={group}
+                                      level='group'
+                                      defaultOpen={
+                                        groupState !== 'pending_sample'
+                                      }
+                                      forceOpen={forceHierarchyOpen}
+                                      label={
+                                        <div className='flex flex-wrap items-center gap-2'>
+                                          <span className='text-sm font-medium'>
+                                            {group || t('Unknown group')}
+                                          </span>
+                                          <Badge
+                                            variant={adminHealthStateBadgeVariant(
+                                              groupState
+                                            )}
+                                          >
+                                            {t(
+                                              adminHealthStateLabelKey(
+                                                groupState
+                                              )
+                                            )}
+                                          </Badge>
+                                          <span className='text-muted-foreground text-xs'>
+                                            {t('{{count}} physical routes', {
+                                              count: groupRoutes.length,
+                                            })}
+                                          </span>
+                                        </div>
+                                      }
+                                    >
+                                      <div className='divide-y'>
+                                        {groupRoutes.map((route) => (
+                                          <AdminRouteRow
+                                            key={route.route_id}
+                                            route={route}
+                                            actions={routeActions}
+                                          />
+                                        ))}
+                                      </div>
+                                    </GroupDisclosure>
+                                  )
+                                }
+                              )}
+                            </GroupDisclosure>
+                          )
+                        })}
+                    </GroupDisclosure>
+                  </section>
+                )
+              })}
+            </div>
+          </ScrollArea>
+
+          <div className='flex flex-wrap items-center justify-between gap-2 pt-1'>
+            <span className='text-muted-foreground text-xs'>
+              {t('Showing {{shown}} of {{total}} routes', {
+                shown: visibleRoutes.length,
+                total: filteredRoutes.length,
+              })}
+            </span>
+            {visibleRoutes.length < filteredRoutes.length ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                onClick={() =>
+                  setVisibleState({
+                    filterKey,
+                    limit: visibleLimit + HEALTH_PAGE_SIZE,
+                  })
+                }
+              >
+                {t('Show {{count}} more', {
+                  count: Math.min(
+                    HEALTH_PAGE_SIZE,
+                    filteredRoutes.length - visibleRoutes.length
+                  ),
+                })}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      <AlertDialog
+        open={confirmation !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmation(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmation?.kind === 'reset-all'
+                ? t('Reset every automatic route state to unknown?')
+                : t('Exclude this route from smart routing?')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmation?.kind === 'reset-all'
+                ? t(
+                    'This explicit operation clears only automatic health failures and makes those physical routes directly eligible for real traffic again. It preserves manual and model-not-found exclusions and does not queue background probes.'
+                  )
+                : t(
+                    'New smart-routing requests will no longer select this physical route until the exclusion is removed.'
+                  )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <p className='text-muted-foreground font-mono text-xs break-all'>
+            {confirmation?.kind === 'reset-all'
+              ? t(
+                  'No channel, price, authorization, credential, or manual policy is changed.'
+                )
+              : confirmation?.route?.route_id}
+          </p>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('Cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (!confirmation) return
+                if (confirmation.kind === 'reset-all') {
+                  resetAllMutation.mutate()
+                } else if (confirmation.route) {
+                  blockMutation.mutate(confirmation.route.route_id)
+                }
+                setConfirmation(null)
+              }}
+            >
+              {confirmation?.kind === 'reset-all'
+                ? t('Reset automatic health')
+                : t('Exclude route')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  )
+}

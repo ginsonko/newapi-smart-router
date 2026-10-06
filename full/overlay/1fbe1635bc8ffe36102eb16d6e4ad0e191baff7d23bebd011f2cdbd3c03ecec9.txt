@@ -1,0 +1,78 @@
+package model
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestLogBrowsingPreservesFiltersAndAccounting(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "logs.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	require.NoError(t, db.AutoMigrate(&Log{}))
+	previousDB, previousType := LOG_DB, common.LogDatabaseType()
+	LOG_DB = db
+	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() { LOG_DB = previousDB; common.SetLogDatabaseType(previousType) })
+	rows := make([]Log, LogSearchCountLimit+1)
+	for i := range rows {
+		rows[i] = Log{UserId: 1, Username: "reader", CreatedAt: int64(i + 1), Type: LogTypeConsume, Quota: 1, ModelName: "test-model", TokenName: "token", RequestId: "request", UpstreamRequestId: "upstream", Content: "billing detail", Other: `{"model_price":1,"admin_info":{"secret":"private"}}`}
+	}
+	require.NoError(t, db.CreateInBatches(&rows, 100).Error)
+	require.NoError(t, db.Create(&Log{UserId: 2, Username: "other", Quota: 999, Type: LogTypeConsume}).Error)
+	ctx := context.Background()
+	logs, total, err := GetUserLogs(ctx, 1, LogTypeConsume, 0, 0, "test-model", "token", 9990, 100, "", "request", "upstream")
+	require.NoError(t, err)
+	assert.EqualValues(t, 10001, total)
+	require.Len(t, logs, 10)
+	assert.Equal(t, "billing detail", logs[0].Content)
+	assert.NotContains(t, logs[0].Other, "admin_info")
+	assert.Contains(t, logs[0].Other, "model_price")
+	logs, total, err = GetUserLogs(ctx, 1, LogTypeConsume, 0, 10000, "", "", 0, 20, "", "", "")
+	require.NoError(t, err)
+	assert.EqualValues(t, 10000, total)
+	assert.EqualValues(t, 10000, logs[0].CreatedAt)
+	_, total, err = GetAllLogs(ctx, LogTypeConsume, 9998, 10001, "test-model", "reader", "token", 0, 100, 0, "", "request", "upstream")
+	require.NoError(t, err)
+	assert.EqualValues(t, 4, total)
+	_, total, err = GetUserLogs(ctx, 2, LogTypeUnknown, 0, 0, "", "", 0, 20, "", "", "")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+	stat, err := SumUsedQuota(ctx, LogTypeConsume, 0, 0, "", "reader", "", 0, "")
+	require.NoError(t, err)
+	assert.Equal(t, 10001, stat.Quota, "browsing limits must not truncate accounting")
+}
+
+func TestLogReadsRejectCancellationAndInvalidPages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "cancel.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	previous := LOG_DB
+	LOG_DB = db
+	t.Cleanup(func() { LOG_DB = previous })
+	_, _, err = GetUserLogs(ctx, 1, LogTypeUnknown, 0, 0, "", "", 0, 20, "", "", "")
+	assert.ErrorIs(t, err, context.Canceled)
+	_, _, err = GetAllLogs(ctx, LogTypeUnknown, 0, 0, "", "", "", 0, 20, 0, "", "", "")
+	assert.ErrorIs(t, err, context.Canceled)
+	_, err = GetLogByTokenId(ctx, 1)
+	assert.ErrorIs(t, err, context.Canceled)
+	_, err = SumUsedQuota(ctx, LogTypeConsume, 0, 0, "", "", "", 0, "")
+	assert.ErrorIs(t, err, context.Canceled)
+	for _, page := range [][2]int{{-1, 20}, {10000, 20}, {0, 0}, {0, 101}} {
+		_, _, err = GetUserLogs(ctx, 1, LogTypeUnknown, 0, 0, "", "", page[0], page[1], "", "", "")
+		assert.ErrorIs(t, err, ErrLogPagination)
+	}
+}

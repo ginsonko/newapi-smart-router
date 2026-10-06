@@ -1,7 +1,7 @@
 # NewAPI Smart Router Bridge SPI
 
 状态：`Normative design contract`  
-版本：`bridge-spi-v1alpha3`
+版本：`bridge-spi-v1alpha4`
 运行边界：本文定义宿主接点，不证明任何宿主已经实现或认证  
 
 ## 1. 目的
@@ -326,7 +326,7 @@ Adapter endpoint allowlist 只能收窄目录合同。`convert_request_failed` �
 
 ## 11. v0.3 追加合同
 
-`bridge-spi-v1alpha3` 在 v0.2 的 Hook 边界上增加以下可移植观察接口：
+历史 `bridge-spi-v1alpha3` 在 v0.2 的 Hook 边界上增加以下可移植观察接口：
 
 - `ActualInputCostSnapshot`：提供脱敏的实际输入 token、缓存命中和证据时间，
   只影响经济排序，不改变预扣、结算或退款；证据缺失或过期必须回到静态价格策略。
@@ -342,3 +342,7 @@ Adapter endpoint allowlist 只能收窄目录合同。`convert_request_failed` �
 
 这些接口均为快照输入或日志输出，不允许在每个请求热路径同步调用控制面。未知字段向后
 兼容地忽略，未知主版本仍 fail closed。
+
+## 12. v0.4 当前合同
+
+当前协议为 `bridge-spi-v1alpha4`。新增必需的每 Key nullable 策略记忆、当前授权目录与报价隔离、持久绘图任务及退款后 fallback 合同，见 [R98 host hooks](r98-host-hooks.md)。未知受理状态只能对账，不得重放；当前尝试授权语义见 [v0.4 delta](../../docs/v0.4-contract-delta.md)。历史小节不覆盖当前合同，也不授予任何官方 revision 的 Certified 身份。

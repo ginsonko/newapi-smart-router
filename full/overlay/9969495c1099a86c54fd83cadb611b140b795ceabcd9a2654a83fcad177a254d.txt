@@ -1,0 +1,293 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { z } from 'zod'
+
+const decimalPattern = /^(?:0|[1-9]\d*)(?:\.\d{1,18})?$/
+const decimalSchema = z
+  .string()
+  .max(128)
+  .regex(
+    decimalPattern,
+    'Use a non-negative decimal with up to 18 decimal places, without exponent notation'
+  )
+const requiredText = z.string().trim().min(1, 'Required')
+
+export const parameterPricingRuleSchema = z
+  .strictObject({
+    id: requiredText,
+    group: requiredText,
+    model: requiredText,
+    channel_id: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    conditions: z.strictObject({
+      resolution: requiredText.optional(),
+      quality: requiredText.optional(),
+    }),
+    unit: z.enum(['per_request', 'per_image', 'per_second', 'fixed_duration']),
+    unit_price: decimalSchema,
+    currency: z.literal('USD'),
+    source_unit_price: decimalSchema.optional(),
+    source_currency: z.literal('USD').optional(),
+    source: z.string().optional(),
+    source_revision: z.string().optional(),
+    fixed_duration_seconds: z.number().int().positive().max(3600).optional(),
+  })
+  .superRefine((rule, ctx) => {
+    if (rule.unit === 'fixed_duration' && !rule.fixed_duration_seconds) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['fixed_duration_seconds'],
+        message: 'Fixed duration seconds are required',
+      })
+    }
+    if (
+      rule.unit !== 'fixed_duration' &&
+      rule.fixed_duration_seconds !== undefined
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['fixed_duration_seconds'],
+        message: 'Fixed duration is only valid for the fixed-duration unit',
+      })
+    }
+  })
+
+export const parameterPricingContractSchema = z
+  .strictObject({
+    schema_version: z.literal(1),
+    revision: z.string(),
+    rules: z.array(parameterPricingRuleSchema),
+  })
+  .superRefine((contract, ctx) => {
+    const ids = new Set<string>()
+    contract.rules.forEach((rule, index) => {
+      if (ids.has(rule.id)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['rules', index, 'id'],
+          message: 'Rule IDs must be unique',
+        })
+      }
+      ids.add(rule.id)
+    })
+  })
+
+export type ParameterPricingRule = z.infer<typeof parameterPricingRuleSchema>
+export type ParameterPricingContract = z.infer<
+  typeof parameterPricingContractSchema
+>
+export type ParameterPricingRuleForm = Omit<
+  ParameterPricingRule,
+  'channel_id' | 'conditions' | 'fixed_duration_seconds'
+> & {
+  channel_id: string
+  resolution: string
+  quality: string
+  fixed_duration_seconds: string
+}
+
+export function emptyParameterPricingContract(): ParameterPricingContract {
+  return { schema_version: 1, revision: '', rules: [] }
+}
+
+export function newParameterPricingRuleForm(
+  id: string
+): ParameterPricingRuleForm {
+  return {
+    id,
+    group: '*',
+    model: '',
+    channel_id: '0',
+    resolution: '',
+    quality: '',
+    unit: 'per_request',
+    unit_price: '',
+    currency: 'USD',
+    fixed_duration_seconds: '',
+  }
+}
+
+export function parameterPricingRuleToForm(
+  rule: ParameterPricingRule
+): ParameterPricingRuleForm {
+  const { conditions, channel_id, fixed_duration_seconds, ...rest } = rule
+  return {
+    ...rest,
+    channel_id: String(channel_id),
+    resolution: conditions.resolution ?? '',
+    quality: conditions.quality ?? '',
+    fixed_duration_seconds:
+      fixed_duration_seconds === undefined
+        ? ''
+        : String(fixed_duration_seconds),
+  }
+}
+
+export function parameterPricingFormToRule(
+  form: ParameterPricingRuleForm
+): ParameterPricingRule {
+  const { resolution, quality, channel_id, fixed_duration_seconds, ...rest } =
+    form
+  if (!/^\d+$/.test(channel_id.trim())) {
+    throw new Error('Channel ID must be a non-negative integer')
+  }
+  if (
+    form.unit === 'fixed_duration' &&
+    !/^\d+$/.test(fixed_duration_seconds.trim())
+  ) {
+    throw new Error('Fixed duration seconds are required')
+  }
+  return parameterPricingRuleSchema.parse({
+    ...rest,
+    channel_id: Number(channel_id),
+    conditions: {
+      ...(resolution.trim() ? { resolution: resolution.trim() } : {}),
+      ...(quality.trim() ? { quality: quality.trim() } : {}),
+    },
+    ...(form.unit === 'fixed_duration'
+      ? { fixed_duration_seconds: Number(fixed_duration_seconds) }
+      : {}),
+  })
+}
+
+/** Strict import rejects unknown fields instead of silently discarding future pricing data. */
+export function importParameterPricingContract(
+  value: unknown
+): ParameterPricingContract {
+  let candidate = value
+  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+    const envelope = candidate as Record<string, unknown>
+    if (
+      envelope.data &&
+      typeof envelope.data === 'object' &&
+      !Array.isArray(envelope.data)
+    ) {
+      candidate =
+        (envelope.data as Record<string, unknown>).contract ?? candidate
+    } else if (envelope.contract) candidate = envelope.contract
+  }
+  return parameterPricingContractSchema.parse(candidate)
+}
+
+/** Integer arithmetic keeps both operands and the result independent of binary floats. */
+export function multiplyParameterPrice(
+  price: string,
+  multiplier: string
+): string {
+  decimalSchema.parse(price)
+  decimalSchema.parse(multiplier)
+  const [priceWhole, priceFraction = ''] = price.split('.')
+  const [multiplierWhole, multiplierFraction = ''] = multiplier.split('.')
+  const scale = priceFraction.length + multiplierFraction.length
+  const product = (
+    BigInt(priceWhole + priceFraction) *
+    BigInt(multiplierWhole + multiplierFraction)
+  ).toString()
+  if (scale === 0) return decimalSchema.parse(product)
+  const padded = product.padStart(scale + 1, '0')
+  const fraction = padded.slice(-scale).replace(/0+$/, '')
+  const result = fraction
+    ? `${padded.slice(0, -scale)}.${fraction}`
+    : padded.slice(0, -scale)
+  // The shared wire contract supports at most 18 fractional places. Never round a price to fit.
+  return decimalSchema.parse(result)
+}
+
+function canonicalRule(rule: ParameterPricingRule | undefined): string {
+  if (!rule) return ''
+  // Rules and parameter conditions are unordered. JSON object key order is not a pricing change.
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries({
+        ...rule,
+        conditions: Object.fromEntries(
+          Object.entries(rule.conditions).sort(([a], [b]) => a.localeCompare(b))
+        ),
+      }).sort(([a], [b]) => a.localeCompare(b))
+    )
+  )
+}
+
+export function parameterPricingRulesEqual(
+  left: ParameterPricingRule | undefined,
+  right: ParameterPricingRule | undefined
+): boolean {
+  return canonicalRule(left) === canonicalRule(right)
+}
+
+export function parameterPricingContractsEqual(
+  left: ParameterPricingContract,
+  right: ParameterPricingContract
+): boolean {
+  const rightRules = new Map(right.rules.map((rule) => [rule.id, rule]))
+  return (
+    left.rules.length === right.rules.length &&
+    left.rules.every((rule) =>
+      parameterPricingRulesEqual(rule, rightRules.get(rule.id))
+    )
+  )
+}
+
+export function diffParameterPricingContracts(
+  before: ParameterPricingContract,
+  after: ParameterPricingContract
+) {
+  const previous = new Map(before.rules.map((rule) => [rule.id, rule]))
+  const next = new Map(after.rules.map((rule) => [rule.id, rule]))
+  return {
+    added: after.rules.filter((rule) => !previous.has(rule.id)).length,
+    updated: after.rules.filter(
+      (rule) =>
+        previous.has(rule.id) &&
+        !parameterPricingRulesEqual(rule, previous.get(rule.id))
+    ).length,
+    removed: before.rules.filter((rule) => !next.has(rule.id)).length,
+  }
+}
+
+export type ParameterPricingConflict = {
+  id: string
+  local?: ParameterPricingRule
+  remote?: ParameterPricingRule
+}
+
+/** A three-way merge preserves disjoint changes and retains both sides of every conflict. */
+export function rebaseParameterPricingContract(
+  base: ParameterPricingContract,
+  draft: ParameterPricingContract,
+  latest: ParameterPricingContract
+) {
+  const before = new Map(base.rules.map((rule) => [rule.id, rule]))
+  const local = new Map(draft.rules.map((rule) => [rule.id, rule]))
+  const remote = new Map(latest.rules.map((rule) => [rule.id, rule]))
+  const merged = new Map(remote)
+  const conflicts: ParameterPricingConflict[] = []
+  for (const id of new Set([...before.keys(), ...local.keys()])) {
+    if (parameterPricingRulesEqual(before.get(id), local.get(id))) continue
+    if (
+      !parameterPricingRulesEqual(before.get(id), remote.get(id)) &&
+      !parameterPricingRulesEqual(local.get(id), remote.get(id))
+    ) {
+      conflicts.push({ id, local: local.get(id), remote: remote.get(id) })
+    }
+    const rule = local.get(id)
+    if (rule) merged.set(id, rule)
+    else merged.delete(id)
+  }
+  return { contract: { ...latest, rules: [...merged.values()] }, conflicts }
+}

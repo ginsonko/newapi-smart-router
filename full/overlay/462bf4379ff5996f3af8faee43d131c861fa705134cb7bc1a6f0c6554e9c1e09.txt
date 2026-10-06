@@ -1,0 +1,145 @@
+import { CircleDollarSign, DatabaseZap } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+
+import { cn } from '@/lib/utils'
+
+import { DEFAULT_TOKEN_UNIT } from '../constants'
+import { formatEstimatedInputPrice } from '../lib/price'
+import type { PricingModel, TokenUnit } from '../types'
+
+type ActualInputCostProps = {
+  model: PricingModel
+  group?: string
+  tokenUnit?: TokenUnit
+  showRechargePrice?: boolean
+  priceRate?: number
+  usdExchangeRate?: number
+  compact?: boolean
+  align?: 'start' | 'end'
+  className?: string
+}
+
+function formatCacheRate(ppm: number) {
+  return new Intl.NumberFormat(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 1,
+  }).format(ppm / 10_000)
+}
+
+function validMetric(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+export function ActualInputCost(props: ActualInputCostProps) {
+  const { t } = useTranslation()
+  const group = props.group?.trim()
+  if (!group || group === 'all') return null
+
+  const metric = props.model.group_pricing?.[group]
+  if (!metric) return null
+  const isSampleWeighted =
+    metric.actual_input_cost_basis === 'sample_weighted_physical_routes'
+  const hasCacheRate =
+    validMetric(metric.recent_cache_rate_ppm) &&
+    metric.recent_cache_rate_ppm <= 1_000_000
+  const hasEstimatedPrice = validMetric(metric.estimated_input_usd_per_million)
+  if (!hasCacheRate && !hasEstimatedPrice) return null
+
+  const tokenUnit = props.tokenUnit ?? DEFAULT_TOKEN_UNIT
+  const unitLabel = tokenUnit === 'K' ? '1K' : '1M'
+  const estimatedPrice = hasEstimatedPrice
+    ? formatEstimatedInputPrice(
+        metric.estimated_input_usd_per_million as number,
+        tokenUnit,
+        props.showRechargePrice,
+        props.priceRate,
+        props.usdExchangeRate
+      )
+    : ''
+  const evidence = []
+  if ((metric.actual_input_cost_samples ?? 0) > 0) {
+    evidence.push(
+      isSampleWeighted
+        ? t('{{count}} valid samples', {
+            count: metric.actual_input_cost_samples,
+          })
+        : t('{{count}} samples', {
+            count: metric.actual_input_cost_samples,
+          })
+    )
+  }
+  if ((metric.sampled_route_count ?? 0) > 0) {
+    evidence.push(
+      t('{{count}} sampled routes', { count: metric.sampled_route_count })
+    )
+  }
+  const observedAt = metric.actual_input_cost_last_observed_at_ms
+    ? new Date(metric.actual_input_cost_last_observed_at_ms).toLocaleString()
+    : ''
+  const basisExplanation = isSampleWeighted
+    ? t(
+        "Weighted by each sampled physical route's valid sample count; routes without samples are excluded. Cache-read share is the share of input tokens read from cache, not the probability that a request hits cache. Smart Router status shows the preferred route for the next request, so its value may differ."
+      )
+    : ''
+  const title = [
+    basisExplanation,
+    metric.actual_input_cost_endpoint
+      ? `${t('Endpoint')}: ${metric.actual_input_cost_endpoint}`
+      : '',
+    observedAt ? t('Cost sample updated {{time}}', { time: observedAt }) : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  let cacheLabel = ''
+  if (hasCacheRate) {
+    const rate = `${formatCacheRate(metric.recent_cache_rate_ppm as number)}%`
+    cacheLabel = isSampleWeighted
+      ? t('Group recent cache-read share {{rate}}', { rate })
+      : t('Recent cache {{rate}}', { rate })
+  }
+  const estimatedInputLabel = isSampleWeighted
+    ? t('Group estimated input {{price}} / {{unit}}', {
+        price: estimatedPrice,
+        unit: unitLabel,
+      })
+    : t('Estimated input {{price}} / {{unit}}', {
+        price: estimatedPrice,
+        unit: unitLabel,
+      })
+
+  return (
+    <div
+      className={cn(
+        'text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px]',
+        props.align === 'end' && 'justify-end text-right',
+        props.className
+      )}
+      title={title || undefined}
+    >
+      {hasCacheRate ? (
+        <span className='inline-flex items-center gap-1 whitespace-nowrap'>
+          <DatabaseZap className='size-3.5' aria-hidden='true' />
+          {cacheLabel}
+        </span>
+      ) : null}
+      {estimatedPrice ? (
+        <span className='inline-flex items-center gap-1 font-medium whitespace-nowrap'>
+          <CircleDollarSign className='size-3.5' aria-hidden='true' />
+          {estimatedInputLabel}
+        </span>
+      ) : null}
+      {!props.compact && evidence.length > 0 ? (
+        <span className='text-muted-foreground/70 whitespace-nowrap'>
+          {evidence.join(' / ')}
+        </span>
+      ) : null}
+      {!props.compact && isSampleWeighted ? (
+        <span className='text-muted-foreground/70 min-w-full text-[10px] leading-relaxed'>
+          {t(
+            'Weighted across sampled routes; Smart Router status shows the preferred next route'
+          )}
+        </span>
+      ) : null}
+    </div>
+  )
+}

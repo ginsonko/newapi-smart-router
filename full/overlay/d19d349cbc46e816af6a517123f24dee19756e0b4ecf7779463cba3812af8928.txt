@@ -1,0 +1,99 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useTranslation } from 'react-i18next'
+
+import { useSystemConfigStore } from '@/stores/system-config-store'
+
+import {
+  distinctParameterPrices,
+  parameterConditionEntries,
+  parameterDisplayAmount,
+  parameterUnitLabel,
+} from '../lib/parameter-price-display'
+import type { ParameterPrice } from '../types'
+
+export type ParameterPriceTableProps = {
+  prices: ParameterPrice[]
+  compact?: boolean
+  useDisplayCurrency?: boolean
+  showRechargePrice?: boolean
+  priceRate?: number
+  usdExchangeRate?: number
+}
+
+const conditionLabels: Record<string, string> = {
+  resolution: 'Resolution',
+  quality: 'Quality',
+}
+
+export function ParameterPriceTable(props: ParameterPriceTableProps) {
+  const { t } = useTranslation()
+  const currency = useSystemConfigStore((state) => state.config.currency)
+  if (!props.prices.length) {
+    return (
+      <p className='text-muted-foreground text-xs'>
+        {t('Parameter pricing is temporarily unavailable')}
+      </p>
+    )
+  }
+  const prices = distinctParameterPrices(props.prices)
+  return (
+    <div className='w-full min-w-0 space-y-1.5' data-parameter-price-table>
+      {prices.map((price) => {
+        const amount = parameterDisplayAmount(price, {
+          currency: props.useDisplayCurrency ? currency : undefined,
+          showRechargePrice: props.showRechargePrice,
+          priceRate: props.priceRate,
+          usdExchangeRate: props.usdExchangeRate,
+        })
+        return (
+          <div
+            key={JSON.stringify(price)}
+            className='flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-xs'
+          >
+            <span className='text-muted-foreground'>
+              {price.group} ·{' '}
+              {parameterConditionEntries(price)
+                .map(
+                  ([key, value]) =>
+                    `${t(conditionLabels[key] ?? key)}: ${value}`
+                )
+                .join(' / ') || t('All parameters')}
+            </span>
+            <span className='font-mono tabular-nums'>
+              {amount?.text ??
+                t('Parameter pricing is temporarily unavailable')}{' '}
+              / {t(parameterUnitLabel(price.unit))}
+              {price.unit === 'fixed_duration' &&
+              Number.isSafeInteger(price.fixed_duration_seconds) &&
+              (price.fixed_duration_seconds ?? 0) > 0
+                ? ` (${t('Fixed {{seconds}} seconds', { seconds: price.fixed_duration_seconds })})`
+                : ''}
+              {amount?.originalCurrency && props.showRechargePrice ? (
+                <span className='text-muted-foreground block font-sans text-[11px]'>
+                  {t('Original quote; recharge conversion unavailable')}
+                </span>
+              ) : null}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}

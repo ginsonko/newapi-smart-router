@@ -1,0 +1,301 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import type {
+  MediaCapabilityContract,
+  StudioFormValue,
+  StudioReference,
+} from './types'
+
+export function promptReferenceTokens(
+  capability: MediaCapabilityContract | undefined,
+  references: StudioReference[]
+) {
+  const rule = capability?.prompt_reference
+  const counts = { image: 0, video: 0, audio: 0 }
+  return references.map((reference, position) => {
+    const index =
+      rule?.index_scope === 'global' ? position : counts[reference.type]
+    counts[reference.type]++
+    const template = rule?.templates?.[reference.type]
+    return {
+      id: reference.id,
+      token: template?.replace(
+        '{index}',
+        String(index + (rule?.index_base ?? 0))
+      ),
+    }
+  })
+}
+
+export type StudioDurationContract = NonNullable<
+  MediaCapabilityContract['duration']
+>
+
+/** Discrete seconds declared by the contract. Empty means a free or 1-second range. */
+export function studioDurationOptions(
+  duration: StudioDurationContract | undefined
+): number[] {
+  if (!duration) return []
+  if (duration.mode === 'fixed' && duration.fixed) {
+    return [duration.fixed]
+  }
+  const min = duration.min
+  const max = duration.max
+  const step = duration.step
+  if (
+    min !== undefined &&
+    max !== undefined &&
+    step &&
+    step > 1 &&
+    max >= min &&
+    (max - min) % step === 0 &&
+    (max - min) / step <= 64
+  ) {
+    const options: number[] = []
+    for (let value = min; value <= max; value += step) options.push(value)
+    return options
+  }
+  return []
+}
+
+export function isStudioDurationAllowed(
+  duration: StudioDurationContract | undefined,
+  seconds: number
+) {
+  if (!Number.isFinite(seconds) || !Number.isInteger(seconds) || seconds <= 0)
+    {return false}
+  if (!duration) return true
+  const options = studioDurationOptions(duration)
+  if (options.length) return options.includes(seconds)
+  if (duration.fixed !== undefined && seconds !== duration.fixed) return false
+  if (duration.min !== undefined && seconds < duration.min) return false
+  if (duration.max !== undefined && seconds > duration.max) return false
+  if (
+    duration.step &&
+    duration.min !== undefined &&
+    (seconds - duration.min) % duration.step !== 0
+  ) {
+    return false
+  }
+  return true
+}
+
+export function clampStudioDuration(
+  duration: StudioDurationContract | undefined,
+  current: number
+) {
+  const options = studioDurationOptions(duration)
+  if (options.length) {
+    if (options.includes(current)) return current
+    if (duration?.default !== undefined && options.includes(duration.default)) {
+      return duration.default
+    }
+    return options[0]
+  }
+  if (duration?.mode === 'fixed' && duration.fixed) return duration.fixed
+  if (!duration) return current
+  let next = current
+  if (duration.min !== undefined && next < duration.min) {
+    next = duration.default ?? duration.min
+  }
+  if (duration.max !== undefined && next > duration.max) {
+    next = duration.default ?? duration.max
+  }
+  if (duration.step && duration.min !== undefined) {
+    next =
+      duration.min +
+      Math.floor((next - duration.min) / duration.step) * duration.step
+  }
+  return next
+}
+
+export function formatStudioDurationHint(
+  duration: StudioDurationContract | undefined
+) {
+  const options = studioDurationOptions(duration)
+  if (options.length === 1) {
+    return {
+      kind: 'fixed' as const,
+      seconds: options[0],
+    }
+  }
+  if (options.length > 1) {
+    return {
+      kind: 'enum' as const,
+      seconds: options,
+    }
+  }
+  if (duration?.min !== undefined && duration.max !== undefined) {
+    return {
+      kind: 'range' as const,
+      min: duration.min,
+      max: duration.max,
+    }
+  }
+  return undefined
+}
+
+export function studioDurationHintCopy(
+  duration: StudioDurationContract | undefined
+): { key: string; values: Record<string, string | number> } | undefined {
+  const hint = formatStudioDurationHint(duration)
+  if (hint?.kind === 'fixed') {
+    return {
+      key: 'This model always generates {{seconds}} seconds',
+      values: { seconds: hint.seconds },
+    }
+  }
+  if (hint?.kind === 'enum') {
+    return {
+      key: 'Generated duration options: {{seconds}} seconds',
+      values: { seconds: hint.seconds.join(' / ') },
+    }
+  }
+  if (hint?.kind === 'range') {
+    return {
+      key: 'Generated duration: {{min}}–{{max}} seconds',
+      values: { min: hint.min, max: hint.max },
+    }
+  }
+  return undefined
+}
+
+export function containsPromptToken(prompt: string, token: string): boolean {
+  let offset = 0
+  while (offset <= prompt.length - token.length) {
+    const start = prompt.indexOf(token, offset)
+    if (start < 0) return false
+    const end = start + token.length
+    if (
+      (!/^\d/.test(token) || !/\d/.test(prompt[start - 1] ?? '')) &&
+      (!/\d$/.test(token) || !/\d/.test(prompt[end] ?? ''))
+    ) {
+      return true
+    }
+    offset = start + 1
+  }
+  return false
+}
+
+/** Renumber configured tokens by asset identity when a reference is removed, without rewriting ordinary words. */
+export function rebindPromptReferences(
+  prompt: string,
+  before: StudioReference[],
+  after: StudioReference[],
+  capability: MediaCapabilityContract | undefined
+): string {
+  if (!capability?.prompt_reference) return prompt
+  const next = new Map(
+    promptReferenceTokens(capability, after).map((entry) => [
+      entry.id,
+      entry.token,
+    ])
+  )
+  const replacements = new Map(
+    promptReferenceTokens(capability, before).flatMap((entry) =>
+      entry.token ? [[entry.token, next.get(entry.id) ?? ''] as const] : []
+    )
+  )
+  if (!replacements.size) return prompt
+  const escape = (value: string) =>
+    value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const pattern = new RegExp(
+    [...replacements.keys()]
+      .sort((a, b) => b.length - a.length)
+      .map(escape)
+      .join('|'),
+    'g'
+  )
+  return prompt.replaceAll(pattern, (token: string, offset: number) => {
+    if (/^\d/.test(token) && /\d/.test(prompt[offset - 1] ?? '')) return token
+    if (/\d$/.test(token) && /\d/.test(prompt[offset + token.length] ?? '')) {
+      return token
+    }
+    return replacements.get(token) ?? token
+  })
+}
+
+export function managedCapabilityIssues(
+  capability: MediaCapabilityContract | undefined,
+  value: Pick<
+    StudioFormValue,
+    'mode' | 'duration' | 'resolution' | 'aspectRatio' | 'prompt'
+  >,
+  references: StudioReference[]
+): string[] {
+  if (!capability?.runtime_enforced) return []
+  const issues: string[] = []
+  if (
+    capability.min_visual &&
+    references.filter((reference) => reference.type !== 'audio').length <
+      capability.min_visual
+  ) {
+    issues.push('Add at least one image or video reference before creating')
+  }
+  if (capability.require_resolution && !value.resolution) {
+    issues.push('Select a resolution required by this model')
+  }
+  if (
+    value.resolution &&
+    capability.resolutions?.length &&
+    !capability.resolutions.includes(value.resolution)
+  ) {
+    issues.push('The selected resolution is not supported by this model')
+  }
+  if (
+    value.aspectRatio &&
+    capability.aspect_ratios?.length &&
+    !capability.aspect_ratios.includes(value.aspectRatio)
+  ) {
+    issues.push('The selected aspect ratio is not supported by this model')
+  }
+  if (
+    value.mode === 'videos' &&
+    !isStudioDurationAllowed(capability.duration, value.duration)
+  ) {
+    issues.push('The selected duration is not supported by this model')
+  }
+  if (
+    capability.mixed_references === false &&
+    new Set(references.map((reference) => reference.type)).size > 1
+  ) {
+    issues.push('This model does not support mixed reference types')
+  }
+  if (
+    references.some((reference) =>
+      capability.forbidden_roles?.includes(reference.role)
+    )
+  ) {
+    issues.push('Remove or change reference roles prohibited by this model')
+  }
+  if (capability.prompt_reference?.required) {
+    const tokens = promptReferenceTokens(capability, references)
+    if (tokens.some((entry) => !entry.token)) {
+      issues.push('Reference syntax is not configured for this model')
+    } else if (
+      tokens.some(
+        (entry) =>
+          entry.token && !containsPromptToken(value.prompt, entry.token)
+      )
+    ) {
+      issues.push('Insert every reference into the prompt before creating')
+    }
+  }
+  return issues
+}

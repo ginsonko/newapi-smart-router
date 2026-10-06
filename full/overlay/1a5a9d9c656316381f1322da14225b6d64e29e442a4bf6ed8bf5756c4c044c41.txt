@@ -1,0 +1,73 @@
+package controller
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupTenantCostAdminHandlerDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previous := model.DB
+	previousMain := common.MainDatabaseType()
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:tenant-admin-handler-%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previous
+		common.SetMainDatabaseType(previousMain)
+	})
+	require.NoError(t, db.AutoMigrate(&model.TenantCostDownstream{}, &model.TenantCostAuditEvent{}))
+	return db
+}
+
+func invokeTenantCostDownstreamUpsert(t *testing.T, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/tenant-cost/downstreams", bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("id", 7)
+	AdminUpsertTenantCostDownstream(ctx)
+	return recorder
+}
+
+func TestAdminUpsertTenantCostDownstreamPreservesDisabledStateInModelTransaction(t *testing.T) {
+	setupTenantCostAdminHandlerDB(t)
+	row := &model.TenantCostDownstream{
+		TenantID: "handler-tenant", DisplayName: "Before", ConfigKey: "handler_tenant",
+		Status: model.TenantCostDownstreamActive,
+	}
+	require.NoError(t, model.UpsertTenantCostDownstream(row))
+	require.NoError(t, model.SetTenantCostDownstreamStatus(row.TenantID, model.TenantCostDownstreamDisabled, 7))
+
+	recorder := invokeTenantCostDownstreamUpsert(t, `{"tenant_id":"handler-tenant","display_name":"After","config_key":"handler_tenant","status":"active"}`)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool                       `json:"success"`
+		Data    model.TenantCostDownstream `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.True(t, response.Success)
+	assert.Equal(t, model.TenantCostDownstreamDisabled, response.Data.Status)
+	assert.Equal(t, "After", response.Data.DisplayName)
+
+	stored, err := model.GetTenantCostDownstream(row.TenantID)
+	require.NoError(t, err)
+	assert.Equal(t, model.TenantCostDownstreamDisabled, stored.Status)
+	assert.Equal(t, "After", stored.DisplayName)
+}

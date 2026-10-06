@@ -1,0 +1,338 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+)
+
+type SmartRouteBulkRecoveryResult struct {
+	Contracts      int `json:"contracts"`
+	PhysicalRoutes int `json:"physical_routes"`
+	Queued         int `json:"queued"`
+	AlreadyQueued  int `json:"already_queued"`
+	QueueFull      int `json:"queue_full"`
+}
+
+// maybeScheduleCatalogRecoverySweep closes the low-traffic recovery gap. The
+// durable queue remains the execution authority; this coordinator only
+// reconstructs missing work from current catalog and health evidence.
+func (worker *SmartRouteProbeWorker) maybeScheduleCatalogRecoverySweep(
+	setting smartroutersetting.Setting,
+) {
+	if worker == nil || !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return
+	}
+	interval := time.Duration(setting.RecoverySweepIntervalSeconds) * time.Second
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	nowMS := time.Now().UnixMilli()
+	lastMS := worker.lastRecoverySweepMS.Load()
+	if lastMS > 0 && nowMS-lastMS < interval.Milliseconds() {
+		return
+	}
+	if !worker.recoverySweepRunning.CompareAndSwap(false, true) {
+		return
+	}
+	worker.lastRecoverySweepMS.Store(nowMS)
+	worker.wg.Add(1)
+	go func() {
+		defer worker.wg.Done()
+		defer worker.recoverySweepRunning.Store(false)
+		worker.mu.Lock()
+		ctx := worker.ctx
+		worker.mu.Unlock()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		sweepCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		scheduled, err := worker.runCatalogRecoverySweep(sweepCtx, setting)
+		if err != nil {
+			worker.recoverySweepFailures.Add(1)
+			worker.noteDeferred("catalog_recovery_sweep")
+			return
+		}
+		worker.recoverySweepScheduled.Add(int64(scheduled))
+		worker.lastRecoverySweepDoneMS.Store(time.Now().UnixMilli())
+	}()
+}
+
+func (worker *SmartRouteProbeWorker) runCatalogRecoverySweep(
+	ctx context.Context,
+	setting smartroutersetting.Setting,
+) (int, error) {
+	if worker == nil || worker.engine == nil || worker.engine.Catalogs == nil || worker.engine.State == nil {
+		return 0, errors.New("smart router recovery coordinator dependencies are incomplete")
+	}
+	hints, err := buildCatalogRecoveryHints(ctx, worker.engine, setting, false)
+	if err != nil {
+		return 0, err
+	}
+	scheduled := 0
+	for _, hint := range hints {
+		disposition := worker.hint(hint, true)
+		if disposition == SmartRouteProbeEnqueued || disposition == SmartRouteProbeAlreadyQueued {
+			scheduled++
+		}
+	}
+	return scheduled, nil
+}
+
+// ScheduleAllAutomaticRecoveries is the administrator's one-click recovery
+// action. It never removes a manual blacklist and never probes healthy or
+// virgin routes; it only makes every existing automatic recovery item due now.
+func (engine *SmartRouterEngine) ScheduleAllAutomaticRecoveries(
+	ctx context.Context,
+) (SmartRouteBulkRecoveryResult, error) {
+	result := SmartRouteBulkRecoveryResult{}
+	if engine == nil || engine.Settings == nil {
+		return result, errors.New("smart router engine is unavailable")
+	}
+	setting := smartroutersetting.Normalize(engine.Settings())
+	if !setting.Enabled || !setting.BackgroundProbeEnabled {
+		return result, ErrSmartRouterDisabled
+	}
+	hints, err := buildCatalogRecoveryHints(ctx, engine, setting, true)
+	if err != nil {
+		return result, err
+	}
+	for _, hint := range hints {
+		physicalHints := splitSmartRouteBulkRecoveryHint(hint)
+		if len(physicalHints) == 0 {
+			continue
+		}
+		result.Contracts++
+		for _, physicalHint := range physicalHints {
+			result.PhysicalRoutes++
+			var disposition SmartRouteProbeEnqueueDisposition
+			if common.RedisEnabled && common.RDB != nil {
+				disposition, err = persistSmartRouteRecoveryHint(ctx, physicalHint, setting.ProbeQueueCapacity)
+				if err != nil {
+					return result, err
+				}
+			} else {
+				engine.recoveryHintsMu.RLock()
+				sink := engine.recoveryHints
+				engine.recoveryHintsMu.RUnlock()
+				worker, ok := sink.(*SmartRouteProbeWorker)
+				if !ok || worker == nil {
+					return result, ErrSmartRouteProbeExecutorUnavailable
+				}
+				disposition = worker.hint(physicalHint, false)
+			}
+			switch disposition {
+			case SmartRouteProbeEnqueued:
+				result.Queued++
+			case SmartRouteProbeAlreadyQueued:
+				result.AlreadyQueued++
+			case SmartRouteProbeQueueFull:
+				result.QueueFull++
+			default:
+				return result, fmt.Errorf("schedule automatic recovery: unexpected disposition %q", disposition)
+			}
+		}
+	}
+	return result, nil
+}
+
+// splitSmartRouteBulkRecoveryHint creates one acknowledgement unit per
+// physical upstream probe. Several route IDs may alias the same physical
+// channel/model/contract and must be queued and counted only once.
+func splitSmartRouteBulkRecoveryHint(hint SmartRouteRecoveryHint) []SmartRouteRecoveryHint {
+	routesByPhysicalKey := make(map[string][]smartrouter.CertifiedRoute)
+	for _, route := range hint.Routes {
+		key := smartRoutePhysicalProbeKey(hint.Request.ContractID, hint.Request.Endpoint, route)
+		if key != "" {
+			routesByPhysicalKey[key] = append(routesByPhysicalKey[key], route)
+		}
+	}
+	keys := make([]string, 0, len(routesByPhysicalKey))
+	for key := range routesByPhysicalKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	result := make([]SmartRouteRecoveryHint, 0, len(keys))
+	for _, key := range keys {
+		routes := routesByPhysicalKey[key]
+		sort.Slice(routes, func(i, j int) bool { return routes[i].RouteID < routes[j].RouteID })
+		physicalHint := hint
+		physicalHint.Routes = append([]smartrouter.CertifiedRoute(nil), routes...)
+		physicalHint.AllowedGroups = make([]string, 0, len(routes))
+		physicalHint.Prices = smartrouter.PriceSnapshot{
+			Version: hint.Prices.Version, RatiosPPM: make(map[string]int64, len(routes)),
+		}
+		physicalHint.Runtime = SmartRouteRuntimeSnapshot{Quality: smartrouter.QualitySnapshot{
+			Version: hint.Runtime.Quality.Version, Routes: make(map[string]smartrouter.QualityState, len(routes)),
+		}}
+		seenGroups := make(map[string]struct{}, len(routes))
+		for _, route := range routes {
+			if _, exists := seenGroups[route.Group]; !exists {
+				seenGroups[route.Group] = struct{}{}
+				physicalHint.AllowedGroups = append(physicalHint.AllowedGroups, route.Group)
+			}
+			if ratio, exists := hint.Prices.RatiosPPM[route.RouteID]; exists {
+				physicalHint.Prices.RatiosPPM[route.RouteID] = ratio
+			}
+			if quality, exists := hint.Runtime.Quality.Routes[route.RouteID]; exists {
+				physicalHint.Runtime.Quality.Routes[route.RouteID] = quality
+			}
+		}
+		result = append(result, physicalHint)
+	}
+	return result
+}
+
+func buildCatalogRecoveryHints(
+	ctx context.Context,
+	engine *SmartRouterEngine,
+	setting smartroutersetting.Setting,
+	force bool,
+) ([]SmartRouteRecoveryHint, error) {
+	if engine == nil || engine.Catalogs == nil || engine.State == nil {
+		return nil, errors.New("smart router recovery coordinator dependencies are incomplete")
+	}
+	catalog, err := engine.Catalogs.RefreshIfDue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if catalog == nil {
+		return nil, ErrNoCurrentSmartCatalog
+	}
+
+	contracts := make([]smartrouter.ContractCatalog, 0, len(catalog.Contracts))
+	routesByID := make(map[string]smartrouter.CertifiedRoute)
+	for _, entry := range catalog.Contracts {
+		if !SmartRouteSyntheticProbeAllowed(entry.Contract.Endpoint, entry.Contract.CanonicalModel, contractCatalogRoutes(entry)...) {
+			continue
+		}
+		contracts = append(contracts, entry)
+		for _, route := range contractCatalogRoutes(entry) {
+			routesByID[route.RouteID] = route
+		}
+	}
+	if len(routesByID) == 0 {
+		return nil, nil
+	}
+	routeIDs := make([]string, 0, len(routesByID))
+	for routeID := range routesByID {
+		routeIDs = append(routeIDs, routeID)
+	}
+	sort.Strings(routeIDs)
+	stateRoutes := make([]SmartRouteStateRoute, 0, len(routeIDs))
+	for _, routeID := range routeIDs {
+		route := routesByID[routeID]
+		stateRoutes = append(stateRoutes, SmartRouteStateRoute{
+			RouteID: route.RouteID, CapacityDomain: route.CapacityDomain,
+			CredentialDomain: smartrouter.RouteCredentialDomain(route),
+			StableFallback:   route.StableFallback, MaxInflight: route.MaxInflight,
+		})
+	}
+	runtime, err := engine.State.Snapshot(ctx, SmartRouteStateSnapshotRequest{Routes: stateRoutes})
+	if err != nil {
+		return nil, err
+	}
+
+	policy := smartrouter.NormalizePolicy(setting.DefaultPolicy)
+	policy.Version = smartrouter.PolicyVersion
+	policy.Enabled = true
+	policy.ExcludedGroups = nil
+	policy.ExcludedRoutes = nil
+	policy.ManualGroupOrder = nil
+	policy.MaxEffectiveRatioPPM = 0
+	policy.AllowFutureGroups = true
+	policy.AllowFutureCertifiedRoutes = true
+
+	hints := make([]SmartRouteRecoveryHint, 0)
+	for _, entry := range contracts {
+		allRoutes := contractCatalogRoutes(entry)
+		physicalDue := make(map[string]struct{})
+		for _, route := range allRoutes {
+			quality, ok := runtime.Quality.Routes[route.RouteID]
+			if !ok || !smartRouteHasAutomaticRecoveryEvidence(quality) {
+				continue
+			}
+			physicalDue[smartRoutePhysicalProbeKey(entry.Contract.ContractID, entry.Contract.Endpoint, route)] = struct{}{}
+		}
+		if len(physicalDue) == 0 {
+			continue
+		}
+		routes := make([]smartrouter.CertifiedRoute, 0, len(allRoutes))
+		allowedGroups := make([]string, 0, len(allRoutes))
+		quality := make(map[string]smartrouter.QualityState)
+		prices := make(map[string]int64)
+		for _, route := range allRoutes {
+			physicalKey := smartRoutePhysicalProbeKey(entry.Contract.ContractID, entry.Contract.Endpoint, route)
+			if _, due := physicalDue[physicalKey]; !due {
+				continue
+			}
+			routes = append(routes, route)
+			allowedGroups = append(allowedGroups, route.Group)
+			quality[route.RouteID] = runtime.Quality.Routes[route.RouteID]
+			prices[route.RouteID] = globalRecoveryRouteRatioPPM(route.Group)
+		}
+		if len(routes) == 0 {
+			continue
+		}
+		hints = append(hints, SmartRouteRecoveryHint{
+			CatalogVersion: catalog.Version, ScopeKey: "global-recovery", ForceProbe: force,
+			Request: smartrouter.RouteRequest{
+				ContractID: entry.Contract.ContractID, CanonicalModel: entry.Contract.CanonicalModel,
+				Endpoint: entry.Contract.Endpoint, CapabilityFingerprint: entry.Contract.CapabilityFingerprint,
+				ReplayClass: smartrouter.ReplaySafeText,
+			},
+			Policy: policy, AllowedGroups: allowedGroups, Routes: routes,
+			Prices: smartrouter.PriceSnapshot{Version: catalog.Version + ":global-recovery", RatiosPPM: prices},
+			Runtime: SmartRouteRuntimeSnapshot{Quality: smartrouter.QualitySnapshot{
+				Version: runtime.Quality.Version, Routes: quality,
+			}},
+		})
+	}
+	return hints, nil
+}
+
+func contractCatalogRoutes(entry smartrouter.ContractCatalog) []smartrouter.CertifiedRoute {
+	routes := make(map[string]smartrouter.CertifiedRoute)
+	for _, pool := range entry.Pools {
+		for _, route := range pool.Candidates {
+			routes[route.RouteID] = route
+		}
+	}
+	ordered := make([]smartrouter.CertifiedRoute, 0, len(routes))
+	for _, route := range routes {
+		ordered = append(ordered, route)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].RouteID < ordered[j].RouteID })
+	return ordered
+}
+
+func smartRouteHasAutomaticRecoveryEvidence(quality smartrouter.QualityState) bool {
+	// Revision/counter changes do not turn unknown into failure evidence. A
+	// rolling-upgrade normalization may legitimately rewrite bootstrap or
+	// warming-without-evidence to unknown; probing that state would recreate the
+	// release-wide cold-start wave. Only an explicitly unavailable route enters
+	// automatic recovery.
+	normalized, _ := smartrouter.NormalizeAutomaticRecoveryState(quality, time.Now().UnixMilli())
+	return normalized.Phase == smartrouter.QualityOpen
+}
+
+func globalRecoveryRouteRatioPPM(group string) int64 {
+	if ratio_setting.ContainsGroupRatio(group) {
+		if ratio, ok := ratioToFixedPPM(ratio_setting.GetGroupRatio(group)); ok {
+			return ratio
+		}
+	}
+	// Missing pricing stays last, but health recovery is not permanently
+	// disabled merely because an administrator is editing a ratio.
+	return math.MaxInt64 / 4
+}

@@ -1,0 +1,627 @@
+package model
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"math"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+func setupRouteAnalyticsTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	previousDB := DB
+	previousLogDB := LOG_DB
+	dsn := fmt.Sprintf("file:route-analytics-%d?mode=memory&cache=shared&_busy_timeout=30000", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(
+		&RouteAnalyticsDimensionV1{},
+		&RouteAnalyticsObservationV1{},
+		&RouteAnalyticsBucketV1{},
+		&KeyUsageAnalyticsBucketV1{},
+		&RouteAnalyticsHistoryV1{},
+		&RouteAnalyticsWorkerStateV1{},
+	))
+	DB = db
+	LOG_DB = db
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		DB = previousDB
+		LOG_DB = previousLogDB
+		common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	})
+	return db
+}
+
+func analyticsTestDigest(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func analyticsTestProjection(eventTimeMS int64, observation string, projection string) RouteAnalyticsProjectionV1 {
+	routeDigest := analyticsTestDigest("route")
+	ttft := int64(1_200)
+	return RouteAnalyticsProjectionV1{
+		ObservationDigest:      analyticsTestDigest(observation),
+		ProjectionHash:         analyticsTestDigest(projection),
+		EventTimeMS:            eventTimeMS,
+		IngestedAtMS:           eventTimeMS + 1_000,
+		EventKind:              "logical_request",
+		Granularity:            RouteAnalyticsGranularity5m,
+		RouteFingerprintDigest: routeDigest,
+		UserDigest:             analyticsTestDigest("user"),
+		TokenID:                42,
+		LegacyIdentity:         true,
+		RouteBucket: &RouteAnalyticsBucketIdentityV1{
+			BucketKey:              analyticsTestDigest("route-bucket"),
+			RouteFingerprintDigest: routeDigest,
+			DetailID:               analyticsTestDigest("detail")[:32],
+			BucketStartMS:          analyticsBucketStartMS(eventTimeMS, RouteAnalyticsGranularity5m),
+			Granularity:            RouteAnalyticsGranularity5m,
+			Model:                  "gpt-5.6-sol",
+			Endpoint:               "openai-responses-v1",
+			CapabilityContract:     "responses-text-v1",
+		},
+		KeyBucket: &KeyUsageAnalyticsBucketIdentityV1{
+			BucketKey:     analyticsTestDigest("key-bucket"),
+			UserID:        7,
+			TokenID:       42,
+			BucketStartMS: analyticsBucketStartMS(eventTimeMS, RouteAnalyticsGranularity5m),
+			Granularity:   RouteAnalyticsGranularity5m,
+			Model:         "gpt-5.6-sol",
+			Endpoint:      "openai-responses-v1",
+		},
+		RouteMeasures: RouteAnalyticsMeasuresV1{
+			LogicalRequests:       1,
+			FinalSuccesses:        1,
+			FirstHitSuccesses:     1,
+			TTFTMS:                &ttft,
+			CacheReadTokens:       800,
+			TotalInputTokens:      1_000,
+			PredictedInputMicros:  250,
+			PredictedInputTokens:  1_000,
+			HealthAvailableEvents: 1,
+			PriceRevision:         "price-v1",
+		},
+		KeyMeasures: KeyUsageAnalyticsMeasuresV1{
+			LogicalRequests: 1,
+			Successes:       1,
+			PositiveQuota:   200,
+			InputTokens:     1_000,
+			OutputTokens:    100,
+			CacheReadTokens: 800,
+			TTFTMS:          &ttft,
+		},
+	}
+}
+
+func TestRouteAnalyticsSchemaAndOpaqueDimension(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	for _, table := range []any{
+		&RouteAnalyticsDimensionV1{},
+		&RouteAnalyticsObservationV1{},
+		&RouteAnalyticsBucketV1{},
+		&KeyUsageAnalyticsBucketV1{},
+		&RouteAnalyticsHistoryV1{},
+		&RouteAnalyticsWorkerStateV1{},
+	} {
+		assert.True(t, db.Migrator().HasTable(table))
+	}
+
+	dimension := RouteAnalyticsDimensionV1{
+		RouteFingerprintDigest: analyticsTestDigest("dimension-route"),
+		ChannelID:              9,
+		ChannelGeneration:      "generation-1",
+		UpstreamModel:          "gpt-5.6-sol",
+		Model:                  "gpt-5.6-sol",
+		Endpoint:               "openai-responses-v1",
+		CapabilityContract:     "responses-text-v1",
+		PublicGroupName:        "Example Discount  GPT",
+		GroupRatioPPM:          55_000,
+		ProjectionVersion:      "route-projection-v1",
+		FirstSeenAtMS:          1_000,
+		LastSeenAtMS:           2_000,
+	}
+	created, err := EnsureRouteAnalyticsDimensionV1(context.Background(), dimension)
+	require.NoError(t, err)
+	assert.Len(t, created.DetailID, 32)
+	assert.True(t, validAnalyticsHex(created.DetailID, 32))
+
+	dimension.PublicGroupName = "Example Discount  GPT Pro"
+	dimension.GroupRatioPPM = 65_000
+	dimension.LastSeenAtMS = 3_000
+	updated, err := EnsureRouteAnalyticsDimensionV1(context.Background(), dimension)
+	require.NoError(t, err)
+	assert.Equal(t, created.DetailID, updated.DetailID)
+	assert.Equal(t, "Example Discount  GPT Pro", updated.PublicGroupName)
+	assert.Equal(t, int64(65_000), updated.GroupRatioPPM)
+	assert.Equal(t, int64(3_000), updated.LastSeenAtMS)
+
+	dimension.RouteFingerprintDigest = "z" + dimension.RouteFingerprintDigest[1:]
+	_, err = EnsureRouteAnalyticsDimensionV1(context.Background(), dimension)
+	assert.ErrorContains(t, err, "64 hexadecimal")
+}
+
+func TestApplyRouteAnalyticsProjectionIsIdempotentAndCorrectable(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	eventTimeMS := int64(1_800_000)
+	projection := analyticsTestProjection(eventTimeMS, "observation-1", "projection-1")
+
+	applied, err := ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+	require.NoError(t, err)
+	assert.Equal(t, 1, applied)
+	applied, err = ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+	require.NoError(t, err)
+	assert.Zero(t, applied)
+
+	var routeBucket RouteAnalyticsBucketV1
+	require.NoError(t, db.First(&routeBucket, "bucket_key = ?", projection.RouteBucket.BucketKey).Error)
+	assert.Equal(t, int64(1), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+	assert.Equal(t, int64(1), routeBucket.TTFTCount)
+	assert.Equal(t, int64(1_200), routeBucket.TTFTSumMS)
+	assert.Equal(t, int64(250), routeBucket.PredictedInputMicros)
+	assert.JSONEq(t, `{"price-v1":1}`, routeBucket.PriceRevisionCountsJSON)
+
+	var keyBucket KeyUsageAnalyticsBucketV1
+	require.NoError(t, db.First(&keyBucket, "bucket_key = ?", projection.KeyBucket.BucketKey).Error)
+	assert.Equal(t, int64(1), keyBucket.LogicalRequests)
+	assert.Equal(t, int64(1), keyBucket.Successes)
+	assert.Equal(t, int64(200), keyBucket.PositiveQuota)
+
+	corrected := projection
+	corrected.ProjectionHash = analyticsTestDigest("projection-2")
+	corrected.IngestedAtMS++
+	corrected.RouteFingerprintDigest = ""
+	corrected.UserDigest = ""
+	corrected.TokenID = 0
+	corrected.LegacyIdentity = false
+	corrected.RouteBucket = nil
+	corrected.KeyBucket = nil
+	corrected.RouteMeasures = RouteAnalyticsMeasuresV1{}
+	corrected.KeyMeasures = KeyUsageAnalyticsMeasuresV1{}
+	applied, err = ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{corrected})
+	require.NoError(t, err)
+	assert.Equal(t, 1, applied)
+
+	require.NoError(t, db.First(&routeBucket, "bucket_key = ?", projection.RouteBucket.BucketKey).Error)
+	assert.Zero(t, routeBucket.LogicalRequests)
+	assert.Zero(t, routeBucket.FinalSuccesses)
+	assert.Zero(t, routeBucket.TTFTCount)
+	assert.Zero(t, routeBucket.TTFTSumMS)
+	assert.Zero(t, routeBucket.PredictedInputMicros)
+	assert.JSONEq(t, `{}`, routeBucket.PriceRevisionCountsJSON)
+
+	require.NoError(t, db.First(&keyBucket, "bucket_key = ?", projection.KeyBucket.BucketKey).Error)
+	assert.Zero(t, keyBucket.LogicalRequests)
+	assert.Zero(t, keyBucket.Successes)
+	assert.Zero(t, keyBucket.PositiveQuota)
+
+	var observation RouteAnalyticsObservationV1
+	require.NoError(t, db.First(&observation, "observation_digest = ?", projection.ObservationDigest).Error)
+	assert.Equal(t, corrected.ProjectionHash, observation.ProjectionHash)
+	assert.Empty(t, observation.RouteFingerprintDigest)
+	assert.Empty(t, observation.UserDigest)
+	assert.Zero(t, observation.TokenID)
+	assert.False(t, observation.LegacyIdentity)
+	assert.Empty(t, observation.RouteBucketKey)
+	assert.Empty(t, observation.KeyBucketKey)
+	assert.JSONEq(t, `{}`, observation.RouteMeasuresJSON)
+	assert.JSONEq(t, `{}`, observation.KeyMeasuresJSON)
+}
+
+func TestRouteAnalyticsTrueZeroTTFTAndUnknownRemainDistinct(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	eventTimeMS := int64(3_600_000)
+	zero := int64(0)
+	withZero := analyticsTestProjection(eventTimeMS, "zero-ttft", "zero-ttft-v1")
+	withZero.RouteMeasures.TTFTMS = &zero
+	withZero.KeyMeasures.TTFTMS = &zero
+
+	withoutTTFT := analyticsTestProjection(eventTimeMS, "unknown-ttft", "unknown-ttft-v1")
+	withoutTTFT.RouteMeasures.TTFTMS = nil
+	withoutTTFT.KeyMeasures.TTFTMS = nil
+
+	applied, err := ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{withZero, withoutTTFT})
+	require.NoError(t, err)
+	assert.Equal(t, 2, applied)
+
+	var routeBucket RouteAnalyticsBucketV1
+	require.NoError(t, db.First(&routeBucket, "bucket_key = ?", withZero.RouteBucket.BucketKey).Error)
+	assert.Equal(t, int64(2), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.TTFTCount)
+	assert.Zero(t, routeBucket.TTFTSumMS)
+	var histogram []int64
+	require.NoError(t, common.UnmarshalJsonStr(routeBucket.TTFTHistogramJSON, &histogram))
+	require.Len(t, histogram, len(ttftHistogramUpperBoundsMS))
+	assert.Equal(t, int64(1), histogram[0])
+}
+
+func TestRouteAnalyticsRejectsInvalidOrOverflowingProjectionAtomically(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	eventTimeMS := int64(5_400_000)
+	projection := analyticsTestProjection(eventTimeMS, "invalid", "invalid-v1")
+	projection.ObservationDigest = "g" + projection.ObservationDigest[1:]
+	_, err := ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+	assert.ErrorContains(t, err, "64 hexadecimal")
+
+	projection = analyticsTestProjection(eventTimeMS, "negative", "negative-v1")
+	projection.KeyMeasures.PositiveQuota = -1
+	_, err = ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+	assert.ErrorContains(t, err, "cannot be negative")
+
+	projection = analyticsTestProjection(eventTimeMS, "missing-bucket", "missing-bucket-v1")
+	projection.RouteBucket = nil
+	_, err = ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+	assert.ErrorContains(t, err, "require a route bucket")
+
+	var count int64
+	require.NoError(t, db.Model(&RouteAnalyticsObservationV1{}).Count(&count).Error)
+	assert.Zero(t, count)
+	_, err = addAnalyticsMeasureV1(math.MaxInt64, 1, 1)
+	assert.ErrorContains(t, err, "overflow")
+}
+
+func TestRouteAnalyticsReplayCorrectionClampsExhaustedAggregates(t *testing.T) {
+	route := RouteAnalyticsBucketV1{CacheReadTokens: 1, TTFTHistogramJSON: "[]", PriceRevisionCountsJSON: "{}"}
+	require.NoError(t, mutateRouteAnalyticsBucketV1(&route, RouteAnalyticsMeasuresV1{CacheReadTokens: 2}, -1, 10))
+	assert.Zero(t, route.CacheReadTokens)
+
+	key := KeyUsageAnalyticsBucketV1{CacheReadTokens: 1, TTFTHistogramJSON: "[]"}
+	require.NoError(t, mutateKeyUsageAnalyticsBucketV1(&key, KeyUsageAnalyticsMeasuresV1{CacheReadTokens: 2}, -1, 10))
+	assert.Zero(t, key.CacheReadTokens)
+}
+
+func TestRouteAnalyticsCorrectionIgnoresWhitespaceOnlyPriorBucketKeys(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	eventTimeMS := int64(1_800_000)
+	projection := analyticsTestProjection(eventTimeMS, "whitespace-key", "whitespace-key-v1")
+	require.NoError(t, db.Create(&RouteAnalyticsObservationV1{
+		ObservationDigest: projection.ObservationDigest, ProjectionHash: analyticsTestDigest("old"),
+		ProjectionRank: 1, EventTimeMS: eventTimeMS, IngestedAtMS: eventTimeMS,
+		EventKind: projection.EventKind, Granularity: projection.Granularity,
+		RouteBucketKey: strings.Repeat(" ", 64), KeyBucketKey: strings.Repeat(" ", 64),
+		RouteMeasuresJSON: `{"logical_requests":1}`, KeyMeasuresJSON: `{"logical_requests":1}`,
+	}).Error)
+	_, err := ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+	require.NoError(t, err)
+}
+
+func TestRouteAnalyticsConcurrentReplayCountsOnce(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	projection := analyticsTestProjection(7_200_000, "concurrent", "concurrent-v1")
+
+	results := make(chan int, 2)
+	errorsByWorker := make(chan error, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			applied, applyErr := ApplyRouteAnalyticsProjectionsV1(context.Background(), []RouteAnalyticsProjectionV1{projection})
+			results <- applied
+			errorsByWorker <- applyErr
+		}()
+	}
+	workers.Wait()
+	close(results)
+	close(errorsByWorker)
+
+	totalApplied := 0
+	for applyErr := range errorsByWorker {
+		require.NoError(t, applyErr)
+	}
+	for applied := range results {
+		totalApplied += applied
+	}
+	assert.Equal(t, 1, totalApplied)
+
+	var routeBucket RouteAnalyticsBucketV1
+	require.NoError(t, db.First(&routeBucket, "bucket_key = ?", projection.RouteBucket.BucketKey).Error)
+	assert.Equal(t, int64(1), routeBucket.LogicalRequests)
+	assert.Equal(t, int64(1), routeBucket.FinalSuccesses)
+}
+
+func TestRouteAnalyticsSchemasCompileForSupportedDialects(t *testing.T) {
+	testCases := []struct {
+		name      string
+		dialector gorm.Dialector
+	}{
+		{
+			name: "mysql",
+			dialector: mysql.New(mysql.Config{
+				DSN:                       "gorm:gorm@tcp(localhost:9910)/gorm?charset=utf8mb4&parseTime=True&loc=Local",
+				SkipInitializeWithVersion: true,
+			}),
+		},
+		{
+			name: "postgresql",
+			dialector: postgres.New(postgres.Config{
+				DSN:                  "host=localhost user=gorm password=gorm dbname=gorm port=9920 sslmode=disable",
+				PreferSimpleProtocol: true,
+			}),
+		},
+	}
+	models := []any{
+		&RouteAnalyticsDimensionV1{},
+		&RouteAnalyticsObservationV1{},
+		&RouteAnalyticsBucketV1{},
+		&KeyUsageAnalyticsBucketV1{},
+		&RouteAnalyticsHistoryV1{},
+		&RouteAnalyticsWorkerStateV1{},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db, err := gorm.Open(testCase.dialector, &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+			require.NoError(t, err)
+			for _, schema := range models {
+				require.NoError(t, db.Migrator().CreateTable(schema))
+			}
+		})
+	}
+}
+
+func TestRouteAnalyticsLogBatchUsesEventTimeWhenIDsAreZero(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	require.NoError(t, db.Exec(`
+		CREATE TABLE logs (
+			id INTEGER,
+			user_id INTEGER,
+			created_at INTEGER,
+			type INTEGER,
+			model_name TEXT,
+			quota INTEGER,
+			prompt_tokens INTEGER,
+			completion_tokens INTEGER,
+			use_time INTEGER,
+			is_stream BOOLEAN,
+			channel_id INTEGER,
+			token_id INTEGER,
+			"group" TEXT,
+			request_id TEXT,
+			other TEXT
+		)
+	`).Error)
+	rows := []map[string]any{
+		{"id": 0, "user_id": 1, "created_at": 100, "type": LogTypeError, "model_name": "gpt-5.6-sol", "request_id": "request-a", "other": `{}`},
+		{"id": 0, "user_id": 1, "created_at": 100, "type": LogTypeConsume, "model_name": "gpt-5.6-sol", "request_id": "request-a", "other": `{}`},
+		{"id": 0, "user_id": 2, "created_at": 100, "type": LogTypeConsume, "model_name": "gpt-5.6-sol", "request_id": "", "other": `{}`},
+		{"id": 0, "user_id": 2, "created_at": 101, "type": LogTypeRefund, "model_name": "gpt-5.6-sol", "request_id": "request-b", "other": `{}`},
+	}
+	for _, row := range rows {
+		require.NoError(t, db.Table("logs").Create(row).Error)
+	}
+
+	batch, err := GetRouteAnalyticsLogBatchV1(context.Background(), 100, 101, 2, 10)
+	require.NoError(t, err)
+	assert.True(t, batch.HasMore)
+	assert.Equal(t, int64(100), batch.CompleteThroughSec)
+	assert.Len(t, batch.Logs, 3)
+	for _, logRow := range batch.Logs {
+		assert.Zero(t, logRow.Id)
+		assert.Equal(t, int64(100), logRow.CreatedAt)
+	}
+
+	next, err := GetRouteAnalyticsLogBatchV1(context.Background(), 101, 101, 2, 10)
+	require.NoError(t, err)
+	assert.False(t, next.HasMore)
+	assert.Equal(t, int64(101), next.CompleteThroughSec)
+	require.Len(t, next.Logs, 1)
+	assert.Equal(t, LogTypeRefund, next.Logs[0].Type)
+}
+
+func TestRouteAnalyticsWorkerLeaseIsExclusiveAndFenced(t *testing.T) {
+	setupRouteAnalyticsTestDB(t)
+	ctx := context.Background()
+	state, acquired, err := AcquireRouteAnalyticsWorkerLeaseV1(ctx, "worker-a", 1_000, 2_000)
+	require.NoError(t, err)
+	assert.True(t, acquired)
+	assert.Equal(t, "worker-a", state.LeaseOwner)
+
+	_, acquired, err = AcquireRouteAnalyticsWorkerLeaseV1(ctx, "worker-b", 1_500, 2_500)
+	require.NoError(t, err)
+	assert.False(t, acquired)
+
+	state, acquired, err = AcquireRouteAnalyticsWorkerLeaseV1(ctx, "worker-b", 2_001, 3_000)
+	require.NoError(t, err)
+	assert.True(t, acquired)
+	assert.Equal(t, "worker-b", state.LeaseOwner)
+
+	err = UpdateRouteAnalyticsWorkerStateV1(ctx, "worker-a", 2_100, 3_100, map[string]any{"freshness_at_ms": int64(2_100)})
+	assert.ErrorIs(t, err, ErrRouteAnalyticsWorkerLeaseLost)
+	require.NoError(t, UpdateRouteAnalyticsWorkerStateV1(
+		ctx,
+		"worker-b",
+		2_100,
+		3_100,
+		map[string]any{"freshness_at_ms": int64(2_100), "cursor_created_at": int64(123)},
+	))
+	state, err = GetRouteAnalyticsWorkerStateV1(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2_100), state.FreshnessAtMS)
+	assert.Equal(t, int64(123), state.CursorCreatedAt)
+
+	require.NoError(t, ReleaseRouteAnalyticsWorkerLeaseV1(ctx, "worker-b", 2_200))
+	state, err = GetRouteAnalyticsWorkerStateV1(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, state.LeaseOwner)
+	assert.Zero(t, state.LeaseUntilMS)
+}
+
+func TestRouteAnalyticsRetentionDeletesOnlyExpiredRows(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	oldObservation := RouteAnalyticsObservationV1{
+		ObservationDigest: analyticsTestDigest("old-observation"), ProjectionHash: analyticsTestDigest("old-projection"),
+		EventTimeMS: now.Add(-11 * 24 * time.Hour).UnixMilli(), IngestedAtMS: now.Add(-11 * 24 * time.Hour).UnixMilli(),
+		EventKind: "request", Granularity: RouteAnalyticsGranularity1h, RouteMeasuresJSON: `{}`, KeyMeasuresJSON: `{}`,
+	}
+	recentObservation := oldObservation
+	recentObservation.ObservationDigest = analyticsTestDigest("recent-observation")
+	recentObservation.ProjectionHash = analyticsTestDigest("recent-projection")
+	recentObservation.EventTimeMS = now.Add(-time.Hour).UnixMilli()
+	recentObservation.IngestedAtMS = now.Add(-time.Hour).UnixMilli()
+	require.NoError(t, db.Create(&[]RouteAnalyticsObservationV1{oldObservation, recentObservation}).Error)
+
+	oldRouteBucket := RouteAnalyticsBucketV1{
+		BucketKey: analyticsTestDigest("old-route-bucket"), RouteFingerprintDigest: analyticsTestDigest("old-route"),
+		DetailID: analyticsTestDigest("old-detail")[:32], BucketStartMS: now.Add(-5 * 24 * time.Hour).UnixMilli(),
+		Granularity: RouteAnalyticsGranularity1h, Model: "gpt-5.6-sol", Endpoint: "openai-responses-v1",
+		CapabilityContract: "responses-text-v1", TTFTHistogramJSON: `[]`, PriceRevisionCountsJSON: `{}`,
+	}
+	recentRouteBucket := oldRouteBucket
+	recentRouteBucket.BucketKey = analyticsTestDigest("recent-route-bucket")
+	recentRouteBucket.BucketStartMS = now.Add(-time.Hour).UnixMilli()
+	require.NoError(t, db.Create(&[]RouteAnalyticsBucketV1{oldRouteBucket, recentRouteBucket}).Error)
+
+	oldKeyBucket := KeyUsageAnalyticsBucketV1{
+		BucketKey: analyticsTestDigest("old-key-bucket"), UserID: 1, TokenID: 2,
+		BucketStartMS: now.Add(-9 * 24 * time.Hour).UnixMilli(), Granularity: RouteAnalyticsGranularity1h,
+		Model: "gpt-5.6-sol", Endpoint: "openai-responses-v1", TTFTHistogramJSON: `[]`,
+	}
+	recentKeyBucket := oldKeyBucket
+	recentKeyBucket.BucketKey = analyticsTestDigest("recent-key-bucket")
+	recentKeyBucket.BucketStartMS = now.Add(-time.Hour).UnixMilli()
+	require.NoError(t, db.Create(&[]KeyUsageAnalyticsBucketV1{oldKeyBucket, recentKeyBucket}).Error)
+
+	oldDimension := RouteAnalyticsDimensionV1{
+		DetailID: analyticsTestDigest("retired-detail")[:32], RouteFingerprintDigest: analyticsTestDigest("retired-route"),
+		ChannelID: 1, ChannelGeneration: "generation", UpstreamModel: "gpt-5.6-sol", Model: "gpt-5.6-sol",
+		Endpoint: "openai-responses-v1", CapabilityContract: "responses-text-v1", PublicGroupName: "retired",
+		ProjectionVersion: "v1", FirstSeenAtMS: 1, LastSeenAtMS: 2, RetiredAtMS: now.Add(-5 * 24 * time.Hour).UnixMilli(),
+	}
+	recentDimension := oldDimension
+	recentDimension.DetailID = analyticsTestDigest("active-detail")[:32]
+	recentDimension.RouteFingerprintDigest = analyticsTestDigest("active-route")
+	recentDimension.PublicGroupName = "active"
+	recentDimension.RetiredAtMS = 0
+	require.NoError(t, db.Create(&[]RouteAnalyticsDimensionV1{oldDimension, recentDimension}).Error)
+
+	result, err := CleanupRouteAnalyticsRetentionV1(context.Background(), now, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), result.Observations)
+	assert.Equal(t, int64(1), result.RouteBuckets)
+	assert.Equal(t, int64(1), result.KeyBuckets)
+	assert.Equal(t, int64(1), result.Dimensions)
+
+	var count int64
+	require.NoError(t, db.Model(&RouteAnalyticsObservationV1{}).Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+	require.NoError(t, db.Model(&RouteAnalyticsBucketV1{}).Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+	require.NoError(t, db.Model(&KeyUsageAnalyticsBucketV1{}).Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+	require.NoError(t, db.Model(&RouteAnalyticsDimensionV1{}).Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+}
+
+func TestRouteAnalyticsQueriesStayBoundedToOpaqueRouteAndKeyOwner(t *testing.T) {
+	db := setupRouteAnalyticsTestDB(t)
+	dimension := RouteAnalyticsDimensionV1{
+		DetailID: analyticsTestDigest("query-detail")[:32], RouteFingerprintDigest: analyticsTestDigest("query-route"),
+		ChannelID: 11, ChannelGeneration: "generation-1", UpstreamModel: "gpt-5.6-sol",
+		Model: "gpt-5.6-sol", Endpoint: "openai-responses-v1", CapabilityContract: "responses-text-v1",
+		PublicGroupName: "Example Discount  GPT", GroupRatioPPM: 55_000, ProjectionVersion: "v1",
+		FirstSeenAtMS: 1_000, LastSeenAtMS: 2_000,
+	}
+	require.NoError(t, db.Create(&dimension).Error)
+
+	routeBuckets := []RouteAnalyticsBucketV1{
+		{BucketKey: analyticsTestDigest("query-route-1"), RouteFingerprintDigest: dimension.RouteFingerprintDigest,
+			DetailID: dimension.DetailID, BucketStartMS: 3_600_000, Granularity: RouteAnalyticsGranularity5m,
+			Model: dimension.Model, Endpoint: dimension.Endpoint, CapabilityContract: dimension.CapabilityContract,
+			LogicalRequests: 1, TTFTHistogramJSON: `[]`, PriceRevisionCountsJSON: `{}`},
+		{BucketKey: analyticsTestDigest("query-route-2"), RouteFingerprintDigest: dimension.RouteFingerprintDigest,
+			DetailID: dimension.DetailID, BucketStartMS: 3_900_000, Granularity: RouteAnalyticsGranularity5m,
+			Model: dimension.Model, Endpoint: dimension.Endpoint, CapabilityContract: dimension.CapabilityContract,
+			LogicalRequests: 2, TTFTHistogramJSON: `[]`, PriceRevisionCountsJSON: `{}`},
+	}
+	require.NoError(t, db.Create(&routeBuckets).Error)
+	keyBuckets := []KeyUsageAnalyticsBucketV1{
+		{BucketKey: analyticsTestDigest("query-key-a"), UserID: 7, TokenID: 42, BucketStartMS: 3_600_000,
+			Granularity: RouteAnalyticsGranularity5m, Model: dimension.Model, Endpoint: dimension.Endpoint,
+			LogicalRequests: 1, TTFTHistogramJSON: `[]`},
+		{BucketKey: analyticsTestDigest("query-key-b"), UserID: 8, TokenID: 42, BucketStartMS: 3_600_000,
+			Granularity: RouteAnalyticsGranularity5m, Model: dimension.Model, Endpoint: dimension.Endpoint,
+			LogicalRequests: 9, TTFTHistogramJSON: `[]`},
+	}
+	require.NoError(t, db.Create(&keyBuckets).Error)
+
+	readDimension, err := GetRouteAnalyticsDimensionByDetailIDV1(context.Background(), dimension.DetailID)
+	require.NoError(t, err)
+	assert.Equal(t, dimension.RouteFingerprintDigest, readDimension.RouteFingerprintDigest)
+	dimensions, err := ListRouteAnalyticsDimensionsByFingerprintsV1(
+		context.Background(), []string{dimension.RouteFingerprintDigest, dimension.RouteFingerprintDigest},
+	)
+	require.NoError(t, err)
+	require.Len(t, dimensions, 1)
+
+	readRouteBuckets, err := ListRouteAnalyticsBucketsV1(
+		context.Background(), dimension.DetailID, RouteAnalyticsGranularity5m, 3_600_000, 3_900_000,
+	)
+	require.NoError(t, err)
+	require.Len(t, readRouteBuckets, 1)
+	assert.Equal(t, int64(1), readRouteBuckets[0].LogicalRequests)
+
+	readKeyBuckets, err := ListKeyUsageAnalyticsBucketsV1(
+		context.Background(), 7, 42, RouteAnalyticsGranularity5m, 3_600_000, 3_900_000, dimension.Model,
+	)
+	require.NoError(t, err)
+	require.Len(t, readKeyBuckets, 1)
+	assert.Equal(t, int64(1), readKeyBuckets[0].LogicalRequests)
+}
+
+func TestRouteAnalyticsTTFTPercentilesMergeHistogramsAndPreserveUnknown(t *testing.T) {
+	p50, p95, total, capped, err := RouteAnalyticsTTFTPercentilesV1(nil)
+	require.NoError(t, err)
+	assert.Nil(t, p50)
+	assert.Nil(t, p95)
+	assert.Zero(t, total)
+	assert.False(t, capped)
+
+	first := make([]int64, len(ttftHistogramUpperBoundsMS))
+	first[0] = 1
+	first[4] = 8
+	first[len(first)-1] = 1
+	second := make([]int64, len(ttftHistogramUpperBoundsMS))
+	second[4] = 10
+	firstJSON, err := common.Marshal(first)
+	require.NoError(t, err)
+	secondJSON, err := common.Marshal(second)
+	require.NoError(t, err)
+
+	p50, p95, total, capped, err = RouteAnalyticsTTFTPercentilesV1([]string{string(firstJSON), string(secondJSON)})
+	require.NoError(t, err)
+	require.NotNil(t, p50)
+	require.NotNil(t, p95)
+	assert.Equal(t, int64(2_000), *p50)
+	assert.Equal(t, int64(2_000), *p95)
+	assert.Equal(t, int64(20), total)
+	assert.False(t, capped)
+
+	lastOnly := make([]int64, len(ttftHistogramUpperBoundsMS))
+	lastOnly[len(lastOnly)-1] = 1
+	lastJSON, err := common.Marshal(lastOnly)
+	require.NoError(t, err)
+	_, p95, total, capped, err = RouteAnalyticsTTFTPercentilesV1([]string{string(lastJSON)})
+	require.NoError(t, err)
+	require.NotNil(t, p95)
+	assert.Equal(t, int64(300_000), *p95)
+	assert.Equal(t, int64(1), total)
+	assert.True(t, capped)
+}

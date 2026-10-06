@@ -1,0 +1,247 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { Funnel, Search, X } from 'lucide-react'
+import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { GroupBadge } from '@/components/group-badge'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { sortGroupNames } from '@/lib/group-visuals'
+import { useSystemConfigStore } from '@/stores/system-config-store'
+
+import {
+  smartRouterEndpointLabelKey,
+  type SmartRouterHealthFilter,
+  type SmartRouterStatusSort,
+} from './health-view-model'
+
+type StatusToolbarProps = {
+  query: string
+  onQueryChange: (value: string) => void
+  status: SmartRouterHealthFilter
+  onStatusChange: (value: SmartRouterHealthFilter) => void
+  group: string
+  onGroupChange: (value: string) => void
+  endpoint: string
+  onEndpointChange: (value: string) => void
+  sort: SmartRouterStatusSort
+  onSortChange: (value: SmartRouterStatusSort) => void
+  groups: string[]
+  endpoints: string[]
+  onClear: () => void
+}
+
+const STATUS_OPTIONS: Array<{
+  value: SmartRouterHealthFilter
+  label: string
+}> = [
+  { value: 'all', label: 'All' },
+  { value: 'attention', label: 'Needs attention' },
+  { value: 'recovering', label: 'Recovering' },
+  { value: 'healthy', label: 'Healthy' },
+  { value: 'pending', label: 'Pending sampling' },
+]
+
+const SORT_OPTIONS: Array<{ value: SmartRouterStatusSort; label: string }> = [
+  { value: 'decision', label: 'Decision priority' },
+  { value: 'price', label: 'Lowest Key price ceiling' },
+  { value: 'model', label: 'Model name' },
+  { value: 'activity', label: 'Recent activity' },
+]
+
+export function StatusToolbar(props: StatusToolbarProps) {
+  const { t } = useTranslation()
+  const groupColors = useSystemConfigStore(
+    (state) => state.config.groupColors ?? {}
+  )
+  const orderedGroups = useMemo(
+    () => sortGroupNames(props.groups, groupColors),
+    [groupColors, props.groups]
+  )
+  const hasFilters = Boolean(
+    props.query || props.status !== 'all' || props.group || props.endpoint
+  )
+
+  return (
+    <div className='bg-background sticky top-0 z-10 -mx-1 space-y-2 border-y px-1 py-2'>
+      <div className='flex min-w-0 flex-wrap gap-2'>
+        <div className='relative min-w-48 flex-1'>
+          <Search
+            className='text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2'
+            aria-hidden='true'
+          />
+          <Input
+            value={props.query}
+            onChange={(event) => props.onQueryChange(event.target.value)}
+            placeholder={t('Search models or groups')}
+            className='pl-8'
+          />
+        </div>
+
+        <div className='hidden min-w-0 flex-wrap gap-2 md:flex'>
+          <NativeSelect
+            value={props.group}
+            onChange={(event) => props.onGroupChange(event.target.value)}
+            aria-label={t('Group filter')}
+          >
+            <NativeSelectOption value=''>{t('All groups')}</NativeSelectOption>
+            {orderedGroups.map((group) => (
+              <NativeSelectOption key={group} value={group}>
+                {group}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+          <NativeSelect
+            value={props.endpoint}
+            onChange={(event) => props.onEndpointChange(event.target.value)}
+            aria-label={t('Endpoint filter')}
+          >
+            <NativeSelectOption value=''>
+              {t('All endpoints')}
+            </NativeSelectOption>
+            {props.endpoints.map((endpoint) => (
+              <NativeSelectOption key={endpoint} value={endpoint}>
+                {t(smartRouterEndpointLabelKey(endpoint))}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+          <NativeSelect
+            value={props.sort}
+            onChange={(event) =>
+              props.onSortChange(event.target.value as SmartRouterStatusSort)
+            }
+            aria-label={t('Sort routes')}
+          >
+            {SORT_OPTIONS.map((option) => (
+              <NativeSelectOption key={option.value} value={option.value}>
+                {t(option.label)}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        </div>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                type='button'
+                variant='outline'
+                size='icon'
+                className='md:hidden'
+                aria-label={t('Filters and sorting')}
+              />
+            }
+          >
+            <Funnel />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align='end'
+            className='max-h-[min(70vh,28rem)] w-64 overflow-y-auto'
+          >
+            <DropdownMenuLabel>{t('Group')}</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={props.group}
+              onValueChange={(value) => props.onGroupChange(String(value))}
+            >
+              <DropdownMenuRadioItem value=''>
+                {t('All groups')}
+              </DropdownMenuRadioItem>
+              {orderedGroups.map((group) => (
+                <DropdownMenuRadioItem key={group} value={group}>
+                  <GroupBadge group={group} copyable={false} size='sm' />
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>{t('Endpoint')}</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={props.endpoint}
+              onValueChange={(value) => props.onEndpointChange(String(value))}
+            >
+              <DropdownMenuRadioItem value=''>
+                {t('All endpoints')}
+              </DropdownMenuRadioItem>
+              {props.endpoints.map((endpoint) => (
+                <DropdownMenuRadioItem key={endpoint} value={endpoint}>
+                  {t(smartRouterEndpointLabelKey(endpoint))}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>{t('Sort')}</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={props.sort}
+              onValueChange={(value) =>
+                props.onSortChange(String(value) as SmartRouterStatusSort)
+              }
+            >
+              {SORT_OPTIONS.map((option) => (
+                <DropdownMenuRadioItem key={option.value} value={option.value}>
+                  {t(option.label)}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {hasFilters ? (
+          <Button
+            type='button'
+            variant='ghost'
+            size='icon'
+            aria-label={t('Clear filters')}
+            title={t('Clear filters')}
+            onClick={props.onClear}
+          >
+            <X />
+          </Button>
+        ) : null}
+      </div>
+
+      <div
+        className='flex max-w-full gap-1 overflow-x-auto pb-0.5'
+        aria-label={t('Health status filter')}
+      >
+        {STATUS_OPTIONS.map((option) => (
+          <Button
+            key={option.value}
+            type='button'
+            size='sm'
+            variant={props.status === option.value ? 'secondary' : 'ghost'}
+            aria-pressed={props.status === option.value}
+            className='shrink-0'
+            onClick={() => props.onStatusChange(option.value)}
+          >
+            {t(option.label)}
+          </Button>
+        ))}
+      </div>
+    </div>
+  )
+}

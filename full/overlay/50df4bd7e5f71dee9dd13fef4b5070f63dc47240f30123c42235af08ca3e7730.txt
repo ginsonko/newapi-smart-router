@@ -1,0 +1,90 @@
+package controller
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func controllerAnalyticsDigestV1(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func setupSmartRouterAnalyticsControllerDBV1(t *testing.T) {
+	t.Helper()
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RouteAnalyticsDimensionV1{},
+		&model.RouteAnalyticsBucketV1{},
+		&model.KeyUsageAnalyticsBucketV1{},
+		&model.RouteAnalyticsWorkerStateV1{},
+	))
+}
+
+func TestSmartRouterKeyUsageAnalyticsEnforcesExactOwnerWithoutAdminBypass(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupSmartRouterAnalyticsControllerDBV1(t)
+	require.NoError(t, model.DB.Create(&model.Token{Id: 42, UserId: 7, Key: "owner-secret", Name: "owner"}).Error)
+	now := time.Now()
+	bucketStartMS := now.UnixMilli() - now.UnixMilli()%int64(5*time.Minute/time.Millisecond)
+	require.NoError(t, model.DB.Create(&model.KeyUsageAnalyticsBucketV1{
+		BucketKey: controllerAnalyticsDigestV1("owner-bucket"), UserID: 7, TokenID: 42,
+		BucketStartMS: bucketStartMS, Granularity: model.RouteAnalyticsGranularity5m,
+		Model: "gpt-5.6-sol", Endpoint: "openai-responses-v1", LogicalRequests: 1, Successes: 1,
+		PositiveQuota: 500, InputTokens: 1_000, CacheReadTokens: 900, TTFTHistogramJSON: `[]`,
+	}).Error)
+	require.NoError(t, model.DB.Create(&model.RouteAnalyticsWorkerStateV1{
+		ID: model.RouteAnalyticsWorkerStateGlobalID, CoverageStartMS: now.Add(-time.Hour).UnixMilli(),
+		CoverageEndMS: now.Add(-time.Minute).UnixMilli(), FreshnessAtMS: now.Add(-time.Minute).UnixMilli(),
+	}).Error)
+
+	ownerRecorder := httptest.NewRecorder()
+	ownerContext, _ := gin.CreateTestContext(ownerRecorder)
+	ownerContext.Set("id", 7)
+	ownerContext.Request = httptest.NewRequest(http.MethodGet, "/api/smart-router/usage-analytics?token_id=42&range=1h", nil)
+	GetSmartRouterKeyUsageAnalytics(ownerContext)
+	assert.Equal(t, http.StatusOK, ownerRecorder.Code)
+	assert.Contains(t, ownerRecorder.Body.String(), `"success":true`)
+	assert.Contains(t, ownerRecorder.Body.String(), `"logical_requests":1`)
+	assert.NotContains(t, ownerRecorder.Body.String(), "owner-secret")
+
+	otherRecorder := httptest.NewRecorder()
+	otherContext, _ := gin.CreateTestContext(otherRecorder)
+	otherContext.Set("id", 8)
+	otherContext.Set("role", 100)
+	otherContext.Request = httptest.NewRequest(http.MethodGet, "/api/smart-router/usage-analytics?token_id=42&range=1h", nil)
+	GetSmartRouterKeyUsageAnalytics(otherContext)
+	assert.Equal(t, http.StatusNotFound, otherRecorder.Code)
+	assert.Contains(t, otherRecorder.Body.String(), "key usage analytics were not found")
+	assert.NotContains(t, otherRecorder.Body.String(), `"data"`)
+}
+
+func TestSmartRouterRouteAnalyticsDoesNotExposeIDEnumerationDifferences(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupSmartRouterAnalyticsControllerDBV1(t)
+
+	request := func(detailID string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Params = gin.Params{{Key: "detail_id", Value: detailID}}
+		context.Request = httptest.NewRequest(http.MethodGet, "/api/smart-router/leaderboard/routes/"+detailID+"/analytics?range=1h", nil)
+		GetSmartRouterRouteAnalytics(context)
+		return recorder
+	}
+	invalid := request("invalid")
+	unknown := request(controllerAnalyticsDigestV1("unknown-detail")[:32])
+	assert.Equal(t, http.StatusNotFound, invalid.Code)
+	assert.Equal(t, http.StatusNotFound, unknown.Code)
+	assert.Equal(t, invalid.Body.String(), unknown.Body.String())
+	assert.NotContains(t, invalid.Body.String(), "channel")
+	assert.NotContains(t, invalid.Body.String(), "fingerprint")
+}

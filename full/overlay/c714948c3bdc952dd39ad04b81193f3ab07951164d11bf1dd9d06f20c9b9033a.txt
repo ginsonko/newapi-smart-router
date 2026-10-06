@@ -1,0 +1,111 @@
+package model
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/types"
+	"maps"
+	"sort"
+)
+
+// PublicParameterPrices exposes independent public price schedules. Its IDs
+// hash only public rows, never channel identities or procurement fields.
+// Scope precedence stays exact without a Cartesian resolution/quality grid.
+func PublicParameterPrices(modelName, group string, channelIDs []int) []types.ParameterPublicPrice {
+	contract := billing_setting.GetParameterPricingContract()
+	applicable := []billing_setting.ParameterPriceRule{}
+	for _, rule := range contract.Rules {
+		if rule.Model == modelName && (rule.Group == group || rule.Group == "*") {
+			applicable = append(applicable, rule)
+		}
+	}
+	schedules := map[string][]types.ParameterPublicPrice{}
+	seenChannels := map[int]bool{}
+	for _, channelID := range channelIDs {
+		if channelID <= 0 || seenChannels[channelID] {
+			continue
+		}
+		seenChannels[channelID] = true
+		rows := []types.ParameterPublicPrice{}
+		for _, rule := range applicable {
+			if rule.ChannelID != 0 && rule.ChannelID != channelID {
+				continue
+			}
+			scope := 0
+			if rule.Group == group {
+				scope += 2
+			}
+			if rule.ChannelID != 0 {
+				scope++
+			}
+			rows = append(rows, types.ParameterPublicPrice{Revision: contract.Revision, Priority: scope*3 + len(rule.Conditions), Model: modelName, Group: group, Unit: rule.Unit, Currency: rule.Currency, UnitPrice: rule.UnitPrice, Conditions: maps.Clone(rule.Conditions), FixedDurationSeconds: rule.FixedDurationSeconds})
+		}
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].Priority != rows[j].Priority {
+				return rows[i].Priority > rows[j].Priority
+			}
+			a, _ := common.Marshal(rows[i])
+			b, _ := common.Marshal(rows[j])
+			return string(a) < string(b)
+		})
+		// A higher-priority subset condition completely shadows a row. There
+		// are only four subset lookups with the two supported dimensions.
+		covered := map[string]int{}
+		effective := make([]types.ParameterPublicPrice, 0, len(rows))
+		for _, row := range rows {
+			resolution, quality := row.Conditions["resolution"], row.Conditions["quality"]
+			keys := []string{"*"}
+			if resolution != "" {
+				keys = append(keys, "r:"+resolution)
+			}
+			if quality != "" {
+				keys = append(keys, "q:"+quality)
+			}
+			own := "*"
+			if resolution != "" {
+				own = "r:" + resolution
+			}
+			if quality != "" {
+				own = "q:" + quality
+			}
+			if resolution != "" && quality != "" {
+				raw, _ := common.Marshal([]string{resolution, quality})
+				own = "b:" + string(raw)
+				keys = append(keys, own)
+			}
+			shadowed := false
+			for _, key := range keys {
+				if priority, ok := covered[key]; ok && priority > row.Priority {
+					shadowed = true
+					break
+				}
+			}
+			if shadowed {
+				continue
+			}
+			effective = append(effective, row)
+			if old, ok := covered[own]; !ok || row.Priority > old {
+				covered[own] = row.Priority
+			}
+		}
+		if len(effective) == 0 {
+			continue
+		}
+		raw, _ := common.Marshal(effective)
+		id := common.Sha1(raw)
+		for i := range effective {
+			effective[i].ScheduleID = id
+		}
+		schedules[id] = effective
+	}
+	ids := make([]string, 0, len(schedules))
+	for id := range schedules {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	result := []types.ParameterPublicPrice{}
+	for _, id := range ids {
+		result = append(result, schedules[id]...)
+	}
+	return result
+}

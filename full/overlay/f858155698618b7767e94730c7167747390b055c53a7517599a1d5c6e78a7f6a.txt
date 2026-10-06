@@ -1,0 +1,93 @@
+package common
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type observedRequestBody struct {
+	io.ReadCloser
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (b *observedRequestBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(func() { close(b.closed) })
+	return err
+}
+
+func TestOutboundBodyReleasedWhileResponseRemainsOpenAndInputReplays(t *testing.T) {
+	previous := common.GetDiskCacheConfig()
+	t.Cleanup(func() { common.SetDiskCacheConfig(previous) })
+	common.SetDiskCacheConfig(common.DiskCacheConfig{Enabled: false, ThresholdMB: 10, MaxSizeMB: 128})
+	payload := []byte(`{"model":"fixture","input":"` + strings.Repeat("context ", 8192) + `"}`)
+	inbound, err := common.CreateBodyStorage(payload)
+	require.NoError(t, err)
+	defer inbound.Close()
+	base := common.GetDiskCacheStats()
+	finishResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actual, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, payload, actual)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: pending\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-finishResponse:
+		case <-r.Context().Done():
+		}
+	}))
+	defer func() { close(finishResponse); server.Close() }()
+	for attempt := 0; attempt < 2; attempt++ {
+		_, err = inbound.Seek(0, io.SeekStart)
+		require.NoError(t, err)
+		replay, err := io.ReadAll(common.ReaderOnly(inbound))
+		require.NoError(t, err)
+		body, size, closer, err := NewOutboundJSONBody(replay)
+		require.NoError(t, err)
+		request, err := http.NewRequest(http.MethodPost, server.URL, body)
+		require.NoError(t, err)
+		request.ContentLength = size
+		observed := &observedRequestBody{ReadCloser: request.Body, closed: make(chan struct{})}
+		request.Body = observed
+		response, err := server.Client().Do(request)
+		require.NoError(t, err)
+		select {
+		case <-observed.closed:
+		case <-time.After(3 * time.Second):
+			t.Fatal("transport did not release the sent request body")
+		}
+		stats := common.GetDiskCacheStats()
+		assert.Equal(t, base.ActiveMemoryBuffers, stats.ActiveMemoryBuffers, "only reusable input remains while response is open")
+		assert.Equal(t, base.CurrentMemoryUsageBytes, stats.CurrentMemoryUsageBytes)
+		_, err = closer.(common.BodyStorage).Bytes()
+		assert.ErrorIs(t, err, common.ErrStorageClosed)
+		require.NoError(t, closer.Close(), "caller cleanup stays idempotent")
+		require.NoError(t, response.Body.Close())
+		original, err := inbound.Bytes()
+		require.NoError(t, err)
+		assert.Equal(t, payload, original, "a completed attempt must not close the input required for failover")
+	}
+}
+
+func TestOutboundBodyCallerCleanupBeforeTransport(t *testing.T) {
+	before := common.GetDiskCacheStats()
+	_, _, closer, err := NewOutboundJSONBody([]byte(`{"input":"fixture"}`))
+	require.NoError(t, err)
+	require.NoError(t, closer.Close())
+	require.NoError(t, closer.Close())
+	after := common.GetDiskCacheStats()
+	assert.Equal(t, before.ActiveMemoryBuffers, after.ActiveMemoryBuffers)
+	assert.Equal(t, before.CurrentMemoryUsageBytes, after.CurrentMemoryUsageBytes)
+}

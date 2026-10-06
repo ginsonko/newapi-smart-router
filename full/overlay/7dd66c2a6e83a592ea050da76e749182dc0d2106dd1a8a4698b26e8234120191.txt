@@ -1,0 +1,67 @@
+package controller
+
+import (
+	"bytes"
+	"io"
+	"mime"
+	"mime/multipart"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestImageRouteBodyNormalizesStreamWithoutLosingRequestFields(t *testing.T) {
+	var output bytes.Buffer
+	contentType, err := normalizeImageRouteBody(strings.NewReader(`{"model":"image","stream":true,"partial_images":3,"seed":9007199254740993,"quality":"high","n":2,"extension":{"foo":"bar"}}`), &output, "application/json")
+	require.NoError(t, err)
+	assert.Equal(t, "application/json", contentType)
+	assert.Contains(t, output.String(), `"stream":false`)
+	assert.NotContains(t, output.String(), "partial_images")
+	assert.Contains(t, output.String(), `9007199254740993`)
+	assert.Contains(t, output.String(), `"quality":"high"`)
+	assert.Contains(t, output.String(), `"extension":{"foo":"bar"}`)
+	var payload map[string]any
+	require.NoError(t, common.Unmarshal(output.Bytes(), &payload))
+	assert.EqualValues(t, 2, payload["n"])
+}
+
+func TestImageRouteMultipartRetainsImagesAndUnknownFields(t *testing.T) {
+	var input bytes.Buffer
+	writer := multipart.NewWriter(&input)
+	require.NoError(t, writer.WriteField("stream", "true"))
+	require.NoError(t, writer.WriteField("partial_images", "2"))
+	require.NoError(t, writer.WriteField("model", "image"))
+	require.NoError(t, writer.WriteField("new_parameter", "retained"))
+	part, err := writer.CreateFormFile("image[]", "ref.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte{0, 1, 2, 255})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	var output bytes.Buffer
+	contentType, err := normalizeImageRouteBody(&input, &output, writer.FormDataContentType())
+	require.NoError(t, err)
+	_, parameters, err := mime.ParseMediaType(contentType)
+	require.NoError(t, err)
+	reader := multipart.NewReader(&output, parameters["boundary"])
+	values := map[string][]byte{}
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		value, err := io.ReadAll(part)
+		require.NoError(t, err)
+		values[part.FormName()] = value
+		if part.FormName() == "image[]" {
+			assert.Equal(t, "ref.png", part.FileName())
+		}
+	}
+	assert.Equal(t, []byte{0, 1, 2, 255}, values["image[]"])
+	assert.Equal(t, "false", string(values["stream"]))
+	assert.Equal(t, "retained", string(values["new_parameter"]))
+	assert.NotContains(t, values, "partial_images")
+}

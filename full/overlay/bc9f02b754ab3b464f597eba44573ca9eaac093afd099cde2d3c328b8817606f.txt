@@ -1,0 +1,157 @@
+package controller
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMediaErrorAbortsWithOneStructuredResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	mediaError(context, http.StatusForbidden, "group unavailable")
+
+	assert.True(t, context.IsAborted())
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+	assert.Equal(t, false, body["success"])
+	assert.Equal(t, "group unavailable", body["message"])
+}
+
+func TestMediaModeContractMapsEveryStudioMode(t *testing.T) {
+	tests := []struct {
+		mode         string
+		path         string
+		endpoint     string
+		endpointType constant.EndpointType
+	}{
+		{mode: "images", path: "/v1/images/generations", endpoint: service.SmartEndpointImages, endpointType: constant.EndpointTypeImageGeneration},
+		{mode: "image-edits", path: "/v1/images/edits", endpoint: "openai-images-edits-v1", endpointType: constant.EndpointTypeImageGeneration},
+		{mode: "videos", path: "/v1/videos", endpoint: service.SmartEndpointVideos, endpointType: constant.EndpointTypeOpenAIVideo},
+		{mode: "speech", path: "/v1/audio/speech", endpoint: "openai-audio-speech-v1", endpointType: constant.EndpointTypeAudioSpeech},
+		{mode: "transcriptions", path: "/v1/audio/transcriptions", endpoint: "openai-audio-transcriptions-v1", endpointType: constant.EndpointTypeAudioTranscription},
+		{mode: "translations", path: "/v1/audio/translations", endpoint: "openai-audio-translations-v1", endpointType: constant.EndpointTypeAudioTranslation},
+	}
+
+	for _, test := range tests {
+		t.Run(test.mode, func(t *testing.T) {
+			contract, ok := mediaContractForMode(test.mode)
+			require.True(t, ok)
+			assert.Equal(t, test.path, contract.Path)
+			assert.Equal(t, test.endpoint, contract.Endpoint)
+			assert.Equal(t, test.endpointType, contract.EndpointType)
+		})
+	}
+
+	_, ok := mediaContractForMode("unknown")
+	assert.False(t, ok, "an unknown mode must not inherit video semantics")
+}
+
+func TestMediaCatalogKeepsTextAndImageModelsOutOfVideoMode(t *testing.T) {
+	video, ok := mediaContractForMode("videos")
+	require.True(t, ok)
+	image, ok := mediaContractForMode("images")
+	require.True(t, ok)
+
+	assert.False(t, channelSupportsMediaContract(model.AbilityWithChannel{
+		Ability: model.Ability{Model: "gpt-5.6-sol"}, ChannelType: constant.ChannelTypeOpenAI,
+	}, video))
+	assert.False(t, channelSupportsMediaContract(model.AbilityWithChannel{
+		Ability: model.Ability{Model: "gpt-image-2"}, ChannelType: constant.ChannelTypeOpenAI,
+	}, video))
+	assert.True(t, channelSupportsMediaContract(model.AbilityWithChannel{
+		Ability: model.Ability{Model: "gpt-image-2"}, ChannelType: constant.ChannelTypeOpenAI,
+	}, image))
+	assert.True(t, channelSupportsMediaContract(model.AbilityWithChannel{
+		Ability: model.Ability{Model: "sora-2"}, ChannelType: constant.ChannelTypeSora,
+	}, video))
+}
+
+func TestAnonymousMediaRouteCapabilitiesAreDeduplicatedWithoutRouteIdentity(t *testing.T) {
+	imageOnly := mediaservice.Capability{
+		ReferenceImage: true, ImageRoles: []string{"first_frame", "reference"}, MaxImages: 2,
+	}
+	withAudio := mediaservice.Capability{
+		ReferenceImage: true, ReferenceAudio: true,
+		ImageRoles: []string{"reference"}, AudioRoles: []string{"driving_audio"},
+		MaxImages: 1, MaxAudios: 1,
+	}
+
+	result := anonymousMediaRouteCapabilities([]mediaservice.Capability{withAudio, imageOnly, withAudio})
+
+	require.Len(t, result, 2)
+	assert.Contains(t, result, imageOnly)
+	assert.Contains(t, result, withAudio)
+}
+
+func TestAvailableMediaCapabilityKeepsUnknownRoutePermissive(t *testing.T) {
+	strict := mediaservice.Capability{
+		ReferenceImage: true,
+		ImageRoles:     []string{"reference"},
+		MaxImages:      1,
+		AspectRatios:   []string{"16:9"},
+		Resolutions:    []string{"720p"},
+		Duration:       mediaservice.DurationCapability{Mode: "fixed", Fixed: 5, Default: 5},
+		OutputCount:    mediaservice.OutputCountCapability{Min: 1, Max: 1, Default: 1},
+	}
+	unknown := mediaservice.Capability{
+		ReferenceImage: true,
+		ReferenceVideo: true,
+		ReferenceAudio: true,
+	}
+
+	available := mergeMediaCapabilities([]mediaservice.Capability{strict, unknown}, false)
+
+	assert.True(t, available.ReferenceImage)
+	assert.True(t, available.ReferenceVideo)
+	assert.True(t, available.ReferenceAudio)
+	assert.Empty(t, available.ImageRoles)
+	assert.Zero(t, available.MaxImages)
+	assert.Zero(t, available.MaxVideos)
+	assert.Zero(t, available.MaxAudios)
+	assert.Empty(t, available.AspectRatios)
+	assert.Empty(t, available.Resolutions)
+	assert.Empty(t, available.Duration.Mode)
+	assert.Zero(t, available.OutputCount.Max)
+}
+
+func TestMediaEventConnectionGateEnforcesGlobalAndUserLimits(t *testing.T) {
+	gate := mediaEventConnectionGate{}
+	require.True(t, gate.acquire(1, 2, 1))
+	assert.False(t, gate.acquire(1, 2, 1), "one user cannot occupy more than its allowance")
+	require.True(t, gate.acquire(2, 2, 1))
+	assert.False(t, gate.acquire(3, 2, 1), "the process-wide limit remains authoritative")
+
+	gate.release(1)
+	require.True(t, gate.acquire(3, 2, 1))
+	gate.release(2)
+	gate.release(3)
+	assert.Zero(t, gate.total)
+}
+
+func TestResolveRequestedMediaGroupHonorsUserBoundary(t *testing.T) {
+	usable := map[string]string{"cheap": "cheap", "stable": "stable"}
+
+	group, err := resolveRequestedMediaGroup("cheap", "", usable)
+	require.NoError(t, err)
+	assert.Equal(t, "cheap", group)
+
+	group, err = resolveRequestedMediaGroup("cheap", "stable", usable)
+	require.NoError(t, err)
+	assert.Equal(t, "stable", group)
+
+	_, err = resolveRequestedMediaGroup("cheap", "private", usable)
+	assert.Error(t, err)
+}

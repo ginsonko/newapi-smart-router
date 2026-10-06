@@ -1,0 +1,499 @@
+/*
+Copyright (C) 2025 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Button,
+  Card,
+  Input,
+  InputNumber,
+  Modal,
+  Space,
+  Spin,
+  Table,
+  Tabs,
+  Typography,
+} from '@douyinfe/semi-ui';
+import { Copy, Eye, WalletCards } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { API, renderQuota, showError, showSuccess } from '../../helpers';
+import {
+  displayAmountToQuota,
+  quotaToDisplayAmount,
+} from '../../helpers/quota';
+
+const { Text } = Typography;
+
+function idempotencyHeaders() {
+  const value =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return { 'Idempotency-Key': `commission-classic-${value}` };
+}
+
+const CommissionWalletPanel = () => {
+  const { t } = useTranslation();
+  const [summary, setSummary] = useState(null);
+  const [ledger, setLedger] = useState([]);
+  const [invitees, setInvitees] = useState([]);
+  const [ledgerPage, setLedgerPage] = useState(1);
+  const [ledgerTotal, setLedgerTotal] = useState(0);
+  const [inviteesPage, setInviteesPage] = useState(1);
+  const [inviteesTotal, setInviteesTotal] = useState(0);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [unsupported, setUnsupported] = useState(false);
+  const [detailsVisible, setDetailsVisible] = useState(false);
+  const [transferVisible, setTransferVisible] = useState(false);
+  const [bindVisible, setBindVisible] = useState(false);
+  const [transferAmount, setTransferAmount] = useState('');
+  const [invitationCode, setInvitationCode] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [summaryRes, ledgerRes, inviteesRes] = await Promise.all([
+        API.get('/api/commission/me'),
+        API.get('/api/commission/me/ledger?p=1&page_size=50'),
+        API.get('/api/commission/me/invitees?p=1&page_size=100'),
+      ]);
+      if (!summaryRes.data.success)
+        throw new Error(summaryRes.data.message || t('加载佣金账户失败'));
+      if (!ledgerRes.data.success)
+        throw new Error(ledgerRes.data.message || t('加载佣金账户失败'));
+      if (!inviteesRes.data.success)
+        throw new Error(inviteesRes.data.message || t('加载佣金账户失败'));
+      setSummary(summaryRes.data.data);
+      setLedger(ledgerRes.data.data?.items || []);
+      setLedgerPage(1);
+      setLedgerTotal(ledgerRes.data.data?.total || 0);
+      setInvitees(inviteesRes.data.data?.items || []);
+      setInviteesPage(1);
+      setInviteesTotal(inviteesRes.data.data?.total || 0);
+      setUnsupported(false);
+    } catch (error) {
+      if (error?.response?.status === 404) setUnsupported(true);
+      else showError(error.message || t('加载佣金账户失败'));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  const loadLedgerPage = async (page) => {
+    setDetailsLoading(true);
+    try {
+      const response = await API.get(
+        `/api/commission/me/ledger?p=${page}&page_size=50`,
+      );
+      if (!response.data.success) {
+        throw new Error(response.data.message || t('加载佣金账户失败'));
+      }
+      setLedger(response.data.data?.items || []);
+      setLedgerPage(response.data.data?.page || page);
+      setLedgerTotal(response.data.data?.total || 0);
+    } catch (error) {
+      showError(
+        error.response?.data?.message || error.message || t('加载佣金账户失败'),
+      );
+    } finally {
+      setDetailsLoading(false);
+    }
+  };
+
+  const loadInviteesPage = async (page) => {
+    setDetailsLoading(true);
+    try {
+      const response = await API.get(
+        `/api/commission/me/invitees?p=${page}&page_size=100`,
+      );
+      if (!response.data.success) {
+        throw new Error(response.data.message || t('加载佣金账户失败'));
+      }
+      setInvitees(response.data.data?.items || []);
+      setInviteesPage(response.data.data?.page || page);
+      setInviteesTotal(response.data.data?.total || 0);
+    } catch (error) {
+      showError(
+        error.response?.data?.message || error.message || t('加载佣金账户失败'),
+      );
+    } finally {
+      setDetailsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const invitationLink = useMemo(() => {
+    if (!summary?.invitation_code) return '';
+    return `${window.location.origin}/register?aff=${encodeURIComponent(summary.invitation_code)}`;
+  }, [summary?.invitation_code]);
+  const amountQuota = displayAmountToQuota(transferAmount);
+  const canTransfer =
+    amountQuota > 0 &&
+    amountQuota <= Number(summary?.commission_available_quota || 0);
+  const hasInviter = Number(summary?.inviter_id || 0) > 0;
+
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(invitationLink);
+      showSuccess(t('邀请链接已复制'));
+    } catch {
+      showError(t('复制邀请链接失败'));
+    }
+  };
+  const transfer = async () => {
+    if (!canTransfer || !summary?.account_version) return;
+    setSubmitting(true);
+    try {
+      const response = await API.post(
+        '/api/commission/me/transfer',
+        {
+          amount_quota: amountQuota,
+          expected_version: summary.account_version,
+        },
+        { headers: idempotencyHeaders() },
+      );
+      if (!response.data.success)
+        throw new Error(response.data.message || t('佣金转入余额失败'));
+      showSuccess(t('佣金已转入普通余额'));
+      setTransferVisible(false);
+      await refresh();
+    } catch (error) {
+      showError(error.message || t('佣金转入余额失败'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  const bind = async () => {
+    if (!invitationCode.trim()) return;
+    setSubmitting(true);
+    try {
+      const response = await API.post(
+        '/api/commission/me/inviter',
+        { aff_code: invitationCode.trim() },
+        { headers: idempotencyHeaders() },
+      );
+      if (!response.data.success)
+        throw new Error(response.data.message || t('绑定邀请码失败'));
+      showSuccess(t('邀请码绑定成功'));
+      setBindVisible(false);
+      setInvitationCode('');
+      await refresh();
+    } catch (error) {
+      showError(error.message || t('绑定邀请码失败'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  if (unsupported) return null;
+  if (loading) return <Spin spinning />;
+
+  const ledgerColumns = [
+    {
+      title: t('时间'),
+      dataIndex: 'created_at',
+      render: (value) => new Date(value).toLocaleString(),
+    },
+    {
+      title: t('事项'),
+      render: (_, row) => (
+        <>
+          <div>{t(row.event_type)}</div>
+          <div className='mt-1 space-y-0.5 text-xs text-gray-500'>
+            {row.consumer_user_id > 0 && (
+              <div>
+                {t('消费用户')} #{row.consumer_user_id}
+              </div>
+            )}
+            {row.eligible_ordinary_quota !== 0 && (
+              <div>
+                {t('参与返佣的消费')}：
+                {renderQuota(row.eligible_ordinary_quota)} · {t('佣金比例')}{' '}
+                {(Number(row.rate_bps || 0) / 100).toFixed(2)}% ·{' '}
+                {t('所在阶梯起点')} {renderQuota(row.tier_threshold || 0)}
+              </div>
+            )}
+            {row.user_quota_delta !== 0 && (
+              <div>
+                {t('转入普通余额')}：{renderQuota(row.user_quota_delta)}
+              </div>
+            )}
+            {row.actor_user_id > 0 && (
+              <div>
+                {t('操作人用户 ID')}：#{row.actor_user_id}
+              </div>
+            )}
+            <div>{row.reason_code || '-'}</div>
+          </div>
+        </>
+      ),
+    },
+    {
+      title: t('变化'),
+      render: (_, row) =>
+        renderQuota(
+          row.available_delta + row.pending_capacity_delta - row.debt_delta,
+        ),
+    },
+    { title: t('余额'), dataIndex: 'available_after', render: renderQuota },
+  ];
+  const inviteeColumns = [
+    {
+      title: t('被邀请用户 ID'),
+      dataIndex: 'user_id',
+      render: (value) => `#${value}`,
+    },
+    {
+      title: t('注册时间'),
+      dataIndex: 'created_at',
+      render: (value) => new Date(value * 1000).toLocaleString(),
+    },
+  ];
+  const ledgerPages = Math.max(1, Math.ceil(ledgerTotal / 50));
+  const inviteePages = Math.max(1, Math.ceil(inviteesTotal / 100));
+
+  return (
+    <>
+      <Card className='!rounded-lg shadow-sm border-0'>
+        <div className='flex flex-wrap justify-between gap-3 mb-4'>
+          <div>
+            <Typography.Title heading={5}>{t('消费佣金')}</Typography.Title>
+            <Text type='tertiary' size='small'>
+              {t(
+                '每个人都可以邀请用户；佣金单独记账，需手动转入普通余额后才能使用。',
+              )}
+            </Text>
+          </div>
+          <Space wrap>
+            <Button
+              icon={<Eye size={15} />}
+              onClick={() => setDetailsVisible(true)}
+            >
+              {t('查看账本')}
+            </Button>
+            {!hasInviter && (
+              <Button onClick={() => setBindVisible(true)}>
+                {t('绑定邀请码')}
+              </Button>
+            )}
+            <Button
+              type='primary'
+              theme='solid'
+              icon={<WalletCards size={15} />}
+              disabled={!summary?.commission_available_quota}
+              onClick={() => {
+                setTransferAmount(
+                  String(
+                    quotaToDisplayAmount(
+                      summary?.commission_available_quota || 0,
+                    ),
+                  ),
+                );
+                setTransferVisible(true);
+              }}
+            >
+              {t('佣金转入余额')}
+            </Button>
+          </Space>
+        </div>
+        <div className='grid grid-cols-2 md:grid-cols-4 gap-3'>
+          {[
+            [
+              t('可用佣金'),
+              renderQuota(summary?.commission_available_quota || 0),
+            ],
+            [t('累计获得'), renderQuota(summary?.lifetime_earned_quota || 0)],
+            [t('已邀请用户'), summary?.invited_users || 0],
+            [
+              t('当前阶梯'),
+              `${(Number(summary?.current_rate_bps || 0) / 100).toFixed(2)}%`,
+            ],
+          ].map(([label, value]) => (
+            <div key={label} className='rounded-lg border p-3'>
+              <Text type='tertiary' size='small'>
+                {label}
+              </Text>
+              <div className='font-semibold mt-1'>{value}</div>
+            </div>
+          ))}
+        </div>
+        <div className='flex flex-wrap items-center justify-between gap-2 mt-4 rounded-lg border p-3'>
+          <div className='flex flex-wrap gap-x-8 gap-y-2'>
+            <div>
+              <Text type='tertiary' size='small'>
+                {t('我的邀请码')}
+              </Text>
+              <div className='font-mono font-semibold'>
+                {summary?.invitation_code || '-'}
+              </div>
+            </div>
+            <div>
+              <Text type='tertiary' size='small'>
+                {t('当前邀请人用户 ID')}
+              </Text>
+              <div className='font-semibold'>
+                {hasInviter ? `#${summary.inviter_id}` : t('未绑定')}
+              </div>
+            </div>
+          </div>
+          <Button
+            icon={<Copy size={15} />}
+            disabled={!invitationLink}
+            onClick={copyLink}
+          >
+            {t('复制邀请链接')}
+          </Button>
+        </div>
+      </Card>
+      <Modal
+        visible={transferVisible}
+        title={t('佣金转入余额')}
+        onCancel={() => setTransferVisible(false)}
+        onOk={transfer}
+        confirmLoading={submitting}
+        okButtonProps={{ disabled: !canTransfer }}
+        centered
+      >
+        <div className='space-y-3'>
+          <Text type='tertiary'>
+            {t('转入后会立即成为普通 API 余额，并记录在佣金账本中。')}
+          </Text>
+          <InputNumber
+            value={transferAmount}
+            min={0}
+            max={quotaToDisplayAmount(summary?.commission_available_quota || 0)}
+            precision={6}
+            onChange={setTransferAmount}
+            style={{ width: '100%' }}
+          />
+        </div>
+      </Modal>
+      <Modal
+        visible={bindVisible}
+        title={t('绑定邀请码')}
+        onCancel={() => setBindVisible(false)}
+        onOk={bind}
+        confirmLoading={submitting}
+        okButtonProps={{ disabled: !invitationCode.trim() }}
+        centered
+      >
+        <div className='space-y-3'>
+          <Text type='tertiary'>
+            {t('未绑定邀请人的账户可绑定一次邀请码。')}
+          </Text>
+          <Input
+            value={invitationCode}
+            maxLength={32}
+            onChange={setInvitationCode}
+          />
+        </div>
+      </Modal>
+      <Modal
+        visible={detailsVisible}
+        title={t('佣金明细')}
+        onCancel={() => setDetailsVisible(false)}
+        footer={null}
+        width={760}
+        centered
+      >
+        <Tabs type='line'>
+          <Tabs.TabPane tab={t('佣金账本')} itemKey='ledger'>
+            <Table
+              columns={ledgerColumns}
+              dataSource={ledger}
+              pagination={false}
+              rowKey='event_uuid'
+            />
+            {ledgerPages > 1 && (
+              <div className='mt-3 flex items-center justify-between gap-3'>
+                <Button
+                  disabled={ledgerPage <= 1 || detailsLoading}
+                  onClick={() => loadLedgerPage(ledgerPage - 1)}
+                >
+                  {t('上一页')}
+                </Button>
+                <Text type='tertiary' size='small'>
+                  {t('第 {{current}} 页，共 {{total}} 页', {
+                    current: ledgerPage,
+                    total: ledgerPages,
+                  })}
+                </Text>
+                <Button
+                  disabled={ledgerPage >= ledgerPages || detailsLoading}
+                  onClick={() => loadLedgerPage(ledgerPage + 1)}
+                >
+                  {t('下一页')}
+                </Button>
+              </div>
+            )}
+          </Tabs.TabPane>
+          <Tabs.TabPane tab={t('被邀请用户')} itemKey='invitees'>
+            <Table
+              columns={inviteeColumns}
+              dataSource={invitees}
+              pagination={false}
+              rowKey='user_id'
+            />
+            {inviteePages > 1 && (
+              <div className='mt-3 flex items-center justify-between gap-3'>
+                <Button
+                  disabled={inviteesPage <= 1 || detailsLoading}
+                  onClick={() => loadInviteesPage(inviteesPage - 1)}
+                >
+                  {t('上一页')}
+                </Button>
+                <Text type='tertiary' size='small'>
+                  {t('第 {{current}} 页，共 {{total}} 页', {
+                    current: inviteesPage,
+                    total: inviteePages,
+                  })}
+                </Text>
+                <Button
+                  disabled={inviteesPage >= inviteePages || detailsLoading}
+                  onClick={() => loadInviteesPage(inviteesPage + 1)}
+                >
+                  {t('下一页')}
+                </Button>
+              </div>
+            )}
+          </Tabs.TabPane>
+          <Tabs.TabPane tab={t('阶梯规则')} itemKey='tiers'>
+            {(summary?.tiers || []).map((tier) => (
+              <div
+                key={`${tier.threshold_quota}-${tier.rate_bps}`}
+                className='flex justify-between rounded-lg border p-3 mb-2'
+              >
+                <span>
+                  {renderQuota(tier.threshold_quota)} {t('起')}
+                </span>
+                <strong>{(tier.rate_bps / 100).toFixed(2)}%</strong>
+              </div>
+            ))}
+          </Tabs.TabPane>
+        </Tabs>
+      </Modal>
+    </>
+  );
+};
+
+export default CommissionWalletPanel;

@@ -1,0 +1,25 @@
+package openai
+
+import (
+	"testing"
+
+	appconstant "github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/stretchr/testify/require"
+)
+
+func TestOpenAICompatibleStandaloneSearchPreservesEndpoint(t *testing.T) {
+	url, err := (&Adaptor{}).GetRequestURL(&relaycommon.RelayInfo{
+		RelayFormat:    types.RelayFormatStandaloneSearch,
+		RelayMode:      relayconstant.RelayModeStandaloneSearch,
+		RequestURLPath: "/v1/alpha/search",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelBaseUrl: "https://example.test",
+			ChannelType:    appconstant.ChannelTypeOpenAI,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "https://example.test/v1/alpha/search", url)
+}

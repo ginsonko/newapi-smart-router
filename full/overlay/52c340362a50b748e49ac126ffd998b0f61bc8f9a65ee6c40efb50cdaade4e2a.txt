@@ -1,0 +1,18 @@
+package common
+
+import (
+	"encoding/base64"
+	"github.com/stretchr/testify/require"
+	"testing"
+)
+
+func TestNativeArrayNormalizationRejectsMixedSources(t *testing.T) {
+	for _, req := range []TaskSubmitReq{
+		{VideoB64s: []string{"YQ=="}, References: []MediaReference{{Type: "image", URL: "https://example.test/image"}}},
+		{VideoB64s: []string{"YQ=="}, Image: "legacy"},
+		{VideoB64s: []string{"not_base64!"}},
+		{AudioB64s: []string{base64.StdEncoding.EncodeToString([]byte("<html>invalid</html>"))}},
+	} {
+		require.Error(t, NormalizeNativeMediaArrays(&req))
+	}
+}

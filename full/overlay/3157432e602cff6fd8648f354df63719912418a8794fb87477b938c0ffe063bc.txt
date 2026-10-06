@@ -1,0 +1,208 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+func setupPaymentCompletionTest(t *testing.T, postgresMode bool) {
+	t.Helper()
+	previousDB, previousLogDB := DB, LOG_DB
+	previousRedis, previousQuota, previousType := common.RedisEnabled, common.QuotaPerUnit, common.MainDatabaseType()
+	var db *gorm.DB
+	var err error
+	if postgresMode {
+		dsn := os.Getenv("EPAY_TEST_PG_DSN")
+		if dsn == "" {
+			t.Skip("isolated local PostgreSQL not configured")
+		}
+		// Prevent this test from ever accepting a production database address.
+		require.Contains(t, dsn, "host=127.0.0.1 ")
+		require.Contains(t, dsn, "dbname=epay_test ")
+		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
+	} else {
+		db, err = gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+		common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	}
+	require.NoError(t, err)
+	DB, LOG_DB, common.RedisEnabled, common.QuotaPerUnit = db, db, false, 500000
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	if !postgresMode {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+		DB, LOG_DB = previousDB, previousLogDB
+		common.RedisEnabled, common.QuotaPerUnit = previousRedis, previousQuota
+		common.SetMainDatabaseType(previousType)
+	})
+	if postgresMode {
+		require.NoError(t, db.Migrator().DropTable(&TopUp{}, &User{}, &Log{}))
+	}
+	require.NoError(t, db.AutoMigrate(&User{}, &TopUp{}, &Log{}))
+	u := User{Id: 1, Username: "payment-test", Password: "not-a-real-account", Quota: 100, AffCode: "payment-test"}
+	require.NoError(t, db.Create(&u).Error)
+}
+
+func createPaymentOrder(t *testing.T, name string) TopUp {
+	t.Helper()
+	o := TopUp{UserId: 1, TradeNo: name, Amount: 20, Money: 20, PaymentProvider: PaymentProviderEpay, PaymentMethod: "alipay", Status: common.TopUpStatusPending}
+	require.NoError(t, DB.Create(&o).Error)
+	return o
+}
+
+func TestPaymentCompletionAtomicAndReplay(t *testing.T) {
+	setupPaymentCompletionTest(t, false)
+	o := createPaymentOrder(t, "paid-once")
+	r, err := CompleteEpayTopUp(o.TradeNo, "20.00", "wxpay", "127.0.0.1")
+	require.NoError(t, err)
+	require.True(t, r.Applied)
+	require.Equal(t, 10000000, r.QuotaAdded)
+	require.Positive(t, r.TopUp.CompleteTime)
+	require.Equal(t, "wxpay", r.TopUp.PaymentMethod)
+	r2, err := CompleteEpayTopUp(o.TradeNo, "20", "wxpay", "127.0.0.1")
+	require.NoError(t, err)
+	require.False(t, r2.Applied)
+	require.Equal(t, r.TopUp.CompleteTime, r2.TopUp.CompleteTime)
+	require.NoError(t, ManualCompleteTopUp(o.TradeNo, "127.0.0.1"))
+	var u User
+	require.NoError(t, DB.First(&u, 1).Error)
+	require.Equal(t, 10000100, u.Quota)
+	var count int64
+	require.NoError(t, DB.Model(&Log{}).Where("type = ?", LogTypeTopup).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+}
+
+func TestPaymentCompletionRejectsInvalidWithoutPartialCredit(t *testing.T) {
+	for _, tc := range []string{"money", "missing-user", "deleted-user", "provider", "terminal", "quota-overflow", "balance-overflow", "bad-amount"} {
+		t.Run(tc, func(t *testing.T) {
+			setupPaymentCompletionTest(t, false)
+			o := createPaymentOrder(t, tc)
+			paid := "20.00"
+			switch tc {
+			case "money":
+				paid = "19.99"
+			case "missing-user":
+				require.NoError(t, DB.Unscoped().Delete(&User{}, 1).Error)
+			case "deleted-user":
+				require.NoError(t, DB.Delete(&User{}, 1).Error)
+			case "provider":
+				require.NoError(t, DB.Model(&o).Update("payment_provider", PaymentProviderStripe).Error)
+			case "terminal":
+				require.NoError(t, DB.Model(&o).Update("status", "failed").Error)
+			case "quota-overflow":
+				require.NoError(t, DB.Model(&o).Update("amount", int64(math.MaxInt64)).Error)
+			case "balance-overflow":
+				require.NoError(t, DB.Model(&User{}).Where("id = 1").Update("quota", int64(math.MaxInt64-10)).Error)
+			case "bad-amount":
+				require.NoError(t, DB.Model(&o).Update("amount", -1).Error)
+			}
+			_, err := CompleteEpayTopUp(o.TradeNo, paid, "alipay", "")
+			require.Error(t, err)
+			var after TopUp
+			require.NoError(t, DB.First(&after, o.Id).Error)
+			require.NotEqual(t, common.TopUpStatusSuccess, after.Status)
+			require.Zero(t, after.CompleteTime)
+		})
+	}
+}
+
+func TestPaymentCompletionFailureRollsBackAndRetries(t *testing.T) {
+	for _, failTable := range []string{"users", "top_ups"} {
+		t.Run(failTable, func(t *testing.T) {
+			setupPaymentCompletionTest(t, false)
+			o := createPaymentOrder(t, "rollback")
+			require.NoError(t, DB.Callback().Update().Before("gorm:update").Register("epay_test_fail", func(tx *gorm.DB) {
+				if tx.Statement.Table == failTable {
+					tx.AddError(errors.New("injected database failure"))
+				}
+			}))
+			_, err := CompleteEpayTopUp(o.TradeNo, "20", "alipay", "")
+			require.Error(t, err)
+			require.NoError(t, DB.Callback().Update().Remove("epay_test_fail"))
+			var u User
+			require.NoError(t, DB.First(&u, 1).Error)
+			require.Equal(t, 100, u.Quota)
+			var after TopUp
+			require.NoError(t, DB.First(&after, o.Id).Error)
+			require.Equal(t, common.TopUpStatusPending, after.Status)
+			require.Zero(t, after.CompleteTime)
+			r, err := CompleteEpayTopUp(o.TradeNo, "20", "alipay", "")
+			require.NoError(t, err)
+			require.True(t, r.Applied)
+		})
+	}
+}
+
+func TestPaymentCompletionNegativeBalanceAndPurchaseRounding(t *testing.T) {
+	setupPaymentCompletionTest(t, false)
+	require.NoError(t, DB.Model(&User{}).Where("id = 1").Update("quota", -20000000).Error)
+	o := createPaymentOrder(t, "debt")
+	require.NoError(t, DB.Model(&o).Update("money", 20.125).Error)
+	r, err := CompleteEpayTopUp(o.TradeNo, "20.12", "alipay", "")
+	require.NoError(t, err)
+	require.True(t, r.Applied)
+	var u User
+	require.NoError(t, DB.First(&u, 1).Error)
+	require.Equal(t, -10000000, u.Quota)
+}
+
+func TestPaymentCompletionPostgresConcurrency(t *testing.T) {
+	setupPaymentCompletionTest(t, true)
+	o := createPaymentOrder(t, "same-order")
+	var wg sync.WaitGroup
+	var applied atomic.Int32
+	errs := make(chan error, 80)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if i%2 == 0 {
+				errs <- ManualCompleteTopUp(o.TradeNo, "")
+			} else {
+				r, e := CompleteEpayTopUp(o.TradeNo, "20", "wxpay", "")
+				if e == nil && r.Applied {
+					applied.Add(1)
+				}
+				errs <- e
+			}
+		}(i)
+	}
+	wg.Wait()
+	var u User
+	require.NoError(t, DB.First(&u, 1).Error)
+	require.Equal(t, 10000100, u.Quota)
+	var count int64
+	require.NoError(t, DB.Model(&Log{}).Where("type = ?", LogTypeTopup).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+	for i := 0; i < 20; i++ {
+		order := createPaymentOrder(t, fmt.Sprintf("different-%d", i))
+		wg.Add(2)
+		go func(n string) { defer wg.Done(); _, e := CompleteEpayTopUp(n, "20", "alipay", ""); errs <- e }(order.TradeNo)
+		go func() {
+			defer wg.Done()
+			errs <- DB.Model(&User{}).Where("id = 1").UpdateColumn("quota", gorm.Expr("quota - ?", 73)).Error
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		require.NoError(t, e)
+	}
+	require.NoError(t, DB.First(&u, 1).Error)
+	require.Equal(t, 210000100-20*73, u.Quota)
+}

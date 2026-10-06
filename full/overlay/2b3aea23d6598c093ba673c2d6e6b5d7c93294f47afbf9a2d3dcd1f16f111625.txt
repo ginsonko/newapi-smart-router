@@ -1,0 +1,715 @@
+package controller
+
+import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestNormalizeMediaStudioResponseFormatByMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	newContext := func(t *testing.T) *gin.Context {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		require.NoError(t, writer.WriteField("model", "gpt-image-2"))
+		require.NoError(t, writer.WriteField("prompt", "edit this image"))
+		require.NoError(t, writer.WriteField("response_format", "mp3"))
+		part, err := writer.CreateFormFile("image", "input.png")
+		require.NoError(t, err)
+		_, err = part.Write([]byte("image bytes"))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+
+		context, _ := gin.CreateTestContext(httptest.NewRecorder())
+		context.Request = httptest.NewRequest(http.MethodPost, "/api/media/studio/image-edits", &body)
+		context.Request.Header.Set("Content-Type", writer.FormDataContentType())
+		return context
+	}
+
+	for _, test := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "image-edits", want: "url"},
+		{mode: "transcriptions", want: "json"},
+		{mode: "translations", want: "json"},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			context := newContext(t)
+			require.NoError(t, normalizeMediaStudioResponseFormat(context, test.mode))
+			require.NotNil(t, context.Request.MultipartForm)
+			assert.Equal(t, test.want, context.Request.PostForm.Get("response_format"))
+			assert.Equal(t, test.want, context.Request.MultipartForm.Value["response_format"][0])
+			require.Len(t, context.Request.MultipartForm.File["image"], 1)
+			file, err := context.Request.MultipartForm.File["image"][0].Open()
+			require.NoError(t, err)
+			defer file.Close()
+			content, err := io.ReadAll(file)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("image bytes"), content)
+		})
+	}
+
+	t.Run("speech remains client selected", func(t *testing.T) {
+		context := newContext(t)
+		require.NoError(t, normalizeMediaStudioResponseFormat(context, "speech"))
+		assert.Nil(t, context.Request.MultipartForm)
+	})
+}
+
+func TestMediaStudioOperationIDIsStrictAndPrivateToImageStudio(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	valid := "studio_3f37de08-c768-4ab8-a2ec-fd33d6f4d5ee"
+
+	for _, test := range []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "absent remains compatible"},
+		{name: "canonical UUID", value: valid, want: valid},
+		{name: "missing prefix", value: strings.TrimPrefix(valid, mediaStudioOperationPrefix), wantErr: true},
+		{name: "upper case is not canonical", value: strings.ToUpper(valid), wantErr: true},
+		{name: "invalid UUID", value: "studio_not-a-uuid", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := validateMediaStudioOperationID(test.value)
+			if test.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.want, result)
+		})
+	}
+
+	newContext := func(mode, operationID string) *gin.Context {
+		context, _ := gin.CreateTestContext(httptest.NewRecorder())
+		context.Request = httptest.NewRequest(http.MethodPost, "/api/media/studio/"+mode, nil)
+		context.Request.Header.Set(mediaStudioOperationHeader, operationID)
+		return context
+	}
+
+	context := newContext("images", valid)
+	require.NoError(t, setMediaStudioOperationID(context, "images"))
+	stored, exists := context.Get(mediaStudioOperationContextKey)
+	require.True(t, exists)
+	assert.Equal(t, valid, stored)
+
+	context = newContext("videos", valid)
+	require.NoError(t, setMediaStudioOperationID(context, "videos"))
+	stored, exists = context.Get(mediaStudioOperationContextKey)
+	assert.True(t, exists, "video children need a stable idempotency identity")
+	assert.Equal(t, valid, stored)
+
+	context = newContext("image-edits", "studio_not-a-uuid")
+	assert.Error(t, setMediaStudioOperationID(context, "image-edits"))
+	_, exists = context.Get(mediaStudioOperationContextKey)
+	assert.False(t, exists)
+}
+
+func TestMediaStudioBatchCountIsBounded(t *testing.T) {
+	for _, count := range []int{1, mediaStudioMaxBatchCount} {
+		assert.NoError(t, validateMediaStudioBatchCount(count))
+	}
+	for _, count := range []int{0, mediaStudioMaxBatchCount + 1, 128} {
+		assert.Error(t, validateMediaStudioBatchCount(count))
+	}
+}
+
+func TestMediaStudioFallbackGroupsRemainOrderedAndUserScoped(t *testing.T) {
+	usable := map[string]string{"cheap": "1", "plus": "2", "primary": "3"}
+
+	groups, err := resolveMediaStudioFallbackGroups(
+		`["cheap","plus","cheap"]`, "primary", usable,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"cheap", "plus", "primary"}, groups)
+
+	groups, err = resolveMediaStudioFallbackGroups("", "primary", usable)
+	require.NoError(t, err)
+	assert.Nil(t, groups, "an ordinary fixed-group studio request must remain fixed")
+
+	_, err = resolveMediaStudioFallbackGroups(`["cheap","forbidden"]`, "primary", usable)
+	assert.ErrorContains(t, err, "not available")
+	_, err = resolveMediaStudioFallbackGroups(`not-json`, "primary", usable)
+	assert.ErrorContains(t, err, "invalid media studio fallback")
+}
+
+func TestMediaStudioFallbackPolicyUsesOneServerOwnedManualRouteScope(t *testing.T) {
+	policy, err := mediaStudioRoutingPolicy([]string{"cheap", "plus"})
+	require.NoError(t, err)
+	assert.Equal(t, smartrouter.PolicyVersion, policy.Version)
+	assert.Equal(t, smartrouter.StrategyManual, policy.EffectiveStrategy())
+	assert.Equal(t, smartrouter.OrderManual, policy.OrderMode)
+	assert.Equal(t, []string{"cheap", "plus"}, policy.ManualGroupOrder)
+	assert.False(t, policy.AllowFutureGroups)
+	assert.False(t, policy.AffinityEnabled, "session users must not share token-zero cache affinity")
+	assert.True(t, policy.HealthGuard)
+	assert.Empty(t, policy.ContractOverrides)
+}
+
+func TestRespondExistingStudioImageResponseReturnsArchivedAssets(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:studio-image-idempotency?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.MediaBlob{}, &model.TaskArtifact{}))
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	blob := &model.MediaBlob{
+		PublicID: "img-idempotent", UserID: 7, Filename: "result.png", Purpose: "generated",
+		MediaType: "image", Role: "primary", Status: model.MediaBlobStatusReady,
+		ModerationStatus: model.MediaModerationApproved, TaskPublicID: "studio_3f37de08-c768-4ab8-a2ec-fd33d6f4d5ee",
+		StorageBackend: model.MediaStorageBackendRemote, PrivateSource: "https://provider.example/result.png",
+	}
+	require.NoError(t, db.Create(blob).Error)
+
+	for _, mode := range []string{"images", "image-edits"} {
+		t.Run(mode, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Request = httptest.NewRequest(http.MethodPost, "/api/media/studio/"+mode, nil)
+			context.Set("is_playground", true)
+			context.Set(relaycommon.TaskMediaModeContextKey, mode)
+			context.Set(mediaStudioOperationContextKey, blob.TaskPublicID)
+			context.Set("id", 7)
+
+			assert.True(t, respondExistingStudioImageResponse(context))
+			assert.Equal(t, http.StatusOK, context.Writer.Status())
+			assert.Contains(t, recorder.Body.String(), blob.PublicID)
+		})
+	}
+}
+
+func TestMediaBlobPublicMapStripsAdministratorFieldsForUsers(t *testing.T) {
+	blob := &model.MediaBlob{
+		PublicID: "blob_public", UserID: 41, UsernameSnapshot: "alice",
+		Filename: "result.png", MediaType: "image", Role: "primary",
+		MimeType: "image/png", Status: model.MediaBlobStatusReady,
+		ModerationStatus: model.MediaModerationViolation, ModerationReason: "review evidence",
+		AdminHold: true, ChannelID: 99, Group: "internal", SourceKind: "provider",
+		ContentHash: "private-content-hash", StorageBackend: model.MediaStorageBackendRemote,
+		MaterializeStatus: model.MediaMaterializeRetry, MaterializeAttempts: 3,
+		MaterializeNextRetryAt: 1234, MaterializeLastError: "private upstream error",
+		MaterializedAt: 5678,
+	}
+
+	userView := mediaBlobPublicMap(blob, false)
+	adminView := mediaBlobPublicMap(blob, true)
+
+	for _, key := range []string{
+		"moderation_reason", "admin_hold", "user_id", "username", "channel_id",
+		"group", "source_kind", "content_hash", "last_accessed_at", "storage_backend",
+		"materialize_status", "materialize_attempts", "materialize_next_retry_at",
+		"materialize_last_error", "materialized_at",
+	} {
+		assert.NotContains(t, userView, key, "ordinary users must not receive administrator field %q", key)
+		require.Contains(t, adminView, key, "administrator view must retain field %q", key)
+	}
+	assert.Equal(t, blob.PublicID, userView["id"])
+	assert.Equal(t, blob.ModerationStatus, userView["moderation_status"])
+}
+
+func TestMediaFileResponseDoesNotPresentFailedArchiveAsProcessed(t *testing.T) {
+	failed := &model.MediaBlob{
+		PublicID: "archive-failed-file", Status: model.MediaBlobStatusFailed,
+		Filename: "result.png", Purpose: "generated", MimeType: "image/png",
+	}
+	assert.Equal(t, "error", mediaFileResponseFromBlob(failed).Status)
+
+	ready := &model.MediaBlob{
+		PublicID: "ready-file", Status: model.MediaBlobStatusReady,
+		Filename: "result.png", Purpose: "generated", MimeType: "image/png",
+	}
+	assert.Equal(t, "processed", mediaFileResponseFromBlob(ready).Status)
+}
+
+func TestMediaBlobPublicMapIncludesPromptOnlyWhenAvailable(t *testing.T) {
+	blob := &model.MediaBlob{
+		PublicID: "blob-with-prompt", UserID: 41, Filename: "result.png",
+		MediaType: "image", MimeType: "image/png", Status: model.MediaBlobStatusReady,
+		ModerationStatus: model.MediaModerationApproved,
+	}
+	withPrompt := mediaBlobPublicMapWithPrompt(blob, false, model.MediaAssetPrompt{
+		Prompt: "paint a quiet courtyard", Truncated: true,
+	})
+	assert.Equal(t, "paint a quiet courtyard", withPrompt["prompt"])
+	assert.Equal(t, true, withPrompt["prompt_truncated"])
+
+	withoutPrompt := mediaBlobPublicMap(blob, false)
+	assert.NotContains(t, withoutPrompt, "prompt")
+	assert.NotContains(t, withoutPrompt, "prompt_truncated")
+}
+
+func TestMediaBlobPublicMapDoesNotSignMissingLocalObject(t *testing.T) {
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	objectKey := filepath.Join("objects", "missing", "result.png")
+	blob := &model.MediaBlob{
+		PublicID: "blob-missing-preview", UserID: 41, Filename: "result.png",
+		MediaType: "image", MimeType: "image/png", SizeBytes: 4,
+		Status: model.MediaBlobStatusReady, StorageBackend: model.MediaStorageBackendLocal,
+		ObjectKey: objectKey, ModerationStatus: model.MediaModerationApproved,
+	}
+
+	missing := mediaBlobPublicMap(blob, true)
+	assert.Equal(t, mediaservice.MediaAvailabilityUnavailable, missing["availability_status"])
+	assert.Equal(t, "local_object_missing", missing["availability_reason"])
+	assert.Empty(t, missing["content_url"])
+	assert.Empty(t, missing["download_url"])
+
+	path, err := mediaservice.ResolveObjectPath(objectKey)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o640))
+	available := mediaBlobPublicMap(blob, true)
+	assert.Equal(t, mediaservice.MediaAvailabilityAvailable, available["availability_status"])
+	assert.NotEmpty(t, available["content_url"])
+	assert.NotEmpty(t, available["download_url"])
+}
+
+func TestResolveMediaBlobForAdminSignatureFallsBackToStandaloneBlob(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-admin-signed-blob?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.MediaBlob{}, &model.TaskArtifact{}))
+
+	blob := &model.MediaBlob{
+		PublicID: "standalone-admin-preview", UserID: 41, Filename: "upload.png",
+		MediaType: "image", MimeType: "image/png", Status: model.MediaBlobStatusReady,
+		StorageBackend: model.MediaStorageBackendLocal,
+	}
+	require.NoError(t, db.Create(blob).Error)
+
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Params = gin.Params{{Key: "asset_id", Value: blob.PublicID}}
+	context.Set("media_signed", true)
+	context.Set("media_signature_audience", "admin")
+
+	resolved, artifact, err := resolveMediaBlobForRequest(context)
+	require.NoError(t, err)
+	assert.Equal(t, blob.ID, resolved.ID)
+	assert.Nil(t, artifact)
+}
+
+func TestSignedArtifactDeliverySupportsHeadAndRangeWithoutSession(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-signed-artifact-delivery?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.MediaBlob{}, &model.TaskArtifact{}))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	content := []byte("0123456789")
+	objectKey := filepath.Join("objects", "signed", "result.mp4")
+	objectPath, err := mediaservice.ResolveObjectPath(objectKey)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(objectPath), 0o750))
+	require.NoError(t, os.WriteFile(objectPath, content, 0o640))
+	blob := &model.MediaBlob{
+		PublicID: "blob_signed", UserID: 41, Filename: "result.mp4",
+		MediaType: "video", MimeType: "video/mp4", SizeBytes: int64(len(content)),
+		Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved,
+		StorageBackend: model.MediaStorageBackendLocal, ObjectKey: objectKey,
+		ContentHash: strings.Repeat("a", 64),
+	}
+	require.NoError(t, db.Create(blob).Error)
+	require.NoError(t, db.Create(&model.TaskArtifact{
+		PublicAssetID: "asset_signed", MediaBlobID: blob.ID, UserID: blob.UserID,
+		ProviderOutputIdentity: "provider-signed", Type: "video", Role: "primary",
+		Status: "ready", MimeType: blob.MimeType, Filename: blob.Filename, SizeBytes: blob.SizeBytes,
+	}).Error)
+
+	tests := []struct {
+		method      string
+		rangeHeader string
+		wantStatus  int
+		wantBody    string
+	}{
+		{method: http.MethodHead, wantStatus: http.StatusOK},
+		{method: http.MethodGet, rangeHeader: "bytes=2-5", wantStatus: http.StatusPartialContent, wantBody: "2345"},
+	}
+	for _, test := range tests {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Params = gin.Params{{Key: "asset_id", Value: "asset_signed"}}
+		context.Set("media_signed", true)
+		context.Set("media_signature_audience", "user")
+		context.Request = httptest.NewRequest(test.method, "/v1/assets/asset_signed/content", nil)
+		if test.rangeHeader != "" {
+			context.Request.Header.Set("Range", test.rangeHeader)
+		}
+
+		resolved, artifact, resolveErr := resolveMediaBlobForRequest(context)
+		require.NoError(t, resolveErr)
+		require.NotNil(t, artifact)
+		serveMediaBlob(context, resolved)
+
+		assert.Equal(t, test.wantStatus, recorder.Code)
+		assert.Equal(t, test.wantBody, recorder.Body.String())
+		assert.Equal(t, "bytes", recorder.Header().Get("Accept-Ranges"))
+	}
+}
+
+func TestMediaResponseCaptureFlushesStreamingResponsesImmediately(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	file, err := os.CreateTemp(t.TempDir(), "capture-*")
+	require.NoError(t, err)
+	defer file.Close()
+	writer := &mediaResponseCaptureWriter{
+		ResponseWriter: context.Writer, file: file, maxBytes: 1024, hold: true,
+	}
+	context.Writer = writer
+	context.Header("Content-Type", "text/event-stream")
+
+	_, err = context.Writer.Write([]byte("data: hello\n\n"))
+	require.NoError(t, err)
+	context.Writer.Flush()
+
+	assert.Equal(t, "data: hello\n\n", recorder.Body.String())
+	assert.False(t, writer.hold)
+}
+
+func TestMediaResponseCaptureKeepsOrdinaryJSONBufferedAfterWriteHeaderNow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	file, err := os.CreateTemp(t.TempDir(), "capture-*")
+	require.NoError(t, err)
+	defer file.Close()
+	writer := &mediaResponseCaptureWriter{
+		ResponseWriter: context.Writer, file: file, maxBytes: 1024, hold: true,
+	}
+	context.Writer = writer
+	context.Header("Content-Type", "application/json")
+	context.Status(http.StatusOK)
+	context.Writer.WriteHeaderNow()
+
+	_, err = context.Writer.Write([]byte(`{"data":[{"url":"https://provider.example/image.png"}]}`))
+	require.NoError(t, err)
+	assert.True(t, writer.hold)
+	assert.Empty(t, recorder.Body.String(), "ordinary image JSON must remain rewritable until relay completion")
+
+	require.NoError(t, writer.commitBuffered([]byte(`{"data":[{"asset_id":"asset_1"}]}`), true))
+	assert.JSONEq(t, `{"data":[{"asset_id":"asset_1"}]}`, recorder.Body.String())
+}
+
+func TestMediaResponseCaptureDoesNotReportBufferedJSONAsCommitted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	file, err := os.CreateTemp(t.TempDir(), "capture-")
+	require.NoError(t, err)
+	defer file.Close()
+	writer := &mediaResponseCaptureWriter{
+		ResponseWriter: context.Writer, file: file, maxBytes: 1024, hold: true,
+	}
+	context.Writer = writer
+	context.Header("Content-Type", "application/json")
+	context.Status(http.StatusOK)
+	context.Writer.WriteHeaderNow()
+	_, err = context.Writer.Write([]byte(`{"data":[{"url":"https://provider.example/image.png"}]}`))
+	require.NoError(t, err)
+
+	assert.False(t, writer.Written(), "buffered image JSON must remain retryable until committed")
+	assert.False(t, recorder.Flushed)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestMediaArchiveChannelIDHandlesMissingChannelMeta(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Set("channel_id", 46)
+
+	info := &relaycommon.RelayInfo{}
+	assert.Equal(t, 46, mediaArchiveChannelID(context, info))
+	assert.NotPanics(t, func() { _ = mediaArchiveChannelID(context, info) })
+}
+
+func TestMediaArchiveChannelIDPrefersFinalRelayChannel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Set("channel_id", 49)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 46}}
+
+	assert.Equal(t, 46, mediaArchiveChannelID(context, info))
+	assert.Zero(t, mediaArchiveChannelID(nil, &relaycommon.RelayInfo{}))
+}
+
+func TestBeginMediaResponseCaptureUsesProgressiveSpoolReservation(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-response-progressive-spool-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.MaxFileBytes = 32 * 1024 * 1024
+	nextSetting.MaxRequestBytes = 32 * 1024 * 1024
+	nextSetting.GlobalMaxBytes = 64 * 1024 * 1024
+	nextSetting.PerUserMaxBytes = 64 * 1024 * 1024
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader("{}"))
+	capture := beginMediaResponseCapture(context, types.RelayFormatOpenAIImage)
+	require.NotNil(t, capture)
+
+	var state model.MediaStorageState
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.EqualValues(t, 8*1024*1024, state.ReservedBytes)
+	capture.finish(context, nil, false)
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.Zero(t, state.ReservedBytes)
+}
+
+func TestPrepareMediaUploadRequestAppliesDynamicLimitBeforeParsing(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-upload-request-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.MaxFileBytes = 8
+	nextSetting.MaxRequestBytes = 8
+	nextSetting.MaxUploadConcurrency = 1
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/media/files", strings.NewReader("123456789"))
+	_, err = prepareMediaUploadRequest(context)
+	assert.ErrorIs(t, err, mediaservice.ErrMediaFileTooLarge)
+
+	recorder = httptest.NewRecorder()
+	context, _ = gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/media/files", strings.NewReader("123456789"))
+	context.Request.ContentLength = -1
+	release, err := prepareMediaUploadRequest(context)
+	require.NoError(t, err)
+	_, err = io.ReadAll(context.Request.Body)
+	var maxBytesError *http.MaxBytesError
+	assert.ErrorAs(t, err, &maxBytesError)
+	release()
+
+	recorder = httptest.NewRecorder()
+	context, _ = gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/media/studio/images", strings.NewReader("12345678"))
+	context.Request.ContentLength = -1
+	release, err = prepareMediaUploadRequest(context)
+	require.NoError(t, err)
+	storage, err := common.GetBodyStorage(context)
+	require.NoError(t, err)
+	assert.True(t, storage.IsDisk(), "unknown-length media bodies must spool instead of growing the heap")
+	require.NoError(t, storage.Close())
+	release()
+}
+
+func TestPrepareMediaUploadRequestUnknownLengthDoesNotReserveFullTwoGiB(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-progressive-spool-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.MediaStorageState{}, &model.MediaStorageReservation{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.MaxFileBytes = 32 * 1024 * 1024
+	nextSetting.MaxRequestBytes = 32 * 1024 * 1024
+	nextSetting.GlobalMaxBytes = 64 * 1024 * 1024
+	nextSetting.PerUserMaxBytes = 64 * 1024 * 1024
+	nextSetting.MaxUploadConcurrency = 1
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/media/studio/images",
+		bytes.NewReader(make([]byte, 1024*1024)),
+	)
+	context.Request.ContentLength = -1
+	release, err := prepareMediaUploadRequest(context)
+	require.NoError(t, err)
+	defer release()
+
+	var state model.MediaStorageState
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.EqualValues(t, 8*1024*1024, state.ReservedBytes)
+	_, err = io.Copy(io.Discard, context.Request.Body)
+	require.NoError(t, err)
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.EqualValues(t, 8*1024*1024, state.ReservedBytes)
+
+	release()
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.Zero(t, state.ReservedBytes)
+}
+
+func TestMediaTaskPublicMapDoesNotInventProgress(t *testing.T) {
+	task := &model.Task{
+		TaskID: "task-public", Group: "smart", Status: model.TaskStatusInProgress,
+		Progress: "0%", Properties: model.Properties{
+			Input: "a paper kite", OriginModelName: "video-model", MediaMode: "videos",
+			MediaSize: "1280x720", MediaDuration: 8, MediaReferenceCount: 2,
+		},
+	}
+
+	result := mediaTaskPublicMap(task, nil)
+
+	assert.Empty(t, result["progress"])
+	assert.Equal(t, "in_progress", result["status"])
+	assert.Equal(t, "video-model", result["model"])
+	assert.Equal(t, "a paper kite", result["prompt"])
+	assert.Equal(t, 2, result["reference_count"])
+}
+
+func TestMediaTaskPublicMapExposesArtifactFinalizationStage(t *testing.T) {
+	task := &model.Task{
+		TaskID: "task-finalizing-public", Status: model.TaskStatusFinalizing,
+		Progress: "99%", Properties: model.Properties{MediaMode: "videos"},
+	}
+
+	result := mediaTaskPublicMap(task, nil)
+
+	assert.Equal(t, "resolving_artifacts", result["status"])
+	assert.Equal(t, "99%", result["progress"])
+}
+
+func TestMediaDownloadAssetArchiveCreatesOneOwnedZipWithFailureManifest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-archive?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.TaskArtifact{}, &model.MediaStorageState{},
+		&model.MediaStorageReservation{},
+	))
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.ReservedFreeBytes = 1
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+	require.NoError(t, mediaservice.EnsureStorage())
+
+	blobs := []model.MediaBlob{
+		{PublicID: "owned-a", UserID: 7, Filename: "图片.png", MediaType: "image", MimeType: "image/png", StorageBackend: model.MediaStorageBackendLocal, ObjectKey: filepath.Join("objects", "owned-a.png"), SizeBytes: 3, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved},
+		{PublicID: "owned-b", UserID: 7, Filename: "图片.png", MediaType: "image", MimeType: "image/png", StorageBackend: model.MediaStorageBackendLocal, ObjectKey: filepath.Join("objects", "owned-b.png"), SizeBytes: 4, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved},
+		{PublicID: "foreign", UserID: 8, Filename: "foreign.png", MediaType: "image", MimeType: "image/png", StorageBackend: model.MediaStorageBackendLocal, ObjectKey: filepath.Join("objects", "foreign.png"), SizeBytes: 5, Status: model.MediaBlobStatusReady, ModerationStatus: model.MediaModerationApproved},
+	}
+	for index := range blobs {
+		path, pathErr := mediaservice.ResolveObjectPath(blobs[index].ObjectKey)
+		require.NoError(t, pathErr)
+		require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte{byte(index + 1)}, int(blobs[index].SizeBytes)), 0o600))
+	}
+	require.NoError(t, db.Create(&blobs).Error)
+
+	body, err := json.Marshal(map[string]any{"asset_ids": []string{"owned-a", "owned-b", "foreign"}})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/media/assets/download-archive", bytes.NewReader(body))
+	context.Request.Header.Set("Content-Type", "application/json")
+	context.Set("id", 7)
+
+	MediaDownloadAssetArchive(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "application/zip", recorder.Header().Get("Content-Type"))
+	archive, err := zip.NewReader(bytes.NewReader(recorder.Body.Bytes()), int64(recorder.Body.Len()))
+	require.NoError(t, err)
+	names := make([]string, 0, len(archive.File))
+	contents := make(map[string][]byte, len(archive.File))
+	for _, file := range archive.File {
+		names = append(names, file.Name)
+		entry, openErr := file.Open()
+		require.NoError(t, openErr)
+		data, readErr := io.ReadAll(entry)
+		require.NoError(t, readErr)
+		require.NoError(t, entry.Close())
+		contents[file.Name] = data
+	}
+	assert.Contains(t, names, "图片.png")
+	assert.Contains(t, names, "图片 (2).png")
+	assert.Contains(t, names, "下载说明.txt")
+	assert.NotContains(t, names, "foreign.png")
+	assert.Equal(t, bytes.Repeat([]byte{1}, 3), contents["图片.png"])
+	assert.Equal(t, bytes.Repeat([]byte{2}, 4), contents["图片 (2).png"])
+	assert.Contains(t, string(contents["下载说明.txt"]), "foreign")
+	var storageState model.MediaStorageState
+	require.NoError(t, db.First(&storageState, 1).Error)
+	assert.Zero(t, storageState.ReservedBytes, "ZIP and remote-source spool reservations must be released")
+}

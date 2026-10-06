@@ -1,0 +1,27 @@
+package relay
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestExplicitStandaloneSearchRejectionOnlyForNon2xx(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusOK,
+		http.StatusCreated,
+		http.StatusAccepted,
+		http.StatusNoContent,
+	} {
+		require.False(t, isExplicitStandaloneSearchRejection(statusCode), statusCode)
+	}
+	for _, statusCode := range []int{
+		http.StatusContinue,
+		http.StatusPermanentRedirect,
+		http.StatusBadRequest,
+		http.StatusInternalServerError,
+	} {
+		require.True(t, isExplicitStandaloneSearchRejection(statusCode), statusCode)
+	}
+}

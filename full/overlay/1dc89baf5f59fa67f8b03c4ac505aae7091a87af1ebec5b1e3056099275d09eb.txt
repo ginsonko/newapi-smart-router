@@ -1,0 +1,116 @@
+package service
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	smartroutersetting "github.com/QuantumNous/new-api/setting/smart_router_setting"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/require"
+)
+
+type unavailableRecoveryProbeStore struct{ SmartRouteStateStore }
+
+func (store unavailableRecoveryProbeStore) TryAcquireProbe(context.Context, SmartRouteProbeRequest) (*SmartRouteLease, bool, error) {
+	return nil, false, nil
+}
+
+func TestRecoveryFallbackCanUseDueRoutesWhenProbeBudgetIsUnavailable(t *testing.T) {
+	state, err := NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+	require.NoError(t, err)
+	session, _ := managerTestSession(t, unavailableRecoveryProbeStore{state})
+	setting := session.engine.Settings()
+	setting.TextRecoveryProbeAfterSeconds = nil
+	session.engine.Settings = func() smartroutersetting.Setting { return setting }
+	now := time.Now().UnixMilli()
+	state.mu.Lock()
+	for _, id := range []string{"cheap", "fallback"} {
+		state.quality[id] = smartrouter.QualityState{
+			Phase: smartrouter.QualityOpen, Epoch: 1, DemandRecovery: true,
+			RecoveryStartedMS: now - 10_000, LastFailureMS: now - 3_000, NextProbeAtMS: now - 1,
+		}
+	}
+	state.mu.Unlock()
+	handle, err := session.Next(context.Background())
+	require.NoError(t, err)
+	require.True(t, handle.Plan.RecoveryFallback)
+	require.Equal(t, "cheap", handle.Route.RouteID)
+	require.Len(t, session.recoveryBlockedRoutes, 2)
+	session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess}, 0, 0, false)
+}
+
+func TestRecoveryFallbackLeaseAndSuccessClearAutomaticState(t *testing.T) {
+	for _, kind := range []string{"memory", "redis"} {
+		t.Run(kind, func(t *testing.T) {
+			var state SmartRouteStateStore
+			var err error
+			if kind == "redis" {
+				server := miniredis.RunT(t)
+				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { _ = client.Close() })
+				state, err = NewRedisSmartRouteStateStore(client, DefaultSmartRouteStateConfig())
+			} else {
+				state, err = NewMemorySmartRouteStateStore(DefaultSmartRouteStateConfig())
+			}
+			require.NoError(t, err)
+			session, _ := managerTestSession(t, state)
+			setting := session.engine.Settings()
+			setting.TextRecoveryProbeAfterSeconds = nil
+			session.engine.Settings = func() smartroutersetting.Setting { return setting }
+			catalog, _ := session.engine.Catalogs.Current()
+			entry := catalog.Contracts[session.request.ContractID]
+			routes := entry.Pools["balanced-v1"].Candidates
+			for _, route := range routes {
+				record := SmartRouteAttemptRecord{
+					CatalogVersion: catalog.Version, RouteID: route.RouteID,
+					Group: route.Group, Model: session.request.CanonicalModel,
+					ChannelID: route.ChannelID, ContractID: session.request.ContractID,
+					Endpoint: session.request.Endpoint, CapacityDomain: route.CapacityDomain,
+					CredentialDomain: smartrouter.RouteCredentialDomain(route),
+					Outcome:          smartrouter.OutcomeCapacityLimited, Admission: smartrouter.AdmissionNormal,
+					DemandRecovery: true, ObservationID: "failure-" + route.RouteID,
+					RetryAfter: time.Minute,
+				}
+				require.NoError(t, state.RecordAttempt(context.Background(), record))
+				require.NoError(t, state.QuarantineRoute(context.Background(), SmartRouteQuarantineRequest{
+					CatalogVersion: catalog.Version, RouteID: route.RouteID,
+					FailureScope: SmartFailureRouteModel, TTL: time.Minute,
+				}))
+			}
+			handle, err := session.Next(context.Background())
+			require.NoError(t, err)
+			require.True(t, handle.Plan.RecoveryFallback)
+			require.Equal(t, "cheap", handle.Route.RouteID)
+			require.Nil(t, handle.probe, "real fallback must not acquire a synthetic-probe lease")
+			session.RecordAttempt(context.Background(), handle, SmartRouteOutcome{Outcome: smartrouter.OutcomeSuccess}, 0, 0, false)
+			snapshot, err := state.Snapshot(context.Background(), SmartRouteStateSnapshotRequest{Routes: smartRouteStateRoutes(routes)})
+			require.NoError(t, err)
+			q := snapshot.Quality.Routes["cheap"]
+			require.Equal(t, smartrouter.QualityHealthy, q.Phase)
+			require.Zero(t, q.DemandRecoveryFailures)
+			require.Zero(t, q.ConsecutiveHardFailures)
+			require.Zero(t, q.NextProbeAtMS)
+			require.EqualValues(t, 1, q.RealSuccesses)
+			require.Zero(t, q.ProbeSuccesses)
+			require.Zero(t, snapshot.Capacity.Domains["cheap-capacity"].BlockedUntilMS)
+			require.NotEqual(t, smartrouter.QualityHealthy, snapshot.Quality.Routes["fallback"].Phase)
+			exclusions, err := state.RouteExclusions(context.Background(), SmartRouteExclusionRequest{
+				CatalogVersion: catalog.Version, Routes: smartRouteStateRoutes(routes), FailureScopes: []SmartRouteFailureScope{SmartFailureRouteModel},
+			})
+			require.NoError(t, err)
+			require.Equal(t, []string{"fallback"}, exclusions.RouteIDs)
+
+			request := SmartRouteCapacityRequest{CapacityDomain: "fallback-capacity", MaxInflight: 1, RecoveryFallback: true}
+			first, err := state.TryAcquireCapacity(context.Background(), request)
+			require.NoError(t, err)
+			require.True(t, first.Granted())
+			second, err := state.TryAcquireCapacity(context.Background(), request)
+			require.NoError(t, err)
+			require.False(t, second.Granted(), "fallback must respect active capacity holders")
+			require.NoError(t, first.Lease.Release(context.Background()))
+		})
+	}
+}

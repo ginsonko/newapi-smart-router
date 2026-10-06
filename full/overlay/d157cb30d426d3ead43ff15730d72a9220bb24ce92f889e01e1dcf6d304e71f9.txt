@@ -1,0 +1,340 @@
+package controller
+
+import (
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+type imageRouteMediaNoNetwork struct {
+	testing *testing.T
+}
+
+func (transport imageRouteMediaNoNetwork) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.testing.Errorf("media projection attempted an HTTP request: %s", request.Method)
+	return nil, errors.New("network disabled in media projection test")
+}
+
+func setupImageRouteMediaTest(t *testing.T) *gorm.DB {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	database, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "media.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.ImageRouteJob{}, &model.MediaBlob{}, &model.TaskArtifact{}))
+	previousDB := model.DB
+	model.DB = database
+	t.Cleanup(func() {
+		model.DB = previousDB
+		connection, closeErr := database.DB()
+		require.NoError(t, closeErr)
+		require.NoError(t, connection.Close())
+	})
+	if service.GetHttpClient() == nil || service.GetSSRFProtectedHTTPClient() == nil {
+		service.InitHttpClient()
+	}
+	for _, client := range []*http.Client{http.DefaultClient, service.GetHttpClient(), service.GetSSRFProtectedHTTPClient()} {
+		previousTransport := client.Transport
+		client.Transport = imageRouteMediaNoNetwork{testing: t}
+		t.Cleanup(func() { client.Transport = previousTransport })
+	}
+	return database
+}
+
+func createImageRouteMediaRoot(t *testing.T, database *gorm.DB, noRetention bool) (*model.Task, *model.ImageRouteJob) {
+	t.Helper()
+	root := &model.Task{
+		TaskID: "root-image", UserId: 71, Platform: "smart_image", Status: model.TaskStatusSuccess, Progress: "100%",
+		Properties:  model.Properties{MediaMode: "images", OriginModelName: "image-model"},
+		PrivateData: model.TaskPrivateData{ImageTask: &model.ImageTaskContext{NoRetention: noRetention}},
+		Data:        []byte(`{"data":[{"url":"https://invalid.example/root-snapshot-must-not-leak.png"}]}`),
+	}
+	job := &model.ImageRouteJob{PublicTaskID: root.TaskID, UserID: root.UserId, State: model.ImageRouteJobSucceeded, NoRetention: noRetention}
+	require.NoError(t, database.Create(root).Error)
+	require.NoError(t, database.Create(job).Error)
+	return root, job
+}
+
+func createImageRouteMediaChild(t *testing.T, database *gorm.DB, root *model.Task, job *model.ImageRouteJob) *model.Task {
+	t.Helper()
+	child := &model.Task{
+		TaskID: "child-image", UserId: root.UserId, Platform: constant.TaskPlatformOpenAIImage, Status: model.TaskStatusSuccess,
+		PrivateData: model.TaskPrivateData{Key: "private-key-fixture", ImageTask: &model.ImageTaskContext{ResponseFormat: "b64_json", NoRetention: job.NoRetention}},
+		Data:        []byte(`{"data":[{"url":"https://invalid.example/child.png"}]}`),
+	}
+	require.NoError(t, database.Create(child).Error)
+	job.CurrentTaskID = child.TaskID
+	require.NoError(t, database.Save(job).Error)
+	return child
+}
+
+func createImageRouteMediaArtifact(t *testing.T, database *gorm.DB, owner int, taskID, assetID string) {
+	t.Helper()
+	blob := &model.MediaBlob{
+		PublicID: assetID, UserID: owner, TaskPublicID: taskID, MediaType: "image", MimeType: "image/png",
+		Status: model.MediaBlobStatusReady, StorageBackend: model.MediaStorageBackendRemote,
+		PrivateSource: "https://invalid.example/private-source.png?api_key=do-not-expose", ModerationStatus: model.MediaModerationApproved,
+	}
+	require.NoError(t, database.Create(blob).Error)
+	require.NoError(t, database.Create(&model.TaskArtifact{
+		PublicAssetID: assetID, MediaBlobID: blob.ID, UserID: owner, TaskPublicID: taskID,
+		ProviderOutputIdentity: assetID, Type: "image", Role: "result", Status: "ready", MimeType: "image/png",
+	}).Error)
+}
+
+func readImageRouteMediaEndpoint(t *testing.T, handler gin.HandlerFunc, userID int, taskID string, event bool) map[string]any {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodGet, "/api/media/tasks/"+taskID, nil)
+	requestContext.Set("id", userID)
+	requestContext.Params = gin.Params{{Key: "task_id", Value: taskID}}
+	handler(requestContext)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var payload map[string]any
+	if event {
+		for _, line := range strings.Split(recorder.Body.String(), "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				require.NoError(t, common.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &payload))
+				return payload
+			}
+		}
+		t.Fatal("event stream has no data")
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
+	require.Equal(t, true, payload["success"], recorder.Body.String())
+	if result, ok := payload["data"].(map[string]any); ok {
+		if items, exists := result["items"].([]any); exists {
+			for _, item := range items {
+				entry := item.(map[string]any)
+				if entry["id"] == taskID {
+					return entry
+				}
+			}
+			t.Fatal("root task missing from list")
+		}
+		return result
+	}
+	return map[string]any{"artifacts": payload["data"]}
+}
+
+func requireImageRouteMediaNoArchives(t *testing.T, database *gorm.DB, expected int64) {
+	t.Helper()
+	for _, table := range []any{&model.TaskArtifact{}, &model.MediaBlob{}} {
+		var count int64
+		require.NoError(t, database.Model(table).Count(&count).Error)
+		require.Equal(t, expected, count)
+	}
+}
+
+func TestImageRouteMediaAsyncArtifactsAcrossEndpoints(t *testing.T) {
+	database := setupImageRouteMediaTest(t)
+	root, job := createImageRouteMediaRoot(t, database, false)
+	child := createImageRouteMediaChild(t, database, root, job)
+	createImageRouteMediaArtifact(t, database, root.UserId, child.TaskID, "owned-artifact")
+	createImageRouteMediaArtifact(t, database, root.UserId+1, child.TaskID, "foreign-artifact")
+	endpoints := []struct {
+		name    string
+		handler gin.HandlerFunc
+		event   bool
+	}{
+		{"detail", MediaGetTask, false}, {"list", MediaListTasks, false},
+		{"events", MediaTaskEvents, true}, {"artifacts", MediaListTaskArtifacts, false},
+	}
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			for repeat := 0; repeat < 2; repeat++ {
+				payload := readImageRouteMediaEndpoint(t, endpoint.handler, root.UserId, root.TaskID, endpoint.event)
+				artifacts := payload["artifacts"].([]any)
+				require.Len(t, artifacts, 1)
+				artifact := artifacts[0].(map[string]any)
+				require.Equal(t, "owned-artifact", artifact["id"])
+				require.Contains(t, artifact["content_url"], "/v1/assets/owned-artifact/content?")
+				require.Contains(t, artifact["content_url"], "signature=")
+				if endpoint.name != "artifacts" {
+					require.Len(t, payload["data"], 1)
+					require.Equal(t, root.TaskID, payload["id"])
+				}
+				serialized, err := common.Marshal(payload)
+				require.NoError(t, err)
+				for _, forbidden := range []string{"foreign-artifact", "private-source", "child.png", "root-snapshot", "private-key-fixture"} {
+					require.NotContains(t, string(serialized), forbidden)
+				}
+			}
+		})
+	}
+	requireImageRouteMediaNoArchives(t, database, 2)
+}
+
+func TestImageRouteMediaSyncSpoolAcrossEndpoints(t *testing.T) {
+	for _, noRetention := range []bool{false, true} {
+		name := "retained"
+		if noRetention {
+			name = "no-retention"
+		}
+		t.Run(name, func(t *testing.T) {
+			database := setupImageRouteMediaTest(t)
+			root, job := createImageRouteMediaRoot(t, database, noRetention)
+			png := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jfIoAAAAASUVORK5CYII="
+			response, err := common.Marshal(map[string]any{
+				"data":                   []dto.ImageData{{Url: "https://invalid.example/sync.png?signature=fixture", RevisedPrompt: "private-prompt"}, {B64Json: png}, {B64Json: base64.StdEncoding.EncodeToString([]byte("not an image"))}, {Url: "https://invalid.example/secret.png?api_key=hidden"}},
+				"private_provider_field": "do-not-expose",
+			})
+			require.NoError(t, err)
+			job.ResultPath = filepath.Join(t.TempDir(), "result.json")
+			require.NoError(t, os.WriteFile(job.ResultPath, response, 0600))
+			require.NoError(t, database.Save(job).Error)
+			for _, endpoint := range []struct {
+				name    string
+				handler gin.HandlerFunc
+				event   bool
+			}{
+				{"detail", MediaGetTask, false}, {"list", MediaListTasks, false}, {"events", MediaTaskEvents, true}, {"artifacts", MediaListTaskArtifacts, false},
+			} {
+				t.Run(endpoint.name, func(t *testing.T) {
+					payload := readImageRouteMediaEndpoint(t, endpoint.handler, root.UserId, root.TaskID, endpoint.event)
+					artifacts := payload["artifacts"].([]any)
+					require.Len(t, artifacts, 2)
+					require.Equal(t, "https://invalid.example/sync.png?signature=fixture", artifacts[0].(map[string]any)["content_url"])
+					require.Equal(t, "data:image/png;base64,"+png, artifacts[1].(map[string]any)["content_url"])
+					if endpoint.name != "artifacts" {
+						require.Len(t, payload["data"], 2)
+					}
+					serialized, marshalErr := common.Marshal(payload)
+					require.NoError(t, marshalErr)
+					for _, forbidden := range []string{"private-prompt", "private_provider_field", "secret.png", "root-snapshot", "result.json"} {
+						require.NotContains(t, string(serialized), forbidden)
+					}
+				})
+			}
+			requireImageRouteMediaNoArchives(t, database, 0)
+		})
+	}
+}
+
+func TestImageRouteMediaOwnerAndStateBoundaries(t *testing.T) {
+	for _, testCase := range []string{"foreign-job", "foreign-child", "missing-job", "missing-child", "wrong-platform", "pending-child", "pending-job", "pending-root", "missing-spool", "malformed-spool"} {
+		t.Run(testCase, func(t *testing.T) {
+			database := setupImageRouteMediaTest(t)
+			root, job := createImageRouteMediaRoot(t, database, false)
+			child := createImageRouteMediaChild(t, database, root, job)
+			switch testCase {
+			case "foreign-job":
+				job.UserID++
+			case "foreign-child":
+				child.UserId++
+			case "wrong-platform":
+				child.Platform = "video"
+			case "pending-child":
+				child.Status = model.TaskStatusInProgress
+			case "pending-job":
+				job.State = model.ImageRouteJobWaiting
+			case "pending-root":
+				root.Status = model.TaskStatusInProgress
+			case "missing-child":
+				job.CurrentTaskID = "missing"
+			case "missing-spool", "malformed-spool":
+				job.CurrentTaskID = ""
+				job.ResultPath = filepath.Join(t.TempDir(), "result.json")
+				if testCase == "malformed-spool" {
+					require.NoError(t, os.WriteFile(job.ResultPath, []byte("invalid"), 0600))
+				}
+			}
+			require.NoError(t, database.Save(job).Error)
+			require.NoError(t, database.Save(child).Error)
+			if testCase == "missing-job" {
+				require.NoError(t, database.Delete(job).Error)
+			}
+			payload := mediaTaskPublicMap(root, nil)
+			require.Empty(t, payload["artifacts"])
+			require.Empty(t, payload["data"])
+			requireImageRouteMediaNoArchives(t, database, 0)
+		})
+	}
+}
+
+func TestImageRouteMediaForeignRootDenied(t *testing.T) {
+	database := setupImageRouteMediaTest(t)
+	root, job := createImageRouteMediaRoot(t, database, false)
+	child := createImageRouteMediaChild(t, database, root, job)
+	createImageRouteMediaArtifact(t, database, root.UserId, child.TaskID, "owner-only")
+	for _, handler := range []gin.HandlerFunc{MediaGetTask, MediaTaskEvents, MediaListTaskArtifacts} {
+		recorder := httptest.NewRecorder()
+		requestContext, _ := gin.CreateTestContext(recorder)
+		requestContext.Request = httptest.NewRequest(http.MethodGet, "/api/media/tasks/"+root.TaskID, nil)
+		requestContext.Set("id", root.UserId+1)
+		requestContext.Params = gin.Params{{Key: "task_id", Value: root.TaskID}}
+		handler(requestContext)
+		require.Equal(t, http.StatusNotFound, recorder.Code)
+		require.NotContains(t, recorder.Body.String(), "owner-only")
+	}
+}
+
+func TestImageRouteMediaAsyncURLFallbackSanitized(t *testing.T) {
+	database := setupImageRouteMediaTest(t)
+	root, job := createImageRouteMediaRoot(t, database, true)
+	child := createImageRouteMediaChild(t, database, root, job)
+	child.Data = []byte(`{"data":[{"url":"https://invalid.example/safe.png?signature=signed"},{"url":"javascript:alert(1)"},{"url":"file:///private.png"},{"url":"https://user:pass@invalid.example/private.png"},{"url":"https://invalid.example/private.png?api_key=secret"},{"url":"https://invalid.example/private-key-fixture.png"}],"secret":"hidden"}`)
+	require.NoError(t, database.Save(child).Error)
+	createImageRouteMediaArtifact(t, database, root.UserId, child.TaskID, "must-not-retain")
+	for _, handler := range []gin.HandlerFunc{MediaGetTask, MediaListTasks, MediaListTaskArtifacts} {
+		payload := readImageRouteMediaEndpoint(t, handler, root.UserId, root.TaskID, false)
+		artifacts := payload["artifacts"].([]any)
+		require.Len(t, artifacts, 1)
+		require.Equal(t, "https://invalid.example/safe.png?signature=signed", artifacts[0].(map[string]any)["content_url"])
+		require.Equal(t, root.TaskID+"-0", artifacts[0].(map[string]any)["id"])
+	}
+	requireImageRouteMediaNoArchives(t, database, 1)
+}
+
+func TestImageRouteMediaUnavailableArchivesDoNotExposeOriginalURL(t *testing.T) {
+	for _, condition := range []string{"deleted", "moderated", "foreign-blob", "missing-blob"} {
+		t.Run(condition, func(t *testing.T) {
+			database := setupImageRouteMediaTest(t)
+			root, job := createImageRouteMediaRoot(t, database, false)
+			child := createImageRouteMediaChild(t, database, root, job)
+			createImageRouteMediaArtifact(t, database, root.UserId, child.TaskID, "unavailable")
+			switch condition {
+			case "deleted":
+				require.NoError(t, database.Model(&model.MediaBlob{}).Where("public_id = ?", "unavailable").Update("deleted_at", 1).Error)
+			case "moderated":
+				require.NoError(t, database.Model(&model.MediaBlob{}).Where("public_id = ?", "unavailable").Update("moderation_status", model.MediaModerationViolation).Error)
+			case "foreign-blob":
+				require.NoError(t, database.Model(&model.MediaBlob{}).Where("public_id = ?", "unavailable").Update("user_id", root.UserId+1).Error)
+			case "missing-blob":
+				require.NoError(t, database.Where("public_id = ?", "unavailable").Delete(&model.MediaBlob{}).Error)
+			}
+			payload := readImageRouteMediaEndpoint(t, MediaGetTask, root.UserId, root.TaskID, false)
+			require.Empty(t, payload["artifacts"])
+			require.Empty(t, payload["data"])
+		})
+	}
+}
+
+func TestImageRouteMediaSyncExistingArtifactSurvivesExpiredSpool(t *testing.T) {
+	database := setupImageRouteMediaTest(t)
+	root, job := createImageRouteMediaRoot(t, database, false)
+	job.ResultPath = filepath.Join(t.TempDir(), "expired.json")
+	require.NoError(t, database.Save(job).Error)
+	createImageRouteMediaArtifact(t, database, root.UserId, root.TaskID, "already-archived")
+	payload := readImageRouteMediaEndpoint(t, MediaGetTask, root.UserId, root.TaskID, false)
+	artifacts := payload["artifacts"].([]any)
+	require.Len(t, artifacts, 1)
+	require.Equal(t, "already-archived", artifacts[0].(map[string]any)["id"])
+	requireImageRouteMediaNoArchives(t, database, 1)
+}

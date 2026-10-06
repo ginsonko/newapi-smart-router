@@ -1,0 +1,781 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	smartRouteBillingOperationTimeout      = 15 * time.Second
+	smartRouteReservationHeartbeatInterval = 30 * time.Second
+	smartRouteReservationHeartbeatTimeout  = 5 * time.Second
+)
+
+// SmartRouteBillingSession keeps one durable reservation across every route
+// attempt. A more expensive fallback extends the existing hold atomically;
+// settlement therefore always uses the route that actually produced output.
+type SmartRouteBillingSession struct {
+	mu sync.Mutex
+
+	reservations      *QuotaReservationService
+	spec              QuotaReservationSpec
+	reservation       string
+	reserved          int
+	lastQuotedQuota   int
+	settled           bool
+	refunded          bool
+	settlementStarted bool
+	finalQuota        int
+	lastError         error
+	relayInfo         *relaycommon.RelayInfo
+	heartbeatStop     chan struct{}
+	heartbeatDone     chan struct{}
+	heartbeatStopOnce sync.Once
+
+	subscriptionAmountTotal            int64
+	subscriptionAmountUsedAfterReserve int64
+	subscriptionPlanId                 int
+	subscriptionPlanTitle              string
+}
+
+func (session *SmartRouteBillingSession) OwnsUsageProjection() bool {
+	return session != nil
+}
+
+func NewSmartRouteBillingSession(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	targetQuota int,
+) (*SmartRouteBillingSession, *types.NewAPIError) {
+	return newSmartRouteBillingSession(c, relayInfo, targetQuota, nil)
+}
+
+func NewSmartRouteBillingSessionWithQuote(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	targetQuota int,
+	quote QuotaReservationRouteQuote,
+) (*SmartRouteBillingSession, *types.NewAPIError) {
+	return newSmartRouteBillingSession(c, relayInfo, targetQuota, &quote)
+}
+
+func newSmartRouteBillingSession(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	targetQuota int,
+	quote *QuotaReservationRouteQuote,
+) (*SmartRouteBillingSession, *types.NewAPIError) {
+	if relayInfo == nil {
+		return nil, types.NewError(errors.New("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	if targetQuota < 0 {
+		return nil, types.NewError(errors.New("smart route quota must not be negative"), types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry())
+	}
+	requestID := strings.TrimSpace(relayInfo.RequestId)
+	if requestID == "" {
+		return nil, types.NewError(errors.New("smart route request id is empty"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	reservationID := "smart:" + requestID
+	if len(reservationID) > 128 {
+		reservationID = "smart:" + common.Sha1([]byte(requestID))
+	}
+
+	session := &SmartRouteBillingSession{
+		reservations: NewQuotaReservationService(),
+		reservation:  reservationID,
+		relayInfo:    relayInfo,
+	}
+	baseSpec := QuotaReservationSpec{
+		ReservationId:  reservationID,
+		RequestId:      requestID,
+		UserId:         relayInfo.UserId,
+		TokenId:        relayInfo.TokenId,
+		TokenUnlimited: relayInfo.TokenUnlimited,
+	}
+
+	preference := common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference)
+	tryWallet := func() error {
+		spec := baseSpec
+		spec.FundingSource = model.QuotaReservationFundingWallet
+		return session.reserveInitial(smartRouteRequestContext(c), spec, targetQuota, quote)
+	}
+	trySubscriptions := func() error {
+		subscriptions, err := model.GetAllActiveUserSubscriptions(relayInfo.UserId)
+		if err != nil {
+			return err
+		}
+		if len(subscriptions) == 0 {
+			return model.ErrQuotaReservationInsufficientPlan
+		}
+		sort.SliceStable(subscriptions, func(i, j int) bool {
+			left := subscriptions[i].Subscription
+			right := subscriptions[j].Subscription
+			if left == nil || right == nil {
+				return right == nil && left != nil
+			}
+			if targetQuota == 0 {
+				leftAvailable := left.AmountTotal == 0 || left.AmountUsed < left.AmountTotal
+				rightAvailable := right.AmountTotal == 0 || right.AmountUsed < right.AmountTotal
+				if leftAvailable != rightAvailable {
+					return leftAvailable
+				}
+			}
+			if left.EndTime != right.EndTime {
+				return left.EndTime < right.EndTime
+			}
+			return left.Id < right.Id
+		})
+		var lastInsufficient error = model.ErrQuotaReservationInsufficientPlan
+		for _, summary := range subscriptions {
+			if summary.Subscription == nil || summary.Subscription.Id <= 0 {
+				continue
+			}
+			spec := baseSpec
+			spec.FundingSource = model.QuotaReservationFundingSubscription
+			spec.UserSubscriptionId = summary.Subscription.Id
+			if err := session.reserveInitial(smartRouteRequestContext(c), spec, targetQuota, quote); err != nil {
+				if errors.Is(err, model.ErrQuotaReservationInsufficientPlan) {
+					lastInsufficient = err
+					continue
+				}
+				return err
+			}
+			session.applySubscriptionInfo(smartRouteRequestContext(c), summary.Subscription)
+			return nil
+		}
+		return lastInsufficient
+	}
+
+	var err error
+	switch preference {
+	case "subscription_only":
+		err = trySubscriptions()
+	case "wallet_only":
+		err = tryWallet()
+	case "wallet_first":
+		err = tryWallet()
+		if isSmartRouteFundingInsufficient(err) {
+			err = trySubscriptions()
+		}
+	case "subscription_first":
+		fallthrough
+	default:
+		hasSubscription, queryErr := model.HasActiveUserSubscription(relayInfo.UserId)
+		if queryErr != nil {
+			err = queryErr
+			break
+		}
+		if !hasSubscription {
+			err = tryWallet()
+			break
+		}
+		err = trySubscriptions()
+		if isSmartRouteFundingInsufficient(err) {
+			allowWallet, overflowErr := model.UserActiveSubscriptionsAllowWalletOverflow(relayInfo.UserId)
+			if overflowErr != nil {
+				err = overflowErr
+			} else if allowWallet {
+				err = tryWallet()
+			}
+		}
+	}
+	if err != nil {
+		return nil, SmartRouteBillingError(err)
+	}
+	session.bindRelayInfoLocked(relayInfo)
+	session.startReservationHeartbeat()
+	return session, nil
+}
+
+func (session *SmartRouteBillingSession) startReservationHeartbeat() {
+	if session == nil || session.heartbeatStop != nil {
+		return
+	}
+	session.heartbeatStop = make(chan struct{})
+	session.heartbeatDone = make(chan struct{})
+	go func() {
+		defer close(session.heartbeatDone)
+		ticker := time.NewTicker(smartRouteReservationHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				active, err := session.refreshReservationHeartbeat()
+				if err != nil {
+					logger.LogWarn(context.Background(), "smart route reservation heartbeat failed: "+err.Error())
+					continue
+				}
+				if !active {
+					return
+				}
+			case <-session.heartbeatStop:
+				return
+			}
+		}
+	}()
+}
+
+func (session *SmartRouteBillingSession) refreshReservationHeartbeat() (bool, error) {
+	if session == nil || session.reservations == nil || strings.TrimSpace(session.reservation) == "" {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteReservationHeartbeatTimeout)
+	defer cancel()
+	return session.reservations.Heartbeat(ctx, session.reservation)
+}
+
+func (session *SmartRouteBillingSession) stopReservationHeartbeatLocked() {
+	if session == nil || session.heartbeatStop == nil || session.heartbeatDone == nil {
+		return
+	}
+	session.heartbeatStopOnce.Do(func() { close(session.heartbeatStop) })
+	<-session.heartbeatDone
+}
+
+func (session *SmartRouteBillingSession) reserveInitial(
+	ctx context.Context,
+	spec QuotaReservationSpec,
+	targetQuota int,
+	quote *QuotaReservationRouteQuote,
+) error {
+	var reservation *model.QuotaReservation
+	var err error
+	if quote == nil {
+		reservation, err = session.reservations.ReserveTo(ctx, spec, targetQuota)
+	} else {
+		reservation, err = session.reservations.ReserveToWithRouteQuote(ctx, spec, targetQuota, *quote)
+	}
+	if err != nil {
+		return err
+	}
+	session.spec = spec
+	session.reserved = reservation.ReservedQuota
+	if quote != nil {
+		session.lastQuotedQuota = reservation.QuotedQuota
+	}
+	return nil
+}
+
+func (session *SmartRouteBillingSession) applySubscriptionInfo(ctx context.Context, subscription *model.UserSubscription) {
+	if subscription == nil {
+		return
+	}
+	session.subscriptionAmountTotal = subscription.AmountTotal
+	session.subscriptionAmountUsedAfterReserve = subscription.AmountUsed + int64(session.reserved)
+	session.refreshSubscriptionUsageLocked(ctx)
+	if plan, err := model.GetSubscriptionPlanInfoByUserSubscriptionId(subscription.Id); err == nil && plan != nil {
+		session.subscriptionPlanId = plan.PlanId
+		session.subscriptionPlanTitle = plan.PlanTitle
+	}
+	if session.relayInfo != nil {
+		session.bindRelayInfoLocked(session.relayInfo)
+	}
+}
+
+func (session *SmartRouteBillingSession) refreshSubscriptionUsageLocked(ctx context.Context) {
+	if session.spec.FundingSource != model.QuotaReservationFundingSubscription {
+		return
+	}
+	usage, err := session.reservations.SubscriptionUsage(ctx, session.spec.UserId, session.spec.UserSubscriptionId)
+	if err != nil || usage == nil {
+		return
+	}
+	session.subscriptionAmountTotal = usage.AmountTotal
+	session.subscriptionAmountUsedAfterReserve = usage.AmountUsed
+}
+
+func (session *SmartRouteBillingSession) BindRelayInfo(relayInfo *relaycommon.RelayInfo) {
+	if session == nil || relayInfo == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.relayInfo = relayInfo
+	session.bindRelayInfoLocked(relayInfo)
+}
+
+func (session *SmartRouteBillingSession) bindRelayInfoLocked(relayInfo *relaycommon.RelayInfo) {
+	if relayInfo == nil {
+		return
+	}
+	relayInfo.Billing = session
+	relayInfo.FinalPreConsumedQuota = session.reserved
+	relayInfo.BillingSource = session.spec.FundingSource
+	if session.spec.FundingSource == model.QuotaReservationFundingSubscription {
+		relayInfo.SubscriptionId = session.spec.UserSubscriptionId
+		relayInfo.SubscriptionPreConsumed = int64(session.reserved)
+		relayInfo.SubscriptionPostDelta = 0
+		relayInfo.SubscriptionAmountTotal = session.subscriptionAmountTotal
+		relayInfo.SubscriptionAmountUsedAfterPreConsume = session.subscriptionAmountUsedAfterReserve
+		relayInfo.SubscriptionPlanId = session.subscriptionPlanId
+		relayInfo.SubscriptionPlanTitle = session.subscriptionPlanTitle
+	} else {
+		relayInfo.SubscriptionId = 0
+		relayInfo.SubscriptionPreConsumed = 0
+		relayInfo.SubscriptionPostDelta = 0
+		relayInfo.SubscriptionAmountTotal = 0
+		relayInfo.SubscriptionAmountUsedAfterPreConsume = 0
+		relayInfo.SubscriptionPlanId = 0
+		relayInfo.SubscriptionPlanTitle = ""
+	}
+}
+
+func (session *SmartRouteBillingSession) Settle(actualQuota int) error {
+	if session == nil {
+		return errors.New("smart route billing session is nil")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	// Zero usage is ambiguous when an upstream stream ends after output: the
+	// provider may have charged but omitted its terminal usage event. Do not
+	// silently refund a non-zero reservation; settle at the latest durable quote
+	// (or the held reservation) until a later reconciliation can refine it.
+	settlementQuota := actualQuota
+	if settlementQuota == 0 {
+		if session.lastQuotedQuota > 0 {
+			settlementQuota = session.lastQuotedQuota
+		} else if session.reserved > 0 {
+			settlementQuota = session.reserved
+		}
+	}
+	if session.refunded {
+		return model.ErrQuotaReservationFinalized
+	}
+	if session.settled {
+		if session.finalQuota == settlementQuota {
+			return nil
+		}
+		session.lastError = model.ErrQuotaReservationSettlementConflict
+		return session.lastError
+	}
+	session.stopReservationHeartbeatLocked()
+	session.settlementStarted = true
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteBillingOperationTimeout)
+	defer cancel()
+	reservation, err := session.reservations.Settle(ctx, session.reservation, settlementQuota)
+	if err != nil {
+		session.lastError = err
+		return err
+	}
+	session.reserved = reservation.ReservedQuota
+	session.lastQuotedQuota = reservation.QuotedQuota
+	session.settled = true
+	session.finalQuota = settlementQuota
+	session.lastError = nil
+	if session.relayInfo != nil {
+		session.relayInfo.FinalPreConsumedQuota = reservation.ReservedQuota
+		if session.spec.FundingSource == model.QuotaReservationFundingSubscription {
+			session.relayInfo.SubscriptionPostDelta = int64(settlementQuota) - session.relayInfo.SubscriptionPreConsumed
+		}
+	}
+	return nil
+}
+
+func (session *SmartRouteBillingSession) HandoffTaskBilling() {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.settled || session.refunded {
+		return
+	}
+	session.stopReservationHeartbeatLocked()
+	session.settlementStarted = true
+}
+
+func (session *SmartRouteBillingSession) ConfirmTaskBillingApplied(actualQuota int) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.refunded {
+		return
+	}
+	session.stopReservationHeartbeatLocked()
+	session.settlementStarted = true
+	session.settled = true
+	session.finalQuota = actualQuota
+	session.lastError = nil
+	if session.relayInfo != nil {
+		session.relayInfo.FinalPreConsumedQuota = actualQuota
+		if session.spec.FundingSource == model.QuotaReservationFundingSubscription {
+			session.relayInfo.SubscriptionPostDelta = int64(actualQuota) - session.relayInfo.SubscriptionPreConsumed
+		}
+	}
+}
+
+func (session *SmartRouteBillingSession) Refund(c *gin.Context) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.settled || session.refunded || session.settlementStarted {
+		return
+	}
+	session.stopReservationHeartbeatLocked()
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteBillingOperationTimeout)
+	defer cancel()
+	if err := session.refundLocked(ctx); err != nil {
+		session.lastError = err
+		logger.LogError(c, "smart route reservation refund failed: "+err.Error())
+	}
+}
+
+func (session *SmartRouteBillingSession) refundLocked(ctx context.Context) error {
+	reservation, err := session.reservations.Refund(ctx, session.reservation)
+	if err != nil {
+		return err
+	}
+	if session.relayInfo != nil {
+		ProjectTenantCostZeroAsync(nil, session.relayInfo, "smart_route_refunded_before_authoritative_settlement")
+	}
+	session.refunded = true
+	session.reserved = 0
+	session.lastError = nil
+	if session.relayInfo != nil {
+		session.relayInfo.FinalPreConsumedQuota = 0
+		if session.spec.FundingSource == model.QuotaReservationFundingSubscription {
+			session.relayInfo.SubscriptionPostDelta = -session.relayInfo.SubscriptionPreConsumed
+			session.refreshSubscriptionUsageLocked(ctx)
+			session.relayInfo.SubscriptionAmountUsedAfterPreConsume = session.subscriptionAmountUsedAfterReserve
+		}
+	}
+	if reservation != nil {
+		session.lastQuotedQuota = reservation.QuotedQuota
+	}
+	return nil
+}
+
+func (session *SmartRouteBillingSession) NeedsRefund() bool {
+	if session == nil {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return !session.settled && !session.refunded && !session.settlementStarted
+}
+
+func (session *SmartRouteBillingSession) GetPreConsumedQuota() int {
+	if session == nil {
+		return 0
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.reserved
+}
+
+// ReservationID returns the durable idempotency key used by the smart-route
+// reservation and its accounting projection.
+func (session *SmartRouteBillingSession) ReservationID() string {
+	if session == nil {
+		return ""
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.reservation
+}
+
+const smartRouteCommittedBillingMarker = "smart_route_committed_settlement"
+
+const smartRouteAccountingProjectedContextKey = "smart_route_accounting_projected"
+
+// MarkSmartRouteAccountingProjected records that the normal usage path has
+// already updated user/channel counters. It lets the controller's fallback
+// settle path distinguish a real missing-usage projection from a successful
+// usage callback when consume logs are disabled.
+func MarkSmartRouteAccountingProjected(c *gin.Context) {
+	if c != nil {
+		c.Set(smartRouteAccountingProjectedContextKey, true)
+	}
+}
+
+func ResetSmartRouteAccountingProjection(c *gin.Context) {
+	if c != nil {
+		c.Set(smartRouteAccountingProjectedContextKey, false)
+	}
+}
+
+func SmartRouteAccountingProjected(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, ok := c.Get(smartRouteAccountingProjectedContextKey)
+	return ok && value == true
+}
+
+// ProjectSmartRouteCommittedSettlement closes the accounting side of a
+// committed smart-route stream after its reservation has been settled. The
+// reservation transaction is the exactly-once fence for user/channel usage;
+// the consume log is then written idempotently by request ID. No wallet or
+// token balance is changed here because Settle already owns that ledger.
+func ProjectSmartRouteCommittedSettlement(
+	c *gin.Context,
+	billing *SmartRouteBillingSession,
+	relayInfo *relaycommon.RelayInfo,
+	upstreamErr error,
+) error {
+	if billing == nil {
+		return errors.New("smart route billing session is nil")
+	}
+	if relayInfo == nil {
+		return errors.New("smart route relay info is nil")
+	}
+	requestID := strings.TrimSpace(relayInfo.RequestId)
+	if requestID == "" {
+		return errors.New("smart route committed billing request id is empty")
+	}
+	if c == nil {
+		return errors.New("smart route committed billing context is nil")
+	}
+	c.Set(common.RequestIdKey, requestID)
+
+	projectionCtx := context.WithoutCancel(c.Request.Context())
+	var reservation *model.QuotaReservation
+	var err error
+	if SmartRouteAccountingProjected(c) {
+		if err := model.MarkSmartRouteCommittedAccountingProjection(projectionCtx, billing.ReservationID()); err != nil {
+			return fmt.Errorf("mark normal smart-route accounting projection: %w", err)
+		}
+		reservation, err = model.GetQuotaReservation(projectionCtx, billing.ReservationID())
+	} else {
+		hasPositiveLog, checkErr := model.HasPositiveConsumeLogForRequest(requestID)
+		if checkErr != nil {
+			return fmt.Errorf("check smart-route consume log projection: %w", checkErr)
+		}
+		if hasPositiveLog {
+			if markErr := model.MarkSmartRouteCommittedAccountingProjection(projectionCtx, billing.ReservationID()); markErr != nil {
+				return fmt.Errorf("mark existing smart-route accounting projection: %w", markErr)
+			}
+			reservation, err = model.GetQuotaReservation(projectionCtx, billing.ReservationID())
+		} else {
+			reservation, _, err = model.ApplySmartRouteCommittedAccountingProjection(projectionCtx, billing.ReservationID())
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("apply smart-route accounting projection: %w", err)
+	}
+	if reservation == nil {
+		return errors.New("smart-route accounting projection returned no reservation")
+	}
+	// The reservation is the smart-router financial authority. Export the
+	// final route exactly once by its deterministic request ID; a duplicate
+	// call is an idempotent no-op in tenant_cost_events and cannot alter money.
+	ProjectTenantCostSettlementAsync(c, relayInfo, int64(reservation.FinalQuota))
+
+	other := map[string]interface{}{
+		"billing_fallback": smartRouteCommittedBillingMarker,
+		"usage_known":      false,
+		"final_quota":      reservation.FinalQuota,
+		"reservation_id":   reservation.ReservationId,
+	}
+	logContent := "智能路由正常完成但上游未提供可用计费信息，服务器按已结算报价完成计费"
+	if relayInfo.RelayMode == relayconstant.RelayModeStandaloneSearch {
+		other["web_search"] = true
+		other["web_search_call_count"] = 1
+		other["web_search_price"] = operation_setting.GetToolPriceForModel("web_search", relayInfo.OriginModelName)
+		other["standalone_search"] = true
+		logContent = "Standalone Web Search 调用 1 次"
+	}
+	if upstreamErr != nil {
+		other["upstream_terminal_reason"] = common.LocalLogPreview(upstreamErr.Error())
+	}
+	modelName := relayInfo.OriginModelName
+	if modelName == "" && relayInfo.ChannelMeta != nil {
+		modelName = relayInfo.ChannelMeta.UpstreamModelName
+	}
+	if modelName == "" {
+		modelName = "unknown"
+	}
+	useTimeSeconds := 0
+	if !relayInfo.StartTime.IsZero() {
+		useTimeSeconds = int(time.Since(relayInfo.StartTime).Seconds())
+		if useTimeSeconds < 0 {
+			useTimeSeconds = 0
+		}
+	}
+	if upstreamErr != nil {
+		logContent = "智能路由已输出后上游异常结束，服务器按已结算报价完成计费"
+	}
+	if _, err := model.RecordConsumeLogIfAbsent(c, reservation.UserId, model.RecordConsumeLogParams{
+		ChannelId:      reservation.ChannelId,
+		ModelName:      modelName,
+		TokenName:      c.GetString("token_name"),
+		Quota:          reservation.FinalQuota,
+		Content:        logContent,
+		TokenId:        reservation.TokenId,
+		UseTimeSeconds: useTimeSeconds,
+		IsStream:       relayInfo.IsStream,
+		Group:          reservation.Group,
+		Other:          other,
+	}); err != nil {
+		// The money and usage projection is already durable. Keep the request
+		// charged and surface the missing log to reconciliation instead of
+		// retrying the upstream request or refunding the reservation.
+		logger.LogError(c, "smart-route committed settlement log projection pending: "+err.Error())
+		return fmt.Errorf("record smart-route committed consume log: %w", err)
+	}
+	return nil
+}
+
+func (session *SmartRouteBillingSession) Reserve(targetQuota int) error {
+	if session == nil {
+		return errors.New("smart route billing session is nil")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.settled || session.refunded || session.settlementStarted {
+		return model.ErrQuotaReservationFinalized
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteBillingOperationTimeout)
+	defer cancel()
+	reservation, err := session.reservations.ReserveTo(ctx, session.spec, targetQuota)
+	if err != nil {
+		session.lastError = err
+		return err
+	}
+	session.reserved = reservation.ReservedQuota
+	session.lastQuotedQuota = reservation.QuotedQuota
+	session.refreshSubscriptionUsageLocked(ctx)
+	session.lastError = nil
+	if session.relayInfo != nil {
+		session.bindRelayInfoLocked(session.relayInfo)
+	}
+	return nil
+}
+
+func (session *SmartRouteBillingSession) ReserveAndRecordRouteQuote(
+	targetQuota int,
+	quote QuotaReservationRouteQuote,
+) error {
+	if session == nil {
+		return errors.New("smart route billing session is nil")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.settled || session.refunded || session.settlementStarted {
+		return model.ErrQuotaReservationFinalized
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteBillingOperationTimeout)
+	defer cancel()
+	reservation, err := session.reservations.ReserveToWithRouteQuote(ctx, session.spec, targetQuota, quote)
+	if err != nil {
+		session.lastError = err
+		return err
+	}
+	session.reserved = reservation.ReservedQuota
+	session.lastQuotedQuota = reservation.QuotedQuota
+	session.refreshSubscriptionUsageLocked(ctx)
+	session.lastError = nil
+	if session.relayInfo != nil {
+		session.bindRelayInfoLocked(session.relayInfo)
+	}
+	return nil
+}
+
+func (session *SmartRouteBillingSession) HoldForReconciliation(reason string) error {
+	if session == nil {
+		return errors.New("smart route billing session is nil")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.settled {
+		return nil
+	}
+	if session.refunded {
+		return model.ErrQuotaReservationFinalized
+	}
+	session.stopReservationHeartbeatLocked()
+	session.settlementStarted = true
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteBillingOperationTimeout)
+	defer cancel()
+	_, err := session.reservations.HoldForReconciliation(ctx, session.reservation, reason)
+	if err != nil {
+		session.lastError = err
+		return err
+	}
+	session.lastError = nil
+	return nil
+}
+
+func (session *SmartRouteBillingSession) RecordRouteQuote(quote QuotaReservationRouteQuote) error {
+	if session == nil {
+		return errors.New("smart route billing session is nil")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.settled || session.refunded || session.settlementStarted {
+		return model.ErrQuotaReservationFinalized
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), smartRouteBillingOperationTimeout)
+	defer cancel()
+	reservation, err := session.reservations.RecordRouteQuote(ctx, session.reservation, quote)
+	if err != nil {
+		session.lastError = err
+		return err
+	}
+	session.lastQuotedQuota = reservation.QuotedQuota
+	session.lastError = nil
+	return nil
+}
+
+func (session *SmartRouteBillingSession) LastError() error {
+	if session == nil {
+		return nil
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.lastError
+}
+
+func (session *SmartRouteBillingSession) IsSettled() bool {
+	if session == nil {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.settled
+}
+
+func smartRouteRequestContext(c *gin.Context) context.Context {
+	if c != nil && c.Request != nil {
+		return c.Request.Context()
+	}
+	return context.Background()
+}
+
+func isSmartRouteFundingInsufficient(err error) bool {
+	return errors.Is(err, model.ErrQuotaReservationInsufficientWallet) ||
+		errors.Is(err, model.ErrQuotaReservationInsufficientPlan)
+}
+
+func SmartRouteBillingError(err error) *types.NewAPIError {
+	if isSmartRouteFundingInsufficient(err) || errors.Is(err, model.ErrQuotaReservationInsufficientToken) {
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("智能路由预留额度失败: %w", err),
+			types.ErrorCodeInsufficientUserQuota,
+			http.StatusForbidden,
+			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithNoRecordErrorLog(),
+		)
+	}
+	return types.NewError(fmt.Errorf("智能路由账务预留失败: %w", err), types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+}

@@ -1,0 +1,95 @@
+package service
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSmartRouteReceiptIncludesSuccessfulConsumeAttemptOnce(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	AppendSmartRouteAttemptAudit(ctx, SmartRouteAttemptAudit{Attempt: 1, Group: "first", Outcome: smartrouter.OutcomeInfrastructure, StatusCode: 502})
+	AppendSmartRouteAttemptAudit(ctx, SmartRouteAttemptAudit{Attempt: 2, Group: "fallback", RatioPPM: 80000})
+	CompleteSmartRouteConsumeAttempt(ctx)
+	other := make(map[string]interface{})
+	AppendSmartRouterLogInfo(ctx, other, nil)
+	receipt, ok := other["smart_router_receipt"].(SmartRouteUserReceipt)
+	require.True(t, ok)
+	require.Len(t, receipt.Attempts, 2)
+	assert.True(t, receipt.Completed)
+	assert.Equal(t, "fallback", receipt.FinalGroup)
+	assert.Equal(t, smartrouter.OutcomeSuccess, receipt.Attempts[1].Outcome)
+	AppendSmartRouteAttemptAudit(ctx, SmartRouteAttemptAudit{Attempt: 2, Group: "fallback", Outcome: smartrouter.OutcomeSuccess, StatusCode: 200, Committed: true})
+	AppendSmartRouterLogInfo(ctx, other, nil)
+	receipt = other["smart_router_receipt"].(SmartRouteUserReceipt)
+	assert.Len(t, receipt.Attempts, 2)
+	assert.True(t, receipt.Attempts[1].Committed)
+}
+
+func TestSmartRouteReceiptCommittedFailureIsNotCompleted(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	AppendSmartRouteAttemptAudit(ctx, SmartRouteAttemptAudit{Attempt: 1, Group: "first", Outcome: smartrouter.OutcomeInfrastructure, StatusCode: 502, Committed: true})
+	CompleteSmartRouteConsumeAttempt(ctx)
+	other := make(map[string]interface{})
+	AppendSmartRouterLogInfo(ctx, other, nil)
+	receipt, ok := other["smart_router_receipt"].(SmartRouteUserReceipt)
+	require.True(t, ok)
+	assert.False(t, receipt.Completed)
+	assert.Empty(t, receipt.FinalGroup)
+	assert.Equal(t, smartrouter.OutcomeInfrastructure, receipt.Attempts[0].Outcome)
+}
+
+func TestAppendSmartRouterLogInfoSeparatesUserReceiptFromAdminTopology(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(nil)
+	AppendSmartRouteAttemptAudit(ctx, SmartRouteAttemptAudit{
+		Attempt: 1, RouteID: "private-route", ChannelID: 91, Group: "special",
+		RatioPPM: 20_000, Price: smartrouter.RoutePrice{
+			BillingMode: "fixed_price", BillingUnit: "per_second", ComparisonClass: "fixed-second",
+			ScorePPM: 200_000, StaticComparable: true, Scope: "group_model", Revision: "contract-a",
+		}, Admission: smartrouter.AdmissionNormal,
+		Outcome: smartrouter.OutcomeInfrastructure, StatusCode: 503,
+		CatalogVersion: "catalog-a", PriceVersion: "price-a",
+	})
+	AppendSmartRouteAttemptAudit(ctx, SmartRouteAttemptAudit{
+		Attempt: 2, RouteID: "private-route-2", ChannelID: 92, Group: "plus",
+		RatioPPM: 80_000, Price: smartrouter.RoutePrice{
+			BillingMode: "fixed_price", BillingUnit: "per_second", ComparisonClass: "fixed-second",
+			ScorePPM: 800_000, StaticComparable: true, Scope: "group_model", Revision: "contract-a",
+		}, Admission: smartrouter.AdmissionNormal,
+		Outcome: smartrouter.OutcomeSuccess, StatusCode: 200, Committed: true,
+		CatalogVersion: "catalog-a", PriceVersion: "price-a",
+	})
+
+	other := make(map[string]interface{})
+	adminInfo := make(map[string]interface{})
+	AppendSmartRouterLogInfo(ctx, other, adminInfo)
+
+	adminAttempts, ok := adminInfo["smart_router_attempts"].([]SmartRouteAttemptAudit)
+	require.True(t, ok)
+	require.Equal(t, "private-route", adminAttempts[0].RouteID)
+	require.Equal(t, 91, adminAttempts[0].ChannelID)
+
+	receipt, ok := other["smart_router_receipt"].(SmartRouteUserReceipt)
+	require.True(t, ok)
+	require.True(t, receipt.Completed)
+	require.Equal(t, "plus", receipt.FinalGroup)
+	require.Equal(t, int64(80_000), receipt.FinalRatioPPM)
+	require.NotNil(t, receipt.FinalPrice)
+	require.Equal(t, int64(800_000), receipt.FinalPrice.ScorePPM)
+	require.Equal(t, "contract-a", receipt.FinalPrice.Revision)
+	require.Len(t, receipt.Attempts, 2)
+	require.Equal(t, "per_second", receipt.Attempts[0].Price.BillingUnit)
+
+	encoded, err := common.Marshal(receipt)
+	require.NoError(t, err)
+	serialized := string(encoded)
+	require.NotContains(t, serialized, "private-route")
+	require.NotContains(t, serialized, "channel_id")
+	require.NotContains(t, serialized, "route_id")
+	require.NotContains(t, serialized, "upstream")
+}

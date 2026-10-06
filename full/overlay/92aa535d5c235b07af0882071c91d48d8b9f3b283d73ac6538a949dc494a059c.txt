@@ -1,0 +1,61 @@
+package middleware
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	TenantCostReportingTokenContextKey = "tenant_reporting_token"
+	TenantCostTenantContextKey         = "tenant_cost_tenant_id"
+	TenantCostTenantHeader             = "X-Gateway-Tenant"
+	TenantCostLegacyTenantHeader       = "X-Downstream-Tenant"
+)
+
+// TenantCostReportingAuth authenticates only a hash-backed reporting token.
+// It is intentionally separate from TokenAuth: a normal data-plane sk key
+// cannot enter the reporting API, and a reporting token cannot enter /v1.
+func TenantCostReportingAuth() func(c *gin.Context) {
+	return func(c *gin.Context) {
+		secret := strings.TrimSpace(c.GetHeader("Authorization"))
+		if strings.HasPrefix(strings.ToLower(secret), "bearer ") {
+			secret = strings.TrimSpace(secret[7:])
+		}
+		if secret == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "reporting token required"})
+			c.Abort()
+			return
+		}
+		token, err := model.LookupTenantReportingToken(secret)
+		if err != nil || token == nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "reporting token invalid or expired"})
+			c.Abort()
+			return
+		}
+		if strings.TrimSpace(token.Permission) != model.TenantCostReportingPermission {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "reporting scope denied"})
+			c.Abort()
+			return
+		}
+		for _, header := range []string{TenantCostTenantHeader, TenantCostLegacyTenantHeader} {
+			if supplied := strings.TrimSpace(c.GetHeader(header)); supplied != "" && supplied != token.TenantID {
+				c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "tenant scope denied"})
+				c.Abort()
+				return
+			}
+		}
+		if supplied := strings.TrimSpace(c.Query("tenant_id")); supplied != "" && supplied != token.TenantID {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "tenant scope denied"})
+			c.Abort()
+			return
+		}
+		c.Set(TenantCostReportingTokenContextKey, token)
+		c.Set(TenantCostTenantContextKey, token.TenantID)
+		// Keep the server-side scope authoritative; callers cannot select a
+		// different tenant with query parameters or headers.
+		c.Next()
+	}
+}

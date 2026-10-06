@@ -1,0 +1,35 @@
+package controller
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestSmartRouterLeaderboardPageUsesDedicatedBound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name     string
+		query    string
+		expected int
+	}{
+		{name: "ordinary size", query: "?page_size=50", expected: 50},
+		{name: "above ordinary ceiling", query: "?page_size=101", expected: 101},
+		{name: "complete leaderboard", query: "?page_size=1000", expected: 1000},
+		{name: "bounded oversized request", query: "?page_size=5000", expected: 1000},
+		{name: "negative falls back", query: "?page_size=-1", expected: 10},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			context, _ := gin.CreateTestContext(httptest.NewRecorder())
+			context.Request = httptest.NewRequest("GET", "/api/smart-router/leaderboard/models"+test.query, nil)
+
+			page := smartRouterLeaderboardPage(context)
+
+			assert.Equal(t, test.expected, page.PageSize)
+		})
+	}
+}

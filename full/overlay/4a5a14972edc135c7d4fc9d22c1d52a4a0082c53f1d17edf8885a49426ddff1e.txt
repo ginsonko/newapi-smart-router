@@ -1,0 +1,67 @@
+package controller
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLeaderboardScopeUsesCurrentAccountInsteadOfSessionOrQuery(t *testing.T) {
+	db := setupChannelManagedStateControllerTest(t)
+	user := model.User{Id: 8821, Username: "leaderboard-scope", Group: "default", Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&user).Error)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/api/smart-router/leaderboard/models?user_group=vip&group=vip", nil)
+	c.Set("id", user.Id)
+	c.Set("user_group", "vip")
+	group, err := smartRouterLeaderboardUserGroup(c)
+	require.NoError(t, err)
+	assert.Equal(t, "default", group, "client input and stale session cannot grant VIP visibility")
+	require.NoError(t, db.Model(&user).Update("group", "test-vip").Error)
+	c.Set("user_group", "default")
+	group, err = smartRouterLeaderboardUserGroup(c)
+	require.NoError(t, err)
+	assert.Equal(t, "test-vip", group, "account upgrade is visible without signing in again")
+	c.Set("id", 991122)
+	_, err = smartRouterLeaderboardUserGroup(c)
+	require.Error(t, err, "identity lookup failure must not fall back to a privileged session")
+}
+
+func TestLeaderboardPrivateRouteDetailRequiresAccountGroupAccess(t *testing.T) {
+	setupSmartRouterAnalyticsControllerDBV1(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}))
+	require.NoError(t, model.DB.Create(&model.User{Id: 8822, Username: "private-route", Group: "default"}).Error)
+	id := controllerAnalyticsDigestV1("private-detail")[:32]
+	require.NoError(t, model.DB.Create(&model.RouteAnalyticsDimensionV1{
+		DetailID: id, RouteFingerprintDigest: controllerAnalyticsDigestV1("private-route"),
+		Model: "scope-test-model", Endpoint: "openai-responses-v1", PublicGroupName: "scope-private",
+	}).Error)
+	special := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	original := special.ReadAll()
+	t.Cleanup(func() { special.Replace(original) })
+	special.Replace(map[string]map[string]string{"scope-vip": {"+:scope-private": "专属"}})
+	request := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("id", 8822)
+		c.Params = gin.Params{{Key: "detail_id", Value: id}}
+		c.Request = httptest.NewRequest("GET", "/api/smart-router/leaderboard/routes/"+id+"/analytics?range=1h", nil)
+		GetSmartRouterRouteAnalytics(c)
+		return recorder
+	}
+	denied := request()
+	assert.Equal(t, http.StatusNotFound, denied.Code)
+	assert.NotContains(t, denied.Body.String(), "scope-private")
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 8822).Update("group", "scope-vip").Error)
+	allowed := request()
+	assert.Equal(t, http.StatusOK, allowed.Code)
+	assert.Contains(t, allowed.Body.String(), `"success":true`)
+	assert.Contains(t, allowed.Body.String(), "scope-private")
+}

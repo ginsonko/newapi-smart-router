@@ -1,0 +1,264 @@
+package service
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/stretchr/testify/require"
+)
+
+func claudeStreamInfo() *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{ClaudeConvertInfo: relaycommon.NewClaudeConvertInfo()}
+}
+
+func intPointer(v int) *int { return &v }
+
+func toolChunk(model string, calls ...dto.ToolCallResponse) *dto.ChatCompletionsStreamResponse {
+	return &dto.ChatCompletionsStreamResponse{
+		Id:    "resp_test",
+		Model: model,
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: calls},
+		}},
+	}
+}
+
+func toolCall(id, name, args string, index *int) dto.ToolCallResponse {
+	return dto.ToolCallResponse{ID: id, Index: index, Function: dto.FunctionResponse{Name: name, Arguments: args}}
+}
+
+func finishChunk(model, reason string) *dto.ChatCompletionsStreamResponse {
+	return &dto.ChatCompletionsStreamResponse{
+		Id:    "resp_test",
+		Model: model,
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			FinishReason: &reason,
+		}},
+		Usage: &dto.Usage{PromptTokens: 4, CompletionTokens: 3, TotalTokens: 7},
+	}
+}
+
+func eventIndices(events []*dto.ClaudeResponse, eventType string) []int {
+	indices := make([]int, 0)
+	for _, event := range events {
+		if event.Type == eventType && event.Index != nil {
+			indices = append(indices, *event.Index)
+		}
+	}
+	return indices
+}
+
+func TestStreamResponseOpenAI2ClaudeParallelToolsHaveOneLifecycleEach(t *testing.T) {
+	for _, model := range []string{"claude-power", "gpt-5.6-sol", "gemini-tool-compatible"} {
+		info := claudeStreamInfo()
+		zero, two := 0, 2
+		first := toolChunk(model,
+			toolCall("call-a", "search", `{"q":"one"}`, &zero),
+			toolCall("call-b", "open", `{"url":"https://example.test"}`, &two),
+		)
+		firstEvents := StreamResponseOpenAI2Claude(first, info)
+		require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+		require.Equal(t, []int{0, 1}, eventIndices(firstEvents, "content_block_start"))
+		require.Equal(t, []int{0, 1}, eventIndices(firstEvents, "content_block_delta"))
+
+		lastEvents := StreamResponseOpenAI2Claude(finishChunk(model, "tool_calls"), info)
+		require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+		require.Equal(t, []int{0, 1}, eventIndices(lastEvents, "content_block_stop"))
+		require.True(t, info.ClaudeConvertInfo.Done)
+	}
+}
+
+func TestStreamResponseOpenAI2ClaudeBuffersArgumentsUntilToolName(t *testing.T) {
+	info := claudeStreamInfo()
+	first := toolChunk("any-model", toolCall("call-a", "", `{"q":`, nil))
+	firstEvents := StreamResponseOpenAI2Claude(first, info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Empty(t, eventIndices(firstEvents, "content_block_start"))
+	require.Empty(t, eventIndices(firstEvents, "content_block_delta"))
+
+	second := toolChunk("any-model", toolCall("call-a", "search", `"one"}`, nil))
+	secondEvents := StreamResponseOpenAI2Claude(second, info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Equal(t, []int{0}, eventIndices(secondEvents, "content_block_start"))
+	require.Equal(t, []int{0, 0}, eventIndices(secondEvents, "content_block_delta"))
+
+	lastEvents := StreamResponseOpenAI2Claude(finishChunk("any-model", "tool_calls"), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Equal(t, []int{0}, eventIndices(lastEvents, "content_block_stop"))
+}
+
+func TestStreamResponseOpenAI2ClaudeClosesToolBeforeTextWithoutIndexReuse(t *testing.T) {
+	info := claudeStreamInfo()
+	toolEvents := StreamResponseOpenAI2Claude(toolChunk("any-model", toolCall("call-a", "search", `{}`, nil)), info)
+	require.Equal(t, []int{0}, eventIndices(toolEvents, "content_block_start"))
+
+	text := "after tool"
+	textEvents := StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{
+		Model: "any-model",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{Content: &text},
+		}},
+	}, info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	starts := eventIndices(textEvents, "content_block_start")
+	require.Equal(t, []int{1}, starts)
+	stops := eventIndices(textEvents, "content_block_stop")
+	require.Equal(t, []int{0}, stops)
+
+	lastEvents := StreamResponseOpenAI2Claude(finishChunk("any-model", "stop"), info)
+	require.Equal(t, []int{1}, eventIndices(lastEvents, "content_block_stop"))
+}
+
+func TestStreamResponseOpenAI2ClaudeRejectsUnresolvedToolName(t *testing.T) {
+	info := claudeStreamInfo()
+	_ = StreamResponseOpenAI2Claude(toolChunk("any-model", toolCall("call-a", "", `{"q":`, nil)), info)
+	_ = StreamResponseOpenAI2Claude(finishChunk("any-model", "tool_calls"), info)
+	require.Error(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Contains(t, info.ClaudeConvertInfo.ProtocolError.Error(), "valid name")
+}
+
+func TestStreamResponseOpenAI2ClaudeTextThinkingAndUsageOnlyLifecycle(t *testing.T) {
+	info := claudeStreamInfo()
+	thinking := "reason"
+	text := "answer"
+	first := StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{
+		Id:    "resp_text",
+		Model: "model-a",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ReasoningContent: &thinking},
+		}},
+	}, info)
+	require.Equal(t, []int{0}, eventIndices(first, "content_block_start"))
+	second := StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{
+		Model: "model-a",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{Content: &text},
+		}},
+	}, info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Equal(t, []int{0}, eventIndices(second, "content_block_stop"))
+	require.Equal(t, []int{1}, eventIndices(second, "content_block_start"))
+
+	usageEvents := StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{
+		Model: "model-a",
+		Usage: &dto.Usage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14},
+	}, info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Equal(t, []int{1}, eventIndices(usageEvents, "content_block_stop"))
+	require.Equal(t, 1, countClaudeEvents(usageEvents, "message_stop"))
+}
+
+func countClaudeEvents(events []*dto.ClaudeResponse, eventType string) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == eventType {
+			count++
+		}
+	}
+	return count
+}
+
+func TestStreamResponseOpenAI2ClaudeNeverEmitsDeltaOrStopForUnstartedIndex(t *testing.T) {
+	info := claudeStreamInfo()
+	indexTwo := 2
+	events := StreamResponseOpenAI2Claude(toolChunk("model-b", toolCall("call-b", "open", `{}`, &indexTwo)), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	started := map[int]bool{}
+	for _, event := range events {
+		switch event.Type {
+		case "content_block_start":
+			started[event.GetIndex()] = true
+		case "content_block_delta", "content_block_stop":
+			require.True(t, started[event.GetIndex()], "event %s referenced an unstarted index", event.Type)
+		}
+	}
+	finish := StreamResponseOpenAI2Claude(finishChunk("model-b", "tool_calls"), info)
+	for _, event := range finish {
+		if event.Type == "content_block_stop" {
+			require.True(t, started[event.GetIndex()])
+		}
+	}
+}
+
+func TestStreamResponseOpenAI2ClaudeStableIDSurvivesProviderIndexDrift(t *testing.T) {
+	info := claudeStreamInfo()
+	zero, two := 0, 2
+	first := StreamResponseOpenAI2Claude(toolChunk("model-c", toolCall("call-a", "search", `{`, &zero)), info)
+	require.Equal(t, []int{0}, eventIndices(first, "content_block_start"))
+	second := StreamResponseOpenAI2Claude(toolChunk("model-c", toolCall("call-a", "", `}`, &two)), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Equal(t, []int{0}, eventIndices(second, "content_block_delta"))
+	last := StreamResponseOpenAI2Claude(finishChunk("model-c", "tool_calls"), info)
+	require.Equal(t, []int{0}, eventIndices(last, "content_block_stop"))
+}
+
+func TestStreamResponseOpenAI2ClaudeRejectsConflictingToolIdentity(t *testing.T) {
+	info := claudeStreamInfo()
+	zero, one := 0, 1
+	_ = StreamResponseOpenAI2Claude(toolChunk("model-d",
+		toolCall("call-a", "search", `{}`, &zero),
+		toolCall("call-b", "open", `{}`, &one),
+	), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+
+	// The ID points to the first tool while the provider index points to the
+	// second. Guessing would corrupt the downstream tool lifecycle.
+	events := StreamResponseOpenAI2Claude(toolChunk("model-d", toolCall("call-a", "", `x`, &one)), info)
+	require.Nil(t, events)
+	require.Error(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Contains(t, info.ClaudeConvertInfo.ProtocolError.Error(), "conflicting tool identity")
+}
+
+func TestStreamResponseOpenAI2ClaudeRejectsAmbiguousIdentifierFreeFragment(t *testing.T) {
+	info := claudeStreamInfo()
+	_ = StreamResponseOpenAI2Claude(toolChunk("model-e",
+		toolCall("", "search", `{`, nil),
+		toolCall("", "open", `{`, nil),
+	), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+
+	events := StreamResponseOpenAI2Claude(toolChunk("model-e", toolCall("", "", `}`, nil)), info)
+	require.Nil(t, events)
+	require.Error(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Contains(t, info.ClaudeConvertInfo.ProtocolError.Error(), "cannot be assigned")
+}
+
+func TestStreamResponseOpenAI2ClaudeBoundsPendingArguments(t *testing.T) {
+	info := claudeStreamInfo()
+	withinLimit := strings.Repeat("x", maxClaudePendingToolArgumentBytes)
+	events := StreamResponseOpenAI2Claude(toolChunk("model-f", toolCall("call-a", "", withinLimit, nil)), info)
+	require.NoError(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Empty(t, eventIndices(events, "content_block_delta"))
+	require.Equal(t, maxClaudePendingToolArgumentBytes, info.ClaudeConvertInfo.PendingToolArgumentBytes)
+
+	events = StreamResponseOpenAI2Claude(toolChunk("model-f", toolCall("call-a", "", "x", nil)), info)
+	require.Nil(t, events)
+	require.Error(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Contains(t, info.ClaudeConvertInfo.ProtocolError.Error(), "exceeded")
+}
+
+func TestStreamResponseOpenAI2ClaudeRejectsContentAfterMessageStop(t *testing.T) {
+	info := claudeStreamInfo()
+	text := "done"
+	_ = StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{
+		Model: "model-g",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{Content: &text},
+		}},
+	}, info)
+	_ = StreamResponseOpenAI2Claude(finishChunk("model-g", "stop"), info)
+	require.True(t, info.ClaudeConvertInfo.Done)
+
+	late := "late"
+	events := StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{
+		Model: "model-g",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{Content: &late},
+		}},
+	}, info)
+	require.Nil(t, events)
+	require.Error(t, info.ClaudeConvertInfo.ProtocolError)
+	require.Contains(t, info.ClaudeConvertInfo.ProtocolError.Error(), "after message_stop")
+}

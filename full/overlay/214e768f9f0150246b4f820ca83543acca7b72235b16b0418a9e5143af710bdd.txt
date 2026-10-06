@@ -1,0 +1,72 @@
+package controller
+
+import (
+	"errors"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+func imageRouteCommitmentSnapshot(c *gin.Context, key string) (string, error) {
+	value, found := c.Get(key)
+	if !found {
+		return "", nil
+	}
+	snapshot, ok := value.(*types.ParameterPriceSnapshot)
+	if !ok || snapshot == nil {
+		return "", errors.New("绘图价格承诺无效")
+	}
+	encoded, err := common.Marshal(snapshot)
+	return string(encoded), err
+}
+
+func restoreImageRouteCommitments(c *gin.Context, job *model.ImageRouteJob) error {
+	for key, encoded := range map[string]string{
+		types.ParameterQuoteContextKey:      job.QuoteSnapshotJSON,
+		types.ParameterCommitmentContextKey: job.CommitmentJSON,
+	} {
+		if encoded == "" {
+			continue
+		}
+		var snapshot types.ParameterPriceSnapshot
+		if err := common.UnmarshalJsonStr(encoded, &snapshot); err != nil {
+			return err
+		}
+		c.Set(key, &snapshot)
+	}
+	if job.QuoteToken != "" && job.QuoteSnapshotJSON == "" {
+		return errors.New("绘图报价尚未经服务器验证")
+	}
+	return nil
+}
+
+func persistImageRouteCommitment(c *gin.Context) error {
+	jobID := c.GetInt64(service.ImageRouteJobContextKey)
+	if jobID == 0 {
+		return nil
+	}
+	encoded, err := imageRouteCommitmentSnapshot(c, types.ParameterCommitmentContextKey)
+	if err != nil || encoded == "" {
+		return err
+	}
+	result := model.DB.Model(&model.ImageRouteJob{}).
+		Where("id = ? AND state = ? AND commitment_json = ?", jobID, model.ImageRouteJobDispatching, "").
+		Update("commitment_json", encoded)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+	var job model.ImageRouteJob
+	if err := model.DB.First(&job, jobID).Error; err != nil {
+		return err
+	}
+	if job.State != model.ImageRouteJobDispatching || job.CommitmentJSON != encoded {
+		return model.ErrImageRouteJobConflict
+	}
+	return nil
+}

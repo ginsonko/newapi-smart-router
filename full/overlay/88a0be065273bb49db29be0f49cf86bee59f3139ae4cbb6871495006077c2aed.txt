@@ -1,0 +1,194 @@
+package media
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestArchiveSynchronousResponsePersistsStudioOperationForInlineAndRemoteImages(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:studio-operation-archive?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.MediaStorageReservation{}, &model.MediaStorageState{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	const operationID = "studio_3f37de08-c768-4ab8-a2ec-fd33d6f4d5ee"
+	raw := strings.NewReader(`{"data":[{"url":"https://provider.example.test/result.png"},{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlR5ZkAAAAASUVORK5CYII="}]}`)
+	blobs, err := ArchiveSynchronousResponse(context.Background(), SynchronousArchiveInput{
+		UserID: 77, Username: "studio-user", TaskPublicID: operationID,
+		ChannelID: 9, Model: "gpt-image-2", Group: "images", Kind: "image",
+		ContentType: "application/json",
+	}, raw)
+	require.NoError(t, err)
+	require.Len(t, blobs, 2)
+	for index := range blobs {
+		assert.Equal(t, operationID, blobs[index].TaskPublicID)
+		var stored model.MediaBlob
+		require.NoError(t, db.Where("id = ?", blobs[index].ID).First(&stored).Error)
+		assert.Equal(t, operationID, stored.TaskPublicID)
+	}
+}
+
+func TestArchiveSynchronousResponseRecordsCapacityFailureIdempotently(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:archive-capacity-failure?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.MediaStorageReservation{}, &model.MediaStorageState{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.MaxFileBytes = 1024 * 1024
+	nextSetting.MaxRequestBytes = 1024 * 1024
+	nextSetting.PerUserMaxBytes = 1
+	nextSetting.GlobalMaxBytes = 1024 * 1024 * 1024
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	// The existing ready row exhausts the user's durable allowance. The
+	// response itself must still be returned to the caller; only its archive
+	// record is marked failed.
+	require.NoError(t, db.Create(&model.MediaBlob{
+		PublicID: "existing-user-media", UserID: 77,
+		StorageBackend: model.MediaStorageBackendLocal, ObjectKey: "objects/existing.png",
+		SizeBytes: 1, Status: model.MediaBlobStatusReady,
+	}).Error)
+
+	input := SynchronousArchiveInput{
+		UserID: 77, Username: "archive-user", RequestID: "request-capacity-1",
+		Model: "gpt-image-2", Group: "images", Kind: "image", ContentType: "application/json",
+	}
+	raw := `{"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlR5ZkAAAAASUVORK5CYII="}]}`
+	_, firstErr := ArchiveSynchronousResponse(context.Background(), input, strings.NewReader(raw))
+	assert.ErrorIs(t, firstErr, ErrUserMediaCapacity)
+
+	var failures []model.MediaBlob
+	require.NoError(t, db.Where("source_kind = ?", synchronousArchiveFailureSourceKind).Find(&failures).Error)
+	require.Len(t, failures, 1)
+	assert.Equal(t, model.MediaBlobStatusFailed, failures[0].Status)
+	assert.Equal(t, model.MediaMaterializeDisabled, failures[0].MaterializeStatus)
+	assert.Zero(t, failures[0].SizeBytes)
+	assert.Empty(t, failures[0].ObjectKey)
+	assert.Empty(t, failures[0].PrivateSource)
+	assert.Equal(t, "archive skipped: user media capacity exceeded", failures[0].MaterializeLastError)
+
+	// Replaying the same archive input must not create another placeholder or
+	// consume a durable-storage reservation.
+	_, secondErr := ArchiveSynchronousResponse(context.Background(), input, strings.NewReader(raw))
+	assert.ErrorIs(t, secondErr, ErrUserMediaCapacity)
+	require.NoError(t, db.Where("source_kind = ?", synchronousArchiveFailureSourceKind).Find(&failures).Error)
+	assert.Len(t, failures, 1)
+
+	var state model.MediaStorageState
+	require.NoError(t, db.First(&state, 1).Error)
+	assert.EqualValues(t, 1, state.UsedBytes)
+	assert.Zero(t, state.ReservedBytes)
+	var reservations int64
+	require.NoError(t, db.Model(&model.MediaStorageReservation{}).Where("state = ?", "reserved").Count(&reservations).Error)
+	assert.Zero(t, reservations)
+}
+
+func TestArchiveSynchronousResponseRecordsGlobalCapacityFailure(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:archive-global-capacity-failure?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(
+		&model.MediaBlob{}, &model.MediaStorageReservation{}, &model.MediaStorageState{},
+	))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.StoragePath = t.TempDir()
+	nextSetting.MaxFileBytes = 1024 * 1024
+	nextSetting.MaxRequestBytes = 1024 * 1024
+	nextSetting.PerUserMaxBytes = 100
+	nextSetting.GlobalMaxBytes = 100
+	nextSetting.ReservedFreeBytes = 0
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	require.NoError(t, db.Create(&model.MediaBlob{
+		PublicID: "existing-global-media", UserID: 79,
+		StorageBackend: model.MediaStorageBackendLocal, ObjectKey: "objects/existing.png",
+		SizeBytes: 100, Status: model.MediaBlobStatusReady,
+	}).Error)
+
+	input := SynchronousArchiveInput{
+		UserID: 78, Username: "global-capacity-user", RequestID: "request-global-capacity-1",
+		Model: "gpt-image-2", Group: "images", Kind: "image", ContentType: "application/json",
+	}
+	raw := `{"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlR5ZkAAAAASUVORK5CYII="}]}`
+	_, archiveErr := ArchiveSynchronousResponse(context.Background(), input, strings.NewReader(raw))
+	assert.ErrorIs(t, archiveErr, ErrMediaCapacity)
+
+	var failure model.MediaBlob
+	require.NoError(t, db.Where("source_kind = ?", synchronousArchiveFailureSourceKind).First(&failure).Error)
+	assert.Equal(t, "archive skipped: global media capacity exceeded", failure.MaterializeLastError)
+	assert.Equal(t, model.MediaBlobStatusFailed, failure.Status)
+	assert.Zero(t, failure.SizeBytes)
+}
+
+func TestSynchronousArchiveMetadataStoresPromptWithoutMutatingCandidate(t *testing.T) {
+	candidate := map[string]any{
+		"source_path": "data.0.url", "request_prompt_truncated": true,
+	}
+	encoded := synchronousArchiveMetadata(candidate, "line one\nline two")
+
+	var metadata map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &metadata))
+	assert.Equal(t, "data.0.url", metadata["source_path"])
+	assert.Equal(t, "line one\nline two", metadata["request_prompt"])
+	assert.NotContains(t, metadata, "request_prompt_truncated")
+	assert.NotContains(t, candidate, "request_prompt")
+	assert.Equal(t, true, candidate["request_prompt_truncated"])
+}
+
+func TestSynchronousArchiveMetadataBoundsPromptByUnicodeCharacters(t *testing.T) {
+	exact := strings.Repeat("界", maxStoredRequestPromptRunes)
+	exactEncoded := synchronousArchiveMetadata(nil, exact)
+	var exactMetadata map[string]any
+	require.NoError(t, common.Unmarshal(exactEncoded, &exactMetadata))
+	assert.Equal(t, exact, exactMetadata["request_prompt"])
+	assert.NotContains(t, exactMetadata, "request_prompt_truncated")
+
+	overflow := exact + "终"
+	overflowEncoded := synchronousArchiveMetadata(nil, overflow)
+	var overflowMetadata map[string]any
+	require.NoError(t, common.Unmarshal(overflowEncoded, &overflowMetadata))
+	assert.Equal(t, exact, overflowMetadata["request_prompt"])
+	assert.Equal(t, true, overflowMetadata["request_prompt_truncated"])
+}
+
+func TestSynchronousArchiveMetadataOmitsBlankPrompt(t *testing.T) {
+	encoded := synchronousArchiveMetadata(map[string]any{"source_path": "data.0.b64_json"}, "  \n")
+	var metadata map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &metadata))
+	assert.Equal(t, "data.0.b64_json", metadata["source_path"])
+	assert.NotContains(t, metadata, "request_prompt")
+}

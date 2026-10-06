@@ -1,0 +1,22 @@
+package types
+
+// ParameterQuoteContextKey contains a server-verified consumer commitment.
+// It is request-local and never taken from a user-supplied amount field.
+const ParameterQuoteContextKey = "verified_parameter_quote"
+const ParameterQuoteHeader = "X-Parameter-Quote"
+const ParameterCommitmentContextKey = "parameter_price_commitment"
+
+// ParameterPublicPrice is an explicit public projection of a pricing rule.
+// Physical suppliers and procurement prices must not be exposed here.
+type ParameterPublicPrice struct {
+	Revision             string            `json:"revision"`
+	ScheduleID           string            `json:"schedule_id,omitempty"`
+	Priority             int               `json:"priority"`
+	Model                string            `json:"model"`
+	Group                string            `json:"group"`
+	Unit                 string            `json:"unit"`
+	Currency             string            `json:"currency"`
+	UnitPrice            string            `json:"unit_price"`
+	Conditions           map[string]string `json:"conditions"`
+	FixedDurationSeconds int               `json:"fixed_duration_seconds,omitempty"`
+}

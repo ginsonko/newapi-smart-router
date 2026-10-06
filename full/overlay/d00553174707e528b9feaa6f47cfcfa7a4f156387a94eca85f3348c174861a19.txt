@@ -1,0 +1,449 @@
+package service
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupSmartRouteBillingTest(t *testing.T) {
+	t.Helper()
+	if !model.DB.Migrator().HasTable(&model.SubscriptionPlan{}) {
+		require.NoError(t, model.DB.AutoMigrate(&model.SubscriptionPlan{}))
+	}
+	if !model.DB.Migrator().HasTable(&model.QuotaReservation{}) {
+		require.NoError(t, model.DB.AutoMigrate(&model.QuotaReservation{}))
+	}
+	require.NoError(t, model.DB.Exec("DELETE FROM quota_reservations").Error)
+	require.NoError(t, model.DB.Exec("DELETE FROM subscription_plans").Error)
+	truncate(t)
+
+	oldBatchUpdateEnabled := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = false
+	t.Cleanup(func() {
+		model.DB.Exec("DELETE FROM quota_reservations")
+		model.DB.Exec("DELETE FROM subscription_plans")
+		common.BatchUpdateEnabled = oldBatchUpdateEnabled
+	})
+}
+
+func smartRouteBillingContext() *gin.Context {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	return c
+}
+
+func smartRouteRelayInfo(requestId string, userId int, tokenId int, preference string) *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{
+		RequestId: requestId,
+		UserId:    userId,
+		TokenId:   tokenId,
+		UserSetting: dto.UserSetting{
+			BillingPreference: preference,
+		},
+	}
+}
+
+func smartRouteWalletQuota(t *testing.T, userId int) int {
+	t.Helper()
+	var user model.User
+	require.NoError(t, model.DB.Select("quota").Where("id = ?", userId).First(&user).Error)
+	return user.Quota
+}
+
+func smartRouteTokenQuota(t *testing.T, tokenId int) (int, int) {
+	t.Helper()
+	var token model.Token
+	require.NoError(t, model.DB.Select("remain_quota", "used_quota").Where("id = ?", tokenId).First(&token).Error)
+	return token.RemainQuota, token.UsedQuota
+}
+
+func smartRouteSubscriptionUsed(t *testing.T, subscriptionId int) int64 {
+	t.Helper()
+	var subscription model.UserSubscription
+	require.NoError(t, model.DB.Select("amount_used").Where("id = ?", subscriptionId).First(&subscription).Error)
+	return subscription.AmountUsed
+}
+
+func smartRouteReservation(t *testing.T, requestId string) model.QuotaReservation {
+	t.Helper()
+	var reservation model.QuotaReservation
+	require.NoError(t, model.DB.Where("request_id = ?", requestId).First(&reservation).Error)
+	return reservation
+}
+
+func TestSmartRouteBillingWalletFallbackReserveAndSettle(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4101, 1000)
+	seedToken(t, 4201, 4101, "smart-wallet-token", 1000)
+	c := smartRouteBillingContext()
+	firstInfo := smartRouteRelayInfo("smart-wallet-request", 4101, 4201, "wallet_only")
+	firstQuote := QuotaReservationRouteQuote{
+		RouteId: "route-cheap", ChannelId: 51, Group: "cheap", CatalogVersion: "catalog-v1",
+		PriceVersion: "price-v1", RatioPPM: 20_000, QuotedQuota: 100,
+	}
+
+	session, apiErr := NewSmartRouteBillingSessionWithQuote(c, firstInfo, 100, firstQuote)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	assert.Equal(t, 900, smartRouteWalletQuota(t, 4101))
+	remain, used := smartRouteTokenQuota(t, 4201)
+	assert.Equal(t, 900, remain)
+	assert.Equal(t, 100, used)
+	assert.Equal(t, 100, firstInfo.FinalPreConsumedQuota)
+	assert.Same(t, session, firstInfo.Billing)
+	reservation := smartRouteReservation(t, "smart-wallet-request")
+	assert.Equal(t, "route-cheap", reservation.RouteId)
+	assert.Equal(t, 1, reservation.AttemptCount)
+
+	fallbackInfo := smartRouteRelayInfo("smart-wallet-request", 4101, 4201, "wallet_only")
+	session.BindRelayInfo(fallbackInfo)
+	fallbackQuote := QuotaReservationRouteQuote{
+		RouteId: "route-plus", ChannelId: 52, Group: "plus", CatalogVersion: "catalog-v1",
+		PriceVersion: "price-v2", RatioPPM: 50_000, QuotedQuota: 250,
+	}
+	require.NoError(t, session.ReserveAndRecordRouteQuote(250, fallbackQuote))
+	assert.Equal(t, 750, smartRouteWalletQuota(t, 4101))
+	remain, used = smartRouteTokenQuota(t, 4201)
+	assert.Equal(t, 750, remain)
+	assert.Equal(t, 250, used)
+	assert.Equal(t, 250, fallbackInfo.FinalPreConsumedQuota)
+	reservation = smartRouteReservation(t, "smart-wallet-request")
+	assert.Equal(t, "route-plus", reservation.RouteId)
+	assert.Equal(t, 2, reservation.AttemptCount)
+
+	require.NoError(t, session.Settle(180))
+	assert.True(t, session.IsSettled())
+	assert.False(t, session.NeedsRefund())
+	assert.Equal(t, 820, smartRouteWalletQuota(t, 4101))
+	remain, used = smartRouteTokenQuota(t, 4201)
+	assert.Equal(t, 820, remain)
+	assert.Equal(t, 180, used)
+	require.NoError(t, session.Settle(180))
+	assert.ErrorIs(t, session.Settle(181), model.ErrQuotaReservationSettlementConflict)
+}
+
+func TestSmartRouteBillingCommittedPartialOutputIsRefundedImmediately(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4106, 500)
+	seedToken(t, 4206, 4106, "smart-partial-token", 500)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-partial-request", 4106, 4206, "wallet_only")
+	quote := QuotaReservationRouteQuote{
+		RouteId: "route-partial", ChannelId: 56, Group: "plus", CatalogVersion: "catalog-v1",
+		PriceVersion: "price-v1", RatioPPM: 50_000, QuotedQuota: 100,
+	}
+
+	session, apiErr := NewSmartRouteBillingSessionWithQuote(c, info, 100, quote)
+	require.Nil(t, apiErr)
+	session.Refund(c)
+	assert.False(t, session.NeedsRefund())
+	session.Refund(c)
+	assert.Equal(t, 500, smartRouteWalletQuota(t, 4106))
+	remain, used := smartRouteTokenQuota(t, 4206)
+	assert.Equal(t, 500, remain)
+	assert.Zero(t, used)
+	reservation := smartRouteReservation(t, "smart-partial-request")
+	assert.Equal(t, model.QuotaReservationStatusRefunded, reservation.Status)
+	assert.False(t, reservation.SettlementPending)
+	assert.False(t, reservation.SettlementQuotaKnown)
+	assert.Zero(t, reservation.FinalQuota)
+}
+
+func TestSmartRouteBillingPaidResponseWithoutUsageSettlesAtQuote(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4107, 500)
+	seedToken(t, 4207, 4107, "smart-missing-usage-token", 500)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-missing-usage-request", 4107, 4207, "wallet_only")
+	quote := QuotaReservationRouteQuote{
+		RouteId: "route-paid", ChannelId: 57, Group: "plus", CatalogVersion: "catalog-v1",
+		PriceVersion: "price-v1", RatioPPM: 50_000, QuotedQuota: 100,
+	}
+
+	session, apiErr := NewSmartRouteBillingSessionWithQuote(c, info, 100, quote)
+	require.Nil(t, apiErr)
+	require.NoError(t, session.Settle(0))
+	assert.False(t, session.NeedsRefund())
+	assert.Equal(t, 400, smartRouteWalletQuota(t, 4107))
+	remain, used := smartRouteTokenQuota(t, 4207)
+	assert.Equal(t, 400, remain)
+	assert.Equal(t, 100, used)
+	reservation := smartRouteReservation(t, "smart-missing-usage-request")
+	assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	assert.False(t, reservation.SettlementPending)
+	assert.True(t, reservation.SettlementQuotaKnown)
+	assert.Equal(t, 100, reservation.FinalQuota)
+	assert.NoError(t, session.Settle(0), "settlement at the same fallback quote is idempotent")
+	assert.ErrorIs(t, session.Settle(80), model.ErrQuotaReservationSettlementConflict)
+}
+
+func TestSmartRouteBillingFreeResponseCanSettleAtZero(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4108, 500)
+	seedToken(t, 4208, 4108, "smart-free-settle-token", 500)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-free-settle-request", 4108, 4208, "wallet_only")
+	quote := QuotaReservationRouteQuote{
+		RouteId: "route-free", ChannelId: 58, Group: "free", CatalogVersion: "catalog-v1",
+		PriceVersion: "price-v1", RatioPPM: 0, QuotedQuota: 0,
+	}
+
+	session, apiErr := NewSmartRouteBillingSessionWithQuote(c, info, 0, quote)
+	require.Nil(t, apiErr)
+	require.NoError(t, session.Settle(0))
+	assert.True(t, session.IsSettled())
+	reservation := smartRouteReservation(t, "smart-free-settle-request")
+	assert.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	assert.False(t, reservation.SettlementPending)
+	assert.Equal(t, 500, smartRouteWalletQuota(t, 4108))
+	remain, used := smartRouteTokenQuota(t, 4208)
+	assert.Equal(t, 500, remain)
+	assert.Zero(t, used)
+}
+
+func TestSmartRouteBillingSettlementFailureCannotRefundSuccessfulOutput(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4102, 100)
+	seedToken(t, 4202, 4102, "smart-pending-token", 1000)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-pending-request", 4102, 4202, "wallet_only")
+
+	session, apiErr := NewSmartRouteBillingSession(c, info, 80)
+	require.Nil(t, apiErr)
+	err := session.Settle(120)
+	require.ErrorIs(t, err, model.ErrQuotaReservationInsufficientWallet)
+	assert.False(t, session.NeedsRefund())
+	assert.ErrorIs(t, session.LastError(), model.ErrQuotaReservationInsufficientWallet)
+	session.Refund(c)
+	assert.Equal(t, 20, smartRouteWalletQuota(t, 4102))
+	remain, used := smartRouteTokenQuota(t, 4202)
+	assert.Equal(t, 920, remain)
+	assert.Equal(t, 80, used)
+	reservation := smartRouteReservation(t, "smart-pending-request")
+	assert.True(t, reservation.SettlementPending)
+	assert.Equal(t, 120, reservation.PendingFinalQuota)
+
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 4102).
+		Update("quota", gorm.Expr("quota + ?", 100)).Error)
+	require.NoError(t, session.Settle(120))
+	assert.True(t, session.IsSettled())
+	assert.NoError(t, session.LastError())
+	assert.Equal(t, 80, smartRouteWalletQuota(t, 4102))
+}
+
+func TestSmartRouteBillingSubscriptionMetadataFollowsFallbackReservation(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4103, 1000)
+	seedToken(t, 4203, 4103, "smart-subscription-token", 1000)
+	require.NoError(t, model.DB.Create(&model.SubscriptionPlan{
+		Id: 4303, Title: "Smart Route Plan", TotalAmount: 500,
+	}).Error)
+	now := time.Now().Unix()
+	require.NoError(t, model.DB.Create(&model.UserSubscription{
+		Id: 4403, UserId: 4103, PlanId: 4303, AmountTotal: 500,
+		StartTime: now - 60, EndTime: now + 3600, Status: "active",
+	}).Error)
+	c := smartRouteBillingContext()
+	firstInfo := smartRouteRelayInfo("smart-subscription-request", 4103, 4203, "subscription_only")
+
+	session, apiErr := NewSmartRouteBillingSession(c, firstInfo, 100)
+	require.Nil(t, apiErr)
+	assert.EqualValues(t, 100, smartRouteSubscriptionUsed(t, 4403))
+	assert.Equal(t, 1000, smartRouteWalletQuota(t, 4103))
+	assert.Equal(t, 4403, firstInfo.SubscriptionId)
+	assert.EqualValues(t, 100, firstInfo.SubscriptionPreConsumed)
+	assert.EqualValues(t, 500, firstInfo.SubscriptionAmountTotal)
+	assert.EqualValues(t, 100, firstInfo.SubscriptionAmountUsedAfterPreConsume)
+	assert.Equal(t, 4303, firstInfo.SubscriptionPlanId)
+	assert.Equal(t, "Smart Route Plan", firstInfo.SubscriptionPlanTitle)
+
+	fallbackInfo := smartRouteRelayInfo("smart-subscription-request", 4103, 4203, "subscription_only")
+	session.BindRelayInfo(fallbackInfo)
+	require.NoError(t, session.Reserve(250))
+	assert.EqualValues(t, 250, smartRouteSubscriptionUsed(t, 4403))
+	assert.EqualValues(t, 250, fallbackInfo.SubscriptionPreConsumed)
+	assert.EqualValues(t, 250, fallbackInfo.SubscriptionAmountUsedAfterPreConsume)
+	assert.EqualValues(t, 500, fallbackInfo.SubscriptionAmountTotal)
+	assert.Equal(t, "Smart Route Plan", fallbackInfo.SubscriptionPlanTitle)
+
+	require.NoError(t, session.Settle(180))
+	assert.EqualValues(t, 180, smartRouteSubscriptionUsed(t, 4403))
+	assert.EqualValues(t, -70, fallbackInfo.SubscriptionPostDelta)
+	remain, used := smartRouteTokenQuota(t, 4203)
+	assert.Equal(t, 820, remain)
+	assert.Equal(t, 180, used)
+}
+
+func TestSmartRouteBillingFreeRouteSelectsUsableSubscriptionForPaidFallback(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4104, 1000)
+	seedToken(t, 4204, 4104, "smart-free-token", 1000)
+	now := time.Now().Unix()
+	require.NoError(t, model.DB.Create(&model.UserSubscription{
+		Id: 4404, UserId: 4104, AmountTotal: 100, AmountUsed: 100,
+		StartTime: now - 60, EndTime: now + 1800, Status: "active",
+	}).Error)
+	require.NoError(t, model.DB.Create(&model.UserSubscription{
+		Id: 4405, UserId: 4104, AmountTotal: 500,
+		StartTime: now - 60, EndTime: now + 3600, Status: "active",
+	}).Error)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-free-request", 4104, 4204, "subscription_only")
+
+	session, apiErr := NewSmartRouteBillingSession(c, info, 0)
+	require.Nil(t, apiErr)
+	t.Cleanup(func() { session.Refund(c) })
+	assert.Equal(t, 4405, info.SubscriptionId)
+	assert.Zero(t, smartRouteSubscriptionUsed(t, 4405))
+	remain, used := smartRouteTokenQuota(t, 4204)
+	assert.Equal(t, 1000, remain)
+	assert.Zero(t, used)
+
+	require.NoError(t, session.Reserve(200))
+	assert.EqualValues(t, 200, smartRouteSubscriptionUsed(t, 4405))
+	remain, used = smartRouteTokenQuota(t, 4204)
+	assert.Equal(t, 800, remain)
+	assert.Equal(t, 200, used)
+	assert.Zero(t, smartRouteSubscriptionUsed(t, 4404)-100)
+}
+
+func TestSmartRouteBillingHeartbeatProtectsLongRunningReservation(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4109, 500)
+	seedToken(t, 4209, 4109, "smart-heartbeat-token", 500)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-heartbeat-request", 4109, 4209, "wallet_only")
+
+	session, apiErr := NewSmartRouteBillingSession(c, info, 100)
+	require.Nil(t, apiErr)
+	t.Cleanup(func() { session.Refund(c) })
+	now := time.Now().Unix()
+	require.NoError(t, model.DB.Model(&model.QuotaReservation{}).
+		Where("request_id = ?", info.RequestId).
+		Update("updated_at", now-3600).Error)
+
+	active, err := session.refreshReservationHeartbeat()
+	require.NoError(t, err)
+	require.True(t, active)
+	marked, err := model.MarkStaleQuotaReservationsForReview(
+		c.Request.Context(), now-900, 100, "expired foreground reservation",
+	)
+	require.NoError(t, err)
+	assert.Zero(t, marked)
+	reservation := smartRouteReservation(t, info.RequestId)
+	assert.False(t, reservation.SettlementPending)
+
+	session.Refund(c)
+	active, err = session.refreshReservationHeartbeat()
+	require.NoError(t, err)
+	assert.False(t, active, "terminal reservations cannot be kept alive")
+}
+
+func TestSmartRouteBillingBatchUpdateModeFailsClosed(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4105, 1000)
+	seedToken(t, 4205, 4105, "smart-batch-token", 1000)
+	common.BatchUpdateEnabled = true
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-batch-request", 4105, 4205, "wallet_only")
+
+	session, apiErr := NewSmartRouteBillingSession(c, info, 100)
+	assert.Nil(t, session)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, model.ErrQuotaReservationBatchUpdatesEnabled)
+	assert.Equal(t, 1000, smartRouteWalletQuota(t, 4105))
+	remain, used := smartRouteTokenQuota(t, 4205)
+	assert.Equal(t, 1000, remain)
+	assert.Zero(t, used)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.QuotaReservation{}).Where("request_id = ?", "smart-batch-request").Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestSmartRouteCommittedAccountingProjectionIsIdempotent(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4110, 500)
+	seedToken(t, 4210, 4110, "smart-projection-token", 500)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 5910, Key: "projection-channel", Name: "projection", Status: common.ChannelStatusEnabled}).Error)
+	c := smartRouteBillingContext()
+	info := smartRouteRelayInfo("smart-projection-request", 4110, 4210, "wallet_only")
+	quote := QuotaReservationRouteQuote{RouteId: "route-projection", ChannelId: 5910, Group: "default", CatalogVersion: "catalog-v1", PriceVersion: "price-v1", RatioPPM: 50_000, QuotedQuota: 100}
+	session, apiErr := NewSmartRouteBillingSessionWithQuote(c, info, 100, quote)
+	require.Nil(t, apiErr)
+	require.NoError(t, session.Settle(0))
+	reservation, applied, err := model.ApplySmartRouteCommittedAccountingProjection(c.Request.Context(), session.ReservationID())
+	require.NoError(t, err)
+	require.False(t, applied, "settlement itself owns the atomic usage projection")
+	require.Equal(t, model.QuotaReservationStatusSettled, reservation.Status)
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 4110).First(&user).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", 5910).First(&channel).Error)
+	assert.EqualValues(t, 100, channel.UsedQuota)
+	_, applied, err = model.ApplySmartRouteCommittedAccountingProjection(c.Request.Context(), session.ReservationID())
+	require.NoError(t, err)
+	assert.False(t, applied)
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 4110).First(&user).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+}
+
+func TestSmartRouteCommittedAccountingProjectionAddsPositiveLogAfterZeroDiagnostic(t *testing.T) {
+	setupSmartRouteBillingTest(t)
+	seedUser(t, 4111, 500)
+	seedToken(t, 4211, 4111, "smart-zero-diagnostic-token", 500)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 5911, Key: "zero-diagnostic-channel", Name: "zero-diagnostic", Status: common.ChannelStatusEnabled}).Error)
+
+	const requestID = "smart-zero-diagnostic-request"
+	c := smartRouteBillingContext()
+	c.Set(common.RequestIdKey, requestID)
+	info := smartRouteRelayInfo(requestID, 4111, 4211, "wallet_only")
+	info.OriginModelName = "gpt-5.6-sol"
+	info.StartTime = time.Now()
+	info.IsStream = true
+	quote := QuotaReservationRouteQuote{RouteId: "route-zero-diagnostic", ChannelId: 5911, Group: "default", CatalogVersion: "catalog-v1", PriceVersion: "price-v1", RatioPPM: 50_000, QuotedQuota: 100}
+	session, apiErr := NewSmartRouteBillingSessionWithQuote(c, info, 100, quote)
+	require.Nil(t, apiErr)
+	require.NoError(t, session.Settle(0))
+
+	require.NoError(t, model.LOG_DB.Create(&model.Log{
+		UserId: 4111, Type: model.LogTypeConsume, RequestId: requestID,
+		ModelName: "gpt-5.6-sol", ChannelId: 5911, Quota: 0,
+		Content: "diagnostic zero-usage row",
+	}).Error)
+
+	require.NoError(t, ProjectSmartRouteCommittedSettlement(c, session, info, nil))
+	require.NoError(t, ProjectSmartRouteCommittedSettlement(c, session, info, nil))
+
+	var positiveCount int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).
+		Where("type = ? AND request_id = ? AND quota > 0", model.LogTypeConsume, requestID).
+		Count(&positiveCount).Error)
+	assert.EqualValues(t, 1, positiveCount)
+	var totalCount int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).
+		Where("type = ? AND request_id = ?", model.LogTypeConsume, requestID).
+		Count(&totalCount).Error)
+	assert.EqualValues(t, 2, totalCount, "the zero diagnostic row is preserved and only one positive billing row is added")
+
+	var positiveLog model.Log
+	require.NoError(t, model.LOG_DB.
+		Where("type = ? AND request_id = ? AND quota > 0", model.LogTypeConsume, requestID).
+		First(&positiveLog).Error)
+	assert.Equal(t, 100, positiveLog.Quota)
+	assert.Contains(t, positiveLog.Content, "正常完成")
+}

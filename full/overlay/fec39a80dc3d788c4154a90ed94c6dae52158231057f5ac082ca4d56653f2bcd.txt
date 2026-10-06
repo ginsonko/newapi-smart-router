@@ -1,0 +1,172 @@
+package service
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestRecordMediaMaterializationFailureUsesBoundedExponentialBackoff(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:media-materializer-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.MediaBlob{}))
+
+	previousSetting := mediasetting.Get()
+	nextSetting := previousSetting
+	nextSetting.RemoteMaterializeInitialBackoffSeconds = 5
+	nextSetting.RemoteMaterializeMaxBackoffSeconds = 20
+	nextSetting.RemoteMaterializeMaxAttempts = 4
+	require.NoError(t, mediasetting.Replace(nextSetting))
+	t.Cleanup(func() { require.NoError(t, mediasetting.Replace(previousSetting)) })
+
+	tests := []struct {
+		attempts      int
+		expectedDelay int64
+		expectedState string
+	}{
+		{attempts: 0, expectedDelay: 5, expectedState: model.MediaMaterializeRetry},
+		{attempts: 1, expectedDelay: 10, expectedState: model.MediaMaterializeRetry},
+		{attempts: 2, expectedDelay: 20, expectedState: model.MediaMaterializeRetry},
+		{attempts: 3, expectedState: model.MediaMaterializeAbandoned},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("attempt-%d", test.attempts+1), func(t *testing.T) {
+			blob := &model.MediaBlob{
+				PublicID: fmt.Sprintf("blob-backoff-%d", test.attempts), UserID: 1,
+				Status: model.MediaBlobStatusReady, StorageBackend: model.MediaStorageBackendRemote,
+				MaterializeStatus: model.MediaMaterializeRunning, MaterializeAttempts: test.attempts,
+				MaterializeLeaseOwner: "worker-a", MaterializeLeaseUntil: time.Now().Add(time.Minute).Unix(),
+			}
+			require.NoError(t, db.Create(blob).Error)
+			startedAt := time.Now().Unix()
+
+			recordMediaMaterializationFailure(blob, "worker-a", errors.New("upstream unavailable"))
+
+			var stored model.MediaBlob
+			require.NoError(t, db.First(&stored, blob.ID).Error)
+			assert.Equal(t, test.attempts+1, stored.MaterializeAttempts)
+			assert.Equal(t, test.expectedState, stored.MaterializeStatus)
+			assert.Empty(t, stored.MaterializeLeaseOwner)
+			assert.Zero(t, stored.MaterializeLeaseUntil)
+			assert.Equal(t, "upstream unavailable", stored.MaterializeLastError)
+			if test.expectedState == model.MediaMaterializeAbandoned {
+				assert.Zero(t, stored.MaterializeNextRetryAt)
+			} else {
+				assert.GreaterOrEqual(t, stored.MaterializeNextRetryAt, startedAt+test.expectedDelay)
+				assert.LessOrEqual(t, stored.MaterializeNextRetryAt, time.Now().Unix()+test.expectedDelay)
+			}
+		})
+	}
+}
+
+func TestMediaSourceMatchesExactTaskContentContract(t *testing.T) {
+	credential := &model.MediaMaterializationCredential{
+		Credential: "secret", UpstreamBaseURL: "https://api.aizzz.xyz",
+		UpstreamTaskID: "task-provider-1",
+	}
+	assert.True(t, mediaSourceMatchesTaskContent(
+		"https://api.aizzz.xyz/v1/videos/task-provider-1/content", credential,
+	))
+	assert.False(t, mediaSourceMatchesTaskContent(
+		"https://evil.example/v1/videos/task-provider-1/content", credential,
+	))
+	assert.False(t, mediaSourceMatchesTaskContent(
+		"https://api.aizzz.xyz/v1/videos/task-provider-2/content", credential,
+	))
+	assert.False(t, mediaSourceMatchesTaskContent(
+		"https://api.aizzz.xyz/v1/videos/task-provider-1", credential,
+	))
+}
+
+func TestMediaSourceMatchesExactRecordedSameOriginResult(t *testing.T) {
+	credential := &model.MediaMaterializationCredential{
+		Credential: "secret", UpstreamBaseURL: "https://api.aizzz.xyz",
+		UpstreamTaskID: "task-provider-1",
+		ResultURL:      "https://api.aizzz.xyz/files/result.mp4?token=frozen",
+	}
+	assert.True(t, mediaSourceMatchesAuthorizedTaskResult(
+		"https://api.aizzz.xyz/files/result.mp4?token=frozen", credential,
+	))
+	assert.False(t, mediaSourceMatchesAuthorizedTaskResult(
+		"https://api.aizzz.xyz/files/result.mp4?token=changed", credential,
+	))
+	assert.False(t, mediaSourceMatchesAuthorizedTaskResult(
+		"https://cdn.example/files/result.mp4?token=frozen", credential,
+	))
+}
+
+func TestApplyTaskContentAuthorizationNeverUsesClientOrArbitraryURL(t *testing.T) {
+	request, err := http.NewRequest(http.MethodGet, "https://evil.example/v1/videos/task-provider-1/content", nil)
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer client-token")
+
+	// No database credential record is available in this unit test. A
+	// standardized task-content URL must fail closed, while an arbitrary URL
+	// must not be treated as a task-content source.
+	matched, authErr := ApplyTaskContentAuthorization(request, 999999)
+	assert.True(t, matched)
+	assert.Error(t, authErr)
+	assert.Empty(t, request.Header.Get("Authorization"))
+
+	publicRequest, publicErr := http.NewRequest(http.MethodGet, "https://cdn.example/video.mp4", nil)
+	require.NoError(t, publicErr)
+	publicRequest.Header.Set("Authorization", "Bearer client-token")
+	publicMatched, publicAuthErr := ApplyTaskContentAuthorization(publicRequest, 999999)
+	assert.False(t, publicMatched)
+	assert.NoError(t, publicAuthErr)
+	assert.Empty(t, publicRequest.Header.Get("Authorization"))
+}
+
+func TestOriginalDownloadUsesFrozenTaskCredential(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:original-download-auth?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskArtifact{}, &model.TaskDeliverySnapshot{}))
+	task := model.Task{TaskID: "public-task", PrivateData: model.TaskPrivateData{Key: "upstream-test-key", ResultURL: "https://provider.example/v1/videos/provider-task/content"}}
+	require.NoError(t, db.Create(&task).Error)
+	require.NoError(t, db.Create(&model.TaskArtifact{PublicAssetID: "test-asset", TaskRowID: int64(task.ID), MediaBlobID: 8123}).Error)
+	require.NoError(t, db.Create(&model.TaskDeliverySnapshot{TaskRowID: int64(task.ID), UpstreamBaseURL: "https://provider.example", UpstreamTaskID: "provider-task", CredentialRef: "task.private_data.key"}).Error)
+	cases := []struct {
+		source     string
+		authorized bool
+	}{
+		{"https://provider.example/v1/videos/provider-task/content", true},
+		{"https://provider.example/v1/videos/provider-task/download", true},
+		{"https://provider.example/v1/videos/another-task/download", false},
+		{"https://evil.example/v1/videos/provider-task/download", false},
+		{"http://provider.example/v1/videos/provider-task/download", false},
+		{"https://provider.example/arbitrary/download", false},
+		{"https://provider.example/v1/videos/provider-task/../another-task/download", false},
+		{"https://provider.example/v1/videos/provider-task%2F..%2Fanother-task/download", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.source, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, tc.source, nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer client-test-key")
+			matched, authErr := ApplyTaskContentAuthorization(req, 8123)
+			if tc.authorized {
+				require.NoError(t, authErr)
+				require.True(t, matched)
+				require.Equal(t, "Bearer upstream-test-key", req.Header.Get("Authorization"))
+			} else {
+				require.Empty(t, req.Header.Get("Authorization"))
+			}
+		})
+	}
+}

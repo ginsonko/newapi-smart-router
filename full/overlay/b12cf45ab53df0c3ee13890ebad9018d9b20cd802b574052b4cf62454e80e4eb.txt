@@ -1,0 +1,39 @@
+package middleware
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-gonic/gin"
+)
+
+// SessionOnlyUserAuth is for browser confirmations that must be tied to the
+// currently signed-in account. It intentionally rejects access-token auth and
+// does not require the SPA-only New-Api-User header.
+func SessionOnlyUserAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if strings.TrimSpace(c.GetHeader("Authorization")) != "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": common.TranslateMessage(c, i18n.MsgAuthNotLoggedIn)})
+			return
+		}
+		session := sessions.Default(c)
+		id, idOK := session.Get("id").(int)
+		username, usernameOK := session.Get("username").(string)
+		role, roleOK := session.Get("role").(int)
+		status, statusOK := session.Get("status").(int)
+		if !idOK || id <= 0 || !usernameOK || !roleOK || !statusOK || status != common.UserStatusEnabled || !validUserInfo(username, role) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": common.TranslateMessage(c, i18n.MsgAuthNotLoggedIn)})
+			return
+		}
+		c.Set("id", id)
+		c.Set("username", username)
+		c.Set("role", role)
+		c.Set("status", status)
+		c.Set("group", session.Get("group"))
+		c.Set("user_group", session.Get("group"))
+		c.Next()
+	}
+}

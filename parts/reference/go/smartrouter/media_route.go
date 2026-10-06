@@ -31,6 +31,8 @@ type MediaRequestShape struct {
 	OutputCount            int64                 `json:"output_count,omitempty"`
 	OutputCountKnown       bool                  `json:"output_count_known,omitempty"`
 	Resolution             string                `json:"resolution,omitempty"`
+	RawResolution          string                `json:"raw_resolution,omitempty"`
+	RawSize                string                `json:"raw_size,omitempty"`
 	Quality                string                `json:"quality,omitempty"`
 	AspectRatio            string                `json:"aspect_ratio,omitempty"`
 	References             []MediaReferenceShape `json:"references,omitempty"`

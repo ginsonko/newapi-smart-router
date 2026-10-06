@@ -1,0 +1,488 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import type { TFunction } from 'i18next'
+
+import {
+  MAX_SMART_ROUTER_EFFECTIVE_RATIO,
+  MAX_SMART_ROUTER_TTFT_MS,
+  MAX_SMART_ROUTER_TTFT_SAMPLES,
+  parseSmartRouterPolicy,
+  type SmartRouterStrategy,
+} from '@/features/smart-routing'
+
+import type { ApiKey } from '../types'
+import {
+  buildSmartRouterPolicyFromForm,
+  getApiKeyFormDefaultValues,
+  getApiKeyFormInitializationKey,
+  getApiKeyFormSchema,
+  transformApiKeyToFormDefaults,
+  transformFormDataToPayload,
+} from './api-key-form'
+
+function apiKey(overrides: Partial<ApiKey>): ApiKey {
+  return {
+    id: 1,
+    name: 'key',
+    key: 'masked',
+    status: 1,
+    remain_quota: 0,
+    used_quota: 0,
+    unlimited_quota: true,
+    expired_time: -1,
+    created_time: 1,
+    accessed_time: 1,
+    group: 'default',
+    routing_policy: '',
+    cross_group_retry: false,
+    model_limits_enabled: false,
+    model_limits: '',
+    allow_ips: '',
+    ...overrides,
+  }
+}
+
+describe('API key routing compatibility and initialization', () => {
+  test('keeps a legacy auto-group key in fixed mode', () => {
+    const form = transformApiKeyToFormDefaults(
+      apiKey({ group: 'auto', cross_group_retry: true })
+    )
+    assert.equal(form.routing_mode, 'fixed')
+    const payload = transformFormDataToPayload(form)
+    assert.equal(payload.group, 'auto')
+    assert.equal(payload.cross_group_retry, true)
+    assert.equal(payload.routing_policy, '')
+  })
+
+  test('recognizes only auto keys with a policy as smart routing', () => {
+    const form = transformApiKeyToFormDefaults(
+      apiKey({ group: 'auto', routing_policy: '{"version":4}' })
+    )
+    assert.equal(form.routing_mode, 'smart')
+  })
+
+  test('uses a different initialization identity when the open drawer changes keys', () => {
+    assert.equal(getApiKeyFormInitializationKey(), 'create')
+    assert.equal(getApiKeyFormInitializationKey({ id: 7 }), 'update:7')
+    assert.equal(getApiKeyFormInitializationKey({ id: 8 }), 'update:8')
+  })
+
+  test('normalizes a v3 policy without changing legacy auto keys globally', () => {
+    const policy = parseSmartRouterPolicy(
+      JSON.stringify({
+        version: 3,
+        policy_id: 'old',
+        enabled: true,
+        pool_policy: 'old-pool',
+        order_mode: 'manual',
+        manual_group_order: ['pro', 'cheap'],
+        max_effective_ratio_ppm: 1_000_000,
+        excluded_groups: [],
+        health_guard: true,
+        recovery_profile: 'balanced',
+        ttft_policy: {
+          enabled: false,
+          metric: 'p95',
+          target_ms: 3000,
+          hard_max_ms: 8000,
+          min_samples: 20,
+        },
+        queue_policy: {
+          mode: 'no_queue',
+          max_wait_ms: 0,
+          min_saving_percent: 0,
+        },
+        allow_future_certified_routes: false,
+      })
+    )
+    assert.ok(policy)
+    assert.equal(policy.strategy, 'manual')
+    assert.equal(policy.failure_threshold, 3)
+    assert.equal(policy.max_attempts, 3)
+    assert.equal(policy.allow_future_groups, false)
+    assert.equal(policy.actual_input_cost_ranking, true)
+    assert.equal(policy.affinity_enabled, true)
+    assert.equal(policy.affinity_mode, 'fixed_premium')
+    assert.deepEqual(policy.compression_thresholds, [])
+    assert.equal(policy.recovery_profile, 'balanced')
+  })
+
+  test('initializes a new key from a pre-V4.7 server default safely', () => {
+    const policy = parseSmartRouterPolicy(
+      JSON.stringify({
+        version: 4,
+        enabled: true,
+        strategy: 'price',
+        manual_group_order: [],
+        max_effective_ratio_ppm: 1_000_000,
+        excluded_groups: [],
+        allow_future_groups: true,
+        max_attempts: 3,
+        failure_threshold: 3,
+        health_guard: true,
+        recovery_profile: 'balanced',
+        ttft_policy: {
+          enabled: false,
+          target_ms: 1500,
+          hard_max_ms: 8000,
+          min_samples: 20,
+        },
+        queue_policy: {
+          mode: 'no_queue',
+          max_wait_ms: 0,
+          min_saving_percent: 20,
+        },
+        balanced_weights: { stability: 45, price: 40, ttft: 15 },
+      })
+    )
+    assert.ok(policy)
+    assert.equal(policy.affinity_mode, 'fixed_premium')
+    assert.deepEqual(policy.compression_thresholds, [])
+
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartPolicy: policy,
+      smartGroups: ['cheap', 'plus', 'pro'],
+    })
+    assert.equal(form.routing_mode, 'smart')
+    assert.equal(form.smart_policy.affinity_mode, 'economic_break_even')
+    assert.equal(form.smart_policy.actual_input_cost_ranking, true)
+    assert.deepEqual(form.smart_policy.selected_groups, [
+      'cheap',
+      'plus',
+      'pro',
+    ])
+    assert.deepEqual(form.smart_policy.compression_thresholds, [])
+  })
+
+  test('accepts nullable slices from the live server default policy', () => {
+    const policy = parseSmartRouterPolicy(
+      JSON.stringify({
+        version: 4,
+        policy_id: '',
+        enabled: true,
+        strategy: 'price',
+        pool_policy: '',
+        order_mode: 'auto_price',
+        manual_group_order: ['cheap', 'plus'],
+        max_attempts: 5,
+        failure_threshold: 3,
+        max_effective_ratio_ppm: 1_000_000,
+        excluded_groups: null,
+        excluded_routes: null,
+        contract_overrides: {},
+        health_guard: true,
+        recovery_profile: 'balanced',
+        ttft_policy: {
+          enabled: false,
+          metric: '',
+          target_ms: 0,
+          hard_max_ms: 0,
+          min_samples: 0,
+        },
+        queue_policy: {
+          mode: 'no_queue',
+          max_wait_ms: 0,
+          min_saving_percent: 0,
+        },
+        balanced_weights: { stability: 45, price: 40, ttft: 15 },
+        affinity_enabled: true,
+        affinity_max_premium_percent: 10,
+        affinity_ttl_seconds: 1800,
+        allow_future_groups: true,
+        allow_future_certified_routes: true,
+      })
+    )
+    assert.ok(policy)
+    assert.deepEqual(policy.excluded_groups, [])
+    assert.equal(policy.affinity_mode, 'fixed_premium')
+    assert.deepEqual(policy.compression_thresholds, [])
+
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartPolicy: policy,
+      smartGroups: ['cheap', 'plus'],
+    })
+    assert.equal(form.routing_mode, 'smart')
+    assert.deepEqual(form.smart_policy.selected_groups, ['cheap', 'plus'])
+    assert.equal(form.smart_policy.affinity_mode, 'economic_break_even')
+  })
+})
+
+describe('v4 per-key smart routing policy', () => {
+  test('starts a new smart key with all groups and the lowest-cost preset', () => {
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartGroups: ['cheap', 'plus', 'pro'],
+    })
+    assert.equal(form.routing_mode, 'smart')
+    assert.equal(form.group, 'auto')
+    assert.deepEqual(form.smart_policy.selected_groups, [
+      'cheap',
+      'plus',
+      'pro',
+    ])
+    assert.equal(form.smart_policy.strategy, 'price')
+    assert.equal(form.smart_policy.allow_future_groups, true)
+    assert.equal(form.smart_policy.max_effective_ratio, 1)
+    assert.equal(form.smart_policy.failure_threshold, 3)
+    assert.equal(form.smart_policy.max_attempts, 3)
+    assert.equal(form.smart_policy.recovery_profile, 'balanced')
+    assert.equal(form.smart_policy.actual_input_cost_ranking, true)
+    assert.equal(form.smart_policy.affinity_mode, 'economic_break_even')
+    assert.deepEqual(form.smart_policy.compression_thresholds, [])
+  })
+
+  test('serializes and restores the per-key recovery pace', () => {
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartGroups: ['cheap', 'plus'],
+    })
+    form.smart_policy.recovery_profile = 'stable'
+    const policy = buildSmartRouterPolicyFromForm(form, ['cheap', 'plus'])
+    assert.equal(policy.recovery_profile, 'stable')
+
+    const restored = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartPolicy: policy,
+      smartGroups: ['cheap', 'plus'],
+    })
+    assert.equal(restored.smart_policy.recovery_profile, 'stable')
+  })
+
+  test('keeps actual-input-cost ordering on by default and preserves an explicit opt-out', () => {
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartGroups: ['cheap', 'plus'],
+    })
+    assert.equal(form.smart_policy.actual_input_cost_ranking, true)
+    form.smart_policy.actual_input_cost_ranking = false
+    const policy = buildSmartRouterPolicyFromForm(form, ['cheap', 'plus'])
+    assert.equal(policy.actual_input_cost_ranking, false)
+  })
+
+  test('serializes all six strategy presets independently per key', () => {
+    const strategies: SmartRouterStrategy[] = [
+      'price',
+      'stability',
+      'latency',
+      'balanced',
+      'custom_weighted',
+      'manual',
+    ]
+    for (const strategy of strategies) {
+      const form = getApiKeyFormDefaultValues({
+        useSmartRouting: true,
+        smartGroups: ['cheap', 'plus', 'pro'],
+      })
+      form.smart_policy.strategy = strategy
+      form.smart_policy.manual_group_order = ['pro', 'plus', 'cheap']
+      const policy = buildSmartRouterPolicyFromForm(form, [
+        'cheap',
+        'plus',
+        'pro',
+      ])
+      assert.equal(policy.version, 4)
+      assert.equal(policy.strategy, strategy)
+      assert.deepEqual(policy.manual_group_order, ['pro', 'plus', 'cheap'])
+    }
+  })
+
+  test('follows future groups only while every current group is selected', () => {
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartGroups: ['cheap', 'plus', 'pro'],
+    })
+    const allGroups = buildSmartRouterPolicyFromForm(form, [
+      'cheap',
+      'plus',
+      'pro',
+    ])
+    assert.equal(allGroups.allow_future_groups, true)
+    assert.deepEqual(allGroups.excluded_groups, [])
+
+    form.smart_policy.selected_groups = ['cheap', 'pro']
+    form.smart_policy.allow_future_groups = false
+    const custom = buildSmartRouterPolicyFromForm(form, [
+      'cheap',
+      'plus',
+      'pro',
+    ])
+    assert.equal(custom.allow_future_groups, false)
+    assert.deepEqual(custom.excluded_groups, ['plus'])
+  })
+
+  test('does not widen a fixed key when a group is temporarily absent', () => {
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartPolicy: {
+        ...getApiKeyFormDefaultValues({
+          useSmartRouting: true,
+          smartGroups: ['cheap', 'plus'],
+        }).smart_policy_base,
+        allow_future_groups: false,
+        manual_group_order: ['cheap'],
+        excluded_groups: ['plus'],
+      },
+      smartGroups: ['cheap'],
+    })
+    const policy = buildSmartRouterPolicyFromForm(form, ['cheap'])
+    assert.equal(policy.allow_future_groups, false)
+    assert.deepEqual(policy.excluded_groups, ['plus'])
+  })
+
+  test('round-trips advanced fields and preserves unknown future fields', () => {
+    const base = parseSmartRouterPolicy(
+      JSON.stringify({
+        version: 4,
+        enabled: true,
+        strategy: 'price',
+        excluded_groups: ['hidden'],
+        allow_future_groups: true,
+        manual_group_order: ['cheap', 'plus', 'hidden-future'],
+        max_attempts: 3,
+        failure_threshold: 3,
+        max_effective_ratio_ppm: 0,
+        health_guard: true,
+        affinity_enabled: true,
+        affinity_mode: 'economic_break_even',
+        affinity_max_premium_percent: 10,
+        affinity_ttl_seconds: 1800,
+        compression_thresholds: [{ model: 'gpt-test', tokens: 180_000 }],
+        queue_policy: {
+          mode: 'no_queue',
+          max_wait_ms: 0,
+          min_saving_percent: 20,
+        },
+        ttft_policy: {
+          enabled: false,
+          target_ms: 1500,
+          hard_max_ms: 8000,
+          min_samples: 20,
+          future_window: 50,
+        },
+        balanced_weights: { stability: 45, price: 40, ttft: 15 },
+        future_policy_flag: 'keep-me',
+      })
+    )
+    assert.ok(base)
+    const form = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartPolicy: base,
+      smartGroups: ['cheap', 'plus', 'pro'],
+    })
+    form.smart_policy.selected_groups = ['cheap', 'pro']
+    form.smart_policy.allow_future_groups = false
+    form.smart_policy.strategy = 'balanced'
+    form.smart_policy.failure_threshold = 5
+    form.smart_policy.max_attempts = 4
+    form.smart_policy.max_effective_ratio = 0.42
+    form.smart_policy.affinity_enabled = false
+    form.smart_policy.affinity_mode = 'economic_break_even'
+    form.smart_policy.compression_thresholds = [
+      { model: 'gpt-test', tokens: 200_000 },
+    ]
+    form.smart_policy.queue_mode = 'short_wait'
+    form.smart_policy.queue_max_wait_ms = 500
+    form.smart_policy.ttft_enabled = true
+    form.smart_policy.ttft_target_ms = 1200
+    const policy = buildSmartRouterPolicyFromForm(form, [
+      'cheap',
+      'plus',
+      'pro',
+    ])
+    assert.equal(policy.strategy, 'balanced')
+    assert.equal(policy.failure_threshold, 5)
+    assert.equal(policy.max_attempts, 4)
+    assert.equal(policy.max_effective_ratio_ppm, 420_000)
+    assert.equal(policy.affinity_enabled, false)
+    assert.equal(policy.affinity_mode, 'economic_break_even')
+    assert.deepEqual(policy.compression_thresholds, [
+      { model: 'gpt-test', tokens: 200_000 },
+    ])
+    assert.equal(policy.queue_policy.mode, 'short_wait')
+    assert.equal(policy.queue_policy.max_wait_ms, 500)
+    assert.equal(policy.ttft_policy.target_ms, 1200)
+    assert.equal(policy.ttft_policy.metric, 'p95')
+    assert.equal(
+      (policy as unknown as Record<string, unknown>).future_policy_flag,
+      'keep-me'
+    )
+    assert.equal(
+      (policy.ttft_policy as unknown as Record<string, unknown>).future_window,
+      50
+    )
+  })
+
+  test('validates manual coverage, balanced weights, and bounded numbers', () => {
+    const schema = getApiKeyFormSchema(
+      ((key: string) => key) as unknown as TFunction
+    )
+    const valid = getApiKeyFormDefaultValues({
+      useSmartRouting: true,
+      smartGroups: ['cheap', 'plus'],
+    })
+    valid.name = 'smart-key'
+    assert.equal(schema.safeParse(valid).success, true)
+
+    const manual = structuredClone(valid)
+    manual.smart_policy.strategy = 'manual'
+    manual.smart_policy.manual_group_order = ['cheap']
+    assert.equal(schema.safeParse(manual).success, false)
+
+    const balanced = structuredClone(valid)
+    balanced.smart_policy.strategy = 'balanced'
+    balanced.smart_policy.balanced_price_weight = 50
+    assert.equal(schema.safeParse(balanced).success, false)
+
+    const customWeighted = structuredClone(valid)
+    customWeighted.smart_policy.strategy = 'custom_weighted'
+    customWeighted.smart_policy.custom_cache_weight = 40
+    assert.equal(schema.safeParse(customWeighted).success, false)
+
+    const queue = structuredClone(valid)
+    queue.smart_policy.queue_mode = 'short_wait'
+    queue.smart_policy.queue_max_wait_ms = 0
+    assert.equal(schema.safeParse(queue).success, false)
+
+    const duplicateCompressionModel = structuredClone(valid)
+    duplicateCompressionModel.smart_policy.compression_thresholds = [
+      { model: 'gpt-test', tokens: 100_000 },
+      { model: 'gpt-test', tokens: 200_000 },
+    ]
+    assert.equal(schema.safeParse(duplicateCompressionModel).success, false)
+
+    const invalidValues = [
+      ['max_effective_ratio', MAX_SMART_ROUTER_EFFECTIVE_RATIO + 1],
+      ['ttft_target_ms', MAX_SMART_ROUTER_TTFT_MS + 1],
+      ['ttft_hard_max_ms', MAX_SMART_ROUTER_TTFT_MS + 1],
+      ['ttft_min_samples', MAX_SMART_ROUTER_TTFT_SAMPLES + 1],
+      ['max_attempts', 9],
+      ['failure_threshold', 0],
+    ] as const
+    for (const [field, value] of invalidValues) {
+      const candidate = structuredClone(valid)
+      candidate.smart_policy[field] = value
+      assert.equal(schema.safeParse(candidate).success, false, field)
+    }
+  })
+})

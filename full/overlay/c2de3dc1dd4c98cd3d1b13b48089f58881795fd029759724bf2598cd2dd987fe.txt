@@ -1,0 +1,52 @@
+package controller
+
+import (
+ "bytes"
+ "encoding/json"
+ "mime/multipart"
+ "net/http/httptest"
+ "strings"
+ "testing"
+ "time"
+
+ "github.com/QuantumNous/new-api/common"
+ "github.com/QuantumNous/new-api/setting/billing_setting"
+ "github.com/QuantumNous/new-api/types"
+ "github.com/gin-gonic/gin"
+ "github.com/stretchr/testify/require"
+)
+
+func TestParameterQuoteBindingTamperingAndConfidentiality(t *testing.T) {
+ fields:=map[string]json.RawMessage{"model":json.RawMessage(`"custom-video"`),"seconds":json.RawMessage(`"4"`),"resolution":json.RawMessage(`"480p"`),"references":json.RawMessage(`[{"type":"image","file_id":"file_a"}]`)}
+ req:=parameterQuoteRequest{Mode:"videos",Group:"g",Fields:fields}
+ fingerprint,err:=parameterIntentHash(req);require.NoError(t,err)
+ claims:=parameterQuoteClaims{UserID:42,ExpiresAt:time.Now().Add(time.Minute).Unix(),Intent:fingerprint,Offer:types.ParameterPriceSnapshot{Revision:billing_setting.GetParameterPricingContract().Revision,Model:"custom-video",Group:"g",Currency:"USD",Amount:"1.92"}}
+ token,err:=signParameterQuote(claims);require.NoError(t,err)
+ decoded,err:=decodeParameterQuote(token);require.NoError(t,err);require.Equal(t,claims,decoded)
+ _,err=decodeParameterQuote(token+"x");require.Error(t,err)
+ fields["references"]=json.RawMessage(`[{"type":"image","file_id":"file_b"}]`)
+ changed,err:=parameterIntentHash(req);require.NoError(t,err);require.NotEqual(t,fingerprint,changed)
+ fields["references"]=json.RawMessage(`[{"file_id":"file_a","type":"image"}]`)
+ reordered,err:=parameterIntentHash(req);require.NoError(t,err);require.Equal(t,fingerprint,reordered)
+ raw,_:=common.Marshal(fields)
+ c,_:=gin.CreateTestContext(httptest.NewRecorder());c.Request=httptest.NewRequest("POST","/api/media/studio/videos?group=g",bytes.NewReader(raw));c.Request.Header.Set("Content-Type","application/json");c.Request.Header.Set(types.ParameterQuoteHeader,token);c.Set("id",42)
+ require.NoError(t,verifyMediaParameterQuote(c,"videos"))
+ _,ok:=c.Get(types.ParameterQuoteContextKey);require.True(t,ok)
+ c.Set("id",43);require.Error(t,verifyMediaParameterQuote(c,"videos"))
+}
+
+func TestParameterQuoteExpiryAndMultipartMetadata(t *testing.T) {
+ req:=parameterQuoteRequest{Mode:"image-edits",Group:"g",Fields:map[string]json.RawMessage{"model":json.RawMessage(`"image-model"`),"n":json.RawMessage(`"1"`)},Files:[]parameterQuoteFile{{Field:"image",Name:"input.png",Size:3,Type:"application/octet-stream"}}}
+ fingerprint,err:=parameterIntentHash(req);require.NoError(t,err)
+ claims:=parameterQuoteClaims{UserID:1,ExpiresAt:time.Now().Add(time.Minute).Unix(),Intent:fingerprint,Offer:types.ParameterPriceSnapshot{Revision:billing_setting.GetParameterPricingContract().Revision}}
+ token,err:=signParameterQuote(claims);require.NoError(t,err)
+ var body bytes.Buffer;writer:=multipart.NewWriter(&body)
+ require.NoError(t,writer.WriteField("model","image-model"));require.NoError(t,writer.WriteField("n","1"));part,err:=writer.CreateFormFile("image","input.png");require.NoError(t,err);_,err=part.Write([]byte("abc"));require.NoError(t,err);require.NoError(t,writer.Close())
+ c,_:=gin.CreateTestContext(httptest.NewRecorder());c.Request=httptest.NewRequest("POST","/api/media/studio/image-edits?group=g",bytes.NewReader(body.Bytes()));c.Request.Header.Set("Content-Type",writer.FormDataContentType());c.Request.Header.Set(types.ParameterQuoteHeader,token);c.Set("id",1)
+ require.NoError(t,verifyMediaParameterQuote(c,"image-edits"))
+ claims.ExpiresAt=time.Now().Add(-time.Second).Unix();token,err=signParameterQuote(claims);require.NoError(t,err);c.Request.Header.Set(types.ParameterQuoteHeader,token);require.ErrorContains(t,verifyMediaParameterQuote(c,"image-edits"),"expired")
+ require.NotContains(t,string(mustQuoteJSON(t,claims)),"source_unit_price")
+ require.False(t,strings.Contains(token,"file_a"))
+}
+
+func mustQuoteJSON(t *testing.T,value any)[]byte {raw,err:=json.Marshal(value);require.NoError(t,err);return raw}

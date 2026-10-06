@@ -1,0 +1,1244 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { zodResolver } from '@hookform/resolvers/zod'
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import { useNavigate } from '@tanstack/react-router'
+import { ImagesIcon, LayoutGridIcon, NetworkIcon } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+
+import { Button } from '@/components/ui/button'
+import { getUserGroups } from '@/features/playground/api'
+import { cn } from '@/lib/utils'
+
+import { estimateParameterPrice } from '../pricing/lib/parameter-price'
+import {
+  createStudioMedia,
+  getMediaAsset,
+  getMediaAssets,
+  getMediaCapabilities,
+  getStudioTasks,
+  type StudioBatchResponse,
+} from './api'
+import { AssetDialog } from './components/asset-dialog'
+import { StudioCanvas } from './components/studio-canvas'
+import { StudioControls } from './components/studio-controls'
+import { StudioResults } from './components/studio-results'
+import {
+  applyStudioProgressEvent,
+  createStudioOutput,
+  createStudioPlaceholders,
+  completeStudioConfirmation,
+  expireStudioConfirmation,
+  hasExpectedStudioAssets,
+  isImage2ModelName,
+  mediaCapabilitySupportsOutput,
+  mediaCapabilitySupportsReferences,
+  mediaTypeFromFile,
+  mergeStudioTaskOutputs,
+  pendingStudioOperationID,
+  selectMediaCapability,
+  studioConfirmationExpired,
+  studioConfirmationPollDelay,
+  unwrapStudioRequestError,
+} from './lib'
+import {
+  clampStudioDuration,
+  managedCapabilityIssues,
+  containsPromptToken,
+  rebindPromptReferences,
+} from './parameter-capability'
+import { ParameterQuotePreflightError } from './parameter-quote'
+import { studioSchema, type StudioSchemaValue } from './studio-schema'
+import type {
+  MediaAsset,
+  StudioFormValue,
+  StudioOutput,
+  StudioReference,
+} from './types'
+
+type MediaStudioPageProps = {
+  initialReference?: string
+  initialReferenceType?: string
+}
+
+const DEFAULT_VALUES: StudioSchemaValue = {
+  mode: 'images',
+  group: '',
+  model: '',
+  prompt: '',
+  size: '1024x1024',
+  aspectRatio: '16:9',
+  resolution: '720p',
+  duration: 5,
+  count: 1,
+  quality: 'standard',
+  voice: 'alloy',
+  responseFormat: 'mp3',
+}
+
+type StudioSubmissionValue = StudioSchemaValue & {
+  fallbackEnabled?: boolean
+  fallbackGroups?: string[]
+  image2PriceAscending?: boolean
+}
+
+type StudioCreateVariables = {
+  value: StudioSubmissionValue
+  references: StudioReference[]
+  inputFile?: File
+  operationIds: string[]
+}
+
+function isTerminalStatus(status?: string) {
+  return status === 'completed' || status === 'failed'
+}
+
+function readStoredFallbackOrder(model: string) {
+  if (!model || typeof window === 'undefined') return []
+  try {
+    const raw =
+      window.localStorage.getItem(`media-studio-fallback-order-v2:${model}`) ??
+      window.localStorage.getItem('media-studio-fallback-order-v1')
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === 'string')
+      : []
+  } catch {
+    return []
+  }
+}
+
+function readStoredImage2PriceAscending(model: string) {
+  if (!model || typeof window === 'undefined') return undefined
+  const value = window.localStorage.getItem(
+    `media-studio-image2-price-ascending-v1:${model}`
+  )
+  if (value === 'true') return true
+  if (value === 'false') return false
+  return undefined
+}
+
+function taskRefreshInterval(
+  tasks?: Array<{ status?: string }>
+): number | false {
+  if (
+    tasks?.some((task) => ['queued', 'in_progress'].includes(task.status ?? ''))
+  ) {
+    return 2000
+  }
+  if (tasks?.some((task) => !isTerminalStatus(task.status))) {
+    return 15_000
+  }
+  return false
+}
+
+function requestErrorDetails(error: unknown) {
+  const candidate = unwrapStudioRequestError(error) as {
+    response?: {
+      data?: {
+        code?: string
+        message?: string
+        error?: { message?: string }
+        data?: {
+          category?: string
+          field?: string
+          request_id?: string
+          upstream_status?: number
+          detail?: string
+        }
+      }
+    }
+    message?: string
+  }
+  const message =
+    candidate.response?.data?.message ||
+    candidate.response?.data?.error?.message ||
+    candidate.message ||
+    'Request failed'
+  const diagnostic = candidate.response?.data?.data
+  return {
+    message,
+    details: diagnostic
+      ? {
+          code: candidate.response?.data?.code,
+          category: diagnostic.category,
+          field: diagnostic.field,
+          requestId: diagnostic.request_id,
+          upstreamStatus: diagnostic.upstream_status,
+          detail: diagnostic.detail,
+        }
+      : undefined,
+  }
+}
+
+function isStudioBatchResponse(value: unknown): value is StudioBatchResponse {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return (
+    record.kind === 'studio_batch' &&
+    (record.mode === 'images' ||
+      record.mode === 'image-edits' ||
+      record.mode === 'videos') &&
+    Array.isArray(record.items)
+  )
+}
+
+export function MediaStudioPage(props: MediaStudioPageProps) {
+  const { t } = useTranslation()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const form = useForm<StudioSchemaValue>({
+    resolver: zodResolver(studioSchema),
+    defaultValues: DEFAULT_VALUES,
+  })
+  const [references, setReferences] = useState<StudioReference[]>([])
+  const [inputFile, setInputFile] = useState<File>()
+  const [localOutputs, setOutputs] = useState<StudioOutput[]>([])
+  const [fallbackEnabled, setFallbackEnabled] = useState(false)
+  const [fallbackOrderByModel, setFallbackOrderByModel] = useState<
+    Record<string, string[]>
+  >({})
+  const [image2PriceAscendingByModel, setImage2PriceAscendingByModel] =
+    useState<Record<string, boolean>>({})
+  const [view, setView] = useState<'results' | 'canvas'>('results')
+  const [previewAsset, setPreviewAsset] = useState<MediaAsset | null>(null)
+  const temporaryUrls = useRef(new Set<string>())
+  const completedTaskIds = useRef(new Set<string>())
+  const outputsRef = useRef<StudioOutput[]>([])
+  const mode = useWatch({ control: form.control, name: 'mode' })
+  const group = useWatch({ control: form.control, name: 'group' })
+  const model = useWatch({ control: form.control, name: 'model' })
+  const size = useWatch({ control: form.control, name: 'size' })
+  const aspectRatio = useWatch({
+    control: form.control,
+    name: 'aspectRatio',
+  })
+  const resolution = useWatch({ control: form.control, name: 'resolution' })
+
+  useEffect(
+    () => () => {
+      temporaryUrls.current.forEach((url) => URL.revokeObjectURL(url))
+      temporaryUrls.current.clear()
+    },
+    []
+  )
+
+  const groupsQuery = useQuery({
+    queryKey: ['media-studio-groups'],
+    queryFn: getUserGroups,
+  })
+  const catalogQuery = useQuery({
+    queryKey: ['media-capabilities-catalog', mode],
+    queryFn: () => getMediaCapabilities('', '', mode),
+  })
+  const groups = useMemo(() => {
+    const available = new Set(catalogQuery.data?.groups ?? [])
+    const known = new Map(
+      (groupsQuery.data ?? []).map((item) => [item.value, item])
+    )
+    return [...available].map(
+      (value) => known.get(value) ?? { label: value, value, ratio: 0, desc: '' }
+    )
+  }, [catalogQuery.data?.groups, groupsQuery.data])
+  const models = useMemo(() => {
+    const entry = catalogQuery.data?.catalog.find(
+      (candidate) => candidate.group === group
+    )
+    return (entry?.models ?? []).map((value) => ({ label: value, value }))
+  }, [catalogQuery.data?.catalog, group])
+
+  const capabilitiesQuery = useQuery({
+    queryKey: ['media-capabilities', group, model, mode],
+    queryFn: () => getMediaCapabilities(group, model, mode),
+    enabled: Boolean(group && model),
+  })
+  const modelEligibleGroups = useMemo(() => {
+    if (!model) return []
+    const supported = new Set(
+      (catalogQuery.data?.catalog ?? [])
+        .filter((entry) => entry.models.includes(model))
+        .map((entry) => entry.group)
+    )
+    return groups.filter((item) => supported.has(item.value))
+  }, [catalogQuery.data?.catalog, groups, model])
+  const fallbackCapabilityQueries = useQueries({
+    queries: modelEligibleGroups.map((item) => ({
+      queryKey: ['media-capabilities', item.value, model, mode],
+      queryFn: () => getMediaCapabilities(item.value, model, mode),
+      enabled: Boolean(model),
+      staleTime: 60_000,
+      retry: 1,
+    })),
+  })
+  const fallbackGroupOptions = useMemo(
+    () =>
+      modelEligibleGroups.filter((_, index) => {
+        const capabilities = fallbackCapabilityQueries[index]?.data
+        if (!capabilities || capabilities.route_count === 0) return false
+        const routeCapabilities = capabilities.route_capabilities?.length
+          ? capabilities.route_capabilities
+          : [capabilities.available]
+        return routeCapabilities.some(
+          (candidate) =>
+            mediaCapabilitySupportsReferences(candidate, references) &&
+            mediaCapabilitySupportsOutput(
+              candidate,
+              mode,
+              size,
+              aspectRatio,
+              resolution
+            )
+        )
+      }),
+    [
+      aspectRatio,
+      fallbackCapabilityQueries,
+      mode,
+      modelEligibleGroups,
+      references,
+      resolution,
+      size,
+    ]
+  )
+  const fallbackPricingByGroup = useMemo(() => {
+    const pricing = new Map<string, { price?: number; unit?: string }>()
+    modelEligibleGroups.forEach((item, index) => {
+      const cheapest = (fallbackCapabilityQueries[index]?.data?.routes ?? [])
+        .filter(
+          (route) =>
+            typeof route.actual_price === 'number' &&
+            Number.isFinite(route.actual_price)
+        )
+        .sort(
+          (left, right) =>
+            (left.actual_price as number) - (right.actual_price as number)
+        )[0]
+      pricing.set(
+        item.value,
+        cheapest
+          ? { price: cheapest.actual_price, unit: cheapest.price_unit }
+          : {}
+      )
+    })
+    return pricing
+  }, [fallbackCapabilityQueries, modelEligibleGroups])
+
+  const storedFallbackOrder = useMemo(
+    () => readStoredFallbackOrder(model),
+    [model]
+  )
+  const storedImage2PriceAscending = useMemo(
+    () => readStoredImage2PriceAscending(model),
+    [model]
+  )
+  const image2PriceAscending =
+    image2PriceAscendingByModel[model] ??
+    storedImage2PriceAscending ??
+    isImage2ModelName(model)
+  const fallbackGroups = useMemo(() => {
+    const available = fallbackGroupOptions.map((item) => item.value)
+    const preferred = fallbackOrderByModel[model] ?? storedFallbackOrder
+    const ordered = [...preferred, ...available].filter(
+      (value, index, all) =>
+        available.includes(value) && all.indexOf(value) === index
+    )
+    if (!image2PriceAscending || !isImage2ModelName(model)) return ordered
+    return [...ordered].sort((left, right) => {
+      const leftPrice = fallbackPricingByGroup.get(left)?.price
+      const rightPrice = fallbackPricingByGroup.get(right)?.price
+      if (leftPrice === undefined && rightPrice === undefined) return 0
+      if (leftPrice === undefined) return 1
+      if (rightPrice === undefined) return -1
+      return leftPrice - rightPrice
+    })
+  }, [
+    fallbackOrderByModel,
+    fallbackGroupOptions,
+    fallbackPricingByGroup,
+    image2PriceAscending,
+    model,
+    storedFallbackOrder,
+  ])
+
+  useEffect(() => {
+    if (
+      fallbackGroups.length === 0 ||
+      !model ||
+      typeof window === 'undefined'
+    ) {
+      return
+    }
+    window.localStorage.setItem(
+      `media-studio-fallback-order-v2:${model}`,
+      JSON.stringify(fallbackGroups)
+    )
+  }, [fallbackGroups, model])
+  const activeCapability = useMemo(
+    () => selectMediaCapability(capabilitiesQuery.data, references),
+    [capabilitiesQuery.data, references]
+  )
+  const effectiveCapabilities = useMemo(
+    () =>
+      capabilitiesQuery.data && activeCapability
+        ? { ...capabilitiesQuery.data, available: activeCapability }
+        : capabilitiesQuery.data,
+    [activeCapability, capabilitiesQuery.data]
+  )
+  const tasksQuery = useQuery({
+    queryKey: ['media-studio-tasks'],
+    queryFn: () => getStudioTasks(),
+    refetchInterval: (query) => taskRefreshInterval(query.state.data?.items),
+  })
+  const outputs = useMemo(
+    () => mergeStudioTaskOutputs(localOutputs, tasksQuery.data?.items ?? []),
+    [localOutputs, tasksQuery.data?.items]
+  )
+
+  useEffect(() => {
+    if (!form.getValues('group') && groups[0]) {
+      form.setValue('group', groups[0].value)
+      return
+    }
+    if (!groups.some((item) => item.value === form.getValues('group'))) {
+      form.setValue('group', groups[0]?.value ?? '')
+    }
+  }, [form, groups])
+
+  useEffect(() => {
+    const current = form.getValues('model')
+    if (!models.some((item) => item.value === current)) {
+      form.setValue('model', models[0]?.value ?? '')
+    }
+  }, [form, models])
+
+  useEffect(() => {
+    if (mode !== 'videos' || !activeCapability) {
+      return
+    }
+    const currentDuration = form.getValues('duration')
+    const nextDuration = clampStudioDuration(
+      activeCapability.duration,
+      currentDuration
+    )
+    if (nextDuration !== currentDuration) {
+      form.setValue('duration', nextDuration, { shouldValidate: true })
+    }
+    if (activeCapability.runtime_enforced) return
+    const ratios = activeCapability.aspect_ratios ?? []
+    const currentRatio = form.getValues('aspectRatio')
+    if (ratios.length && !ratios.includes(currentRatio)) {
+      form.setValue('aspectRatio', ratios[0], { shouldValidate: true })
+    }
+    const resolutions = activeCapability.resolutions ?? []
+    const currentResolution = form.getValues('resolution')
+    if (resolutions.length && !resolutions.includes(currentResolution)) {
+      form.setValue('resolution', resolutions[0])
+    }
+    const outputCount = activeCapability.output_count
+    if (outputCount?.default) {
+      form.setValue('count', outputCount.default)
+    }
+  }, [activeCapability, form, mode])
+
+  useEffect(() => {
+    outputsRef.current = outputs
+  }, [outputs])
+
+  const confirmationKey = useMemo(
+    () =>
+      outputs
+        .filter((output) => output.status === 'confirming')
+        .map(
+          (output) =>
+            `${output.operationId ?? ''}:${output.confirmationStartedAt ?? output.createdAt}`
+        )
+        .join('|'),
+    [outputs]
+  )
+
+  useEffect(() => {
+    if (!confirmationKey) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const poll = async () => {
+      const pending = outputsRef.current.filter(
+        (output) => output.status === 'confirming' && output.operationId
+      )
+      if (pending.length === 0) return
+      const now = Date.now()
+      const updates = new Map<string, StudioOutput>()
+      let completed = false
+
+      await Promise.all(
+        pending.map(async (output) => {
+          const startedAt = output.confirmationStartedAt ?? output.createdAt
+          if (studioConfirmationExpired(startedAt, now)) {
+            updates.set(output.requestId, expireStudioConfirmation(output))
+            return
+          }
+          try {
+            const page = await getMediaAssets({
+              page: 1,
+              pageSize: 50,
+              status: 'ready',
+              taskId: output.operationId,
+            })
+            if (hasExpectedStudioAssets(output, page.items)) {
+              updates.set(
+                output.requestId,
+                completeStudioConfirmation(output, page.items)
+              )
+              completed = true
+            }
+          } catch {
+            // A transient confirmation-query failure must not resend generation.
+          }
+        })
+      )
+
+      if (cancelled) return
+      if (updates.size > 0) {
+        setOutputs((current) =>
+          current.map((output) => {
+            const update = updates.get(output.requestId)
+            return update && output.status === 'confirming' ? update : output
+          })
+        )
+        if (completed) {
+          void queryClient.invalidateQueries({ queryKey: ['media-assets'] })
+        }
+        return
+      }
+
+      const nextDelay = Math.min(
+        ...pending.map((output) =>
+          studioConfirmationPollDelay(
+            now - (output.confirmationStartedAt ?? output.createdAt)
+          )
+        )
+      )
+      timer = setTimeout(() => void poll(), nextDelay)
+    }
+
+    timer = setTimeout(() => void poll(), 2_000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [confirmationKey, queryClient])
+
+  useEffect(() => {
+    if (!props.initialReference) return
+    let cancelled = false
+    void getMediaAsset(props.initialReference)
+      .then((asset) => {
+        if (cancelled) return
+        const type = ['image', 'video', 'audio'].includes(asset.type)
+          ? (asset.type as 'image' | 'video' | 'audio')
+          : 'image'
+        setReferences((current) => {
+          if (current.some((reference) => reference.fileId === asset.id)) {
+            return current
+          }
+          return [
+            ...current,
+            {
+              id: crypto.randomUUID(),
+              type,
+              role: type === 'audio' ? 'driving_audio' : 'reference',
+              fileId: asset.id,
+              name: asset.filename,
+              previewUrl: asset.download_url,
+            },
+          ]
+        })
+        form.setValue('mode', type === 'image' ? 'image-edits' : 'videos')
+      })
+      .catch(() => toast.error(t('Unable to load the selected asset')))
+    return () => {
+      cancelled = true
+    }
+  }, [form, props.initialReference, props.initialReferenceType, t])
+
+  const validateReferences = useCallback(() => {
+    if (mode === 'image-edits') {
+      if (references.some((reference) => reference.type !== 'image')) {
+        toast.error(t('Image editing accepts image references only'))
+        return false
+      }
+    }
+    if (!['videos', 'image-edits'].includes(mode) || references.length === 0) {
+      return true
+    }
+    const capabilities = capabilitiesQuery.data
+    if (!capabilities || capabilities.route_count === 0) {
+      toast.error(t('No compatible route for the selected model and group'))
+      return false
+    }
+    const routeCapabilities = capabilities.route_capabilities?.length
+      ? capabilities.route_capabilities
+      : [capabilities.available]
+    if (
+      !routeCapabilities.some((route) =>
+        mediaCapabilitySupportsReferences(route, references)
+      )
+    ) {
+      toast.error(
+        t('The selected model cannot accept this reference combination')
+      )
+      return false
+    }
+    return true
+  }, [capabilitiesQuery.data, mode, references, t])
+
+  const handleImage2PriceAscendingChange = (enabled: boolean) => {
+    setImage2PriceAscendingByModel((current) => ({
+      ...current,
+      [model]: enabled,
+    }))
+    if (typeof window !== 'undefined' && model) {
+      window.localStorage.setItem(
+        `media-studio-image2-price-ascending-v1:${model}`,
+        String(enabled)
+      )
+    }
+  }
+
+  const createMutation = useMutation({
+    retry: false,
+    mutationFn: async (variables: StudioCreateVariables) => {
+      const updateProgress = (
+        event: Parameters<typeof applyStudioProgressEvent>[1]
+      ) => {
+        setOutputs((current) => applyStudioProgressEvent(current, event))
+      }
+      let resolvedReferences = variables.references
+      if (variables.value.mode === 'image-edits') {
+        for (const operationId of variables.operationIds) {
+          updateProgress({ operationId, stage: 'reading_reference' })
+        }
+        resolvedReferences = await Promise.all(
+          variables.references.map(async (reference) => {
+            if (reference.file || !reference.fileId) return reference
+            const asset = await getMediaAsset(reference.fileId)
+            const response = await fetch(asset.download_url)
+            if (!response.ok) {
+              throw new Error(t('Unable to read the reference asset'))
+            }
+            const blob = await response.blob()
+            return {
+              ...reference,
+              file: new File([blob], asset.filename, {
+                type: asset.mime_type || blob.type,
+              }),
+            }
+          })
+        )
+      }
+      const request: StudioFormValue = {
+        ...variables.value,
+        references: resolvedReferences,
+        inputFile: variables.inputFile,
+      }
+      return createStudioMedia(request, {
+        operationIds: variables.operationIds,
+        onProgress: updateProgress,
+      })
+    },
+    onMutate: (variables) => {
+      if (variables.operationIds.length === 0) return
+      const request: StudioFormValue = {
+        ...variables.value,
+        references: variables.references,
+        inputFile: variables.inputFile,
+      }
+      const placeholders = createStudioPlaceholders(
+        request,
+        variables.operationIds
+      )
+      const operationIds = new Set(variables.operationIds)
+      setOutputs((current) => [
+        ...placeholders,
+        ...current.filter(
+          (output) =>
+            !output.operationId || !operationIds.has(output.operationId)
+        ),
+      ])
+    },
+    onSuccess: (response, variables) => {
+      if (
+        response &&
+        typeof response === 'object' &&
+        'kind' in response &&
+        response.kind === 'studio_batch' &&
+        (response as StudioBatchResponse).items.some(
+          (item) => item.error instanceof ParameterQuotePreflightError
+        )
+      ) {
+        void queryClient.invalidateQueries({ queryKey: ['media-capabilities'] })
+      }
+      const value = variables.value
+      const submittedReferences = variables.references
+      const outputs: StudioOutput[] = []
+      if (isStudioBatchResponse(response)) {
+        for (const item of response.items) {
+          const childValue = {
+            ...value,
+            count: 1,
+            references: submittedReferences,
+            inputFile: variables.inputFile,
+          }
+          if (item.ok) {
+            const childOutput = createStudioOutput(childValue, item.response)
+            outputs.push({
+              ...childOutput,
+              operationId: item.operation_id,
+              requestId: `operation-${item.operation_id}`,
+            })
+            continue
+          }
+          if (item.dispatched) {
+            const now = Date.now()
+            outputs.push({
+              requestId: `operation-${item.operation_id}`,
+              operationId: item.operation_id,
+              taskId: item.operation_id,
+              expectedAssetCount: 1,
+              confirmationStartedAt: now,
+              mode: response.mode,
+              status: 'confirming',
+              stage: 'confirming_result',
+              model: value.model,
+              group: value.group,
+              prompt: value.prompt,
+              size: response.mode === 'videos' ? value.aspectRatio : value.size,
+              duration: value.duration,
+              referenceCount: submittedReferences.length,
+              references: submittedReferences,
+              assets: [],
+              createdAt: now,
+            })
+            continue
+          }
+          const failure = requestErrorDetails(item.error)
+          outputs.push({
+            requestId: `failed-${item.operation_id}`,
+            operationId: item.operation_id,
+            mode: response.mode,
+            status: 'failed',
+            model: value.model,
+            group: value.group,
+            prompt: value.prompt,
+            size: response.mode === 'videos' ? value.aspectRatio : value.size,
+            duration: value.duration,
+            referenceCount: submittedReferences.length,
+            references: submittedReferences,
+            assets: [],
+            createdAt: Date.now(),
+            error: t(failure.message),
+            errorDetails: failure.details,
+          })
+        }
+      } else {
+        const output = createStudioOutput(
+          {
+            ...value,
+            references: submittedReferences,
+            inputFile: variables.inputFile,
+          },
+          response
+        )
+        const operationId = variables.operationIds[0]
+        outputs.push(
+          operationId
+            ? {
+                ...output,
+                requestId: `operation-${operationId}`,
+                operationId,
+              }
+            : output
+        )
+      }
+      outputs.forEach((output) => {
+        output.assets.forEach((asset) => {
+          if (asset.download_url.startsWith('blob:')) {
+            temporaryUrls.current.add(asset.download_url)
+          }
+        })
+      })
+      setOutputs((current) => {
+        const replacements = new Map(
+          outputs
+            .filter((output) => output.operationId)
+            .map((output) => [output.operationId as string, output])
+        )
+        const replaced = new Set<string>()
+        const next = current.map((output) => {
+          if (!output.operationId) return output
+          const replacement = replacements.get(output.operationId)
+          if (!replacement) return output
+          replaced.add(output.operationId)
+          return replacement
+        })
+        const missing = outputs.filter(
+          (output) => !output.operationId || !replaced.has(output.operationId)
+        )
+        return [...[...missing].reverse(), ...next]
+      })
+      if (
+        outputs.some(
+          (output) => output.taskId || output.status === 'confirming'
+        )
+      ) {
+        toast.success(t('Task submitted'))
+        void queryClient.invalidateQueries({
+          queryKey: ['media-studio-tasks'],
+        })
+      } else if (outputs.some((output) => output.status === 'succeeded')) {
+        toast.success(t('Creation completed'))
+        void queryClient.invalidateQueries({ queryKey: ['media-assets'] })
+      }
+    },
+    onError: (error, variables) => {
+      if (error instanceof ParameterQuotePreflightError) {
+        void queryClient.invalidateQueries({ queryKey: ['media-capabilities'] })
+      }
+      const value = variables.value
+      const submittedReferences = variables.references
+      const operationId = pendingStudioOperationID(error)
+      if (operationId) {
+        const now = Date.now()
+        toast.info(t('Connection interrupted. Confirming the saved result'))
+        const confirming: StudioOutput = {
+          requestId: `operation-${operationId}`,
+          operationId,
+          expectedAssetCount: 1,
+          confirmationStartedAt: now,
+          mode: value.mode,
+          status: 'confirming',
+          stage: 'confirming_result',
+          model: value.model,
+          group: value.group,
+          prompt: value.prompt,
+          size: value.mode === 'videos' ? value.aspectRatio : value.size,
+          duration: value.duration,
+          referenceCount: submittedReferences.length,
+          references: submittedReferences,
+          assets: [],
+          createdAt: now,
+        }
+        setOutputs((current) => {
+          let replaced = false
+          const next = current.map((output) => {
+            if (output.operationId !== operationId) return output
+            replaced = true
+            return confirming
+          })
+          return replaced ? next : [confirming, ...next]
+        })
+        return
+      }
+      const failure = requestErrorDetails(error)
+      toast.error(t(failure.message))
+      const operationIds =
+        variables.operationIds.length > 0
+          ? variables.operationIds
+          : [crypto.randomUUID()]
+      const failedOutputs = operationIds.map(
+        (failedOperationId, index): StudioOutput => ({
+          requestId: `failed-${failedOperationId}`,
+          operationId:
+            variables.operationIds.length > 0 ? failedOperationId : undefined,
+          mode: value.mode,
+          status: 'failed',
+          model: value.model,
+          group: value.group,
+          prompt: value.prompt,
+          size: value.mode === 'videos' ? value.aspectRatio : value.size,
+          duration: value.duration,
+          referenceCount: submittedReferences.length,
+          references: submittedReferences,
+          assets: [],
+          createdAt: Date.now() + index,
+          error: t(failure.message),
+          errorDetails: failure.details,
+        })
+      )
+      const replacements = new Map(
+        failedOutputs
+          .filter((output) => output.operationId)
+          .map((output) => [output.operationId as string, output])
+      )
+      setOutputs((current) => {
+        const replaced = new Set<string>()
+        const next = current.map((output) => {
+          if (!output.operationId) return output
+          const replacement = replacements.get(output.operationId)
+          if (!replacement) return output
+          replaced.add(output.operationId)
+          return replacement
+        })
+        const missing = failedOutputs.filter(
+          (output) => !output.operationId || !replaced.has(output.operationId)
+        )
+        return [...[...missing].reverse(), ...next]
+      })
+    },
+  })
+
+  useEffect(() => {
+    let newlyCompleted = false
+    for (const task of tasksQuery.data?.items ?? []) {
+      if (
+        task.status !== 'completed' ||
+        completedTaskIds.current.has(task.id)
+      ) {
+        continue
+      }
+      completedTaskIds.current.add(task.id)
+      newlyCompleted = true
+    }
+    if (newlyCompleted) {
+      void queryClient.invalidateQueries({ queryKey: ['media-assets'] })
+    }
+  }, [queryClient, tasksQuery.data?.items])
+
+  const addReferences = useCallback(
+    (files: File[]) => {
+      const next = files.map((file) => {
+        const type = mediaTypeFromFile(file)
+        const previewUrl =
+          type === 'image' ? URL.createObjectURL(file) : undefined
+        if (previewUrl) temporaryUrls.current.add(previewUrl)
+        return {
+          id: crypto.randomUUID(),
+          type,
+          role: type === 'audio' ? 'driving_audio' : 'reference',
+          file,
+          name: file.name,
+          previewUrl,
+        } satisfies StudioReference
+      })
+      setReferences((current) => {
+        const combined = [...current, ...next]
+        const capability = capabilitiesQuery.data?.available
+        const supportsFramePair =
+          capability?.max_images === 2 &&
+          capability.image_roles?.includes('first_frame') &&
+          capability.image_roles?.includes('last_frame')
+        const images = combined.filter(
+          (reference) => reference.type === 'image'
+        )
+        if (!supportsFramePair || images.length !== 2) return combined
+        const firstID = images[0].id
+        const lastID = images[1].id
+        return combined.map((reference) => {
+          if (reference.type !== 'image' || reference.role !== 'reference') {
+            return reference
+          }
+          if (reference.id === firstID) {
+            return { ...reference, role: 'first_frame' }
+          }
+          if (reference.id === lastID) {
+            return { ...reference, role: 'last_frame' }
+          }
+          return reference
+        })
+      })
+    },
+    [capabilitiesQuery.data?.available]
+  )
+
+  const removeReference = useCallback(
+    (id: string) => {
+      setReferences((current) => {
+        const removed = current.find((reference) => reference.id === id)
+        if (removed?.previewUrl?.startsWith('blob:')) {
+          URL.revokeObjectURL(removed.previewUrl)
+          temporaryUrls.current.delete(removed.previewUrl)
+        }
+        const next = current.filter((reference) => reference.id !== id)
+        form.setValue(
+          'prompt',
+          rebindPromptReferences(
+            form.getValues('prompt'),
+            current,
+            next,
+            activeCapability
+          )
+        )
+        return next
+      })
+    },
+    [activeCapability, form]
+  )
+
+  const reuseAsset = useCallback(
+    (asset: MediaAsset) => {
+      const type = ['image', 'video', 'audio'].includes(asset.type)
+        ? (asset.type as 'image' | 'video' | 'audio')
+        : 'image'
+      setReferences((current) => [
+        ...current.filter((reference) => reference.fileId !== asset.id),
+        {
+          id: crypto.randomUUID(),
+          type,
+          role: type === 'audio' ? 'driving_audio' : 'reference',
+          fileId: asset.id,
+          name: asset.filename,
+          previewUrl: asset.download_url,
+        },
+      ])
+      form.setValue('mode', type === 'image' ? 'image-edits' : 'videos')
+    },
+    [form]
+  )
+
+  return (
+    <div className='flex size-full min-h-0 flex-col'>
+      <header className='flex min-h-14 shrink-0 flex-wrap items-center gap-2 border-b px-4 py-2'>
+        <div className='min-w-0 flex-1'>
+          <h1 className='truncate text-base font-semibold'>
+            {t('Creation Studio')}
+          </h1>
+        </div>
+        <div className='bg-muted/30 flex items-center rounded-lg border p-0.5'>
+          <Button
+            aria-label={t('Results view')}
+            className={cn(
+              'h-7',
+              view === 'results' && 'bg-background shadow-xs'
+            )}
+            onClick={() => setView('results')}
+            size='sm'
+            variant='ghost'
+          >
+            <LayoutGridIcon aria-hidden='true' />
+            <span className='hidden sm:inline'>{t('Results')}</span>
+          </Button>
+          <Button
+            aria-label={t('Canvas view')}
+            className={cn(
+              'h-7',
+              view === 'canvas' && 'bg-background shadow-xs'
+            )}
+            onClick={() => setView('canvas')}
+            size='sm'
+            variant='ghost'
+          >
+            <NetworkIcon aria-hidden='true' />
+            <span className='hidden sm:inline'>{t('Canvas')}</span>
+          </Button>
+        </div>
+        <Button
+          onClick={() => void navigate({ to: '/media/assets' })}
+          size='sm'
+          variant='outline'
+        >
+          <ImagesIcon aria-hidden='true' />
+          <span className='hidden sm:inline'>{t('My Assets')}</span>
+        </Button>
+      </header>
+
+      <div className='flex min-h-0 flex-1 flex-col lg:flex-row'>
+        <aside className='max-h-[58svh] min-h-0 shrink-0 border-b lg:max-h-none lg:w-[23rem] lg:border-r lg:border-b-0'>
+          <StudioControls
+            capabilities={effectiveCapabilities}
+            catalogError={catalogQuery.isError || groupsQuery.isError}
+            checkingRoute={
+              catalogQuery.isLoading ||
+              capabilitiesQuery.isLoading ||
+              (fallbackEnabled &&
+                fallbackCapabilityQueries.some((query) => query.isPending))
+            }
+            form={form}
+            generating={createMutation.isPending}
+            groups={groups}
+            fallbackGroupOptions={fallbackGroupOptions}
+            fallbackPrices={Object.fromEntries(
+              [...fallbackPricingByGroup].map(([key, value]) => [
+                key,
+                value.price,
+              ])
+            )}
+            fallbackPriceUnits={Object.fromEntries(
+              [...fallbackPricingByGroup].map(([key, value]) => [
+                key,
+                value.unit,
+              ])
+            )}
+            inputFile={inputFile}
+            loadingModels={catalogQuery.isLoading || groupsQuery.isLoading}
+            models={models}
+            onAddReferences={addReferences}
+            onInputFileChange={setInputFile}
+            onRetryCatalog={() => {
+              void catalogQuery.refetch()
+              void groupsQuery.refetch()
+            }}
+            onReferenceRoleChange={(id, role) =>
+              setReferences((current) =>
+                current.map((reference) =>
+                  reference.id === id ? { ...reference, role } : reference
+                )
+              )
+            }
+            onRemoveReference={removeReference}
+            onInsertReference={(token) => {
+              const prompt = form.getValues('prompt')
+              if (!containsPromptToken(prompt, token)) {
+                form.setValue(
+                  'prompt',
+                  `${prompt}${prompt ? ' ' : ''}${token}`,
+                  { shouldDirty: true }
+                )
+              }
+            }}
+            onSubmit={(value) => {
+              const issues = managedCapabilityIssues(
+                activeCapability,
+                value,
+                references
+              )
+              if (issues.length) {
+                toast.error(t(issues[0]))
+                return
+              }
+              if (validateReferences()) {
+                const estimate = estimateParameterPrice(
+                  effectiveCapabilities?.parameter_prices ?? [],
+                  {
+                    ...value,
+                    size: value.mode === 'videos' ? undefined : value.size,
+                    resolutionAliases: activeCapability?.resolution_aliases,
+                  }
+                )
+                const submittedValue = {
+                  ...value,
+                  runtimeEnforced: activeCapability?.runtime_enforced,
+                  parameterExpectedAmount: estimate?.amount,
+                  parameterExpectedCurrency: estimate?.offer.currency,
+                  parameterPricing: Boolean(
+                    effectiveCapabilities?.parameter_prices?.length
+                  ),
+                  parameterResolution: Boolean(
+                    effectiveCapabilities?.parameter_prices?.some(
+                      (price) => price.conditions.resolution
+                    )
+                  ),
+                  parameterQuality: Boolean(
+                    effectiveCapabilities?.parameter_prices?.some(
+                      (price) => price.conditions.quality
+                    )
+                  ),
+                  fallbackEnabled,
+                  fallbackGroups: fallbackGroups.filter((candidate) =>
+                    fallbackGroupOptions.some(
+                      (option) => option.value === candidate
+                    )
+                  ),
+                  image2PriceAscending,
+                }
+                const operationCount = [
+                  'images',
+                  'image-edits',
+                  'videos',
+                ].includes(submittedValue.mode)
+                  ? submittedValue.count
+                  : 0
+                createMutation.mutate({
+                  value: submittedValue,
+                  references: [...references],
+                  inputFile,
+                  operationIds: Array.from(
+                    { length: operationCount },
+                    () => `studio_${crypto.randomUUID()}`
+                  ),
+                })
+              }
+            }}
+            references={references}
+            fallbackEnabled={fallbackEnabled}
+            fallbackGroups={fallbackGroups}
+            image2PriceAscending={image2PriceAscending}
+            onFallbackEnabledChange={setFallbackEnabled}
+            onFallbackGroupsChange={(next) => {
+              handleImage2PriceAscendingChange(false)
+              setFallbackOrderByModel((current) => ({
+                ...current,
+                [model]: next,
+              }))
+            }}
+            onImage2PriceAscendingChange={handleImage2PriceAscendingChange}
+          />
+        </aside>
+        <main className='bg-muted/10 min-h-0 min-w-0 flex-1 overflow-hidden'>
+          {view === 'canvas' ? (
+            <StudioCanvas
+              onPreview={setPreviewAsset}
+              outputs={outputs}
+              references={references}
+            />
+          ) : (
+            <div className='hover-scrollbar size-full overflow-y-auto'>
+              <StudioResults
+                error={tasksQuery.isError}
+                loading={tasksQuery.isLoading}
+                onPreview={setPreviewAsset}
+                onRetry={() => void tasksQuery.refetch()}
+                onReuse={reuseAsset}
+                onAssetsDeleted={(assetIds) => {
+                  const deleted = new Set(assetIds)
+                  setOutputs((current) =>
+                    current.map((output) => ({
+                      ...output,
+                      assets: output.assets.filter(
+                        (asset) => !deleted.has(asset.id)
+                      ),
+                    }))
+                  )
+                  void queryClient.invalidateQueries({
+                    queryKey: ['media-assets'],
+                  })
+                }}
+                outputs={outputs}
+              />
+            </div>
+          )}
+        </main>
+      </div>
+
+      <AssetDialog
+        asset={previewAsset}
+        onOpenChange={(open) => !open && setPreviewAsset(null)}
+        open={Boolean(previewAsset)}
+      />
+    </div>
+  )
+}

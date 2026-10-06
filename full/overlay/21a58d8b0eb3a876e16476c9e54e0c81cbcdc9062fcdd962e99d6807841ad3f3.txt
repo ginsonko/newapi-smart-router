@@ -1,0 +1,155 @@
+package service
+
+import (
+	"fmt"
+
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	BillingSourceWallet       = "wallet"
+	BillingSourceSubscription = "subscription"
+)
+
+type taskBillingHandoff interface {
+	HandoffTaskBilling()
+	ConfirmTaskBillingApplied(actualQuota int)
+}
+
+type usageProjectionOwner interface {
+	OwnsUsageProjection() bool
+}
+
+// settlementProjectionState lets an export adapter distinguish a failed
+// pre-settlement attempt from a failure reported after the authoritative
+// funding ledger has already committed. The latter must still produce a cost
+// fact, even when a secondary token/quota adjustment returned an error.
+type settlementProjectionState interface {
+	SettlementCommitted() (bool, int)
+}
+
+// BillingOwnsUsageProjection reports whether the billing session atomically
+// projects user/channel usage while settling its durable receipt. Smart Route
+// does this to keep the R52 trusted transaction boundary; fixed-group billing
+// keeps the legacy caller-owned counter updates.
+func BillingOwnsUsageProjection(relayInfo *relaycommon.RelayInfo) bool {
+	if relayInfo == nil || relayInfo.Billing == nil {
+		return false
+	}
+	owner, ok := relayInfo.Billing.(usageProjectionOwner)
+	return ok && owner.OwnsUsageProjection()
+}
+
+// HandoffTaskBilling transfers refund responsibility from the in-memory
+// request session to a task billing receipt that has already been persisted.
+func HandoffTaskBilling(relayInfo *relaycommon.RelayInfo) {
+	if relayInfo == nil || relayInfo.Billing == nil {
+		return
+	}
+	if billing, ok := relayInfo.Billing.(taskBillingHandoff); ok {
+		billing.HandoffTaskBilling()
+	}
+}
+
+// ConfirmTaskBillingApplied closes the in-memory session after the durable
+// receipt has atomically applied the same final amount.
+func ConfirmTaskBillingApplied(relayInfo *relaycommon.RelayInfo, actualQuota int) {
+	if relayInfo == nil || relayInfo.Billing == nil {
+		return
+	}
+	if billing, ok := relayInfo.Billing.(taskBillingHandoff); ok {
+		billing.ConfirmTaskBillingApplied(actualQuota)
+	}
+}
+
+// PreConsumeBilling 根据用户计费偏好创建 BillingSession 并执行预扣费。
+// 会话存储在 relayInfo.Billing 上，供后续 Settle / Refund 使用。
+func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	if relayInfo != nil && relayInfo.IsSmartRouteProbe {
+		return nil
+	}
+	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
+	if apiErr != nil {
+		return apiErr
+	}
+	relayInfo.Billing = session
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// SettleBilling — 后结算辅助函数
+// ---------------------------------------------------------------------------
+
+// SettleBilling 执行计费结算。如果 RelayInfo 上有 BillingSession 则通过 session 结算，
+// 否则回退到旧的 PostConsumeQuota 路径（兼容按次计费等场景）。
+func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) error {
+	if relayInfo != nil && relayInfo.IsSmartRouteProbe {
+		return nil
+	}
+	if relayInfo.Billing != nil {
+		preConsumed := relayInfo.Billing.GetPreConsumedQuota()
+		delta := actualQuota - preConsumed
+
+		if delta > 0 {
+			logger.LogInfo(ctx, fmt.Sprintf("预扣费后补扣费：%s（实际消耗：%s，预扣费：%s）",
+				logger.FormatQuota(delta),
+				logger.FormatQuota(actualQuota),
+				logger.FormatQuota(preConsumed),
+			))
+		} else if delta < 0 {
+			logger.LogInfo(ctx, fmt.Sprintf("预扣费后返还扣费：%s（实际消耗：%s，预扣费：%s）",
+				logger.FormatQuota(-delta),
+				logger.FormatQuota(actualQuota),
+				logger.FormatQuota(preConsumed),
+			))
+		} else {
+			logger.LogInfo(ctx, fmt.Sprintf("预扣费与实际消耗一致，无需调整：%s（按次计费）",
+				logger.FormatQuota(actualQuota),
+			))
+		}
+
+		settleErr := relayInfo.Billing.Settle(actualQuota)
+		if !BillingOwnsUsageProjection(relayInfo) {
+			projectionQuota := actualQuota
+			canProject := settleErr == nil
+			if state, ok := relayInfo.Billing.(settlementProjectionState); ok {
+				committed, committedQuota := state.SettlementCommitted()
+				if committed {
+					canProject = true
+					projectionQuota = committedQuota
+				}
+			}
+			if canProject {
+				ProjectTenantCostSettlementAsync(ctx, relayInfo, int64(projectionQuota))
+			}
+		}
+		if settleErr != nil {
+			return settleErr
+		}
+
+		// 发送额度通知（订阅计费使用订阅剩余额度）
+		if actualQuota != 0 {
+			if relayInfo.BillingSource == BillingSourceSubscription {
+				checkAndSendSubscriptionQuotaNotify(relayInfo)
+			} else {
+				checkAndSendQuotaNotify(relayInfo, actualQuota-preConsumed, preConsumed)
+			}
+		}
+		return nil
+	}
+
+	// 回退：无 BillingSession 时使用旧路径
+	quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
+	if quotaDelta != 0 {
+		err := PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+		if err == nil {
+			ProjectTenantCostSettlementAsync(ctx, relayInfo, int64(actualQuota))
+		}
+		return err
+	}
+	ProjectTenantCostSettlementAsync(ctx, relayInfo, int64(actualQuota))
+	return nil
+}

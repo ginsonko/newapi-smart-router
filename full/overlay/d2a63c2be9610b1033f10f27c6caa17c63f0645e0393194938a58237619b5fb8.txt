@@ -1,0 +1,213 @@
+package model
+
+import (
+	"fmt"
+	"math"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
+// The original award and request hash remain immutable. This private receipt
+// links each later reduction to the wallet owner's refund fact and the exact
+// reversing ledger entries, all committed in the owner's transaction.
+type commissionReservationCorrections struct {
+	Version            int                               `json:"version"`
+	OriginalQuota      int64                             `json:"original_quota"`
+	OriginalAwardQuota int64                             `json:"original_award_quota"`
+	Entries            []commissionReservationCorrection `json:"entries"`
+}
+
+type commissionReservationCorrection struct {
+	TenantID       string  `json:"tenant_id"`
+	EventID        string  `json:"event_id"`
+	RefundQuota    int64   `json:"refund_quota"`
+	Numerator      int64   `json:"numerator"`
+	ReclaimedQuota int64   `json:"reclaimed_quota"`
+	LedgerIDs      []int64 `json:"ledger_ids"`
+}
+
+// correctCommissionReservationRefundTx adjusts only the affiliate projection.
+// The reservation/receipt caller remains the sole owner of the consumer wallet.
+func correctCommissionReservationRefundTx(tx *gorm.DB, reservation *QuotaReservation, spec TenantCostEventSpec, refundQuota int) error {
+	if reservation.CommissionOperationID <= 0 {
+		return nil
+	}
+	operation, found, err := findExistingCommissionOperationTx(tx, reservation)
+	if err != nil {
+		return err
+	}
+	if !found || operation.ID != reservation.CommissionOperationID || refundQuota <= 0 || int64(refundQuota) > operation.FinalTotalQuota {
+		return ErrCommissionProjectionConflict
+	}
+	eventAtMS, err := commissionUnixSecondsToMilliseconds(reservation.FinalizedAt)
+	if err != nil {
+		return err
+	}
+	inviter, _, err := commissionInviterAtTx(tx, reservation.UserId, eventAtMS)
+	if err != nil {
+		return err
+	}
+	program, hasProgram, err := commissionProgramAtTx(tx, eventAtMS)
+	if err != nil {
+		return err
+	}
+	if err := validateExistingCommissionProjectionTx(tx, reservation, operation, int64(reservation.FinalQuota), eventAtMS, inviter, program, hasProgram); err != nil {
+		return err
+	}
+	receipt := commissionReservationCorrections{Version: 1, OriginalQuota: operation.FinalTotalQuota, OriginalAwardQuota: operation.AwardQuota}
+	if operation.ReservationCorrections != nil {
+		if err := common.UnmarshalJsonStr(*operation.ReservationCorrections, &receipt); err != nil {
+			return err
+		}
+	}
+	entry := commissionReservationCorrection{TenantID: spec.TenantID, EventID: spec.EventID, RefundQuota: int64(refundQuota)}
+	oldVersion := operation.Version
+	if operation.Commissionable {
+		users, err := loadCommissionUsersForUpdateTx(tx, operation.BeneficiaryUserID)
+		if err != nil {
+			return err
+		}
+		account, err := loadCommissionAccountForUpdateTx(tx, operation.BeneficiaryUserID)
+		if err != nil {
+			return err
+		}
+		var lastID int64
+		if err := tx.Model(&CommissionLedgerV1{}).Where("operation_id = ?", operation.ID).Select("COALESCE(MAX(id), 0)").Scan(&lastID).Error; err != nil {
+			return err
+		}
+		entry.Numerator, entry.ReclaimedQuota, err = reverseCommissionAwardTx(tx, operation, users[operation.BeneficiaryUserID], account, int64(refundQuota))
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(&CommissionLedgerV1{}).Where("operation_id = ? AND id > ? AND event_type = ?", operation.ID, lastID, "commission_award_reversed").Order("id ASC").Pluck("id", &entry.LedgerIDs).Error; err != nil {
+			return err
+		}
+	}
+	receipt.Entries = append(receipt.Entries, entry)
+	raw, err := common.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	value := string(raw)
+	operation.ReservationCorrections = &value
+	operation.CorrectedNumerator += entry.Numerator
+	operation.AwardQuota -= minInt64(operation.AwardQuota, entry.ReclaimedQuota)
+	operation.FinalTotalQuota -= int64(refundQuota)
+	operation.FinalOrdinaryQuota -= int64(refundQuota)
+	operation.EligibleOrdinaryQuota -= int64(refundQuota)
+	return persistCommissionOperationTx(tx, operation, oldVersion)
+}
+
+func validateCommissionReservationCorrectionsTx(tx *gorm.DB, reservation *QuotaReservation, operation *CommissionOperationV1, finalQuota int64) (*CommissionOperationV1, error) {
+	if tx == nil || reservation == nil || operation == nil || operation.ReservationCorrections == nil {
+		return nil, ErrCommissionProjectionConflict
+	}
+	var receipt commissionReservationCorrections
+	if err := common.UnmarshalJsonStr(*operation.ReservationCorrections, &receipt); err != nil {
+		return nil, err
+	}
+	if receipt.Version != 1 || receipt.OriginalQuota <= 0 || receipt.OriginalQuota > int64(common.MaxQuota) || receipt.OriginalAwardQuota < 0 ||
+		len(receipt.Entries) == 0 || operation.Version != 2+int64(len(receipt.Entries)) || finalQuota < 0 ||
+		operation.FinalTotalQuota != finalQuota || operation.FinalOrdinaryQuota != finalQuota || operation.EligibleOrdinaryQuota != finalQuota {
+		return nil, ErrCommissionProjectionConflict
+	}
+	var ledger []CommissionLedgerV1
+	if err := tx.Where("operation_id = ?", operation.ID).Order("id ASC").Find(&ledger).Error; err != nil {
+		return nil, err
+	}
+	awards, reversals := map[int64]CommissionLedgerV1{}, map[int64]CommissionLedgerV1{}
+	for _, item := range ledger {
+		switch item.EventType {
+		case "commission_awarded":
+			awards[item.ID] = item
+		case "commission_award_reversed":
+			reversals[item.ID] = item
+		default:
+			return nil, ErrCommissionProjectionConflict
+		}
+	}
+	seenEvents, seenLedger := map[string]bool{}, map[int64]bool{}
+	correctedByAward := map[int64]int64{}
+	var totalRefund, totalNumerator, totalReclaimed, previousLedger int64
+	for _, entry := range receipt.Entries {
+		identity := entry.TenantID + ":" + entry.EventID
+		if entry.RefundQuota <= 0 || entry.RefundQuota > receipt.OriginalQuota-totalRefund || entry.Numerator < 0 || entry.ReclaimedQuota < 0 || seenEvents[identity] {
+			return nil, ErrCommissionProjectionConflict
+		}
+		seenEvents[identity] = true
+		var event TenantCostEvent
+		if err := tx.Where("tenant_id = ? AND event_id = ?", entry.TenantID, entry.EventID).First(&event).Error; err != nil {
+			return nil, err
+		}
+		if event.EventType != TenantCostEventRefund || event.ReservationID != reservation.ReservationId || event.GatewayChargeQuota != -entry.RefundQuota || event.ParentEventID == nil {
+			return nil, ErrCommissionProjectionConflict
+		}
+		var eligible, numerator, reclaimed int64
+		for _, id := range entry.LedgerIDs {
+			item, found := reversals[id]
+			if !found || seenLedger[id] || id <= previousLedger || item.RelatedEventID == nil {
+				return nil, ErrCommissionProjectionConflict
+			}
+			previousLedger, seenLedger[id] = id, true
+			award, found := awards[*item.RelatedEventID]
+			if !found || item.ID <= award.ID || item.AccountID != award.AccountID || item.ConsumerUserID != operation.ConsumerUserID ||
+				item.RateBps != award.RateBps || item.TierThreshold != award.TierThreshold || item.EligibleOrdinaryQuota >= 0 || item.EligibleOrdinaryQuota == math.MinInt64 ||
+				item.WithdrawalID != 0 || item.ActorUserID != 0 || item.RequestHash != "" || item.UserQuotaDelta != 0 || item.UsageReservedDelta != 0 || item.WithdrawalHeldDelta != 0 ||
+				item.AvailableDelta > 0 || item.PendingCapacityDelta > 0 || item.DebtDelta < 0 || item.ReasonCode != "linked_consumption_correction" {
+				return nil, ErrCommissionProjectionConflict
+			}
+			take := -item.EligibleOrdinaryQuota
+			if take > award.EligibleOrdinaryQuota-correctedByAward[award.ID] || award.RateBps < 0 || (award.RateBps != 0 && take > math.MaxInt64/award.RateBps) || item.NumeratorDelta != -take*award.RateBps {
+				return nil, ErrCommissionProjectionConflict
+			}
+			correctedByAward[award.ID] += take
+			if item.EventKeyHash != commissionHash("r29-ledger-v1", fmt.Sprintf("%s:award-reversal:%d:%d", operation.PublicID, award.ID, correctedByAward[award.ID])) {
+				return nil, ErrCommissionProjectionConflict
+			}
+			var priorNumerator int64
+			if err := tx.Model(&CommissionLedgerV1{}).Where("account_id = ? AND id < ? AND event_type IN ?", item.AccountID, item.ID, []string{"commission_awarded", "commission_award_reversed"}).Select("COALESCE(SUM(numerator_delta), 0)").Scan(&priorNumerator).Error; err != nil {
+				return nil, err
+			}
+			if priorNumerator < -item.NumeratorDelta {
+				return nil, ErrCommissionProjectionConflict
+			}
+			expected := priorNumerator/commissionRateBase - (priorNumerator+item.NumeratorDelta)/commissionRateBase
+			if item.AvailableDelta == math.MinInt64 || item.PendingCapacityDelta == math.MinInt64 {
+				return nil, ErrCommissionProjectionConflict
+			}
+			actual, err := commissionSafeAdd(-item.AvailableDelta, -item.PendingCapacityDelta)
+			if err != nil {
+				return nil, err
+			}
+			actual, err = commissionSafeAdd(actual, item.DebtDelta)
+			if err != nil || actual != expected {
+				return nil, ErrCommissionProjectionConflict
+			}
+			var previous CommissionLedgerV1
+			if err := tx.Where("account_id = ? AND id < ?", item.AccountID, item.ID).Order("id DESC").First(&previous).Error; err != nil {
+				return nil, err
+			}
+			if item.AvailableAfter != previous.AvailableAfter+item.AvailableDelta || item.DebtAfter != previous.DebtAfter+item.DebtDelta ||
+				item.PendingCapacityAfter != previous.PendingCapacityAfter+item.PendingCapacityDelta || item.UsageReservedAfter != previous.UsageReservedAfter || item.WithdrawalHeldAfter != previous.WithdrawalHeldAfter {
+				return nil, ErrCommissionProjectionConflict
+			}
+			eligible += take
+			numerator -= item.NumeratorDelta
+			reclaimed += actual
+		}
+		if (operation.Commissionable && eligible != entry.RefundQuota) || (!operation.Commissionable && len(entry.LedgerIDs) != 0) || entry.Numerator != numerator || entry.ReclaimedQuota != reclaimed {
+			return nil, ErrCommissionProjectionConflict
+		}
+		totalRefund += entry.RefundQuota
+		totalNumerator += entry.Numerator
+		totalReclaimed += entry.ReclaimedQuota
+	}
+	if len(seenLedger) != len(reversals) || operation.FinalTotalQuota != receipt.OriginalQuota-totalRefund || operation.CorrectedNumerator != totalNumerator || operation.AwardQuota != receipt.OriginalAwardQuota-minInt64(receipt.OriginalAwardQuota, totalReclaimed) {
+		return nil, ErrCommissionProjectionConflict
+	}
+	original := *operation
+	original.FinalTotalQuota, original.FinalOrdinaryQuota, original.EligibleOrdinaryQuota = receipt.OriginalQuota, receipt.OriginalQuota, receipt.OriginalQuota
+	original.AwardQuota, original.CorrectedNumerator, original.Version, original.ReservationCorrections = receipt.OriginalAwardQuota, 0, 2, nil
+	return &original, nil
+}

@@ -1,0 +1,878 @@
+package service
+
+import (
+	"context"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+)
+
+const (
+	actualInputCostObservationContextKey = "smart_router_actual_input_cost_observation"
+	actualInputCostQueueCapacity         = 2048
+	actualInputCostMaxProfiles           = 8192
+	actualInputCostMaxSeen               = 100000
+	actualInputCostSnapshotInterval      = time.Second
+	actualInputCostPersistInterval       = 15 * time.Second
+	actualInputCostRedisTTL              = 14 * 24 * time.Hour
+	actualInputCostRedisSchemaV2         = "actual-input-cost-v2"
+	actualInputCostRedisSchemaV3         = "actual-input-cost-v3"
+)
+
+// SmartRouteActualInputCost is deliberately separate from CacheEconomy. It
+// stores only token-mix evidence used for route ordering and never participates
+// in affinity, billing, health, retries, or task state.
+type SmartRouteActualInputCost interface {
+	Snapshot() smartrouter.ActualInputCostSnapshot
+	Observe(SmartRouteActualInputCostObservation) bool
+	Status() SmartRouteActualInputCostStatus
+	Close()
+}
+
+type SmartRouteActualInputCostHistoricalImporter interface {
+	ImportHistorical([]SmartRouteActualInputCostObservation) int
+}
+
+type SmartRouteActualInputCostObservation struct {
+	ObservationID          string
+	LegacyObservationIDs   []string
+	EventMS                int64
+	Key                    string
+	PoolKey                string
+	RegularInputTokens     int64
+	CacheReadTokens        int64
+	CacheCreation5mTokens  int64
+	CacheCreation1hTokens  int64
+	TotalInputTokens       int64
+	Reliable               bool
+	MissingEvidence        bool
+	TieredExpressionHash   string
+	TieredInputPriceMicros int64
+	Warmup                 bool
+}
+
+type SmartRouteActualInputCostStatus struct {
+	FeatureVersion    string `json:"feature_version"`
+	EstimatorVersion  string `json:"estimator_version"`
+	LearningEnabled   bool   `json:"learning_enabled"`
+	EvidenceReady     bool   `json:"evidence_ready"`
+	QueueDepth        int    `json:"queue_depth"`
+	QueueCapacity     int    `json:"queue_capacity"`
+	Profiles          int    `json:"profiles"`
+	Processed         int64  `json:"processed"`
+	Dropped           int64  `json:"dropped"`
+	Duplicates        int64  `json:"duplicates"`
+	PersistenceErrors int64  `json:"persistence_errors"`
+	WorkerErrors      int64  `json:"worker_errors"`
+	LastUpdateMS      int64  `json:"last_update_ms"`
+}
+
+type smartRouteActualInputCostStore struct {
+	redis  *redis.Client
+	events chan SmartRouteActualInputCostObservation
+	stop   chan struct{}
+	done   chan struct{}
+	once   sync.Once
+
+	mu            sync.RWMutex
+	profiles      smartrouter.ActualInputCostSnapshot
+	seen          map[string]int64
+	dirty         bool
+	snapshotDirty bool
+	snapshot      atomic.Value
+
+	learningEnabled   atomic.Bool
+	evidenceReady     atomic.Bool
+	processed         atomic.Int64
+	dropped           atomic.Int64
+	duplicates        atomic.Int64
+	persistenceErrors atomic.Int64
+	workerErrors      atomic.Int64
+	lastUpdateMS      atomic.Int64
+}
+
+func NewSmartRouteActualInputCost() SmartRouteActualInputCost {
+	var client *redis.Client
+	if common.RedisEnabled {
+		client = common.RDB
+	}
+	store := &smartRouteActualInputCostStore{
+		redis:    client,
+		events:   make(chan SmartRouteActualInputCostObservation, actualInputCostQueueCapacity),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+		profiles: make(smartrouter.ActualInputCostSnapshot),
+		seen:     make(map[string]int64),
+	}
+	store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+	store.learningEnabled.Store(true)
+	store.evidenceReady.Store(client == nil)
+	go store.loadRedis()
+	go store.run()
+	return store
+}
+
+func (store *smartRouteActualInputCostStore) Snapshot() smartrouter.ActualInputCostSnapshot {
+	if store == nil || !store.evidenceReady.Load() {
+		return nil
+	}
+	value := store.snapshot.Load()
+	if value == nil {
+		return nil
+	}
+	return value.(smartrouter.ActualInputCostSnapshot)
+}
+
+func (store *smartRouteActualInputCostStore) Observe(observation SmartRouteActualInputCostObservation) bool {
+	if store == nil || !store.learningEnabled.Load() ||
+		strings.TrimSpace(observation.ObservationID) == "" ||
+		strings.TrimSpace(observation.Key) == "" || strings.TrimSpace(observation.PoolKey) == "" {
+		return false
+	}
+	select {
+	case store.events <- observation:
+		return true
+	default:
+		store.dropped.Add(1)
+		return false
+	}
+}
+
+func (store *smartRouteActualInputCostStore) ImportHistorical(
+	observations []SmartRouteActualInputCostObservation,
+) int {
+	if store == nil || len(observations) == 0 || !store.learningEnabled.Load() {
+		return 0
+	}
+	before := store.processed.Load()
+	store.applyObservations(observations)
+	store.publishSnapshotIfDirty()
+	processed := store.processed.Load() - before
+	if processed <= 0 {
+		return 0
+	}
+	return int(processed)
+}
+
+func (store *smartRouteActualInputCostStore) Status() SmartRouteActualInputCostStatus {
+	if store == nil {
+		return SmartRouteActualInputCostStatus{}
+	}
+	store.mu.RLock()
+	profiles := len(store.profiles)
+	store.mu.RUnlock()
+	return SmartRouteActualInputCostStatus{
+		FeatureVersion:   smartrouter.ActualInputCostFeatureVersion,
+		EstimatorVersion: smartrouter.ActualInputCostEstimatorVersion,
+		LearningEnabled:  store.learningEnabled.Load(),
+		EvidenceReady:    store.evidenceReady.Load(),
+		QueueDepth:       len(store.events), QueueCapacity: cap(store.events), Profiles: profiles,
+		Processed: store.processed.Load(), Dropped: store.dropped.Load(),
+		Duplicates: store.duplicates.Load(), PersistenceErrors: store.persistenceErrors.Load(),
+		WorkerErrors: store.workerErrors.Load(), LastUpdateMS: store.lastUpdateMS.Load(),
+	}
+}
+
+func (store *smartRouteActualInputCostStore) Close() {
+	if store == nil {
+		return
+	}
+	store.once.Do(func() {
+		store.learningEnabled.Store(false)
+		close(store.stop)
+	})
+	<-store.done
+}
+
+func (store *smartRouteActualInputCostStore) run() {
+	defer close(store.done)
+	snapshotTicker := time.NewTicker(actualInputCostSnapshotInterval)
+	persistTicker := time.NewTicker(actualInputCostPersistInterval)
+	defer snapshotTicker.Stop()
+	defer persistTicker.Stop()
+	for {
+		select {
+		case first := <-store.events:
+			store.applyBatch(first)
+		case <-snapshotTicker.C:
+			store.publishSnapshotIfDirty()
+		case <-persistTicker.C:
+			store.persistIfDirty()
+		case <-store.stop:
+			for {
+				select {
+				case observation := <-store.events:
+					store.applyBatch(observation)
+				default:
+					store.publishSnapshotIfDirty()
+					store.persistIfDirty()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (store *smartRouteActualInputCostStore) applyBatch(first SmartRouteActualInputCostObservation) {
+	batch := make([]SmartRouteActualInputCostObservation, 0, 128)
+	batch = append(batch, first)
+	for len(batch) < cap(batch) {
+		select {
+		case observation := <-store.events:
+			batch = append(batch, observation)
+		default:
+			store.applyObservations(batch)
+			return
+		}
+	}
+	store.applyObservations(batch)
+}
+
+func (store *smartRouteActualInputCostStore) applyObservations(batch []SmartRouteActualInputCostObservation) {
+	if store == nil || len(batch) == 0 || !store.learningEnabled.Load() {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			store.workerErrors.Add(1)
+			store.learningEnabled.Store(false)
+			store.evidenceReady.Store(false)
+			store.snapshot.Store(smartrouter.ActualInputCostSnapshot{})
+			store.mu.Lock()
+			store.snapshotDirty = false
+			store.mu.Unlock()
+		}
+	}()
+	nowMS := time.Now().UnixMilli()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	changed := false
+	for _, observation := range batch {
+		if strings.TrimSpace(observation.ObservationID) == "" {
+			continue
+		}
+		if observation.Key == "" || observation.PoolKey == "" {
+			continue
+		}
+		identities := append([]string{observation.ObservationID}, observation.LegacyObservationIDs...)
+		duplicate := false
+		for _, identity := range identities {
+			identity = strings.TrimSpace(identity)
+			if identity == "" {
+				continue
+			}
+			if _, exists := store.seen[identity]; exists || smartrouter.ActualInputCostProfileHasObservation(store.profiles[observation.Key], identity) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			for _, identity := range identities {
+				if identity = strings.TrimSpace(identity); identity != "" {
+					store.seen[identity] = nowMS
+				}
+			}
+			store.duplicates.Add(1)
+			continue
+		}
+		for _, identity := range identities {
+			if identity = strings.TrimSpace(identity); identity != "" {
+				store.seen[identity] = nowMS
+			}
+		}
+		if observation.EventMS <= 0 {
+			observation.EventMS = nowMS
+		}
+		previousExact := store.profiles[observation.Key]
+		exact := smartrouter.ApplyActualInputCostObservation(previousExact, smartrouter.ActualInputCostObservation{
+			ObservationID: observation.ObservationID, Key: observation.Key, PoolKey: observation.PoolKey, EventMS: observation.EventMS,
+			RegularInputTokens: observation.RegularInputTokens, CacheReadTokens: observation.CacheReadTokens,
+			CacheCreation5mTokens: observation.CacheCreation5mTokens, CacheCreation1hTokens: observation.CacheCreation1hTokens,
+			TotalInputTokens: observation.TotalInputTokens, Reliable: observation.Reliable,
+			MissingEvidence: observation.MissingEvidence, Warmup: observation.Warmup,
+		}, nowMS)
+		exact = smartrouter.ApplyActualInputCostWindowObservation(exact, smartrouter.ActualInputCostObservation{
+			ObservationID: observation.ObservationID, Key: observation.Key, PoolKey: observation.PoolKey, EventMS: observation.EventMS,
+			RegularInputTokens: observation.RegularInputTokens, CacheReadTokens: observation.CacheReadTokens,
+			CacheCreation5mTokens: observation.CacheCreation5mTokens, CacheCreation1hTokens: observation.CacheCreation1hTokens,
+			TotalInputTokens: observation.TotalInputTokens, Reliable: observation.Reliable,
+			MissingEvidence:        observation.MissingEvidence,
+			TieredExpressionHash:   observation.TieredExpressionHash,
+			TieredInputPriceMicros: observation.TieredInputPriceMicros,
+			Warmup:                 observation.Warmup,
+		}, nowMS)
+		exactChanged := exact.TotalSamples > previousExact.TotalSamples ||
+			exact.MissingEvidenceStreak != previousExact.MissingEvidenceStreak ||
+			exact.LastMissingEvidenceMS != previousExact.LastMissingEvidenceMS ||
+			len(exact.Window) != len(previousExact.Window) ||
+			(len(exact.Window) > 0 && exact.Window[0].EventMS != previousExact.Window[0].EventMS)
+		if exactChanged {
+			store.profiles[observation.Key] = exact
+			if observation.Reliable && !observation.MissingEvidence {
+				pool := smartrouter.ApplyActualInputCostObservation(store.profiles[observation.PoolKey], smartrouter.ActualInputCostObservation{
+					ObservationID: observation.ObservationID, Key: observation.PoolKey, PoolKey: observation.PoolKey, EventMS: observation.EventMS,
+					RegularInputTokens: observation.RegularInputTokens, CacheReadTokens: observation.CacheReadTokens,
+					CacheCreation5mTokens: observation.CacheCreation5mTokens, CacheCreation1hTokens: observation.CacheCreation1hTokens,
+					TotalInputTokens: observation.TotalInputTokens, Reliable: true, Warmup: observation.Warmup,
+				}, nowMS)
+				pool = smartrouter.ApplyActualInputCostWindowObservation(pool, smartrouter.ActualInputCostObservation{
+					ObservationID: observation.ObservationID, Key: observation.PoolKey, PoolKey: observation.PoolKey, EventMS: observation.EventMS,
+					RegularInputTokens: observation.RegularInputTokens, CacheReadTokens: observation.CacheReadTokens,
+					CacheCreation5mTokens: observation.CacheCreation5mTokens, CacheCreation1hTokens: observation.CacheCreation1hTokens,
+					TotalInputTokens: observation.TotalInputTokens, Reliable: true,
+					TieredExpressionHash:   observation.TieredExpressionHash,
+					TieredInputPriceMicros: observation.TieredInputPriceMicros,
+					Warmup:                 observation.Warmup,
+				}, nowMS)
+				store.profiles[observation.PoolKey] = pool
+			}
+			changed = true
+			store.processed.Add(1)
+		}
+	}
+	store.pruneSeenLocked(nowMS)
+	if len(store.profiles) > actualInputCostMaxProfiles {
+		store.pruneProfilesLocked(len(store.profiles) - actualInputCostMaxProfiles)
+	}
+	if changed {
+		store.snapshotDirty = true
+		store.dirty = true
+		store.lastUpdateMS.Store(nowMS)
+	}
+}
+
+func (store *smartRouteActualInputCostStore) publishSnapshotIfDirty() {
+	if store == nil || !store.learningEnabled.Load() {
+		return
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.snapshotDirty {
+		return
+	}
+	published := make(smartrouter.ActualInputCostSnapshot, len(store.profiles))
+	for key, profile := range store.profiles {
+		published[key] = profile
+	}
+	store.snapshot.Store(published)
+	store.snapshotDirty = false
+}
+
+func (store *smartRouteActualInputCostStore) pruneSeenLocked(nowMS int64) {
+	if len(store.seen) <= actualInputCostMaxSeen {
+		return
+	}
+	cutoff := nowMS - int64(24*time.Hour/time.Millisecond)
+	for key, seenAt := range store.seen {
+		if seenAt < cutoff {
+			delete(store.seen, key)
+		}
+	}
+	if len(store.seen) <= actualInputCostMaxSeen {
+		return
+	}
+	type seenEntry struct {
+		key    string
+		seenAt int64
+	}
+	entries := make([]seenEntry, 0, len(store.seen))
+	for key, seenAt := range store.seen {
+		entries = append(entries, seenEntry{key: key, seenAt: seenAt})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].seenAt != entries[j].seenAt {
+			return entries[i].seenAt < entries[j].seenAt
+		}
+		return entries[i].key < entries[j].key
+	})
+	for _, entry := range entries[:len(entries)-actualInputCostMaxSeen] {
+		delete(store.seen, entry.key)
+	}
+}
+
+func (store *smartRouteActualInputCostStore) pruneProfilesLocked(remove int) {
+	if remove <= 0 || len(store.profiles) == 0 {
+		return
+	}
+	type profileEntry struct {
+		key       string
+		lastEvent int64
+	}
+	entries := make([]profileEntry, 0, len(store.profiles))
+	for key, profile := range store.profiles {
+		entries = append(entries, profileEntry{key: key, lastEvent: profile.LastEventMS})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].lastEvent != entries[j].lastEvent {
+			return entries[i].lastEvent < entries[j].lastEvent
+		}
+		return entries[i].key < entries[j].key
+	})
+	if remove > len(entries) {
+		remove = len(entries)
+	}
+	for _, entry := range entries[:remove] {
+		delete(store.profiles, entry.key)
+	}
+}
+
+func (store *smartRouteActualInputCostStore) persistIfDirty() {
+	if store == nil || store.redis == nil || !store.learningEnabled.Load() {
+		return
+	}
+	store.mu.Lock()
+	if !store.dirty {
+		store.mu.Unlock()
+		return
+	}
+	state := make(smartrouter.ActualInputCostSnapshot, len(store.profiles))
+	for key, profile := range store.profiles {
+		state[key] = profile
+	}
+	store.dirty = false
+	store.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	key := smartRouteRedisKey(actualInputCostRedisSchemaV3)
+	var persistErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		persistErr = store.redis.Watch(ctx, func(tx *redis.Tx) error {
+			merged := make(smartrouter.ActualInputCostSnapshot, len(state))
+			for profileKey, profile := range state {
+				merged[profileKey] = profile
+			}
+			remote, err := tx.Get(ctx, key).Result()
+			if err == nil {
+				var remoteState smartrouter.ActualInputCostSnapshot
+				if common.UnmarshalJsonStr(remote, &remoteState) == nil {
+					for profileKey, remoteProfile := range remoteState {
+						localProfile, exists := merged[profileKey]
+						if !exists {
+							merged[profileKey] = remoteProfile
+						} else {
+							merged[profileKey] = mergeActualInputCostReplicaProfiles(localProfile, remoteProfile)
+						}
+					}
+				}
+			} else if err != redis.Nil {
+				return err
+			}
+			encoded, marshalErr := common.Marshal(merged)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, encoded, actualInputCostRedisTTL)
+				return nil
+			})
+			return err
+		}, key)
+		if persistErr != redis.TxFailedErr {
+			break
+		}
+	}
+	if persistErr != nil {
+		store.persistenceErrors.Add(1)
+		store.markDirty()
+		return
+	}
+	store.evidenceReady.Store(true)
+}
+
+func (store *smartRouteActualInputCostStore) markDirty() {
+	if store == nil {
+		return
+	}
+	store.mu.Lock()
+	store.dirty = true
+	store.mu.Unlock()
+}
+
+func (store *smartRouteActualInputCostStore) loadRedis() {
+	if store == nil || !store.learningEnabled.Load() {
+		return
+	}
+	if store.redis == nil {
+		store.evidenceReady.Store(true)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	values := make([]string, 0, 2)
+	for _, key := range []string{
+		smartRouteRedisKey(actualInputCostRedisSchemaV3),
+		smartRouteRedisKey(actualInputCostRedisSchemaV2),
+		smartRouteRedisKey(smartrouter.ActualInputCostFeatureVersion),
+	} {
+		value, getErr := store.redis.Get(ctx, key).Result()
+		if getErr == redis.Nil {
+			continue
+		}
+		if getErr != nil {
+			store.persistenceErrors.Add(1)
+			continue
+		}
+		values = append(values, value)
+	}
+	if len(values) == 0 {
+		store.evidenceReady.Store(true)
+		return
+	}
+	store.mu.Lock()
+	for _, value := range values {
+		var loaded smartrouter.ActualInputCostSnapshot
+		if common.UnmarshalJsonStr(value, &loaded) != nil || len(loaded) > actualInputCostMaxProfiles {
+			store.persistenceErrors.Add(1)
+			continue
+		}
+		for key, profile := range loaded {
+			if profile.TotalSamples < 0 || profile.LastEventMS < 0 {
+				continue
+			}
+			current, exists := store.profiles[key]
+			if !exists {
+				store.profiles[key] = profile
+			} else {
+				store.profiles[key] = mergeActualInputCostReplicaProfiles(current, profile)
+			}
+		}
+	}
+	published := make(smartrouter.ActualInputCostSnapshot, len(store.profiles))
+	for key, profile := range store.profiles {
+		published[key] = profile
+	}
+	store.snapshot.Store(published)
+	store.snapshotDirty = false
+	store.mu.Unlock()
+	store.evidenceReady.Store(true)
+}
+
+func mergeActualInputCostReplicaProfiles(left, right smartrouter.ActualInputCostProfile) smartrouter.ActualInputCostProfile {
+	newer := left
+	if right.LastEventMS > left.LastEventMS {
+		newer = right
+	}
+	merged, ok := smartrouter.MergeActualInputCostProfiles(left, right)
+	if !ok || len(merged.Window) == 0 {
+		return newer
+	}
+	newer.Window = merged.Window
+	newer.History = merged.History
+	newer.TieredCostHistory = merged.TieredCostHistory
+	if merged.LastEventMS > newer.LastEventMS {
+		newer.LastEventMS = merged.LastEventMS
+	}
+	if newer.TotalSamples < int64(len(merged.Window)) {
+		newer.TotalSamples = int64(len(merged.Window))
+	}
+	if newer.Version == "" {
+		newer.Version = smartrouter.ActualInputCostFeatureVersion
+	}
+	// History and tiered-cost snapshots are compatibility data only. They must
+	// never be copied as if they were current unified-cost evidence.
+	newer.History = merged.History
+	newer.TieredCostHistory = merged.TieredCostHistory
+	return newer
+}
+
+type smartRouteActualInputCostObservationBase struct {
+	sink                 SmartRouteActualInputCost
+	ObservationID        string
+	LegacyObservationIDs []string
+	Key                  string
+	PoolKey              string
+	Warmup               bool
+}
+
+// bindSmartRouteExternalActualInputCostObservation joins successful traffic
+// that did not enter through a SmartRoutingSession to the same immutable,
+// physical-route evidence key used by automatic Smart Routing. Group aliases
+// deliberately collapse to one fact, while protocol contracts, channel
+// generations and upstream model mappings remain isolated.
+//
+// Ambiguous physical mappings are rejected instead of guessing. Dropping one
+// observation is safer than contaminating every user's shared ranking facts.
+func bindSmartRouteExternalActualInputCostObservation(
+	c *gin.Context,
+	engine *SmartRouterEngine,
+	catalog smartrouter.CertifiedRouteCatalog,
+	relayInfo *relaycommon.RelayInfo,
+	channelID int,
+	channelGeneration string,
+	requestPath string,
+) bool {
+	if c == nil || engine == nil || engine.ActualInputCosts == nil || relayInfo == nil ||
+		relayInfo.IsSmartRouteProbe || channelID <= 0 {
+		return false
+	}
+	if _, exists := c.Get(actualInputCostObservationContextKey); exists {
+		return true
+	}
+	channelGeneration = strings.TrimSpace(channelGeneration)
+	canonicalModel := strings.TrimSpace(relayInfo.OriginModelName)
+	if channelGeneration == "" || canonicalModel == "" {
+		return false
+	}
+	contractID, endpoint, _, err := SmartContractIdentity(canonicalModel, requestPath)
+	if err != nil || !isActualInputCostTextEndpoint(endpoint) {
+		return false
+	}
+	contract, exists := catalog.Contracts[contractID]
+	if !exists || contract.Contract.ContractID != contractID ||
+		contract.Contract.CanonicalModel != canonicalModel || contract.Contract.Endpoint != endpoint {
+		return false
+	}
+
+	type physicalRoute struct {
+		route smartrouter.CertifiedRoute
+		key   string
+	}
+	upstreamHint := ""
+	if relayInfo.ChannelMeta != nil {
+		upstreamHint = strings.TrimSpace(relayInfo.UpstreamModelName)
+	}
+	physical := make(map[string]physicalRoute)
+	for _, pool := range contract.Pools {
+		for _, route := range pool.Candidates {
+			if route.ChannelID != channelID || route.ChannelGeneration != channelGeneration {
+				continue
+			}
+			if upstreamHint != "" && strings.TrimSpace(route.UpstreamModel) != upstreamHint {
+				continue
+			}
+			key := smartrouter.ActualInputCostKey(
+				route.CacheNamespaceIdentity(), route.UpstreamModel,
+				canonicalModel, endpoint,
+				(smartrouter.RouteRequest{Endpoint: endpoint}).UsageSemantic(),
+			)
+			physical[key] = physicalRoute{route: route, key: key}
+		}
+	}
+	if len(physical) != 1 {
+		return false
+	}
+	var selected physicalRoute
+	for _, candidate := range physical {
+		selected = candidate
+	}
+	usageSemantic := (smartrouter.RouteRequest{Endpoint: endpoint}).UsageSemantic()
+	poolKey := smartrouter.ActualInputCostPoolKey(
+		selected.route.UpstreamModel, canonicalModel, endpoint, usageSemantic,
+	)
+	decisionID := strings.TrimSpace(relayInfo.RequestId)
+	if decisionID == "" {
+		decisionID = common.Sha1([]byte(canonicalModel + "\x00" + requestPath + "\x00" + selected.key))
+	}
+	legacyID := decisionID + ":external:" + common.Sha1([]byte(selected.key))
+	c.Set(actualInputCostObservationContextKey, smartRouteActualInputCostObservationBase{
+		sink:                 engine.ActualInputCosts,
+		ObservationID:        smartRouteCanonicalObservationID("actual-input", decisionID, selected.key),
+		LegacyObservationIDs: []string{legacyID},
+		Key:                  selected.key, PoolKey: poolKey,
+		Warmup: relayInfo.IsSmartRouteProbe,
+	})
+	return true
+}
+
+func bindSmartRouteExternalActualInputCostObservationForUsage(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+) bool {
+	if c == nil || c.Request == nil || relayInfo == nil || relayInfo.IsSmartRouteProbe {
+		return false
+	}
+	if _, exists := c.Get(actualInputCostObservationContextKey); exists {
+		return true
+	}
+	if relayInfo.ChannelMeta == nil || relayInfo.ChannelId <= 0 {
+		return false
+	}
+	engine, err := GetDefaultSmartRouterEngine()
+	if err != nil || engine == nil || engine.Catalogs == nil || engine.ActualInputCosts == nil {
+		return false
+	}
+	catalog, ok := engine.Catalogs.Current()
+	if !ok || catalog == nil {
+		return false
+	}
+	channel, err := model.CacheGetChannel(relayInfo.ChannelId)
+	if err != nil || channel == nil {
+		return false
+	}
+	requestPath := strings.TrimSpace(c.Request.URL.Path)
+	if requestPath == "" {
+		requestPath = strings.TrimSpace(relayInfo.RequestURLPath)
+	}
+	return bindSmartRouteExternalActualInputCostObservation(
+		c, engine, *catalog, relayInfo, relayInfo.ChannelId,
+		SmartRouteChannelGeneration(*channel), requestPath,
+	)
+}
+
+// ObserveSmartRouteExternalActualInputCostUsage projects a successful real
+// channel test into the same site-wide cache/cost facts as user traffic. It is
+// best-effort and never changes the test's result or billing outcome.
+func ObserveSmartRouteExternalActualInputCostUsage(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	channel *model.Channel,
+	requestPath string,
+	usage *dto.Usage,
+	tieredResult *billingexpr.TieredResult,
+) bool {
+	if c == nil || relayInfo == nil || channel == nil || channel.Id <= 0 || usage == nil || relayInfo.IsSmartRouteProbe {
+		return false
+	}
+	engine, err := GetDefaultSmartRouterEngine()
+	if err != nil || engine == nil || engine.Catalogs == nil || engine.ActualInputCosts == nil {
+		return false
+	}
+	catalog, ok := engine.Catalogs.Current()
+	if !ok || catalog == nil {
+		return false
+	}
+	if !bindSmartRouteExternalActualInputCostObservation(
+		c, engine, *catalog, relayInfo, channel.Id,
+		SmartRouteChannelGeneration(*channel), requestPath,
+	) {
+		return false
+	}
+	observeSmartRouteActualInputCostUsage(c, relayInfo, usage, calculateTextQuotaSummary(c, relayInfo, usage))
+	return true
+}
+
+func (session *SmartRoutingSession) BindActualInputCostObservation(
+	c *gin.Context,
+	handle *SmartRouteAttemptHandle,
+	relayInfo *relaycommon.RelayInfo,
+) {
+	if session == nil || session.engine == nil || session.engine.ActualInputCosts == nil || c == nil || handle == nil || relayInfo == nil ||
+		!isActualInputCostTextEndpoint(session.request.Endpoint) {
+		return
+	}
+	decisionID := strings.TrimSpace(relayInfo.RequestId)
+	if decisionID == "" {
+		decisionID = common.Sha1([]byte(session.request.AdmissionKey + "\x00" + handle.Plan.RouteID))
+	}
+	key := smartrouter.ActualInputCostKey(
+		handle.Route.CacheNamespaceIdentity(), handle.Route.UpstreamModel,
+		session.request.CanonicalModel, session.request.Endpoint, session.request.UsageSemantic(),
+	)
+	poolKey := smartrouter.ActualInputCostPoolKey(
+		handle.Route.UpstreamModel, session.request.CanonicalModel, session.request.Endpoint, session.request.UsageSemantic(),
+	)
+	warmup := handle.Plan.Admission == smartrouter.AdmissionVirginBootstrap
+	if session.affinity != nil {
+		warmup = warmup || session.affinity.CacheDomain != handle.Route.CacheDomain ||
+			session.affinity.CacheNamespaceRevision != handle.Route.CacheNamespaceRevision
+	}
+	c.Set(actualInputCostObservationContextKey, smartRouteActualInputCostObservationBase{
+		sink:                 session.engine.ActualInputCosts,
+		ObservationID:        smartRouteCanonicalObservationID("actual-input", decisionID, key),
+		LegacyObservationIDs: []string{decisionID + ":" + handle.Plan.RouteID},
+		Key:                  key, PoolKey: poolKey,
+		Warmup: warmup,
+	})
+}
+
+func observeSmartRouteActualInputCostUsage(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	usage *dto.Usage,
+	summary textQuotaSummary,
+) {
+	if c == nil || relayInfo == nil {
+		return
+	}
+	bindSmartRouteExternalActualInputCostObservationForUsage(c, relayInfo)
+	value, exists := c.Get(actualInputCostObservationContextKey)
+	base, ok := value.(smartRouteActualInputCostObservationBase)
+	if !exists || !ok || base.sink == nil {
+		return
+	}
+	missingEvidence := func() {
+		base.sink.Observe(SmartRouteActualInputCostObservation{
+			ObservationID: base.ObservationID, EventMS: time.Now().UnixMilli(),
+			LegacyObservationIDs: append([]string(nil), base.LegacyObservationIDs...),
+			Key:                  base.Key, PoolKey: base.PoolKey, MissingEvidence: true, Warmup: base.Warmup,
+		})
+	}
+	if usage == nil {
+		missingEvidence()
+		return
+	}
+	if !usage.CacheUsageReliable &&
+		summary.CacheTokens == 0 && summary.CacheCreationTokens == 0 &&
+		summary.CacheCreationTokens5m == 0 && summary.CacheCreationTokens1h == 0 {
+		missingEvidence()
+		return
+	}
+	read := summary.CacheTokens
+	create5m := summary.CacheCreationTokens5m
+	create1h := summary.CacheCreationTokens1h
+	creation := summary.CacheCreationTokens
+	if create5m+create1h == 0 && creation > 0 {
+		create5m = creation
+	}
+	if read < 0 || create5m < 0 || create1h < 0 {
+		missingEvidence()
+		return
+	}
+	observeReliable := func(regular, total int) {
+		observation := SmartRouteActualInputCostObservation{
+			ObservationID: base.ObservationID, EventMS: time.Now().UnixMilli(), Key: base.Key, PoolKey: base.PoolKey,
+			LegacyObservationIDs: append([]string(nil), base.LegacyObservationIDs...),
+			RegularInputTokens:   int64(regular), CacheReadTokens: int64(read), CacheCreation5mTokens: int64(create5m),
+			CacheCreation1hTokens: int64(create1h), TotalInputTokens: int64(total), Reliable: true,
+			Warmup: base.Warmup || (read == 0 && create5m+create1h > 0),
+		}
+		// The unified estimator requires a fixed two-price ratio contract.
+		// Tiered settlement expressions are deliberately not persisted as a
+		// second prediction source; billing keeps its own request snapshot.
+		base.sink.Observe(observation)
+	}
+	if summary.IsClaudeUsageSemantic {
+		regular := summary.PromptTokens
+		if regular < 0 {
+			missingEvidence()
+			return
+		}
+		total := regular + read + create5m + create1h
+		if total <= 0 {
+			missingEvidence()
+			return
+		}
+		observeReliable(regular, total)
+		return
+	}
+	total := usage.InputTokens
+	if total <= 0 {
+		total = usage.PromptTokens
+	}
+	if total <= 0 || read > total || create5m > total-read || create1h > total-read-create5m {
+		missingEvidence()
+		return
+	}
+	regular := total - read - create5m - create1h
+	observeReliable(regular, total)
+}
+
+func isActualInputCostTextEndpoint(endpoint string) bool {
+	switch strings.TrimSpace(endpoint) {
+	case SmartEndpointChat, SmartEndpointCompletions, SmartEndpointMessages, SmartEndpointResponses:
+		return true
+	default:
+		return false
+	}
+}

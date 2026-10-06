@@ -1,0 +1,68 @@
+package openai
+
+import (
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+)
+
+type responsesToolCounter struct {
+	info        *relaycommon.RelayInfo
+	seenIDs     map[string]bool
+	seenIndexes map[int]bool
+}
+
+func newResponsesToolCounter(info *relaycommon.RelayInfo) *responsesToolCounter {
+	return &responsesToolCounter{info: info, seenIDs: make(map[string]bool), seenIndexes: make(map[int]bool)}
+}
+
+func (counter *responsesToolCounter) observeOutputs(outputs []dto.ResponsesOutput) {
+	for index, item := range outputs {
+		counter.observe(item, &index)
+	}
+}
+
+func (counter *responsesToolCounter) observe(item dto.ResponsesOutput, index *int) {
+	if counter.info == nil || item.Status != "" && item.Status != "completed" {
+		return
+	}
+	toolType := ""
+	switch item.Type {
+	case dto.BuildInCallWebSearchCall:
+		toolType = "web_search"
+		if counter.info.ResponsesUsageInfo != nil {
+			tools := counter.info.ResponsesUsageInfo.BuiltInTools
+			if tools[toolType] == nil && tools[dto.BuildInToolWebSearchPreview] != nil {
+				toolType = dto.BuildInToolWebSearchPreview
+			}
+		}
+	case "file_search_call":
+		toolType = dto.BuildInToolFileSearch
+	default:
+		return
+	}
+	if item.ID == "" && index == nil {
+		return
+	}
+	seen := item.ID != "" && counter.seenIDs[item.ID] || index != nil && counter.seenIndexes[*index]
+	if item.ID != "" {
+		counter.seenIDs[item.ID] = true
+	}
+	if index != nil {
+		counter.seenIndexes[*index] = true
+	}
+	if seen {
+		return
+	}
+	if counter.info.ResponsesUsageInfo == nil {
+		counter.info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{}
+	}
+	if counter.info.ResponsesUsageInfo.BuiltInTools == nil {
+		counter.info.ResponsesUsageInfo.BuiltInTools = make(map[string]*relaycommon.BuildInToolInfo)
+	}
+	tool := counter.info.ResponsesUsageInfo.BuiltInTools[toolType]
+	if tool == nil {
+		tool = &relaycommon.BuildInToolInfo{ToolName: toolType}
+		counter.info.ResponsesUsageInfo.BuiltInTools[toolType] = tool
+	}
+	tool.CallCount++
+}

@@ -1,0 +1,14 @@
+package types
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestLoadFromJSONStringKeepsLastValidMapOnDecodeFailure(t *testing.T) {
+	values := NewRWMap[string, float64]()
+	require.NoError(t, LoadFromJsonString(values, `{"stable":1.5}`))
+	require.Error(t, LoadFromJsonString(values, `{"broken":`))
+	require.Equal(t, map[string]float64{"stable": 1.5}, values.ReadAll())
+}

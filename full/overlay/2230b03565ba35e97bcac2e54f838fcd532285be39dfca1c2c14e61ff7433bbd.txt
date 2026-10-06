@@ -1,0 +1,779 @@
+package model
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+const (
+	// CommissionProjectionSourceReservation is intentionally different from
+	// the legacy capture sources. The worker never calls the legacy funding
+	// admission functions; it only projects already-settled reservations.
+	CommissionProjectionSourceReservation = "reservation"
+	commissionProjectionSkippedID         = int64(-1)
+	commissionProjectionBatchLimit        = 100
+	commissionUnixSecondFloor             = int64(946684800) // 2000-01-01 UTC
+)
+
+var (
+	ErrCommissionProjectionDeferred = errors.New("commission projection waits for task settlement")
+	ErrCommissionProjectionConflict = errors.New("commission projection identity conflict")
+)
+
+// CommissionProjectionResult is a small, internal receipt returned to the
+// worker and tests. It deliberately contains no user-facing monetary fields.
+type CommissionProjectionResult struct {
+	ReservationID string
+	OperationID   int64
+	AwardQuota    int64
+	Skipped       bool
+	Deferred      bool
+}
+
+// EnsureCommissionAccrualWatermark freezes the first worker start time in Unix
+// seconds, matching quota_reservations.finalized_at. Old builds used this field
+// as a small counter or wrote milliseconds; neither value may unlock history.
+func EnsureCommissionAccrualWatermark(candidateUnix int64) (int64, error) {
+	if candidateUnix < commissionUnixSecondFloor {
+		candidateUnix = time.Now().Unix()
+	}
+	var watermark int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var settings CommissionSettingsV1
+		if err := lockForUpdate(tx).First(&settings, 1).Error; err != nil {
+			return err
+		}
+		watermark = settings.AccrualEpoch
+		if validCommissionAccrualWatermark(watermark, candidateUnix) {
+			return nil
+		}
+		updated := tx.Model(&CommissionSettingsV1{}).
+			Where("id = ? AND accrual_epoch = ?", settings.ID, settings.AccrualEpoch).
+			Updates(map[string]interface{}{"accrual_epoch": candidateUnix, "updated_at": time.Now().UnixMilli()})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrCommissionVersionConflict
+		}
+		watermark = candidateUnix
+		return nil
+	})
+	return watermark, err
+}
+
+func validCommissionAccrualWatermark(value, nowUnix int64) bool {
+	return value >= commissionUnixSecondFloor && value <= nowUnix
+}
+
+func GetCommissionAccrualWatermark() (int64, error) {
+	var settings CommissionSettingsV1
+	if err := DB.First(&settings, 1).Error; err != nil {
+		return 0, err
+	}
+	return settings.AccrualEpoch, nil
+}
+
+// ListCommissionProjectionCandidates returns a bounded, stable queue. The
+// projection pointer is updated in the same transaction as the operation, so
+// rescans after a crash are harmless.
+func ListCommissionProjectionCandidates(watermarkUnix, finalizedBeforeUnix, afterID int64, limit int) ([]QuotaReservation, error) {
+	if watermarkUnix < commissionUnixSecondFloor || finalizedBeforeUnix < commissionUnixSecondFloor {
+		return nil, ErrCommissionInvalidInput
+	}
+	if limit <= 0 || limit > commissionProjectionBatchLimit {
+		limit = commissionProjectionBatchLimit
+	}
+	rows := make([]QuotaReservation, 0, limit)
+	if finalizedBeforeUnix < watermarkUnix {
+		return rows, nil
+	}
+	query := DB.Model(&QuotaReservation{}).
+		Where("commission_operation_id = ?", 0).
+		Where("status = ? AND funding_source = ?", QuotaReservationStatusSettled, QuotaReservationFundingWallet).
+		Where("settlement_pending = ? AND settlement_quota_known = ? AND pending_final_quota = final_quota", false, true).
+		Where("finalized_at >= ? AND finalized_at <= ?", watermarkUnix, finalizedBeforeUnix).
+		Where("id > ?", afterID).
+		Order("id ASC").Limit(limit)
+	if err := query.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// ProjectCommissionReservation atomically turns one settled wallet
+// reservation into one immutable commission operation. It never changes the
+// consumer's ordinary wallet or the reservation's financial state.
+func ProjectCommissionReservation(reservationID string) (CommissionProjectionResult, error) {
+	return projectCommissionReservationAt(reservationID, time.Now().UnixMilli())
+}
+
+func projectCommissionReservationAt(reservationID string, nowMS int64) (CommissionProjectionResult, error) {
+	reservationID = strings.TrimSpace(reservationID)
+	if reservationID == "" || nowMS <= 0 {
+		return CommissionProjectionResult{}, ErrCommissionInvalidInput
+	}
+	var result CommissionProjectionResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var reservation QuotaReservation
+		if err := lockForUpdate(tx).Where("reservation_id = ?", reservationID).First(&reservation).Error; err != nil {
+			return err
+		}
+		result.ReservationID = reservation.ReservationId
+		existing, foundExisting, err := findExistingCommissionOperationTx(tx, &reservation)
+		if err != nil {
+			return err
+		}
+		if reservation.CommissionOperationID > 0 &&
+			(!foundExisting || existing.ID != reservation.CommissionOperationID) {
+			return ErrCommissionProjectionConflict
+		}
+		if reservation.CommissionOperationID < 0 && foundExisting {
+			return ErrCommissionProjectionConflict
+		}
+		if reservation.Status != QuotaReservationStatusSettled ||
+			reservation.FundingSource != QuotaReservationFundingWallet {
+			if foundExisting || reservation.CommissionOperationID > 0 {
+				return ErrCommissionProjectionConflict
+			}
+			result.Skipped = true
+			if reservation.CommissionOperationID < 0 {
+				return nil
+			}
+			return markCommissionReservationSkippedTx(tx, &reservation)
+		}
+		if reservation.SettlementPending ||
+			!reservation.SettlementQuotaKnown ||
+			reservation.PendingFinalQuota != reservation.FinalQuota {
+			if foundExisting || reservation.CommissionOperationID != 0 {
+				return ErrCommissionProjectionConflict
+			}
+			result.Deferred = true
+			return ErrCommissionProjectionDeferred
+		}
+
+		finalQuota, eventAtMS, deferred, err := commissionReservationFinalQuotaTx(tx, &reservation, nowMS)
+		if err != nil {
+			if errors.Is(err, ErrCommissionProjectionDeferred) {
+				if foundExisting || reservation.CommissionOperationID > 0 {
+					return ErrCommissionProjectionConflict
+				}
+				result.Deferred = true
+				return err
+			}
+			return err
+		}
+		if finalQuota < 0 {
+			return fmt.Errorf("%w: negative final quota", ErrCommissionInvariant)
+		}
+		if deferred {
+			result.Deferred = true
+			return ErrCommissionProjectionDeferred
+		}
+		if finalQuota == 0 && !(foundExisting && existing.ReservationCorrections != nil) {
+			if foundExisting || reservation.CommissionOperationID > 0 {
+				return ErrCommissionProjectionConflict
+			}
+			result.Skipped = true
+			if reservation.CommissionOperationID < 0 {
+				return nil
+			}
+			return markCommissionReservationSkippedTx(tx, &reservation)
+		}
+		if reservation.CommissionOperationID < 0 {
+			return ErrCommissionProjectionConflict
+		}
+
+		inviterID, _, err := commissionInviterAtTx(tx, reservation.UserId, eventAtMS)
+		if err != nil {
+			return err
+		}
+		program, hasProgram, err := commissionProgramAtTx(tx, eventAtMS)
+		if err != nil {
+			return err
+		}
+		if reservation.CommissionOperationID > 0 {
+			if err := validateExistingCommissionProjectionTx(tx, &reservation, existing, finalQuota, eventAtMS, inviterID, program, hasProgram); err != nil {
+				return err
+			}
+			result.OperationID = existing.ID
+			result.AwardQuota = existing.AwardQuota
+			return nil
+		}
+
+		// A prior unstable build may have committed the operation and its award
+		// ledger before the reservation pointer was written. Reuse it only after
+		// validating the complete immutable financial receipt.
+		if foundExisting {
+			if err := validateExistingCommissionProjectionTx(tx, &reservation, existing, finalQuota, eventAtMS, inviterID, program, hasProgram); err != nil {
+				return err
+			}
+			if err := linkCommissionReservationTx(tx, &reservation, existing.ID); err != nil {
+				return err
+			}
+			result.OperationID = existing.ID
+			result.AwardQuota = existing.AwardQuota
+			return nil
+		}
+
+		operation := &CommissionOperationV1{
+			PublicID:              commissionPublicID("cco"),
+			OperationKeyHash:      commissionHash("r29-sidecar-operation-v1", reservation.ReservationId),
+			RequestHash:           commissionHash("r29-sidecar-request-v1", reservation.ReservationId, fmt.Sprintf("%d", finalQuota), fmt.Sprintf("%d", eventAtMS)),
+			Source:                CommissionProjectionSourceReservation,
+			SourceStableID:        reservation.ReservationId,
+			ConsumerUserID:        reservation.UserId,
+			BeneficiaryUserID:     inviterID,
+			ProgramVersion:        0,
+			SpendPriority:         CommissionOrdinaryFirst,
+			Commissionable:        inviterID > 0 && inviterID != reservation.UserId && hasProgram,
+			FinancialStatus:       CommissionFinancialSettled,
+			ProjectionStatus:      CommissionProjectionPending,
+			ReservedTotalQuota:    int64(reservation.ReservedQuota),
+			ReservedOrdinaryQuota: int64(reservation.ReservedQuota),
+			FinalTotalQuota:       finalQuota,
+			FinalOrdinaryQuota:    finalQuota,
+			EligibleOrdinaryQuota: finalQuota,
+			Version:               1,
+			ReservedAt:            reservation.CreatedAt,
+			FinalizedAt:           eventAtMS,
+		}
+		if hasProgram {
+			operation.ProgramID = program.ID
+			operation.ProgramVersion = program.Version
+			operation.ProgramTiersJSON = program.TiersJSON
+			if _, _, normalizeErr := normalizeCommissionTierJSON(program.TiersJSON); normalizeErr != nil {
+				operation.ProjectionStatus = CommissionProjectionReview
+				operation.ErrorCode = "commission_program_invalid"
+				operation.Commissionable = false
+			}
+		}
+		if err := tx.Create(operation).Error; err != nil {
+			return err
+		}
+		if operation.Commissionable && operation.FinalOrdinaryQuota > 0 {
+			users, err := loadCommissionUsersForUpdateTx(tx, operation.ConsumerUserID, operation.BeneficiaryUserID)
+			if err != nil {
+				return err
+			}
+			beneficiary := users[operation.BeneficiaryUserID]
+			account, err := loadCommissionAccountForUpdateTx(tx, operation.BeneficiaryUserID)
+			if err != nil {
+				return err
+			}
+			awardNumerator, awardQuota, err := settleCommissionAwardTx(tx, operation, beneficiary, account, operation.FinalOrdinaryQuota)
+			if err != nil {
+				return err
+			}
+			operation.AwardNumerator = awardNumerator
+			operation.AwardQuota = awardQuota
+			result.AwardQuota = awardQuota
+		}
+		previousVersion := operation.Version
+		if operation.ProjectionStatus != CommissionProjectionReview {
+			operation.ProjectionStatus = CommissionProjectionApplied
+		}
+		if err := persistCommissionOperationTx(tx, operation, previousVersion); err != nil {
+			return err
+		}
+		if err := linkCommissionReservationTx(tx, &reservation, operation.ID); err != nil {
+			return err
+		}
+		result.OperationID = operation.ID
+		return nil
+	})
+	if errors.Is(err, ErrCommissionProjectionDeferred) {
+		return result, nil
+	}
+	return result, err
+}
+
+func markCommissionReservationSkippedTx(tx *gorm.DB, reservation *QuotaReservation) error {
+	if reservation == nil {
+		return ErrCommissionInvalidInput
+	}
+	updated := tx.Model(&QuotaReservation{}).
+		Where("id = ? AND commission_operation_id = ?", reservation.Id, 0).
+		Update("commission_operation_id", commissionProjectionSkippedID)
+	if updated.Error != nil {
+		return updated.Error
+	}
+	if updated.RowsAffected != 1 {
+		return ErrCommissionProjectionConflict
+	}
+	reservation.CommissionOperationID = commissionProjectionSkippedID
+	return nil
+}
+
+func linkCommissionReservationTx(tx *gorm.DB, reservation *QuotaReservation, operationID int64) error {
+	if reservation == nil || operationID <= 0 {
+		return ErrCommissionInvalidInput
+	}
+	updated := tx.Model(&QuotaReservation{}).
+		Where("id = ? AND commission_operation_id = ?", reservation.Id, 0).
+		Update("commission_operation_id", operationID)
+	if updated.Error != nil {
+		return updated.Error
+	}
+	if updated.RowsAffected != 1 {
+		return ErrCommissionProjectionConflict
+	}
+	reservation.CommissionOperationID = operationID
+	return nil
+}
+
+func findExistingCommissionOperationTx(tx *gorm.DB, reservation *QuotaReservation) (*CommissionOperationV1, bool, error) {
+	if reservation == nil {
+		return nil, false, ErrCommissionInvalidInput
+	}
+	stableIDs := []string{reservation.ReservationId}
+	operationHashes := []string{commissionHash("r29-sidecar-operation-v1", reservation.ReservationId)}
+	if reservation.RequestId != "" && reservation.RequestId != reservation.ReservationId {
+		stableIDs = append(stableIDs, reservation.RequestId)
+		operationHashes = append(operationHashes, commissionHash("r29-sidecar-operation-v1", reservation.RequestId))
+	}
+	var operations []CommissionOperationV1
+	err := lockForUpdate(tx).
+		Where("operation_key_hash IN ? OR source_stable_id IN ?", operationHashes, stableIDs).
+		Order("id ASC").Limit(2).Find(&operations).Error
+	if err != nil {
+		return nil, false, err
+	}
+	if len(operations) == 0 {
+		return nil, false, nil
+	}
+	if len(operations) != 1 {
+		return nil, true, ErrCommissionProjectionConflict
+	}
+	return &operations[0], true, nil
+}
+
+func validateExistingCommissionProjectionTx(
+	tx *gorm.DB,
+	reservation *QuotaReservation,
+	operation *CommissionOperationV1,
+	finalQuota int64,
+	eventAtMS int64,
+	inviterID int,
+	program *CommissionProgramV1,
+	hasProgram bool,
+) error {
+	hasCorrections := operation != nil && operation.ReservationCorrections != nil
+	if hasCorrections {
+		original, err := validateCommissionReservationCorrectionsTx(tx, reservation, operation, finalQuota)
+		if err != nil {
+			return err
+		}
+		operation = original
+		finalQuota = original.FinalTotalQuota
+	}
+	if tx == nil || reservation == nil || operation == nil || operation.ID <= 0 ||
+		finalQuota <= 0 || eventAtMS <= 0 {
+		return ErrCommissionProjectionConflict
+	}
+	modernIdentity := operation.SourceStableID == reservation.ReservationId &&
+		operation.OperationKeyHash == commissionHash("r29-sidecar-operation-v1", reservation.ReservationId) &&
+		operation.RequestHash == commissionHash("r29-sidecar-request-v1", reservation.ReservationId, fmt.Sprintf("%d", finalQuota), fmt.Sprintf("%d", eventAtMS))
+	legacyIdentity := reservation.RequestId != "" &&
+		operation.SourceStableID == reservation.RequestId &&
+		operation.OperationKeyHash == commissionHash("r29-sidecar-operation-v1", reservation.RequestId) &&
+		operation.RequestHash == commissionHash("r29-sidecar-request-v1", reservation.RequestId, fmt.Sprintf("%d", finalQuota), fmt.Sprintf("%d", eventAtMS))
+	expectedCommissionable := inviterID > 0 && inviterID != reservation.UserId && hasProgram
+	if (!modernIdentity && !legacyIdentity) ||
+		!strings.HasPrefix(operation.PublicID, "cco_") ||
+		operation.Source != CommissionProjectionSourceReservation ||
+		operation.ConsumerUserID != reservation.UserId ||
+		operation.TokenID != 0 ||
+		operation.UserSubscriptionID != 0 ||
+		operation.BeneficiaryUserID != inviterID ||
+		operation.ProfileID != 0 ||
+		operation.SpendPriority != CommissionOrdinaryFirst ||
+		operation.CommissionSpendEnabled ||
+		operation.Commissionable != expectedCommissionable ||
+		operation.FinancialStatus != CommissionFinancialSettled ||
+		operation.ProjectionStatus != CommissionProjectionApplied ||
+		operation.ReservedTotalQuota != int64(reservation.ReservedQuota) ||
+		operation.ReservedOrdinaryQuota != int64(reservation.ReservedQuota) ||
+		operation.ReservedCommissionQuota != 0 ||
+		operation.ReservedSubscriptionQuota != 0 ||
+		operation.FinalTotalQuota != finalQuota ||
+		operation.FinalOrdinaryQuota != finalQuota ||
+		operation.EligibleOrdinaryQuota != finalQuota ||
+		operation.FinalCommissionQuota != 0 ||
+		operation.FinalSubscriptionQuota != 0 ||
+		operation.CorrectedNumerator != 0 ||
+		operation.SiteUnfundedCostQuota != 0 ||
+		operation.ProjectionPayload != "" ||
+		operation.ErrorCode != "" ||
+		operation.ReservedAt != reservation.CreatedAt ||
+		operation.FinalizedAt != eventAtMS ||
+		operation.Version != 2 {
+		return ErrCommissionProjectionConflict
+	}
+	if hasProgram {
+		if program == nil || operation.ProgramID != program.ID ||
+			operation.ProgramVersion != program.Version ||
+			operation.ProgramTiersJSON != program.TiersJSON {
+			return ErrCommissionProjectionConflict
+		}
+	} else if operation.ProgramID != 0 || operation.ProgramVersion != 0 || operation.ProgramTiersJSON != "" {
+		return ErrCommissionProjectionConflict
+	}
+	return validateExistingCommissionAwardLedgerTx(tx, operation, hasCorrections)
+}
+
+func validateExistingCommissionAwardLedgerTx(tx *gorm.DB, operation *CommissionOperationV1, hasCorrections bool) error {
+	if tx == nil || operation == nil || operation.ID <= 0 {
+		return ErrCommissionProjectionConflict
+	}
+	var ledger []CommissionLedgerV1
+	if err := tx.Where("operation_id = ?", operation.ID).Order("id ASC").Find(&ledger).Error; err != nil {
+		return err
+	}
+	if hasCorrections {
+		awards := make([]CommissionLedgerV1, 0, len(ledger))
+		for _, event := range ledger {
+			switch event.EventType {
+			case "commission_awarded":
+				awards = append(awards, event)
+			case "commission_award_reversed":
+			default:
+				return ErrCommissionProjectionConflict
+			}
+		}
+		ledger = awards
+	}
+	if !operation.Commissionable {
+		if len(ledger) != 0 || operation.AwardNumerator != 0 || operation.AwardQuota != 0 {
+			return ErrCommissionProjectionConflict
+		}
+		return nil
+	}
+	if len(ledger) == 0 || operation.BeneficiaryUserID <= 0 ||
+		operation.AwardNumerator < 0 || operation.AwardQuota < 0 {
+		return ErrCommissionProjectionConflict
+	}
+	accountID := ledger[0].AccountID
+	if accountID <= 0 {
+		return ErrCommissionProjectionConflict
+	}
+	var account CommissionAccountV1
+	if err := tx.Where("id = ? AND user_id = ?", accountID, operation.BeneficiaryUserID).First(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrCommissionProjectionConflict
+		}
+		return err
+	}
+
+	firstLedgerID := ledger[0].ID
+	var startingEligible int64
+	if err := tx.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type = ? AND id < ?", accountID, "commission_awarded", firstLedgerID).
+		Select("COALESCE(SUM(eligible_ordinary_quota), 0)").Scan(&startingEligible).Error; err != nil {
+		return err
+	}
+	segments, expectedNumerator, err := calculateCommissionAwardSegments(
+		startingEligible, operation.EligibleOrdinaryQuota, operation.ProgramTiersJSON,
+	)
+	if err != nil || len(segments) != len(ledger) {
+		return ErrCommissionProjectionConflict
+	}
+	var priorNumerator int64
+	if err := tx.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type IN ? AND id < ?",
+			accountID, []string{"commission_awarded", "commission_award_reversed"}, firstLedgerID).
+		Select("COALESCE(SUM(numerator_delta), 0)").Scan(&priorNumerator).Error; err != nil {
+		return err
+	}
+	if priorNumerator < 0 {
+		return ErrCommissionProjectionConflict
+	}
+	previousState := CommissionLedgerV1{}
+	previousFound := true
+	if err := tx.Where("account_id = ? AND id < ?", accountID, firstLedgerID).
+		Order("id DESC").First(&previousState).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		previousFound = false
+	}
+	availableAfter := int64(0)
+	usageReservedAfter := int64(0)
+	withdrawalHeldAfter := int64(0)
+	debtAfter := int64(0)
+	pendingCapacityAfter := int64(0)
+	if previousFound {
+		availableAfter = previousState.AvailableAfter
+		usageReservedAfter = previousState.UsageReservedAfter
+		withdrawalHeldAfter = previousState.WithdrawalHeldAfter
+		debtAfter = previousState.DebtAfter
+		pendingCapacityAfter = previousState.PendingCapacityAfter
+	}
+
+	creditedTotal := int64(0)
+	awardUserQuotaAfter := ledger[0].UserQuotaAfter
+	for index, event := range ledger {
+		segment := segments[index]
+		if event.EventType != "commission_awarded" ||
+			event.AccountID != accountID ||
+			event.ConsumerUserID != operation.ConsumerUserID ||
+			event.EventKeyHash != commissionHash("r29-ledger-v1", fmt.Sprintf("%s:award:%d:%d", operation.PublicID, 1, index)) ||
+			!strings.HasPrefix(event.EventUUID, "cce_") ||
+			event.WithdrawalID != 0 ||
+			event.RelatedEventID != nil ||
+			event.ActorUserID != 0 ||
+			event.ReasonCode != "ordinary_consumption_award" ||
+			event.RequestHash != "" ||
+			event.EligibleOrdinaryQuota != segment.Eligible ||
+			event.RateBps != segment.RateBps ||
+			event.TierThreshold != segment.Threshold ||
+			event.NumeratorDelta != segment.Numerator ||
+			event.AvailableDelta < 0 ||
+			event.DebtDelta > 0 ||
+			event.UsageReservedDelta != 0 ||
+			event.WithdrawalHeldDelta != 0 ||
+			event.PendingCapacityDelta != 0 ||
+			event.UserQuotaDelta != 0 ||
+			event.UserQuotaAfter != awardUserQuotaAfter {
+			return ErrCommissionProjectionConflict
+		}
+		if priorNumerator > math.MaxInt64-segment.Numerator {
+			return ErrCommissionProjectionConflict
+		}
+		afterNumerator := priorNumerator + segment.Numerator
+		expectedCredit := afterNumerator/commissionRateBase - priorNumerator/commissionRateBase
+		priorNumerator = afterNumerator
+		if event.DebtDelta == math.MinInt64 {
+			return ErrCommissionProjectionConflict
+		}
+		credited, err := commissionSafeAdd(event.AvailableDelta, -event.DebtDelta)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		if credited != expectedCredit {
+			return ErrCommissionProjectionConflict
+		}
+		creditedTotal, err = commissionSafeAdd(creditedTotal, credited)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		availableAfter, err = commissionSafeAdd(availableAfter, event.AvailableDelta)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		usageReservedAfter, err = commissionSafeAdd(usageReservedAfter, event.UsageReservedDelta)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		withdrawalHeldAfter, err = commissionSafeAdd(withdrawalHeldAfter, event.WithdrawalHeldDelta)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		debtAfter, err = commissionSafeAdd(debtAfter, event.DebtDelta)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		pendingCapacityAfter, err = commissionSafeAdd(pendingCapacityAfter, event.PendingCapacityDelta)
+		if err != nil {
+			return ErrCommissionProjectionConflict
+		}
+		if event.AvailableAfter != availableAfter ||
+			event.UsageReservedAfter != usageReservedAfter ||
+			event.WithdrawalHeldAfter != withdrawalHeldAfter ||
+			event.DebtAfter != debtAfter ||
+			event.PendingCapacityAfter != pendingCapacityAfter {
+			return ErrCommissionProjectionConflict
+		}
+	}
+	if expectedNumerator != operation.AwardNumerator ||
+		creditedTotal != operation.AwardQuota {
+		return ErrCommissionProjectionConflict
+	}
+
+	var allEligible int64
+	if err := tx.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type = ?", accountID, "commission_awarded").
+		Select("COALESCE(SUM(eligible_ordinary_quota), 0)").Scan(&allEligible).Error; err != nil {
+		return err
+	}
+	var allNumerator int64
+	if err := tx.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type IN ?", accountID, []string{"commission_awarded", "commission_award_reversed"}).
+		Select("COALESCE(SUM(numerator_delta), 0)").Scan(&allNumerator).Error; err != nil {
+		return err
+	}
+	var allLifetimeEarned int64
+	if err := tx.Model(&CommissionLedgerV1{}).
+		Where("account_id = ? AND event_type = ?", accountID, "commission_awarded").
+		Select("COALESCE(SUM(available_delta - debt_delta), 0)").Scan(&allLifetimeEarned).Error; err != nil {
+		return err
+	}
+	if allNumerator < 0 ||
+		account.GrossLifetimeEligibleQuota != allEligible ||
+		account.NetEntitledQuota != allNumerator/commissionRateBase ||
+		account.FractionalNumerator != allNumerator%commissionRateBase ||
+		account.LifetimeEarnedQuota != allLifetimeEarned {
+		return ErrCommissionProjectionConflict
+	}
+	var latest CommissionLedgerV1
+	if err := tx.Where("account_id = ?", accountID).Order("id DESC").First(&latest).Error; err != nil {
+		return err
+	}
+	if latest.AvailableAfter != account.AvailableQuota ||
+		latest.UsageReservedAfter != account.UsageReservedQuota ||
+		latest.WithdrawalHeldAfter != account.WithdrawalHeldQuota ||
+		latest.DebtAfter != account.DebtQuota ||
+		latest.PendingCapacityAfter != account.PendingCapacityQuota {
+		return ErrCommissionProjectionConflict
+	}
+	return nil
+}
+
+func commissionProgramAtTx(tx *gorm.DB, eventAtMS int64) (*CommissionProgramV1, bool, error) {
+	if eventAtMS <= 0 {
+		return nil, false, ErrCommissionInvalidInput
+	}
+	var program CommissionProgramV1
+	err := tx.Where("published_at > 0 AND published_at <= ?", eventAtMS).
+		Order("published_at DESC").Order("id DESC").First(&program).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &program, true, nil
+}
+
+func commissionInviterAtTx(tx *gorm.DB, inviteeUserID int, eventAtMS int64) (int, *CommissionInviterBindingV1, error) {
+	if tx == nil || inviteeUserID <= 0 || eventAtMS <= 0 {
+		return 0, nil, ErrCommissionInvalidInput
+	}
+	var binding CommissionInviterBindingV1
+	err := tx.Where("invitee_user_id = ? AND effective_from_ms <= ? AND (effective_to_ms = 0 OR effective_to_ms > ?)",
+		inviteeUserID, eventAtMS, eventAtMS).
+		Order("effective_from_ms DESC, id DESC").First(&binding).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, nil, nil
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	return binding.InviterUserID, &binding, nil
+}
+
+func commissionReservationFinalQuotaTx(tx *gorm.DB, reservation *QuotaReservation, _ int64) (int64, int64, bool, error) {
+	if reservation == nil {
+		return 0, 0, false, ErrCommissionInvalidInput
+	}
+	finalQuota := int64(reservation.FinalQuota)
+	eventAtMS, err := commissionUnixSecondsToMilliseconds(reservation.FinalizedAt)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	var midjourney Midjourney
+	err = lockForUpdate(tx).Where("billing_reservation_id = ?", reservation.ReservationId).Order("id DESC").First(&midjourney).Error
+	if err == nil {
+		var genericTaskCount int64
+		if countErr := tx.Model(&Task{}).Where("billing_reservation_id = ?", reservation.ReservationId).Count(&genericTaskCount).Error; countErr != nil {
+			return 0, 0, false, countErr
+		}
+		if genericTaskCount != 0 {
+			return 0, 0, false, ErrCommissionProjectionConflict
+		}
+		return commissionMidjourneyFinalQuota(reservation, &midjourney, eventAtMS)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, 0, false, err
+	}
+	var task Task
+	err = tx.Where("billing_reservation_id = ?", reservation.ReservationId).Order("id DESC").First(&task).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return finalQuota, eventAtMS, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	var receipt TaskBillingReceipt
+	err = lockForUpdate(tx).Where("task_row_id = ?", task.ID).First(&receipt).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, 0, true, ErrCommissionProjectionDeferred
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if receipt.State != TaskBillingReceiptApplied {
+		return 0, 0, true, ErrCommissionProjectionDeferred
+	}
+	if receipt.ReservationID == nil ||
+		*receipt.ReservationID != reservation.ReservationId ||
+		receipt.RequestID != reservation.RequestId ||
+		receipt.UserID != reservation.UserId ||
+		receipt.TokenID != reservation.TokenId ||
+		receipt.TokenUnlimited != reservation.TokenUnlimited ||
+		receipt.FundingSource != QuotaReservationFundingWallet ||
+		receipt.SubscriptionID != 0 ||
+		receipt.AppliedQuota != receipt.TargetQuota ||
+		receipt.UsageAppliedQuota != receipt.TargetQuota ||
+		!receipt.RequestCountApplied ||
+		receipt.AppliedAt <= 0 ||
+		receipt.AppliedAt < reservation.FinalizedAt ||
+		receipt.TargetQuota != reservation.FinalQuota ||
+		task.UserId != reservation.UserId ||
+		task.BillingReservationID != reservation.ReservationId ||
+		task.Status != receipt.TerminalTargetStatus ||
+		task.Quota != receipt.TargetQuota {
+		return 0, 0, false, ErrCommissionProjectionConflict
+	}
+	switch receipt.TerminalTargetStatus {
+	case TaskStatusSuccess:
+		return int64(receipt.TargetQuota), eventAtMS, false, nil
+	case TaskStatusFailure:
+		if receipt.TargetQuota != 0 {
+			return 0, 0, false, ErrCommissionProjectionConflict
+		}
+		return 0, eventAtMS, false, nil
+	default:
+		return 0, 0, false, ErrCommissionProjectionConflict
+	}
+}
+
+func commissionMidjourneyFinalQuota(reservation *QuotaReservation, task *Midjourney, eventAtMS int64) (int64, int64, bool, error) {
+	if reservation == nil || task == nil ||
+		task.UserId != reservation.UserId ||
+		task.BillingReservationID != reservation.ReservationId {
+		return 0, 0, false, ErrCommissionProjectionConflict
+	}
+	state := strings.TrimSpace(task.BillingState)
+	status := strings.ToUpper(strings.TrimSpace(task.Status))
+	switch state {
+	case "", MidjourneyBillingPending, MidjourneyBillingTracking:
+		return 0, 0, true, ErrCommissionProjectionDeferred
+	case MidjourneyBillingApplied:
+		if status != string(TaskStatusSuccess) || task.Quota != reservation.FinalQuota || reservation.FinalQuota <= 0 {
+			return 0, 0, false, ErrCommissionProjectionConflict
+		}
+		return int64(reservation.FinalQuota), eventAtMS, false, nil
+	case MidjourneyBillingRefunded:
+		if status != string(TaskStatusFailure) || reservation.FinalQuota != 0 {
+			return 0, 0, false, ErrCommissionProjectionConflict
+		}
+		return 0, eventAtMS, false, nil
+	case MidjourneyBillingReview:
+		return 0, 0, false, ErrCommissionProjectionConflict
+	default:
+		return 0, 0, false, ErrCommissionProjectionConflict
+	}
+}
+
+func commissionUnixSecondsToMilliseconds(value int64) (int64, error) {
+	if value < commissionUnixSecondFloor || value > (int64(^uint64(0)>>1)/1000) {
+		return 0, ErrCommissionInvariant
+	}
+	return value * 1000, nil
+}

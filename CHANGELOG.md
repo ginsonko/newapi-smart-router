@@ -1,3 +1,13 @@
+# v0.4.0-alpha.1 — Alpha
+
+[Fixed version page](https://github.com/ginsonko/newapi-smart-router/releases/tag/v0.4.0-alpha.1) · [Capabilities and boundaries](docs/v0.4-contract-delta.md). Version notes describe content; publication and CI results are established separately by the version page and build receipts.
+
+- Generic R98 host, authorization/catalog/quote isolation and per-Key nullable policy memory.
+- Durable asynchronous image attempts, refund-aware fallback and unknown-outcome reconciliation.
+- Standalone core with image health, configurable one-hour default and tier-price expression analysis.
+- Reproducible public-base overlay and source/archive privacy validation.
+- Historical releases and upstream attribution preserved; no official Bridge certification.
+
 # Changelog
 
 ## v0.1.0-alpha.1 - 2026-07-23

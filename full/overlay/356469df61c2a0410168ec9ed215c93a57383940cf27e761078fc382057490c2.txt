@@ -1,0 +1,163 @@
+package service
+
+import (
+	"github.com/QuantumNous/new-api/pkg/smartrouter"
+	"github.com/gin-gonic/gin"
+)
+
+const smartRouteAuditContextKey = "smart_router_audit"
+
+type SmartRouteAttemptAudit struct {
+	Attempt        int                        `json:"attempt"`
+	RouteID        string                     `json:"route_id"`
+	ChannelID      int                        `json:"channel_id"`
+	Group          string                     `json:"group"`
+	RatioPPM       int64                      `json:"ratio_ppm"`
+	Price          smartrouter.RoutePrice     `json:"price"`
+	QuotedQuota    int                        `json:"quoted_quota"`
+	CatalogVersion string                     `json:"catalog_version"`
+	PriceVersion   string                     `json:"price_version"`
+	Admission      smartrouter.AdmissionKind  `json:"admission"`
+	Outcome        smartrouter.QualityOutcome `json:"outcome,omitempty"`
+	FailureScope   SmartRouteFailureScope     `json:"failure_scope,omitempty"`
+	StatusCode     int                        `json:"status_code,omitempty"`
+	Committed      bool                       `json:"committed,omitempty"`
+	// ObservationID is an irreversible request identity used only to make
+	// live projection and bounded log replay idempotent. It is kept in the
+	// administrator-only attempt audit and omitted from the user receipt.
+	ObservationID string `json:"observation_id,omitempty"`
+}
+
+// SmartRouteUserAttemptReceipt is the privacy-preserving record of one real
+// dispatch attempt. It deliberately omits route, channel, provider, upstream,
+// credential, and raw error details so the log owner can inspect fallback
+// behavior without learning the site's physical topology.
+type SmartRouteUserAttemptReceipt struct {
+	Attempt        int                        `json:"attempt"`
+	Group          string                     `json:"group"`
+	RatioPPM       int64                      `json:"ratio_ppm"`
+	Price          smartrouter.RoutePrice     `json:"price"`
+	Admission      smartrouter.AdmissionKind  `json:"admission"`
+	Outcome        smartrouter.QualityOutcome `json:"outcome,omitempty"`
+	StatusCode     int                        `json:"status_code,omitempty"`
+	Committed      bool                       `json:"committed,omitempty"`
+	CatalogVersion string                     `json:"catalog_version,omitempty"`
+	PriceVersion   string                     `json:"price_version,omitempty"`
+}
+
+type SmartRouteUserReceipt struct {
+	Kind           string                         `json:"kind"`
+	Attempts       []SmartRouteUserAttemptReceipt `json:"attempts"`
+	FinalGroup     string                         `json:"final_group,omitempty"`
+	FinalRatioPPM  int64                          `json:"final_ratio_ppm,omitempty"`
+	FinalPrice     *smartrouter.RoutePrice        `json:"final_price,omitempty"`
+	Completed      bool                           `json:"completed"`
+	CatalogVersion string                         `json:"catalog_version,omitempty"`
+	PriceVersion   string                         `json:"price_version,omitempty"`
+}
+
+func AppendSmartRouteAttemptAudit(c *gin.Context, attempt SmartRouteAttemptAudit) {
+	if c == nil {
+		return
+	}
+	current, _ := c.Get(smartRouteAuditContextKey)
+	attempts, _ := current.([]SmartRouteAttemptAudit)
+	for index := range attempts {
+		if attempts[index].Attempt == attempt.Attempt {
+			attempts[index] = attempt
+			c.Set(smartRouteAuditContextKey, attempts)
+			return
+		}
+	}
+	attempts = append(attempts, attempt)
+	c.Set(smartRouteAuditContextKey, attempts)
+}
+
+// CompleteSmartRouteConsumeAttempt includes the current successful text attempt
+// in the consume log, which is created inside the adapter before dispatch returns.
+// The controller still records the authoritative routing outcome after dispatch.
+func CompleteSmartRouteConsumeAttempt(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, _ := c.Get(smartRouteAuditContextKey)
+	attempts, _ := value.([]SmartRouteAttemptAudit)
+	if len(attempts) == 0 || attempts[len(attempts)-1].Outcome != "" {
+		return
+	}
+	current := &attempts[len(attempts)-1]
+	current.Outcome = smartrouter.OutcomeSuccess
+	current.StatusCode = 200
+	current.Committed = c.Writer != nil && c.Writer.Written()
+	c.Set(smartRouteAuditContextKey, attempts)
+}
+
+func AppendSmartRouterAdminInfo(c *gin.Context, adminInfo map[string]interface{}) {
+	if c == nil || adminInfo == nil {
+		return
+	}
+	current, exists := c.Get(smartRouteAuditContextKey)
+	if !exists {
+		return
+	}
+	attempts, ok := current.([]SmartRouteAttemptAudit)
+	if !ok || len(attempts) == 0 {
+		return
+	}
+	copyAttempts := append([]SmartRouteAttemptAudit(nil), attempts...)
+	adminInfo["smart_router_attempts"] = copyAttempts
+}
+
+// AppendSmartRouterLogInfo writes both the root-only physical attempt audit
+// and the group-level receipt visible to the log owner. The receipt describes
+// an actual request and is intentionally separate from the preference snapshot
+// returned by the smart-routing status endpoint.
+func AppendSmartRouterLogInfo(
+	c *gin.Context,
+	other map[string]interface{},
+	adminInfo map[string]interface{},
+) {
+	if c == nil {
+		return
+	}
+	current, exists := c.Get(smartRouteAuditContextKey)
+	if !exists {
+		return
+	}
+	attempts, ok := current.([]SmartRouteAttemptAudit)
+	if !ok || len(attempts) == 0 {
+		return
+	}
+	if adminInfo != nil {
+		adminInfo["smart_router_attempts"] = append([]SmartRouteAttemptAudit(nil), attempts...)
+	}
+	if other == nil {
+		return
+	}
+	receipt := SmartRouteUserReceipt{
+		Kind:     "actual_request",
+		Attempts: make([]SmartRouteUserAttemptReceipt, 0, len(attempts)),
+	}
+	for _, attempt := range attempts {
+		item := SmartRouteUserAttemptReceipt{
+			Attempt: attempt.Attempt, Group: attempt.Group, RatioPPM: attempt.RatioPPM, Price: attempt.Price,
+			Admission: attempt.Admission, Outcome: attempt.Outcome, StatusCode: attempt.StatusCode,
+			Committed: attempt.Committed, CatalogVersion: attempt.CatalogVersion, PriceVersion: attempt.PriceVersion,
+		}
+		receipt.Attempts = append(receipt.Attempts, item)
+		if attempt.CatalogVersion != "" {
+			receipt.CatalogVersion = attempt.CatalogVersion
+		}
+		if attempt.PriceVersion != "" {
+			receipt.PriceVersion = attempt.PriceVersion
+		}
+		if attempt.Outcome == smartrouter.OutcomeSuccess {
+			receipt.FinalGroup = attempt.Group
+			receipt.FinalRatioPPM = attempt.RatioPPM
+			finalPrice := attempt.Price
+			receipt.FinalPrice = &finalPrice
+			receipt.Completed = true
+		}
+	}
+	other["smart_router_receipt"] = receipt
+}

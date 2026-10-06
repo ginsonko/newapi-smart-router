@@ -1,0 +1,138 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestReconcileImageRouteDeliveriesSkipsUnfinishedFirstPage(test *testing.T) {
+	for _, mode := range []string{"missing", "partial", "mixed"} {
+		test.Run(mode, func(test *testing.T) {
+			var requests, posts atomic.Int64
+			fixture, provider, guard := newImageRouteLocalUpstreamFixture(test, func(*imageRouteReconcileFixture) http.Handler {
+				return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					requests.Add(1)
+					if request.Method == http.MethodPost {
+						posts.Add(1)
+					}
+					test.Errorf("delivery recovery must not contact upstream: %s %s", request.Method, request.URL.Path)
+					writer.WriteHeader(http.StatusServiceUnavailable)
+				})
+			})
+			const partialResult = `{"created":123,"data":[{"b64_json":"unfinished`
+			completeResult := fmt.Sprintf(`{"created":123,"data":[{"url":%q}]}`, provider.URL+"/already-generated.png")
+			directory := test.TempDir()
+			partialPaths := map[string]bool{}
+			for index := 0; index < 51; index++ {
+				job := *fixture.job
+				if index > 0 {
+					job.ID = 0
+					job.PublicTaskID = fmt.Sprintf("image-route-recovery-%02d", index)
+					job.BodyPath = filepath.Join(directory, fmt.Sprintf("request-%02d.json", index))
+					require.NoError(test, os.WriteFile(job.BodyPath, []byte(`{"model":"gpt-image-2","prompt":"saved request"}`), 0600))
+					root := &model.Task{Group: "default", Properties: fixture.root.Properties}
+					require.NoError(test, model.CreateImageRouteJob(&job, root))
+				}
+				claimed, won, err := model.ClaimImageRouteJob(job.ID, job.Version)
+				require.NoError(test, err)
+				require.True(test, won)
+				require.NoError(test, model.RecordImageRouteJobChannel(claimed.ID, 703))
+				resultPath := filepath.Join(directory, fmt.Sprintf("result-%02d.json", index))
+				require.NoError(test, fixture.database.Model(claimed).Update("result_path", resultPath).Error)
+				if index == 50 {
+					require.NoError(test, os.WriteFile(resultPath, []byte(completeResult), 0600))
+				} else if mode == "partial" || (mode == "mixed" && index%2 == 0) {
+					partialPaths[resultPath] = true
+					require.NoError(test, os.WriteFile(resultPath, []byte(partialResult), 0600))
+				}
+			}
+			var beforeJobs []model.ImageRouteJob
+			var beforeRoots []model.Task
+			require.NoError(test, fixture.database.Order("id").Find(&beforeJobs).Error)
+			require.NoError(test, fixture.database.Order("id").Find(&beforeRoots).Error)
+			require.Len(test, beforeJobs, 51)
+			require.Len(test, beforeRoots, 51)
+			beforeAccounting := fixture.accounting(test)
+			var pages [][]int64
+			require.NoError(test, fixture.database.Callback().Query().After("gorm:query").Register("observe_image_recovery_pages", func(transaction *gorm.DB) {
+				jobs, ok := transaction.Statement.Dest.(*[]model.ImageRouteJob)
+				if !ok || transaction.Error != nil {
+					return
+				}
+				ids := make([]int64, 0, len(*jobs))
+				for _, job := range *jobs {
+					ids = append(ids, job.ID)
+				}
+				pages = append(pages, ids)
+			}))
+			test.Cleanup(func() {
+				require.NoError(test, fixture.database.Callback().Query().Remove("observe_image_recovery_pages"))
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			reconcileImageRouteDeliveries(ctx)
+			require.NoError(test, ctx.Err())
+			require.NoError(test, fixture.database.Callback().Query().Remove("observe_image_recovery_pages"))
+			require.Len(test, pages, 2)
+			expectedFirstPage := make([]int64, 0, 50)
+			for _, job := range beforeJobs[:50] {
+				expectedFirstPage = append(expectedFirstPage, job.ID)
+			}
+			assert.Equal(test, expectedFirstPage, pages[0])
+			assert.Equal(test, []int64{beforeJobs[50].ID}, pages[1])
+			var afterJobs []model.ImageRouteJob
+			var afterRoots []model.Task
+			require.NoError(test, fixture.database.Order("id").Find(&afterJobs).Error)
+			require.NoError(test, fixture.database.Order("id").Find(&afterRoots).Error)
+			require.Len(test, afterJobs, 51)
+			require.Len(test, afterRoots, 51)
+			assert.Equal(test, beforeJobs[:50], afterJobs[:50])
+			assert.Equal(test, beforeRoots[:50], afterRoots[:50])
+			completed := &afterJobs[50]
+			require.Equal(test, model.ImageRouteJobSucceeded, completed.State)
+			assert.Equal(test, beforeJobs[50].ID, completed.ID)
+			assert.Equal(test, beforeJobs[50].PublicTaskID, afterRoots[50].TaskID)
+			assert.EqualValues(test, model.TaskStatusSuccess, afterRoots[50].Status)
+			assert.Zero(test, afterRoots[50].Quota)
+			assert.Empty(test, completed.CurrentTaskID)
+			assert.Equal(test, "[703]", completed.AttemptedChannelsJSON)
+			assert.Equal(test, beforeJobs[50].ResultPath, completed.ResultPath)
+			delivered, err := imageRouteJobResponse(completed)
+			require.NoError(test, err)
+			assert.JSONEq(test, completeResult, string(delivered))
+			for _, job := range afterJobs[:50] {
+				assert.FileExists(test, job.BodyPath)
+				if partialPaths[job.ResultPath] {
+					raw, err := os.ReadFile(job.ResultPath)
+					require.NoError(test, err)
+					assert.Equal(test, partialResult, string(raw))
+				} else {
+					assert.NoFileExists(test, job.ResultPath)
+				}
+			}
+			assert.NoFileExists(test, completed.BodyPath)
+			reconcileImageRouteDeliveries(ctx)
+			var repeatedJobs []model.ImageRouteJob
+			var repeatedRoots []model.Task
+			require.NoError(test, fixture.database.Order("id").Find(&repeatedJobs).Error)
+			require.NoError(test, fixture.database.Order("id").Find(&repeatedRoots).Error)
+			assert.Equal(test, afterJobs, repeatedJobs)
+			assert.Equal(test, afterRoots, repeatedRoots)
+			assert.Equal(test, beforeAccounting, fixture.accounting(test))
+			assert.Zero(test, posts.Load())
+			assert.Zero(test, requests.Load())
+			assert.Zero(test, guard.blocked.Load())
+		})
+	}
+}

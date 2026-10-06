@@ -1,0 +1,62 @@
+package middleware
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+)
+
+// SystemPerformanceCheck 检查系统性能中间件
+func SystemPerformanceCheck() gin.HandlerFunc {
+	return systemPerformanceCheck(checkSystemPerformance)
+}
+
+func systemPerformanceCheck(check func() *types.NewAPIError) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 仅检查 Relay 接口 (/v1, /v1beta 等)
+		// 这里简单判断路径前缀，可以根据实际路由调整
+		path := c.Request.URL.Path
+		if strings.HasPrefix(path, "/v1/messages") {
+			if err := check(); err != nil {
+				c.Header("Retry-After", "5")
+				c.JSON(err.StatusCode, gin.H{
+					"error": err.ToClaudeError(),
+				})
+				c.Abort()
+				return
+			}
+		} else {
+			if err := check(); err != nil {
+				c.Header("Retry-After", "5")
+				c.JSON(err.StatusCode, gin.H{
+					"error": err.ToOpenAIError(),
+				})
+				c.Abort()
+				return
+			}
+		}
+		c.Next()
+	}
+}
+
+// checkSystemPerformance 检查系统性能是否超过阈值
+func checkSystemPerformance() *types.NewAPIError {
+	protection := common.GetSystemProtectionStatus()
+	if !protection.Active {
+		return nil
+	}
+	for _, resource := range protection.Resources {
+		if !resource.Blocked {
+			continue
+		}
+		common.RecordSystemProtectionRejection(resource.Name)
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("服务器%s负载较高，已暂缓接收新请求，请5秒后重试（当前 %.1f%%，阈值 %d%%）", resource.Label, resource.Usage, resource.Threshold),
+			types.ErrorCode("system_"+resource.Name+"_overloaded"), http.StatusServiceUnavailable)
+	}
+	return nil
+}

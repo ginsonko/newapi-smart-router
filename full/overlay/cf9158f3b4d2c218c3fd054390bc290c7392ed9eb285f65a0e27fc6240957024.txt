@@ -1,0 +1,116 @@
+package controller
+
+import (
+	"errors"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	mediaservice "github.com/QuantumNous/new-api/pkg/media"
+	mediasetting "github.com/QuantumNous/new-api/setting/media_setting"
+)
+
+type imageRouteResponseWriter struct {
+	header      http.Header
+	file        *os.File
+	code        int
+	size        int64
+	reserved    int64
+	reservation string
+	err         error
+}
+
+func (writer *imageRouteResponseWriter) Header() http.Header { return writer.header }
+func (writer *imageRouteResponseWriter) WriteHeader(code int) {
+	if writer.code == 0 {
+		writer.code = code
+	}
+}
+func (writer *imageRouteResponseWriter) Flush() {}
+func (writer *imageRouteResponseWriter) Write(data []byte) (int, error) {
+	if writer.err != nil {
+		return 0, writer.err
+	}
+	if writer.code == 0 {
+		writer.code = http.StatusOK
+	}
+	if writer.size+int64(len(data)) > writer.reserved {
+		target := min(mediasetting.Get().MaxRequestBytes, writer.size+int64(len(data))+(8<<20))
+		if target < writer.size+int64(len(data)) {
+			writer.err = mediaservice.ErrMediaFileTooLarge
+			return 0, writer.err
+		}
+		if err := mediaservice.GrowImageRouteSpool(writer.reservation, target); err != nil {
+			writer.err = err
+			return 0, err
+		}
+		writer.reserved = target
+	}
+	written, err := writer.file.Write(data)
+	writer.size += int64(written)
+	writer.err = err
+	return written, err
+}
+
+func normalizeImageRouteBody(source io.Reader, destination io.Writer, contentType string) (string, error) {
+	mediaType, parameters, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return "", err
+	}
+	if mediaType == "multipart/form-data" {
+		reader := multipart.NewReader(source, parameters["boundary"])
+		writer := multipart.NewWriter(destination)
+		for {
+			part, err := reader.NextPart()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return "", err
+			}
+			if part.FormName() == "stream" || part.FormName() == "partial_images" {
+				_ = part.Close()
+				continue
+			}
+			output, err := writer.CreatePart(part.Header)
+			if err != nil {
+				return "", err
+			}
+			if _, err = io.Copy(output, part); err != nil {
+				return "", err
+			}
+			_ = part.Close()
+		}
+		if err := writer.WriteField("stream", "false"); err != nil {
+			return "", err
+		}
+		return writer.FormDataContentType(), writer.Close()
+	}
+	var payload map[string]any
+	if err := common.DecodeJsonUseNumber(source, &payload); err != nil {
+		return "", err
+	}
+	if payload == nil {
+		return "", errors.New("图片请求必须是JSON对象")
+	}
+	payload["stream"] = false
+	delete(payload, "partial_images")
+	raw, err := common.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	_, err = destination.Write(raw)
+	return "application/json", err
+}
+
+func imageRouteDispatchTimeout() time.Duration {
+	if constant.TaskTimeoutMinutes > 0 {
+		return time.Duration(constant.TaskTimeoutMinutes) * time.Minute
+	}
+	return time.Duration(mediasetting.Get().TemporaryFileTTLHours) * time.Hour
+}
